@@ -1,0 +1,21 @@
+.markdown { white-space: normal; min-width: 0; overflow-wrap: anywhere; line-height: 1.65; }
+.markdown > :first-child { margin-top: 0; }
+.markdown > :last-child { margin-bottom: 0; }
+.markdown p, .markdown ul, .markdown ol, .markdown blockquote, .markdown pre, .markdown table { margin: .8em 0; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { margin: 1.15em 0 .4em; line-height: 1.35; letter-spacing: normal; }
+.markdown h1 { font-size: 1.5em; }
+.markdown h2 { font-size: 1.3em; }
+.markdown h3 { font-size: 1.15em; }
+.markdown h4, .markdown h5, .markdown h6 { font-size: 1em; }
+.markdown ul, .markdown ol { padding-left: 1.6em; }
+.markdown li { margin: .25em 0; }
+.markdown li > ul, .markdown li > ol { margin: .25em 0; }
+.markdown blockquote { border-left: 3px solid #96b3ab; padding: .1em 1em; color: #4c6560; }
+.markdown code { background: #e6eeea; border-radius: 4px; padding: .12em .3em; font-size: .9em; }
+.markdown pre { max-width: 100%; overflow: auto; padding: 1em; background: #edf2ef; border-radius: 8px; white-space: pre; overflow-wrap: normal; }
+.markdown pre code { padding: 0; background: none; font-size: .9em; }
+.markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: .95em; }
+.markdown th, .markdown td { padding: .55em .8em; border: 1px solid #cddbd4; text-align: left; min-width: 7em; vertical-align: top; }
+.markdown th { background: #edf3ee; font-weight: 650; }
+.markdown input[type=checkbox] { width: auto; margin: 0 .35em 0 0; padding: 0; }
+.markdown a { text-decoration: underline; }

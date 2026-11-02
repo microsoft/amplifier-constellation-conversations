@@ -1,0 +1,11 @@
+[Unit]
+Description=Agent Conversations
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/agent-conversations/bin/agent-conversations --home %h/.local/share/agent-conversations serve
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
