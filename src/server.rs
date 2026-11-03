@@ -197,8 +197,18 @@ async fn headers(
     h.insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' {}; form-action 'self'",state.config.embed_origins.join(" ")).parse().unwrap());
     response
 }
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../ui/index.html"))
+async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
+    let name = state
+        .config
+        .agent
+        .label
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    Html(include_str!("../ui/index.html").replace(
+        "<title>Conversations · Your agent, wherever you are</title>",
+        &format!("<title>{name}: Conversations</title>"),
+    ))
 }
 async fn js() -> impl IntoResponse {
     (
