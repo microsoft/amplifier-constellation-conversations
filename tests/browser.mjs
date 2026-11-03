@@ -63,6 +63,23 @@ try{
   const viewAfter=(await api('/api/v1/views')).items.find(v=>v.state.selected_conversation_id===roomId);await api(`/api/v1/views/${viewAfter.id}`,'PUT',{expected_revision:viewAfter.revision,state:{...viewAfter.state,participants_open:false,history_search:'A note from Robin',history_before:null,action:{id:crypto.randomUUID(),kind:'focus',target:'history_search'}}});await waitFor(async()=>await page.locator('#history-search').inputValue()==='A note from Robin','remote history filter missing');await page.locator('#participants-panel[hidden]').waitFor({state:'attached'});assert(await page.locator('#history-search').evaluate(n=>n===document.activeElement));check('room panel and history search can be controlled programmatically');
   await page.locator('#latest-messages').click();await page.locator('#participants-toggle').click();await page.locator('#participant-list .participant-row').filter({hasText:'robin'}).getByRole('button',{name:'Remove'}).click();await waitFor(async()=>await robin.locator('#conversation-list .conversation-item').count()===0,'removed human still sees room');assert(!(await robin.locator('#messages').innerText()).includes('A note from Robin'));check('membership removal immediately removes history from the second browser');await samContext.close();
   await page.screenshot({path:cfg.screenshot.replace('.png','-room.png'),fullPage:true});
+  // An unrelated ACP agent asks for sign-in. No external page opens until the
+  // person explicitly consents; the form and URL remain in this private room.
+  const authAgent=structuredClone(agent);authAgent.label='Sign-in helper';authAgent.env.FIXTURE_AUTH='1';authAgent.env.FIXTURE_EMBEDDED='1';
+  await api('/api/v1/agents','POST',{id:'auth',config:authAgent});
+  const authRoom=await api('/api/v1/conversations','POST',{title:'Sign-in check',agent_ids:['auth']});
+  await page.goto(`${cfg.url}/?conversation=${authRoom.id}`);await page.locator('#app:not([hidden])').waitFor();await waitFor(async()=>await page.locator('#conversation-title').innerText()==='Sign-in check','sign-in room not selected');
+  await page.locator('#message').fill('Read the attached PDF');await page.locator('#file-upload').setInputFiles({name:'document.pdf',mimeType:'application/pdf',buffer:Buffer.from('%PDF-1.7\nfixture document\n%%EOF')});
+  await waitFor(async()=>(await page.locator('#draft-attachments').innerText()).includes('document.pdf'),'PDF preview missing');await page.locator('#send').click();
+  await page.locator('[data-field=method_id]').waitFor();assert.equal(await page.locator('[data-field=method_id] option').count(),2); // empty plus the supported method
+  assert.equal(context.pages().length,1);await page.locator('[data-field=method_id]').selectOption('browser');await page.getByRole('button',{name:'Send answer',exact:true}).click();
+  const urlCard=page.locator('.elicitation-url');await urlCard.waitFor();assert.match(await urlCard.innerText(),/https:\/\/example.test\/authorize/);
+  assert.equal(context.pages().length,1);await page.setViewportSize({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await context.route('https://example.test/**',route=>route.fulfill({status:200,body:'Fixture provider login'}));
+  const popup=context.waitForEvent('page');await page.getByRole('link',{name:'Open and continue',exact:true}).click();const loginPage=await popup;await loginPage.waitForLoadState();assert.equal(await loginPage.evaluate(()=>window.opener),null);await loginPage.close();
+  await waitFor(async()=>await page.locator('#turn-status').isHidden(),'authenticated turn did not finish');assert((await page.locator('#messages').innerText()).includes('Fixture response:'));
+  assert.match(await page.locator('a.attachment-chip').innerText(),/document.pdf/);await page.setViewportSize({width:1440,height:1000});check('explicit ACP browser login and PDF upload work end to end');
+
   await page.setViewportSize({width:390,height:844});await page.locator('#menu').click();await page.locator('#new-conversation').click();await waitFor(async()=>(await page.locator('#conversation-title').innerText())==='New conversation','mobile new conversation failed');assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));check('mobile layout and conversation navigation');
   await page.locator('#message').fill('wait forever');await page.locator('#send').click();await page.locator('#stop:not([hidden])').waitFor();await page.locator('#stop').click();await waitFor(async()=>(await page.locator('#turn-status-text').innerText()).includes('stopped'),'stop did not reach client');check('stop active work');
   await page.evaluate(()=>window.agentConversationsControl.setView({voice_enabled:true}));

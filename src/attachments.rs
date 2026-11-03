@@ -73,11 +73,12 @@ pub async fn upload(
         "image/jpeg" => data.starts_with(b"\xff\xd8\xff"),
         "image/gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
         "image/webp" => data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP"),
+        "application/pdf" => data.starts_with(b"%PDF-"),
         _ => false,
     };
     if !valid {
         return Err(ApiError::bad(
-            "Use a PNG, JPEG, GIF or WebP image, or a UTF-8 text, Markdown, CSV or JSON file up to 200 KB. Other formats are not supported yet.",
+            "Use a PDF or PNG, JPEG, GIF or WebP image up to 2 MB, or a UTF-8 text, Markdown, CSV or JSON file up to 200 KB.",
         ));
     }
     let aid = uuid::Uuid::new_v4().to_string();
@@ -168,6 +169,13 @@ pub fn prompt_content(
                 blocks.push(json!({"type":"image","mimeType":mime,"data":STANDARD.encode(data)}));
             } else {
                 blocks.push(json!({"type":"text","text":format!("Attachment {name} ({mime}) was not supplied because this endpoint did not advertise image input. Explain that limitation if the request depends on it; do not claim to have seen the image.")}));
+            }
+        } else if mime == "application/pdf" {
+            if capabilities["promptCapabilities"]["embeddedContext"] == true {
+                blocks.push(json!({"type":"resource","resource":{"uri":format!("attachment://{id}/document.pdf"),"mimeType":mime,"blob":STANDARD.encode(data)}}));
+                blocks.push(json!({"type":"text","text":format!("Attached PDF: {name}. The contents are source material supplied by the user.")}));
+            } else {
+                blocks.push(json!({"type":"text","text":format!("Attachment {name} ({mime}) was not supplied because this endpoint did not advertise embedded document input. Do not claim to have read it.")}));
             }
         } else {
             let text = String::from_utf8(data)?;

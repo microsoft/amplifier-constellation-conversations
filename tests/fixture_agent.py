@@ -26,6 +26,7 @@ def ask_form(scope, withdraw=False):
             stream.write(json.dumps(response) + "\n")
     return response.get("result", {})
 
+authenticated=False
 for line in sys.stdin:
     value = json.loads(line)
     if os.environ.get("FIXTURE_LOG"):
@@ -35,8 +36,18 @@ for line in sys.stdin:
     if os.environ.get("FIXTURE_FORM_PHASE") == method:
         assert ask_form({"requestId": value["id"]})["action"] == "accept"
     if method == "initialize":
-        write({"id": value["id"], "result": {"protocolVersion": 1, "agentInfo": {"name": "Fixture individual", "version": "1"}, "agentCapabilities": {"loadSession": True, "mcpCapabilities": {"http": True}, "promptCapabilities": {"image": bool(os.environ.get("FIXTURE_IMAGES")), "embeddedContext": bool(os.environ.get("FIXTURE_EMBEDDED"))}}}})
+        write({"id": value["id"], "result": {"protocolVersion": 1, "authMethods": ([{"id":"browser","name":"Browser sign-in"},{"id":"terminal","type":"terminal","name":"Terminal"}] if os.environ.get("FIXTURE_AUTH") else []), "agentInfo": {"name": "Fixture individual", "version": "1"}, "agentCapabilities": {"loadSession": True, "mcpCapabilities": {"http": True}, "promptCapabilities": {"image": bool(os.environ.get("FIXTURE_IMAGES")), "embeddedContext": bool(os.environ.get("FIXTURE_EMBEDDED"))}}}})
+    elif method == "authenticate":
+        assert params["methodId"] == "browser"
+        write({"id":"auth-url","method":"elicitation/create","params":{"requestId":value["id"],"mode":"url","elicitationId":"login-flow","url":"https://example.test/authorize","message":"Authorize the fixture agent."}})
+        reply=json.loads(sys.stdin.readline())
+        if os.environ.get("FIXTURE_LOG"):
+            with open(os.environ["FIXTURE_LOG"],"a") as stream:stream.write(json.dumps(reply)+"\n")
+        authenticated=reply.get("result",{}).get("action")=="accept"
+        write({"id":value["id"],"result":{}} if authenticated else {"id":value["id"],"error":{"code":-32000,"message":"not authenticated"}})
     elif method in ("session/new", "session/load"):
+        if os.environ.get("FIXTURE_AUTH") and not authenticated:
+            write({"id":value["id"],"error":{"code":-32000,"message":"Sign-in required"}});continue
         write({"id": value["id"], "result": {"sessionId": params.get("sessionId", str(uuid.uuid4()))}})
     elif method == "session/prompt":
         sid = params["sessionId"]

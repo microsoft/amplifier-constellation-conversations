@@ -23,3 +23,7 @@ select{font:inherit;border:1px solid var(--border);border-radius:8px;padding:9px
 #elicitations{max-height:48vh;overflow:auto;flex-shrink:0}.elicitation-form .elicitation-field{display:grid;gap:.4rem;margin:.2rem 0;font-weight:600}.elicitation-field input:not([type=checkbox]),.elicitation-field select{width:100%;min-width:0;padding:.65rem;border:1px solid #bccdc6;border-radius:6px;background:var(--surface,#fff);color:inherit;font:inherit}.elicitation-field small{font-weight:400}.elicitation-field input[type=checkbox]{justify-self:start;width:1.2rem;height:1.2rem}.elicitation-field select[multiple]{min-height:6rem}
 
 .chat-panel.has-elicitation .composer-wrap{max-height:75%;min-height:0;flex-shrink:1;overflow-y:auto;scrollbar-width:thin}.chat-panel.has-elicitation #elicitations{max-height:none}
+
+.external-url{overflow-wrap:anywhere;font-family:monospace;font-size:.9rem}
+
+.external-url{overflow-wrap:anywhere;font-family:monospace;font-size:.9rem}

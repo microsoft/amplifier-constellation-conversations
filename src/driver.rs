@@ -10,6 +10,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
+#[derive(Clone, Copy)]
 struct SetupInteraction<'a> {
     state: &'a Arc<AppState>,
     callbacks: &'a Arc<crate::client_callbacks::ClientCallbacks>,
@@ -23,8 +24,65 @@ struct Peer {
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     next: u64,
+    auth_methods: Value,
+    auth_attempted: bool,
 }
 impl Peer {
+    async fn session_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        ctx: SetupInteraction<'_>,
+        cancel: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Value> {
+        let result = self
+            .setup_request(method, params.clone(), ctx, cancel)
+            .await;
+        if !result
+            .as_ref()
+            .is_err_and(crate::acp_auth::authentication_required)
+            || self.auth_attempted
+        {
+            return result;
+        }
+        self.auth_attempted = true;
+        let choice = crate::acp_auth::choice(&self.auth_methods)?;
+        let request = ctx
+            .state
+            .elicitations
+            .request(
+                ctx.room,
+                ctx.actor,
+                ctx.label,
+                &choice,
+                Duration::from_secs(300).min(
+                    ctx.deadline
+                        .saturating_duration_since(tokio::time::Instant::now()),
+                ),
+            )
+            .map_err(anyhow::Error::msg)?;
+        ctx.state.status(
+            ctx.room,
+            "working",
+            &format!("{} needs you to choose a sign-in method.", ctx.label),
+        )?;
+        ctx.state.changed();
+        let reply = tokio::select! {
+            reply = request.wait() => reply,
+            _ = cancel_signal(cancel) => bail!("Turn cancelled"),
+            _ = tokio::time::sleep_until(ctx.deadline) => bail!("Sign-in timed out"),
+        };
+        ensure!(reply["action"] == "accept", "Agent sign-in was cancelled");
+        self.setup_request(
+            "authenticate",
+            json!({"methodId":reply["content"]["method_id"]}),
+            ctx,
+            cancel,
+        )
+        .await?;
+        // Only retry setup. Never replay a prompt whose tools may already have run.
+        self.setup_request(method, params, ctx, cancel).await
+    }
     async fn write(&mut self, v: Value) -> Result<()> {
         self.input.write_all(format!("{v}\n").as_bytes()).await?;
         self.input.flush().await?;
@@ -136,6 +194,9 @@ impl Peer {
                             .as_str()
                             .context("Missing ACP session")?,
                     )?;
+                }
+                if method == "initialize" {
+                    self.auth_methods = v["result"]["authMethods"].clone();
                 }
                 return Ok(v["result"].clone());
             }
@@ -279,6 +340,8 @@ impl Client {
                 input,
                 output,
                 next: 0,
+                auth_methods: json!([]),
+                auth_attempted: false,
             },
         })
     }
@@ -474,7 +537,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     );
     let mut c = Client::start(agent).await?;
     let mut capabilities = callbacks.advertised();
-    capabilities["elicitation"] = json!({"form":{}});
+    capabilities["elicitation"] = json!({"form":{},"url":{}});
     let init = c.peer.setup_request(
         "initialize",
         json!({"protocolVersion":1,"clientInfo":{"name":"agent-conversations","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":capabilities}),
@@ -496,7 +559,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         params["sessionId"] = json!(old);
         let restore = c
             .peer
-            .setup_request(
+            .session_request(
                 "session/load",
                 params.clone(),
                 SetupInteraction {
@@ -541,7 +604,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 json!({"reason":"The endpoint could not restore its previous session"}),
             )?;
             c.peer
-                .setup_request(
+                .session_request(
                     "session/new",
                     params.clone(),
                     SetupInteraction {
@@ -562,7 +625,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         }
     } else {
         c.peer
-            .setup_request(
+            .session_request(
                 "session/new",
                 params,
                 SetupInteraction {

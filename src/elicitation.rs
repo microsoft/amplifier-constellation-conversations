@@ -214,15 +214,36 @@ fn field_schema(schema: &Value, array_item: bool) -> Result<(), &'static str> {
     Ok(())
 }
 pub fn validate_request(params: &Value) -> Result<(), &'static str> {
-    if params["mode"] != "form" {
-        return fail("This client supports form elicitation only");
-    }
     if params.to_string().len() > 65536
         || params["message"]
             .as_str()
             .is_none_or(|s| s.is_empty() || s.len() > 8192)
     {
         return fail("Invalid elicitation message");
+    }
+    if params["mode"] == "url" {
+        let raw = params["url"].as_str().ok_or("Missing interaction URL")?;
+        let url = reqwest::Url::parse(raw).map_err(|_| "Invalid interaction URL")?;
+        let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+        if raw.len() > 8192
+            || raw.chars().any(char::is_control)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || !(url.scheme() == "https" || url.scheme() == "http" && local)
+            || url.host_str().is_none()
+            || params["elicitationId"]
+                .as_str()
+                .is_none_or(|s| s.is_empty() || s.len() > 1024)
+            || params.get("requestedSchema").is_some()
+        {
+            return fail(
+                "Use an HTTPS interaction URL without embedded credentials and a bounded request identifier",
+            );
+        }
+        return Ok(());
+    }
+    if params["mode"] != "form" {
+        return fail("Unsupported elicitation mode");
     }
     let schema = &params["requestedSchema"];
     if schema["type"] != "object" {
@@ -393,7 +414,16 @@ impl Elicitations {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
-        let value = json!({"id":id,"conversation_id":room,"agent":agent,"message":params["message"],"schema":params["requestedSchema"],"expires_at":crate::state::now_ms()+timeout.as_millis() as i64});
+        let mut value = json!({"id":id,"conversation_id":room,"agent":agent,"mode":params["mode"],"message":params["message"],"schema":params["requestedSchema"],"expires_at":crate::state::now_ms()+timeout.as_millis() as i64});
+        if params["mode"] == "url" {
+            value["url"] = params["url"].clone();
+            value["host"] = json!(
+                reqwest::Url::parse(params["url"].as_str().unwrap())
+                    .unwrap()
+                    .host_str()
+            );
+            value["elicitation_id"] = params["elicitationId"].clone();
+        }
         requests.insert(
             id.clone(),
             Pending {
@@ -440,12 +470,12 @@ impl Elicitations {
             requests.remove(id);
             return fail("Form request expired");
         }
-        if action == "accept" {
+        if action == "accept" && p.value["mode"] != "url" {
             validate_content(&p.value["schema"], content.ok_or("Missing form response")?)?;
         }
         let p = requests.remove(id).unwrap();
         let mut result = json!({"action":action});
-        if action == "accept" {
+        if action == "accept" && p.value["mode"] != "url" {
             result["content"] = content.unwrap().clone();
         }
         p.sender
@@ -476,6 +506,29 @@ mod tests {
     }
     fn params() -> Value {
         json!({"mode":"form","message":"Choose approach","requestedSchema":{"type":"object","properties":{"approach":{"type":"string","enum":["small","large"]},"count":{"type":"integer","minimum":1,"maximum":3}},"required":["approach"]}})
+    }
+    #[test]
+    fn external_interactions_require_safe_explicit_destinations() {
+        let mut p = json!({"mode":"url","message":"Sign in","elicitationId":"login","url":"https://example.test/authorize"});
+        for url in [
+            "https://example.test/authorize?state=123",
+            "http://127.0.0.1:8123/auth",
+            "http://[::1]:8123/auth",
+        ] {
+            p["url"] = json!(url);
+            assert!(validate_request(&p).is_ok());
+        }
+        for url in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,hi",
+            "http://example.test",
+            "https://user:password@example.test",
+            "https://example.test/\npath",
+        ] {
+            p["url"] = json!(url);
+            assert!(validate_request(&p).is_err(), "{url}");
+        }
     }
     #[tokio::test]
     async fn private_forms_validate_and_require_an_explicit_single_use_decision() {
@@ -565,7 +618,7 @@ mod tests {
         );
     }
     #[test]
-    fn form_schemas_reject_credentials_nested_objects_and_url_mode() {
+    fn form_schemas_reject_credentials_nested_objects_and_mixed_modes() {
         let mut p = params();
         p["mode"] = json!("url");
         assert!(validate_request(&p).is_err());
