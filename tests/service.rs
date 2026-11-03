@@ -1729,6 +1729,58 @@ async fn attachments_are_private_bounded_and_honest_about_acp_capabilities() {
     );
 }
 #[tokio::test]
+async fn pdf_upload_preserves_bytes_and_obeys_room_and_capability_boundaries() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let f = fixture();
+    let c = f.state.create("PDF fixture").unwrap();
+    let id = c["id"].as_str().unwrap();
+    let base = format!("/api/v1/conversations/{id}");
+    let encoded = STANDARD.encode(b"%PDF-1.7\nfixture\n%%EOF");
+    let (status, pdf) = request(
+        &f.app,
+        "POST",
+        &format!("{base}/attachments"),
+        Some(&f.admin),
+        Some(json!({"name":"brief.pdf","mime_type":"application/pdf","data":encoded})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        user_request(
+            &f,
+            "robin",
+            "GET",
+            &format!("{base}/attachments/{}", pdf["id"].as_str().unwrap()),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(request(&f.app,"POST",&format!("{base}/attachments"),Some(&f.admin),Some(json!({"name":"fake.pdf","mime_type":"application/pdf","data":STANDARD.encode(b"not pdf")}))).await.0,StatusCode::BAD_REQUEST);
+    assert_eq!(request(&f.app,"POST",&format!("{base}/messages"),Some(&f.admin),Some(json!({"text":"Read the file","request_id":uuid::Uuid::new_v4(),"attachment_ids":[pdf["id"]]}))).await.0,StatusCode::ACCEPTED);
+    wait_idle(&f, id).await;
+    let ids = vec![pdf["id"].as_str().unwrap().to_string()];
+    let content = agent_conversations::attachments::prompt_content(
+        &f.state,
+        id,
+        &ids,
+        &json!({"promptCapabilities":{"embeddedContext":true}}),
+    )
+    .unwrap();
+    assert_eq!(content[0]["resource"]["blob"], encoded);
+    let fallback =
+        agent_conversations::attachments::prompt_content(&f.state, id, &ids, &json!({})).unwrap();
+    assert!(
+        fallback[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not supplied")
+    );
+    assert!(!serde_json::to_string(&fallback).unwrap().contains(&encoded));
+}
+
+#[tokio::test]
 async fn message_search_paginates_without_overlap_and_never_reads_another_room() {
     let f = fixture();
     let c = f.state.create("History").unwrap();
@@ -2754,5 +2806,142 @@ async fn request_scoped_forms_work_during_initialization_creation_and_loading() 
             "idle",
             "{phase}"
         );
+    }
+}
+
+#[tokio::test]
+async fn interactive_agent_auth_is_requester_bound_and_retries_only_setup() {
+    for decision in ["accept", "decline", "cancel"] {
+        let f = fixture();
+        let mut agent = f.state.config.agent.clone();
+        agent.env.insert("FIXTURE_AUTH".into(), "1".into());
+        assert_eq!(
+            request(
+                &f.app,
+                "POST",
+                "/api/v1/agents",
+                Some(&f.admin),
+                Some(json!({"id":"auth","config":agent}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let room = f
+            .state
+            .create_room("Sign-in", "owner", &["auth".into()])
+            .unwrap();
+        let id = room["id"].as_str().unwrap();
+        let path = format!("/api/v1/conversations/{id}");
+        user_request(
+            &f,
+            "owner",
+            "POST",
+            &format!("{path}/members"),
+            Some(json!({"username":"robin","share_history":true})),
+        )
+        .await;
+        user_request(
+            &f,
+            "robin",
+            "POST",
+            &format!("{path}/messages"),
+            Some(json!({"text":"Say hello","request_id":uuid::Uuid::new_v4()})),
+        )
+        .await;
+        let form = pending_form(&f, id, "robin").await;
+        assert_eq!(
+            form["schema"]["properties"]["method_id"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let route = format!("{path}/elicitations/{}", form["id"].as_str().unwrap());
+        assert_eq!(
+            user_request(&f, "owner", "GET", &path, None).await.1["elicitations"],
+            json!([])
+        );
+        assert_eq!(
+            user_request(
+                &f,
+                "owner",
+                "POST",
+                &route,
+                Some(json!({"action":"accept","content":{"method_id":"browser"}}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            user_request(
+                &f,
+                "robin",
+                "POST",
+                &route,
+                Some(json!({"action":"accept","content":{"method_id":"terminal"}}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        user_request(
+            &f,
+            "robin",
+            "POST",
+            &route,
+            Some(json!({"action":decision,"content":{"method_id":"browser"}})),
+        )
+        .await;
+        if decision == "accept" {
+            let url = pending_form(&f, id, "robin").await;
+            assert_eq!(url["mode"], "url");
+            assert_eq!(url["host"], "example.test");
+            assert_eq!(
+                user_request(&f, "owner", "GET", &path, None).await.1["elicitations"],
+                json!([])
+            );
+            assert_eq!(
+                user_request(
+                    &f,
+                    "robin",
+                    "POST",
+                    &format!("{path}/elicitations/{}", url["id"].as_str().unwrap()),
+                    Some(json!({"action":"accept","content":{"ignored":"never forwarded"}}))
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+        }
+        wait_idle(&f, id).await;
+        let frames = std::fs::read_to_string(f._home.path().join("frames.jsonl")).unwrap();
+        let rows: Vec<Value> = frames
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["method"] == "authenticate")
+                .count(),
+            usize::from(decision == "accept")
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["method"] == "session/prompt")
+                .count(),
+            usize::from(decision == "accept")
+        );
+        assert!(!frames.contains("never forwarded"));
+        let db = f.state.db.lock().unwrap();
+        let events: Vec<String> = db
+            .prepare("SELECT data FROM audit")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!events.join("").contains("https://example.test/authorize"));
     }
 }

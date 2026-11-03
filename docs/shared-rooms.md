@@ -54,7 +54,7 @@ A message can include up to four private attachments. Supported formats:
 - PNG, JPEG, GIF, WebP: at most 2 MB each, supplied as ACP image blocks only if the endpoint advertises image input.
 - UTF-8 plain text, Markdown, CSV, JSON: at most 200 KB each; embedded resources when supported, otherwise explicit document text blocks.
 
-Unsupported image input produces a clear limitation in the agent's context. The adapter never says an image was read when it was not supplied. Other file types, including PDF and audio/video, are rejected with an explanation. Downloads require current room membership and use attachment disposition with `nosniff`; uploaded HTML/SVG and arbitrary executable files are not accepted. Files do not become host filesystem paths. Unsent uploads remain visible only to their uploader. Current-turn attachments are supplied to the addressed agents; earlier messages retain metadata and authenticated download links for people, rather than silently reattaching all old files to every prompt.
+Unsupported image input produces a clear limitation in the agent's context. The adapter never says an image was read when it was not supplied. PDF files up to 2 MB are sent as standard ACP embedded resources when the endpoint advertises embedded context; its provider must also support PDF input. Otherwise the prompt states that the document was not supplied. Other file types, including audio/video inputs, are rejected with an explanation. Downloads require current room membership and use attachment disposition with `nosniff`; uploaded HTML/SVG and arbitrary executable files are not accepted. Files do not become host filesystem paths. Unsent uploads remain visible only to their uploader. Current-turn attachments are supplied to the addressed agents; earlier messages retain metadata and authenticated download links for people, rather than silently reattaching all old files to every prompt.
 
 Rooms have a 64 MB attachment budget and at most 20 unsent uploads. A user can delete their unsent uploads. Deleting a conversation deletes its stored files; it cannot erase content already incorporated into an agent's own memory.
 
@@ -75,3 +75,21 @@ This service remains standalone. A fleet experience can list/configure ACP conne
 ## Verification
 
 `cargo test --all-targets` exercises authenticated audience isolation, room grants, explicit sharing, independent ACP sessions, ambient/direct participation, requester-bound approval decisions and cancellation, attachment bounds/capability fallback, historical pagination/search, restart, imports, and view ownership. `tests/browser.py` runs the real HTTPS service with model-free ACP subprocesses and two independently authenticated browser contexts. It checks the existing private experience plus invited-user visibility, attributed messages, participant controls, attachments, targeting, history control, removal, mobile layout, and cancellation. Disposable browser sessions do not claim to validate a real user's PAM password or real-model social judgment.
+
+## Agent sign-in and external steps
+
+An agent that returns ACP `AUTH_REQUIRED` during new/load setup can offer its
+`authMethods`. Conversations asks the initiating person to choose a supported
+agent method, calls `authenticate`, and retries session setup once. It never
+replays a model prompt to recover authentication. Terminal-only login methods
+remain a host setup task; their commands are not executed by the web service.
+
+ACP form and URL elicitations are private to the initiating person, including
+inside a shared room. External steps show the full address and host and require
+an explicit **Open and continue** action. Accepting the URL means consent to open
+it, not proof that login completed; the agent must complete its authentication
+request. Credentials are entered at the provider. URLs and answers are not
+written into the conversation or activity audit. Unanswered requests expire and
+are removed on cancellation. Only HTTPS (or loopback HTTP) destinations are
+accepted. The same decisions are available through the elicitation API and view
+controls; `elicitation_open_url` is the browser action for an external step.
