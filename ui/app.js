@@ -32,7 +32,7 @@ async function openApp(){
   $('loading').hidden=true;$('login').hidden=true;$('app').hidden=false;
   $('agent-name').textContent=ui.meta.agent.label;$('agent-initial').textContent=initials(ui.meta.agent.label);$('owner-name').textContent=ui.session.owner;$('agent-registry').hidden=!ui.meta.admin;$('check').hidden=!ui.meta.admin;$('view-label').textContent=`View ${viewId.slice(0,6)}`;$('message').placeholder=`Message ${ui.meta.agent.label}…`;
   $('connection-title').textContent=`Connected to ${ui.meta.agent.label}.`;$('connection-agent').textContent=ui.meta.agent.label;
-  document.title=`${ui.meta.agent.label} · Conversations`;
+  document.title=`${ui.meta.agent.label}: Conversations`;
   const details=[['ACP command',[ui.meta.agent.command,...(ui.meta.agent.args||[])].filter(Boolean).join(' ')||'Managed by the service owner'],['Working folder',ui.meta.agent.cwd],['Context provider',ui.meta.provider.id],['View ID',viewId],['Version',ui.meta.version]];
   $('connection-details').replaceChildren(...details.flatMap(([k,v])=>[el('dt',null,k),el('dd',null,v)]));
   applyView();await refresh();connectEvents();
