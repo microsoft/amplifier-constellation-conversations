@@ -114,12 +114,6 @@ impl AppState {
             .query_map([], conversation_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
-    pub fn list_for(&self, user: &str) -> Result<Vec<Value>> {
-        let db = self.db.lock().unwrap();
-        let mut q=db.prepare("SELECT c.id,c.title,c.created_at,c.updated_at,c.status,c.note,c.agent_info,c.surface,c.read_only,c.owner,c.shared FROM conversations c JOIN room_members m ON m.conversation_id=c.id AND m.username=?1 ORDER BY c.updated_at DESC,c.id DESC LIMIT 200")?;
-        Ok(q.query_map([user], conversation_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
-    }
     pub fn list_for_agent(&self, user: &str, agent: &str) -> Result<Vec<Value>> {
         let db = self.db.lock().unwrap();
         let mut q=db.prepare("SELECT c.id,c.title,c.created_at,c.updated_at,c.status,c.note,c.agent_info,c.surface,c.read_only,c.owner,c.shared FROM conversations c JOIN room_members m ON m.conversation_id=c.id AND m.username=?1 JOIN room_agents a ON a.conversation_id=c.id AND a.agent_id=?2 ORDER BY c.updated_at DESC,c.id DESC LIMIT 200")?;
@@ -142,9 +136,6 @@ impl AppState {
     }
     pub fn conversation_info(&self, id: &str) -> Result<Option<Value>> {
         Ok(self.db.lock().unwrap().query_row("SELECT id,title,created_at,updated_at,status,note,agent_info,surface,read_only,owner,shared FROM conversations WHERE id=?1",[id],conversation_row).optional()?)
-    }
-    pub fn source_messages(&self, id: &str, limit: usize) -> Result<Vec<Value>> {
-        self.source_message_page(id, limit, None, "")
     }
     pub fn source_message_page(
         &self,
