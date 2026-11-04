@@ -331,3 +331,50 @@ async fn cancelling_during_session_creation_does_not_approve_its_callback() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn ambient_room_uses_optional_host_offer_without_a_prompt_on_hold() {
+    for action in ["hold", "engage"] {
+        let f = fixture();
+        let script = f._temp.path().join("agent.py");
+        std::fs::write(&script,format!(r#"import sys,json,pathlib
+root=pathlib.Path(__file__).parent
+def emit(v):print(json.dumps({{'jsonrpc':'2.0',**v}}),flush=True)
+for line in sys.stdin:
+ r=json.loads(line);m=r.get('method');p=r.get('params',{{}});i=r.get('id')
+ if m=='initialize':result={{'protocolVersion':1,'agentCapabilities':{{}},'_meta':{{'com.microsoft.amplifier.attention':{{'version':1,'enabled':True,'method':'_amplifier/attention'}}}}}}
+ elif m=='session/new':result={{'sessionId':'session'}}
+ elif m=='_amplifier/attention':
+  assert p['context']['trigger_id']=='trigger';assert p['occurredAt']>0
+  result={{'action':'{action}','id':'event','ticket':'ticket'}}
+ elif m=='session/prompt':
+  assert '{action}'=='engage';assert p['_meta']['com.microsoft.amplifier.attention']['ticket']=='ticket'
+  (root/'prompted').write_text('yes')
+  emit({{'method':'session/update','params':{{'sessionId':'session','update':{{'sessionUpdate':'agent_message_chunk','content':{{'type':'text','text':'Room response'}}}}}}}})
+  result={{'stopReason':'end_turn'}}
+ else:result={{}}
+ if i is not None:emit({{'id':i,'result':result}})
+"#)).unwrap();
+        f.state.db.lock().unwrap().execute("INSERT INTO room_members(conversation_id,username,role,joined_at) VALUES(?1,'bob','member',0)",[&f.room]).unwrap();
+        f.state.db.lock().unwrap().execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('trigger',?1,'user','What are you all working on?','complete',?2,?2,'alice')",rusqlite::params![f.room,agent_conversations::state::now_ms()]).unwrap();
+        let (tx, _) = tokio::sync::watch::channel(false);
+        f.state.running.lock().unwrap().insert(f.room.clone(), tx);
+        driver::round(
+            f.state.clone(),
+            f.room.clone(),
+            "alice".into(),
+            "trigger".into(),
+            "What are you all working on?".into(),
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(f._temp.path().join("prompted").exists(), action == "engage");
+        let messages = f.state.messages(&f.room, 100).unwrap();
+        assert_eq!(
+            messages.iter().filter(|m| m["role"] == "assistant").count(),
+            if action == "engage" { 1 } else { 0 }
+        );
+    }
+}

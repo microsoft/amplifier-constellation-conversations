@@ -220,3 +220,17 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Optional shared group attention
+
+Ambient group turns discover `com.microsoft.amplifier.attention` v1 on the ACP
+endpoint. The browser service supplies bounded delivered room messages and the
+original trigger timestamp; Instance supplies social policy and a one-use offer.
+A hold removes the empty response placeholder without sending a model prompt.
+Source changes and cancellation discard the offer. Engines without this optional
+host feature continue to receive ordinary bounded ACP participation prompts.
+Direct conversations and explicitly selected recipients retain ordinary ACP.
+
+ACP updates remain available as they arrive. Direct chat displays streamed text;
+shared rooms buffer draft text until the final public contribution or `[[PASS]]`
+is known. This is a presentation choice, not missing streaming in the agent.

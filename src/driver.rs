@@ -657,6 +657,43 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         "UPDATE conversations SET agent_info=?2 WHERE id=?1",
         params![conversation, init["agentInfo"].to_string()],
     )?;
+    let mut attention_offer = None;
+    if participation == "ambient" && crate::attention::supported(&init) {
+        let (evidence, at) = crate::attention::evidence(
+            &conversation,
+            &agent_id,
+            &agent.label,
+            &user_message,
+            &state.messages(&conversation, 100)?,
+        )?;
+        let offer = tokio::select! {
+            v=c.peer.request(crate::attention::METHOD,json!({"sessionId":sid,"occurredAt":at,"context":evidence}))=>v?,
+            _=cancel_signal(&mut cancel_rx)=>bail!("Turn cancelled"),
+            _=tokio::time::sleep_until(deadline)=>bail!("Attention timed out"),
+        };
+        state.audit("attention.offer",Some(&conversation),json!({"agent_id":agent_id,"id":offer["id"],"action":offer["action"],"reason":offer["reason"],"admitted":false}))?;
+        let (fresh, _) = crate::attention::evidence(
+            &conversation,
+            &agent_id,
+            &agent.label,
+            &user_message,
+            &state.messages(&conversation, 100)?,
+        )?;
+        if offer["action"] != "engage" || fresh != evidence {
+            state
+                .db
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM messages WHERE id=?1", [&message_id])?;
+            state.changed();
+            return Ok(());
+        }
+        ensure!(
+            offer["id"].is_string() && offer["ticket"].is_string(),
+            "Invalid host attention offer"
+        );
+        attention_offer = Some(json!({"id":offer["id"],"ticket":offer["ticket"]}));
+    }
     state.audit(
         "turn.started",
         Some(&conversation),
@@ -718,7 +755,13 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     )?);
     c.peer.next += 1;
     let request_id = c.peer.next;
-    c.peer.write(json!({"jsonrpc":"2.0","id":request_id,"method":"session/prompt","params":{"sessionId":sid,"prompt":blocks}})).await?;
+    let mut params = json!({"sessionId":sid,"prompt":blocks});
+    if let Some(offer) = attention_offer {
+        params["_meta"] = json!({crate::attention::META:offer});
+    }
+    c.peer
+        .write(json!({"jsonrpc":"2.0","id":request_id,"method":"session/prompt","params":params}))
+        .await?;
     let mut output = String::new();
     let mut upstream_message: Option<String> = None;
     loop {
