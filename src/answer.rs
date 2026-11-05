@@ -29,6 +29,10 @@ impl Answer {
         let Some(text) = update["content"]["text"].as_str() else {
             return Ok(());
         };
+        // Control-only envelopes must not claim message order or alter a phase.
+        if text.is_empty() {
+            return Ok(());
+        }
         let id = update["messageId"].as_str().unwrap_or("");
         ensure!(
             id.len() <= 1024 && self.bytes + text.len() + 2 <= 2 * 1024 * 1024,
@@ -111,5 +115,36 @@ mod tests {
         a.observe(&chunk("", "Hi")).unwrap();
         a.observe(&chunk("", " there")).unwrap();
         assert_eq!(a.text(), "Hi there");
+    }
+    #[test]
+    fn empty_control_envelopes_do_not_claim_answer_order() {
+        for empty_id in ["", "current"] {
+            let mut answer = Answer::default();
+            answer.observe(&chunk(empty_id, "")).unwrap();
+            answer.observe(&chunk("draft", "Draft")).unwrap();
+            answer.observe(&chunk(empty_id, "Current")).unwrap();
+            assert_eq!(answer.text(), "Current");
+        }
+    }
+    #[test]
+    fn empty_phase_receipts_do_not_reclassify_the_answer() {
+        let mut answer = Answer::default();
+        answer.observe(&chunk("answer", "Complete")).unwrap();
+        let mut commentary = chunk("progress", "Working");
+        commentary["_meta"]["com.microsoft.amplifier.message"]["phase"] = "commentary".into();
+        answer.observe(&commentary).unwrap();
+        let mut receipt = chunk("answer", "");
+        receipt["_meta"]["com.microsoft.amplifier.message"]["phase"] = "commentary".into();
+        answer.observe(&receipt).unwrap();
+        assert_eq!(answer.text(), "Complete");
+    }
+    #[test]
+    fn empty_controls_do_not_exhaust_message_capacity() {
+        let mut answer = Answer::default();
+        for i in 0..1100 {
+            answer.observe(&chunk(&format!("control-{i}"), "")).unwrap();
+        }
+        answer.observe(&chunk("answer", "Complete")).unwrap();
+        assert_eq!(answer.text(), "Complete");
     }
 }
