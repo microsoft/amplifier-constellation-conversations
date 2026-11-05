@@ -26,6 +26,7 @@ struct Peer {
     next: u64,
     auth_methods: Value,
     auth_attempted: bool,
+    read_buffer: Vec<u8>,
 }
 impl Peer {
     async fn session_request(
@@ -89,7 +90,6 @@ impl Peer {
         Ok(())
     }
     async fn read(&mut self) -> Result<Value> {
-        let mut data = Vec::new();
         loop {
             let b = self.output.fill_buf().await?;
             ensure!(!b.is_empty(), "The agent disconnected");
@@ -99,15 +99,16 @@ impl Peer {
                 .map(|n| n + 1)
                 .unwrap_or(b.len());
             ensure!(
-                data.len() + n <= 24 * 1024 * 1024,
+                self.read_buffer.len() + n <= 24 * 1024 * 1024,
                 "The agent sent an oversized response"
             );
-            data.extend_from_slice(&b[..n]);
+            self.read_buffer.extend_from_slice(&b[..n]);
             self.output.consume(n);
-            if data.last() == Some(&b'\n') {
+            if self.read_buffer.last() == Some(&b'\n') {
                 break;
             }
         }
+        let data = std::mem::take(&mut self.read_buffer);
         let v: Value = serde_json::from_slice(&data)?;
         ensure!(
             v["jsonrpc"] == "2.0",
@@ -342,6 +343,7 @@ impl Client {
                 next: 0,
                 auth_methods: json!([]),
                 auth_attempted: false,
+                read_buffer: Vec::new(),
             },
         })
     }
@@ -373,105 +375,109 @@ pub async fn probe(agent: &Agent) -> Result<Value> {
         Ok(json!({"ok":true,"agent_info":init["agentInfo"],"capabilities":init["agentCapabilities"],"authentication":crate::acp_auth::authentication(&init),"note":"ACP initialized. No conversation or model prompt was created."}))
     }).await.context("ACP connection check timed out")?
 }
-pub async fn round(
-    state: Arc<AppState>,
-    conversation: String,
-    actor: String,
-    user_message: String,
-    user_text: String,
-    targets: Vec<String>,
-    attachments: Vec<String>,
-) -> Result<()> {
-    let participants = state.room_agents(&conversation)?;
-    let people = state.members(&conversation)?;
-    let direct = people.len() == 1 && participants.len() == 1;
-    let selected: Vec<_> = participants
-        .iter()
-        .filter(|a| targets.is_empty() || targets.iter().any(|t| a["id"] == *t))
-        .collect();
-    let mut failed = false;
-    let mut authentication_failure = None;
-    for participant in selected {
-        if state
-            .running
-            .lock()
-            .unwrap()
-            .get(&conversation)
-            .is_some_and(|tx| *tx.borrow())
-        {
-            bail!("Turn cancelled");
-        }
-        let id = participant["id"]
-            .as_str()
-            .context("Missing agent ID")?
-            .to_string();
-        let agent = state.agent(&id)?.context("Agent connection removed")?;
-        let assistant_id = uuid::Uuid::new_v4().to_string();
-        let at = crate::state::now_ms();
-        state.db.lock().unwrap().execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES(?1,?2,'assistant','','streaming',?3,?3,?4,?5)",params![assistant_id,conversation,at,agent.label,id])?;
-        let participation = if direct || targets.contains(&id) {
-            "direct"
-        } else {
-            "ambient"
-        };
-        let turn = Turn {
-            agent_id: id.clone(),
-            agent,
-            conversation: conversation.clone(),
-            message_id: assistant_id.clone(),
-            user_text: user_text.clone(),
-            actor: actor.clone(),
-            user_message: user_message.clone(),
-            attachments: attachments.clone(),
-            participation: participation.into(),
-            shared: !direct,
-        };
-        state.status(
-            &conversation,
-            "working",
-            &format!(
-                "{} is considering the conversation…",
-                participant["label"].as_str().unwrap_or("An agent")
-            ),
-        )?;
-        let timeout = turn.agent.timeout_seconds;
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(timeout + 5),
-            turn_agent(state.clone(), turn),
-        )
-        .await;
-        if !matches!(outcome, Ok(Ok(()))) {
-            failed = true;
-            if let Ok(Err(ref error)) = outcome
-                && crate::acp_auth::authentication_required(error)
-            {
-                state.audit(
-                    "agent.sign_in_required",
-                    Some(&conversation),
-                    json!({"agent_id":id,"reason":error.to_string()}),
-                )?;
-                authentication_failure = Some(crate::acp_auth::AuthenticationRequired);
-            }
-            state.db.lock().unwrap().execute(
-                "UPDATE messages SET status='interrupted' WHERE id=?1",
-                [&assistant_id],
-            )?;
-            // Never resume a partial/private failed draft as if it was delivered.
-            if !matches!(&outcome, Ok(Err(error)) if crate::acp_auth::authentication_required(error))
-            {
-                state.db.lock().unwrap().execute("UPDATE room_agents SET session_id=NULL,endpoint=NULL,last_seq=0 WHERE conversation_id=?1 AND agent_id=?2",params![conversation,id])?;
-            }
-            state.audit("turn.interrupted",Some(&conversation),json!({"agent_id":id,"reason":"This agent could not complete its response. Other room participants may continue."}))?;
-        }
+pub async fn deliver(state: Arc<AppState>, input: crate::delivery::Input) -> Result<()> {
+    if let Err(error) = crate::delivery::check_owner(&state, &input) {
+        crate::delivery::set(&state, &input.id, "cancelled")?;
+        return Err(error);
     }
-    if let Some(error) = authentication_failure {
-        return Err(error.into());
+    if !crate::delivery::authorized(&state, &input.message_id, &input.actor)? {
+        crate::delivery::set(&state, &input.id, "notAccepted")?;
+        bail!("The source authorization expired or was revoked before delivery");
     }
-    if failed {
-        bail!("One or more room agents could not complete")
+    let agent = match state.agent(&input.agent)? {
+        Some(a) => a,
+        None => {
+            crate::delivery::set(&state, &input.id, "notAccepted")?;
+            bail!("Agent connection removed")
+        }
     };
-    Ok(())
+    let shared =
+        state.members(&input.room)?.len() != 1 || state.room_agents(&input.room)?.len() != 1;
+    let assistant_id = uuid::Uuid::new_v4().to_string();
+    let at = crate::state::now_ms();
+    crate::delivery::bind(
+        &state,
+        &input.id,
+        &assistant_id,
+        "",
+        "",
+        "prompt",
+        "preparing",
+    )?;
+    state.db.lock().unwrap().execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES(?1,?2,'assistant','','streaming',?3,?3,?4,?5)",params![assistant_id,input.room,at,agent.label,input.agent])?;
+    state.status(
+        &input.room,
+        "working",
+        &format!("{} is considering the conversation…", agent.label),
+    )?;
+    let timeout = agent.timeout_seconds;
+    let turn = Turn {
+        agent_id: input.agent.clone(),
+        agent,
+        conversation: input.room.clone(),
+        message_id: assistant_id.clone(),
+        user_text: input.text,
+        actor: input.actor,
+        user_message: input.message_id,
+        attachments: input.attachments,
+        participation: input.participation,
+        shared,
+        input_id: input.id,
+        source_seq: input.seq,
+        reconcile_only: false,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(timeout + 5),
+        turn_agent(state.clone(), turn),
+    )
+    .await
+    .context("The agent turn timed out")
+    .and_then(|v| v);
+    crate::delivery::finish(&state, &assistant_id, result.is_ok())?;
+    if result.is_err() {
+        state.db.lock().unwrap().execute(
+            "UPDATE messages SET status='interrupted' WHERE id=?1",
+            [&assistant_id],
+        )?;
+        state.audit("turn.interrupted",Some(&input.room),json!({"agent_id":input.agent,"reason":"The agent could not complete. Session binding and delivery receipts were retained; work was not replayed."}))?;
+    }
+    result
 }
+
+/// Reconcile an explicit recovery decision without admitting any new prompt.
+pub async fn reconcile(state: Arc<AppState>, input: crate::delivery::Input) -> Result<()> {
+    crate::delivery::check_owner(&state, &input)?;
+    let acks = crate::delivery::pending_ack(&state, &input.room, &input.agent)?;
+    if acks.iter().all(|a| a.mode.as_deref() != Some("steering")) {
+        for ack in acks {
+            crate::delivery::set(&state, &ack.id, "dismissed")?;
+        }
+        return Ok(());
+    }
+    let agent = state
+        .agent(&input.agent)?
+        .context("Restore the original agent connection before reviewing delivery")?;
+    let timeout = agent.timeout_seconds;
+    let turn = Turn {
+        agent_id: input.agent,
+        agent,
+        conversation: input.room,
+        message_id: String::new(),
+        user_text: String::new(),
+        actor: input.actor,
+        user_message: input.message_id,
+        attachments: vec![],
+        participation: input.participation,
+        shared: true,
+        input_id: input.id,
+        source_seq: input.seq,
+        reconcile_only: true,
+    };
+    tokio::time::timeout(Duration::from_secs(timeout + 5), turn_agent(state, turn))
+        .await
+        .context("Delivery review timed out")?
+}
+
 struct CallbackLifetime(Arc<crate::client_callbacks::ClientCallbacks>);
 impl Drop for CallbackLifetime {
     fn drop(&mut self) {
@@ -489,6 +495,36 @@ struct Turn {
     attachments: Vec<String>,
     participation: String,
     shared: bool,
+    input_id: String,
+    source_seq: i64,
+    reconcile_only: bool,
+}
+struct PendingInput {
+    id: u64,
+    input: crate::delivery::Input,
+    params: Value,
+    attention: bool,
+}
+fn steering_params(
+    state: &AppState,
+    input: &crate::delivery::Input,
+    sid: &str,
+    init: &Value,
+) -> Result<Value> {
+    let text = format!(
+        "New participant input in this conversation. Source message: {}. Author: {}. Preserve the work and completed effects already in progress.\n{}",
+        input.message_id, input.actor, input.text
+    );
+    let mut blocks = vec![json!({"type":"text","text":text})];
+    blocks.extend(crate::attachments::prompt_content(
+        state,
+        &input.room,
+        &input.attachments,
+        &init["agentCapabilities"],
+    )?);
+    Ok(
+        json!({"sessionId":sid,"prompt":blocks,"_meta":{"steering":{"idleBehavior":"promptRequired","inputId":input.id},"com.microsoft.amplifier.conversations":{"messageId":input.message_id,"author":input.actor,"sequence":input.seq,"conversationId":input.room}}}),
+    )
 }
 async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     let Turn {
@@ -502,6 +538,9 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         attachments,
         participation,
         shared,
+        input_id,
+        source_seq,
+        reconcile_only,
     } = t;
     let agent = &agent;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(agent.timeout_seconds);
@@ -522,7 +561,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         .iter()
         .filter_map(|a| a["id"].as_str().map(str::to_owned))
         .collect();
-    let mut callbacks = Arc::new(
+    let callbacks = Arc::new(
         crate::client_callbacks::ClientCallbacks::new(
             agent,
             &state.home,
@@ -554,6 +593,15 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     let prior:Option<(String,i64)>=state.db.lock().unwrap().query_row("SELECT session_id,last_seq FROM room_agents WHERE conversation_id=?1 AND agent_id=?2 AND endpoint=?3 AND session_id IS NOT NULL",params![conversation,agent_id,endpoint],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let last_seq = prior.as_ref().map(|p| p.1).unwrap_or(0);
     let prior = prior.map(|p| p.0).filter(|_| can_load);
+    let acknowledgments = crate::delivery::pending_ack(&state, &conversation, &agent_id)?;
+    for ack in &acknowledgments {
+        if ack.mode.as_deref() == Some("steering") {
+            ensure!(
+                ack.endpoint.as_deref() == Some(&endpoint) && ack.session == prior,
+                "The saved update requires its original endpoint and loaded session; restore that connection before continuing"
+            );
+        }
+    }
     let mut loaded = false;
     let sid = if let Some(old) = prior {
         params["sessionId"] = json!(old);
@@ -574,55 +622,11 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 &mut cancel_rx,
             )
             .await;
-        if let Err(ref error) = restore
-            && crate::acp_auth::authentication_required(error)
-        {
-            return Err(crate::acp_auth::AuthenticationRequired.into());
-        }
-        if restore.is_ok() {
-            loaded = true;
-            old
-        } else {
-            callbacks.stop();
-            callbacks = Arc::new(
-                crate::client_callbacks::ClientCallbacks::new(
-                    agent,
-                    &state.home,
-                    crate::client_callbacks::Audience {
-                        room: &conversation,
-                        actor: &actor,
-                        users: &users,
-                        agents: &agents,
-                    },
-                )
-                .await?,
-            );
-            params.as_object_mut().unwrap().remove("sessionId");
-            state.audit(
-                "session.rebuilt",
-                Some(&conversation),
-                json!({"reason":"The endpoint could not restore its previous session"}),
-            )?;
-            c.peer
-                .session_request(
-                    "session/new",
-                    params.clone(),
-                    SetupInteraction {
-                        state: &state,
-                        callbacks: &callbacks,
-                        room: &conversation,
-                        actor: &actor,
-                        label: &agent.label,
-                        agent_id: &agent_id,
-                        deadline,
-                    },
-                    &mut cancel_rx,
-                )
-                .await?["sessionId"]
-                .as_str()
-                .context("The agent did not return a session")?
-                .to_owned()
-        }
+        // A failed load is not evidence that the previous work never happened.
+        // Keep its binding instead of silently rebuilding and replaying context.
+        restore?;
+        loaded = true;
+        old
     } else {
         c.peer
             .session_request(
@@ -650,21 +654,76 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     let mut forms = crate::elicitation::Callbacks::default();
     let _callback_lifetime = CallbackLifetime(callbacks.clone());
     state.db.lock().unwrap().execute(
-        "UPDATE room_agents SET session_id=?3,endpoint=?4 WHERE conversation_id=?1 AND agent_id=?2",
-        params![conversation, agent_id, sid, endpoint],
-    )?;
-    state.db.lock().unwrap().execute(
         "UPDATE conversations SET agent_info=?2 WHERE id=?1",
         params![conversation, init["agentInfo"].to_string()],
     )?;
-    let mut attention_offer = None;
-    if participation == "ambient" && crate::attention::supported(&init) {
+    // Explicit reconciliation never resubmits the source input. Native engines
+    // also need their saved uncertain receipt acknowledged before another prompt.
+    for crate::delivery::Acknowledgment {
+        id,
+        session: old_sid,
+        mode,
+        ..
+    } in acknowledgments
+    {
+        if mode.as_deref() == Some("steering") {
+            ensure!(
+                old_sid.as_deref().is_none_or(|s| s.is_empty() || s == sid),
+                "The saved delivery belongs to a different session; inspect the agent before continuing"
+            );
+        }
+        if mode.as_deref() == Some("steering")
+            && init["_meta"]["steering"]["receiptsMethod"] == "_session/input_receipts"
+            && init["_meta"]["steering"]["acknowledgeMethod"] == "_session/acknowledge_inputs"
+        {
+            let receipts = c
+                .peer
+                .request("_session/input_receipts", json!({"sessionId":sid}))
+                .await?;
+            if receipts["inputReceipts"]
+                .as_array()
+                .context("The agent did not return a valid receipt list")?
+                .iter()
+                .any(|r| r["inputId"] == id)
+            {
+                let confirmed=c.peer.request("_session/acknowledge_inputs",json!({"sessionId":sid,"inputIds":[id],"disposition":"proceed_without_replay"})).await?;
+                ensure!(
+                    confirmed["inputReceipts"]
+                        .as_array()
+                        .is_some_and(|rows| rows
+                            .iter()
+                            .any(|r| r["inputId"] == id && r["reconciled"] == true)),
+                    "The agent did not confirm delivery review"
+                );
+            }
+        }
+        crate::delivery::set(&state, &id, "dismissed")?;
+    }
+    if reconcile_only {
+        return Ok(());
+    }
+    state.db.lock().unwrap().execute(
+        "UPDATE room_agents SET session_id=?3,endpoint=?4 WHERE conversation_id=?1 AND agent_id=?2",
+        params![conversation, agent_id, sid, endpoint],
+    )?;
+    crate::delivery::bind(
+        &state,
+        &input_id,
+        &message_id,
+        &sid,
+        &endpoint,
+        "prompt",
+        "preparing",
+    )?;
+    let mut attention_offer = crate::delivery::restored_attention(&state, &input_id)?;
+    if participation == "ambient" && attention_offer.is_none() && crate::attention::supported(&init)
+    {
         let (evidence, at) = crate::attention::evidence(
             &conversation,
             &agent_id,
             &agent.label,
             &user_message,
-            &state.messages(&conversation, 100)?,
+            &crate::delivery::safe_history(&state, &conversation, &agent_id, source_seq)?,
         )?;
         let offer = tokio::select! {
             v=c.peer.request(crate::attention::METHOD,json!({"sessionId":sid,"occurredAt":at,"context":evidence}))=>v?,
@@ -677,7 +736,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
             &agent_id,
             &agent.label,
             &user_message,
-            &state.messages(&conversation, 100)?,
+            &crate::delivery::safe_history(&state, &conversation, &agent_id, source_seq)?,
         )?;
         if offer["action"] != "engage" || fresh != evidence {
             state
@@ -685,6 +744,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 .lock()
                 .unwrap()
                 .execute("DELETE FROM messages WHERE id=?1", [&message_id])?;
+            crate::delivery::set(&state, &input_id, "held")?;
             state.changed();
             return Ok(());
         }
@@ -702,15 +762,17 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     let prompt = if loaded && !shared {
         user_text.clone()
     } else {
-        let history: Vec<Value> = state
-            .messages(&conversation, 100)?
-            .into_iter()
-            .filter(|m| {
-                m["id"] != message_id
-                    && m["status"] == "complete"
-                    && (!loaded || m["seq"].as_i64().unwrap_or(0) > last_seq)
-            })
-            .collect();
+        let history: Vec<Value> =
+            crate::delivery::safe_history(&state, &conversation, &agent_id, source_seq)?
+                .into_iter()
+                .filter(|m| {
+                    m["id"] != message_id
+                        && m["status"] == "complete"
+                        && (!loaded
+                            || m["id"] == user_message
+                            || m["seq"].as_i64().unwrap_or(0) > last_seq)
+                })
+                .collect();
         if !shared && history.len() <= 1 {
             user_text.clone()
         } else {
@@ -755,33 +817,165 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     )?);
     c.peer.next += 1;
     let request_id = c.peer.next;
-    let mut params = json!({"sessionId":sid,"prompt":blocks});
+    let mut params = json!({"sessionId":sid,"prompt":blocks,"_meta":{"com.microsoft.amplifier.conversations":{"messageId":user_message,"author":actor,"sequence":source_seq,"conversationId":conversation}}});
     if let Some(offer) = attention_offer {
-        params["_meta"] = json!({crate::attention::META:offer});
+        params["_meta"][crate::attention::META] = offer;
     }
+    if !crate::delivery::authorized(&state, &user_message, &actor)? {
+        crate::delivery::set(&state, &input_id, "notAccepted")?;
+        bail!("The source authorization expired or was revoked before delivery");
+    }
+    crate::delivery::set(&state, &input_id, "submitted")?;
     c.peer
         .write(json!({"jsonrpc":"2.0","id":request_id,"method":"session/prompt","params":params}))
         .await?;
     let mut output = String::new();
     let mut upstream_message: Option<String> = None;
+    let mut steering_open = crate::delivery::supported(&init);
+    let mut pending_input: Option<PendingInput> = None;
+    let mut terminal: Option<Value> = None;
+    let mut intake = tokio::time::interval(Duration::from_millis(50));
     loop {
-        let v = tokio::select! {
-            completed=forms.completed(),if !forms.is_empty()=>{
-                let (id,result)=completed?;
-                c.peer.write(json!({"jsonrpc":"2.0","id":id,"result":result})).await?;
-                state.changed();
-                continue;
-            },
-            completed=pending_callbacks.join_next(),if !pending_callbacks.is_empty()=>{
-                let (id,result):(Value,Result<Value>)=completed.context("Missing client operation")??;
-                let reply=match result {Ok(result)=>json!({"jsonrpc":"2.0","id":id,"result":result}),Err(error)=>json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":error.to_string()}})};
-                c.peer.write(reply).await?;continue;
-            },
-            v=c.peer.read()=>v?,
-            _=cancel_signal(&mut cancel_rx)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; bail!("Turn cancelled");},
-            _=tokio::time::sleep_until(deadline)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; bail!("Turn timed out");},
+        let v = if pending_input.is_none() && terminal.is_some() {
+            terminal.take().unwrap()
+        } else {
+            tokio::select! {
+                _=intake.tick()=>{
+                    if steering_open && pending_input.is_none() && terminal.is_none() {
+                        let next={let db=state.db.lock().unwrap();crate::delivery::next(&db,&conversation,Some(&agent_id))?};
+                        if let Some(input)=next {
+                            crate::delivery::check_owner(&state,&input)?;
+                            if !crate::delivery::authorized(&state,&input.message_id,&input.actor)? {crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;continue;}
+                            let prepared=steering_params(&state,&input,&sid,&init);
+                            let mut params=match prepared {Ok(params)=>params,Err(_)=>{crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;continue;}};
+                            c.peer.next+=1;let id=c.peer.next;
+                            let attention=input.participation=="ambient"&&crate::attention::supported(&init);
+                            crate::delivery::bind(&state,&input.id,&message_id,&sid,&endpoint,"steering",if attention{"offering"}else{"submitted"})?;
+                            if attention {
+                                let (evidence,at)=crate::attention::evidence(&conversation,&agent_id,&agent.label,&input.message_id,&crate::delivery::safe_history(&state,&conversation,&agent_id,input.seq)?)?;
+                                c.peer.write(json!({"jsonrpc":"2.0","id":id,"method":crate::attention::METHOD,"params":{"sessionId":sid,"occurredAt":at,"context":evidence}})).await?;
+                            }else{
+                                params["_meta"]["steering"]["inputId"]=json!(input.id);
+                                c.peer.write(json!({"jsonrpc":"2.0","id":id,"method":crate::delivery::METHOD,"params":params})).await?;
+                            }
+                            pending_input=Some(PendingInput{id,input,params,attention});
+                        }
+                    }
+                    continue;
+                },
+                completed=forms.completed(),if !forms.is_empty()=>{
+                    let (id,result)=completed?;
+                    c.peer.write(json!({"jsonrpc":"2.0","id":id,"result":result})).await?;
+                    state.changed();
+                    continue;
+                },
+                completed=pending_callbacks.join_next(),if !pending_callbacks.is_empty()=>{
+                    let (id,result):(Value,Result<Value>)=completed.context("Missing client operation")??;
+                    let reply=match result {Ok(result)=>json!({"jsonrpc":"2.0","id":id,"result":result}),Err(error)=>json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":error.to_string()}})};
+                    c.peer.write(reply).await?;continue;
+                },
+                v=c.peer.read()=>v?,
+                _=cancel_signal(&mut cancel_rx)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; bail!("Turn cancelled");},
+                _=tokio::time::sleep_until(deadline)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; bail!("Turn timed out");},
+            }
         };
+        if v.get("method").is_none() && pending_input.as_ref().is_some_and(|p| v["id"] == p.id) {
+            let mut pending = pending_input.take().unwrap();
+            if pending.attention {
+                let offer = &v["result"];
+                if v.get("error").is_some()
+                    || offer["action"] != "engage"
+                    || !offer["id"].is_string()
+                    || !offer["ticket"].is_string()
+                {
+                    crate::delivery::set(
+                        &state,
+                        &pending.input.id,
+                        if offer["action"] == "hold" {
+                            "held"
+                        } else {
+                            "notAccepted"
+                        },
+                    )?;
+                    continue;
+                }
+                let admission = json!({"id":offer["id"],"ticket":offer["ticket"]});
+                crate::delivery::attention(&state, &pending.input.id, &admission)?;
+                pending.params["_meta"][crate::attention::META] = admission;
+                pending.params["_meta"]["steering"]["inputId"] = json!(pending.input.id);
+                crate::delivery::set(&state, &pending.input.id, "submitted")?;
+                c.peer.next += 1;
+                pending.id = c.peer.next;
+                pending.attention = false;
+                c.peer.write(json!({"jsonrpc":"2.0","id":pending.id,"method":crate::delivery::METHOD,"params":pending.params})).await?;
+                pending_input = Some(pending);
+                continue;
+            }
+            let result = &v["result"];
+            let bad_id = result["_meta"]["steering"]["inputId"]
+                .as_str()
+                .is_some_and(|id| id != pending.input.id);
+            if v.get("error").is_none() && !bad_id && result["outcome"] == "injected" {
+                // This acknowledgment proves intake only. A later receipt may
+                // establish inclusion in model context.
+                let mut receipt = result["_meta"]["steering"].clone();
+                if !receipt.is_object() {
+                    receipt = json!({});
+                }
+                receipt["inputId"] = json!(pending.input.id);
+                if !receipt["state"].is_string() {
+                    receipt["state"] = json!("received");
+                }
+                crate::delivery::receipt(&state, &message_id, &receipt)?;
+            } else if v.get("error").is_none() && !bad_id && result["outcome"] == "promptRequired" {
+                let had_attention = pending.params["_meta"]
+                    .get(crate::attention::META)
+                    .is_some();
+                let restored = result["_meta"][crate::attention::META]["ticketState"] == "restored";
+                crate::delivery::set(
+                    &state,
+                    &pending.input.id,
+                    if !had_attention || restored {
+                        "promptRequired"
+                    } else {
+                        "notAccepted"
+                    },
+                )?;
+                steering_open = false;
+            } else if v["error"]["code"] == -32601
+                && pending.params["_meta"]
+                    .get(crate::attention::META)
+                    .is_none()
+            {
+                crate::delivery::set(&state, &pending.input.id, "promptRequired")?;
+                steering_open = false;
+            } else {
+                crate::delivery::set(&state, &pending.input.id, "unknown")?;
+                steering_open = false;
+                if result["outcome"] == "startedNewTurn" {
+                    bail!(
+                        "The agent started detached work despite promptRequired; inspect delivery before continuing"
+                    );
+                }
+            }
+            continue;
+        }
         if v.get("method").is_none() && v["id"] == request_id {
+            if pending_input.is_some() {
+                terminal = Some(v);
+                continue;
+            }
+            for receipt in v["result"]["_meta"][crate::delivery::RECEIPTS]["inputReceipts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                crate::delivery::receipt(&state, &message_id, receipt)?;
+            }
+            ensure!(
+                pending_callbacks.is_empty() && forms.is_empty(),
+                "The agent completed with unresolved callbacks"
+            );
             if let Some(error) = v.get("error") {
                 return Err(crate::acp_auth::rejected(error, "session/prompt"));
             }
@@ -817,7 +1011,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                     json!({"characters":output.chars().count(),"agent_id":agent_id}),
                 )?;
             }
-            state.db.lock().unwrap().execute("UPDATE room_agents SET last_seq=COALESCE((SELECT MAX(seq) FROM messages WHERE conversation_id=?1 AND status='complete'),0) WHERE conversation_id=?1 AND agent_id=?2",params![conversation,agent_id])?;
+            state.db.lock().unwrap().execute("UPDATE room_agents SET last_seq=MAX(last_seq,?3,COALESCE((SELECT MAX(m.seq) FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.target_turn=?4 AND d.state IN ('submitted','received_remote','remoteQueued','incorporated','completed')),0)) WHERE conversation_id=?1 AND agent_id=?2",params![conversation,agent_id,source_seq,message_id])?;
             return Ok(());
         }
         if v["method"] == "$/cancel_request" {
@@ -826,6 +1020,9 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         }
         if v["method"] == "session/update" && v["params"]["sessionId"] == sid {
             let u = &v["params"]["update"];
+            if let Some(receipt) = u["_meta"][crate::delivery::RECEIPTS].get("inputReceipt") {
+                crate::delivery::receipt(&state, &message_id, receipt)?;
+            }
             match u["sessionUpdate"].as_str() {
                 Some("agent_message_chunk") => {
                     crate::attachments::receive(
@@ -885,57 +1082,26 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 continue;
             }
             if v["method"] == "session/request_permission" {
-                let outcome = if v["params"]["sessionId"] == sid {
-                    match state.permissions.request(
-                        &conversation,
-                        &actor,
-                        &agent.label,
-                        &v["params"],
-                        Duration::from_secs(180)
-                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-                    ) {
-                        Ok(request) => {
-                            state.audit(
-                                "permission.requested",
-                                Some(&conversation),
-                                json!({"agent_id":agent_id,"request_id":request.id,"actor":actor}),
-                            )?;
-                            state.status(
-                                &conversation,
-                                "working",
-                                &format!(
-                                    "{} is waiting for {} to review an action.",
-                                    agent.label, actor
-                                ),
-                            )?;
-                            let outcome = tokio::select! {
-                                value=request.wait()=>Some(value),
-                                _=cancel_signal(&mut cancel_rx)=>None,
-                                _=c.child.wait()=>bail!("Agent disconnected while awaiting a decision"),
-                            };
-                            if let Some(outcome) = outcome {
-                                outcome
-                            } else {
-                                c.peer.write(json!({"jsonrpc":"2.0","id":v["id"],"result":crate::permissions::cancelled()})).await?;
-                                pending_callbacks.abort_all();
-                                callbacks.stop();
-                                c.peer.cancel(request_id, &sid).await;
-                                bail!("Turn cancelled");
-                            }
-                        }
-                        Err(_) => crate::permissions::cancelled(),
-                    }
-                } else {
-                    crate::permissions::cancelled()
-                };
-                c.peer
-                    .write(json!({"jsonrpc":"2.0","id":v["id"],"result":outcome}))
-                    .await?;
-                state.status(
-                    &conversation,
-                    "working",
-                    &format!("{} is continuing…", agent.label),
-                )?;
+                if v["params"]["sessionId"] != sid {
+                    c.peer.write(json!({"jsonrpc":"2.0","id":v["id"],"result":crate::permissions::cancelled()})).await?;
+                    continue;
+                }
+                ensure!(
+                    pending_callbacks.len() < 16,
+                    "Too many pending client operations"
+                );
+                match state.permissions.request(&conversation,&actor,&agent.label,&v["params"],Duration::from_secs(180).min(deadline.saturating_duration_since(tokio::time::Instant::now()))) {
+                    Ok(request)=>{
+                        state.audit("permission.requested",Some(&conversation),json!({"agent_id":agent_id,"request_id":request.id,"actor":actor}))?;
+                        state.status(&conversation,"working",&format!("{} is waiting for {} to review an action.",agent.label,actor))?;
+                        let id=v["id"].clone();let mut cancelled=cancel_rx.clone();
+                        pending_callbacks.spawn(async move {
+                            let outcome=tokio::select!{v=request.wait()=>v,_=cancel_signal(&mut cancelled)=>crate::permissions::cancelled(),_=tokio::time::sleep_until(deadline)=>crate::permissions::cancelled()};
+                            (id,Ok(outcome))
+                        });
+                    },
+                    Err(_)=>c.peer.write(json!({"jsonrpc":"2.0","id":v["id"],"result":crate::permissions::cancelled()})).await?,
+                }
                 continue;
             }
             let method = v["method"].as_str().unwrap_or("");

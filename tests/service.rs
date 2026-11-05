@@ -520,7 +520,7 @@ async fn cancelling_a_turn_terminates_the_process_and_keeps_the_transcript() {
         )
         .await
         .0,
-        StatusCode::CONFLICT
+        StatusCode::ACCEPTED
     );
     assert_eq!(
         request(
@@ -538,6 +538,13 @@ async fn cancelling_a_turn_terminates_the_process_and_keeps_the_transcript() {
     let c = f.state.conversation(id).unwrap().unwrap();
     assert_eq!(c["status"], "error");
     assert_eq!(c["messages"][1]["status"], "interrupted");
+    assert!(
+        c["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["state"] == "cancelled")
+    );
     assert!(c["note"].as_str().unwrap().contains("stopped"));
 }
 #[tokio::test]
@@ -2944,4 +2951,70 @@ async fn interactive_agent_auth_is_requester_bound_and_retries_only_setup() {
             .unwrap();
         assert!(!events.join("").contains("https://example.test/authorize"));
     }
+}
+
+#[tokio::test]
+async fn delivery_metadata_and_recovery_keep_membership_scope_and_source_authority() {
+    let f = fixture();
+    let c = f
+        .state
+        .create_room("Private recovery", "robin", &["default".into()])
+        .unwrap();
+    let id = c["id"].as_str().unwrap();
+    {
+        let db = f.state.db.lock().unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('source',?1,'user','PRIVATE-INPUT','complete',1,1,'robin')",[id]).unwrap();
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,mode,attention,updated_at) VALUES('delivery','source',?1,'default','direct','unknown','prompt','PRIVATE-TICKET',1)",[id]).unwrap();
+    }
+    let path = format!("/api/v1/conversations/{id}/deliveries");
+    assert_eq!(
+        request(&f.app, "GET", &path, None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&f.app, "GET", &path, Some(&f.context), None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&f.app, "GET", &path, Some(&f.admin), None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let listed = user_request(&f, "robin", "GET", &path, None).await;
+    assert_eq!(listed.0, StatusCode::OK);
+    assert_eq!(listed.1["items"][0]["state"], "unknown");
+    assert!(!listed.1.to_string().contains("PRIVATE-"));
+    f.state
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO room_members VALUES(?1,'owner','member',1)",
+            [id],
+        )
+        .unwrap();
+    let action = format!("{path}/delivery/resolve");
+    let body = Some(json!({"disposition":"proceed_without_replay"}));
+    assert_eq!(
+        user_request(&f, "owner", "POST", &action, body.clone())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        user_request(&f, "casey", "POST", &action, body.clone())
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        user_request(&f, "robin", "POST", &action, body).await.0,
+        StatusCode::OK
+    );
+    wait_idle(&f, id).await;
+    assert_eq!(
+        user_request(&f, "robin", "GET", &path, None).await.1["items"][0]["state"],
+        "dismissed"
+    );
 }

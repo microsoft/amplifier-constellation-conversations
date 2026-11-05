@@ -49,8 +49,8 @@ impl AppState {
             CREATE TABLE IF NOT EXISTS import_sources(source TEXT PRIMARY KEY,surface TEXT NOT NULL,token_id TEXT UNIQUE NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY);")?;
         crate::rooms::migrate(&db, &config)?;
-        db.execute("UPDATE room_agents SET session_id=NULL,endpoint=NULL,last_seq=0 WHERE conversation_id IN (SELECT id FROM conversations WHERE status='working')", [])?;
-        db.execute("UPDATE conversations SET status='error',note='The service restarted during this turn. Send a new message to continue.' WHERE status='working'", [])?;
+        crate::delivery::migrate(&db)?;
+        db.execute("UPDATE conversations SET status='error',note='The service restarted during this turn. Review delivery status before continuing; work was not replayed.' WHERE status='working'", [])?;
         db.execute(
             "UPDATE messages SET status='interrupted' WHERE status='streaming'",
             [],
@@ -124,6 +124,7 @@ impl AppState {
         let mut row = self.conversation_info(id)?;
         if let Some(ref mut c) = row {
             c["messages"] = json!(self.messages(id, 100)?);
+            c["deliveries"] = json!(crate::delivery::list(self, id)?);
             c["members"] = json!(self.members(id)?);
             c["agents"] = json!(self.room_agents(id)?);
             c["has_older"] = json!(self.db.lock().unwrap().query_row(

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Independent duplex ACP fixture. File release gates never call a model."""
+import json, os, select, sys, time, uuid
+from pathlib import Path
+
+mode=os.environ.get('STEERING_MODE','native')
+log=Path(os.environ['FIXTURE_LOG']); release=Path(os.environ['STEERING_RELEASE'])
+receipt_file=log.with_suffix('.receipts.json')
+receipts=json.loads(receipt_file.read_text()) if receipt_file.exists() else {}
+active=None; sid=None; approved=False; inputs=[]; buffer=b''
+
+def record(value):
+    with log.open('a') as f:f.write(json.dumps(value)+'\n')
+def write(value):
+    data=json.dumps({'jsonrpc':'2.0',**value})+'\n'
+    if os.environ.get('STEERING_FRAGMENT'):
+        for offset in range(0,len(data),17):sys.stdout.write(data[offset:offset+17]);sys.stdout.flush();time.sleep(.001)
+    else:sys.stdout.write(data);sys.stdout.flush()
+def receipt(id,state):
+    receipts[id]={'inputId':id,'state':state,'turnId':'fixture-turn','recorded':state=='incorporated'}
+    receipt_file.write_text(json.dumps(receipts))
+    return receipts[id]
+def complete():
+    global active,inputs
+    if active is None:return
+    for id in inputs:
+        if mode=='unsettled':continue
+        r=receipt(id,'incorporated')
+        write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':''},'_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipt':r}}}}})
+    write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Completed the work once.'}}}})
+    write({'id':active,'result':{'stopReason':'end_turn','_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipts':[receipts[id] for id in inputs]}}}})
+    active=None;inputs=[]
+
+while True:
+    if active is not None and release.exists() and approved:complete()
+    if b'\n' not in buffer:
+        ready,_,_=select.select([0],[],[],.01)
+        if not ready:continue
+        chunk=os.read(0,65536)
+        if not chunk:break
+        buffer+=chunk
+        if b'\n' not in buffer:continue
+    line,buffer=buffer.split(b'\n',1)
+    value=json.loads(line);record(value)
+    method=value.get('method');p=value.get('params',{})
+    if method=='initialize':
+        result={'protocolVersion':1,'agentCapabilities':{'loadSession':True},'agentInfo':{'name':'Steering fixture','version':'1'}}
+        if mode!='generic':result['_meta']={'steering':{'supported':True,'version':1,'idleBehavior':['promptRequired'],'receiptsMethod':'_session/input_receipts','acknowledgeMethod':'_session/acknowledge_inputs'}}
+        if mode.startswith('attention_'):result['_meta']['com.microsoft.amplifier.attention']={'version':1,'enabled':True,'method':'_amplifier/attention'}
+        write({'id':value['id'],'result':result})
+    elif method=='session/load' and log.with_name('reject-load').exists():
+        write({'id':value['id'],'error':{'code':-32602,'message':'Fixture cannot restore this session'}})
+    elif method in ('session/new','session/load'):
+        sid=p.get('sessionId',str(uuid.uuid4()));write({'id':value['id'],'result':{'sessionId':sid}})
+    elif method=='session/prompt':
+        assert active is None,'overlapping prompts'
+        active=value['id'];approved=not os.environ.get('STEERING_APPROVAL')
+        if not approved:
+            write({'id':'permission','method':'session/request_permission','params':{'sessionId':sid,'toolCall':{'toolCallId':'write-once','title':'Write once','kind':'edit'},'options':[{'optionId':'yes','name':'Allow once','kind':'allow_once'},{'optionId':'no','name':'Reject once','kind':'reject_once'}]}})
+    elif method=='_amplifier/attention':
+        write({'id':value['id'],'result':{'action':'hold' if mode=='attention_hold' else 'engage','id':'fixture-offer','ticket':'fixture-ticket'}})
+    elif method=='_session/steering':
+        assert p['_meta']['steering']['idleBehavior']=='promptRequired'
+        id=p['_meta']['steering']['inputId']
+        if mode=='generic':raise AssertionError('Generic peer received steering')
+        if mode=='disconnect':receipt(id,'unknown');sys.exit(0)
+        if mode in ('idle','attention_idle') and active is not None:
+            complete();write({'id':value['id'],'result':{'outcome':'promptRequired','_meta':{'com.microsoft.amplifier.attention':{'ticketState':'restored'}}}})
+        elif active is None:write({'id':value['id'],'result':{'outcome':'promptRequired'}})
+        else:
+            if id not in inputs:inputs.append(id)
+            receipt(id,'remoteQueued' if mode=='unsettled' else 'received')
+            if mode=='preack':
+                r=receipt(id,'incorporated')
+                write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':''},'_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipt':r}}}}})
+            write({'id':value['id'],'result':{'outcome':'injected','_meta':{'steering':{'inputId':id,'state':'remoteQueued' if mode=='unsettled' else 'received','turnId':'fixture-turn'}}}})
+    elif method=='_session/input_receipts':write({'id':value['id'],'result':{'inputReceipts':list(receipts.values())}})
+    elif method=='_session/acknowledge_inputs' and log.with_name('reject-ack').exists():
+        write({'id':value['id'],'result':{}})
+    elif method=='_session/acknowledge_inputs':
+        for id in p['inputIds']:receipts[id]['reconciled']=True
+        receipt_file.write_text(json.dumps(receipts));write({'id':value['id'],'result':{'inputReceipts':list(receipts.values())}})
+    elif method=='session/cancel':
+        if active is not None:write({'id':active,'result':{'stopReason':'cancelled'}});active=None
+    elif value.get('id')=='permission' and method is None:
+        approved=True
+        if value.get('result',{}).get('outcome',{}).get('optionId')=='yes':record({'effect':'write-once'})
+    elif method:write({'id':value.get('id'),'error':{'code':-32601,'message':'Unsupported'}})

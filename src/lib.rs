@@ -5,6 +5,7 @@ pub mod auth;
 pub mod client_callbacks;
 pub mod config;
 pub mod context;
+pub mod delivery;
 pub mod driver;
 pub mod elicitation;
 pub mod error;

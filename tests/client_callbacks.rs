@@ -126,17 +126,50 @@ for line in sys.stdin:
         path,
     }
 }
+fn input(
+    f: &Fixture,
+    message_id: &str,
+    text: &str,
+    participation: &str,
+) -> agent_conversations::delivery::Input {
+    let id = uuid::Uuid::new_v4().to_string();
+    let db = f.state.db.lock().unwrap();
+    db.execute("INSERT OR IGNORE INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user',?3,'complete',?4,?4,'alice')",rusqlite::params![message_id,f.room,text,agent_conversations::state::now_ms()]).unwrap();
+    let token = std::fs::read_to_string(f.state.home.join("secrets/control-token")).unwrap();
+    db.execute(
+        "INSERT INTO input_authority(message_id,token_hash) VALUES(?1,?2)",
+        rusqlite::params![message_id, agent_conversations::auth::digest(&token)],
+    )
+    .unwrap();
+    let seq = db
+        .query_row("SELECT seq FROM messages WHERE id=?1", [message_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES(?1,?2,?3,'default',?4,'received',1)",rusqlite::params![id,message_id,f.room,participation]).unwrap();
+    agent_conversations::delivery::Input {
+        id,
+        message_id: message_id.into(),
+        seq,
+        room: f.room.clone(),
+        agent: "default".into(),
+        actor: "alice".into(),
+        text: text.into(),
+        participation: participation.into(),
+        attachments: vec![],
+    }
+}
 fn start(f: &Fixture) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let (tx, _) = tokio::sync::watch::channel(false);
     f.state.running.lock().unwrap().insert(f.room.clone(), tx);
-    tokio::spawn(driver::round(
+    tokio::spawn(driver::deliver(
         f.state.clone(),
-        f.room.clone(),
-        "alice".into(),
-        "trigger".into(),
-        "Please write and read the reviewed result".into(),
-        vec!["default".into()],
-        vec![],
+        input(
+            f,
+            &uuid::Uuid::new_v4().to_string(),
+            "Please write and read the reviewed result",
+            "direct",
+        ),
     ))
 }
 async fn permission(f: &Fixture) -> serde_json::Value {
@@ -359,14 +392,9 @@ for line in sys.stdin:
         f.state.db.lock().unwrap().execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('trigger',?1,'user','What are you all working on?','complete',?2,?2,'alice')",rusqlite::params![f.room,agent_conversations::state::now_ms()]).unwrap();
         let (tx, _) = tokio::sync::watch::channel(false);
         f.state.running.lock().unwrap().insert(f.room.clone(), tx);
-        driver::round(
+        driver::deliver(
             f.state.clone(),
-            f.room.clone(),
-            "alice".into(),
-            "trigger".into(),
-            "What are you all working on?".into(),
-            vec![],
-            vec![],
+            input(&f, "trigger", "What are you all working on?", "ambient"),
         )
         .await
         .unwrap();
