@@ -12,6 +12,7 @@ node tests/voice.mjs
 npm ci
 npx playwright install chromium
 python3 tests/browser.py
+BROWSER_STEERING=1 python3 tests/browser.py
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
@@ -25,3 +26,13 @@ The [Actions page](https://github.com/microsoft/amplifier-constellation-conversa
 against the published source. Earlier private deployment reports and their
 transcripts are excluded. A passing fixture verifies its tested boundary, not
 general agent quality, human approval, or live tenant compatibility.
+
+`tests/steering.rs` exercises real duplex ACP subprocesses: repeated ordered input,
+source deduplication, fragmented frames, unchanged approval and one effect,
+incorporation before acknowledgment, generic FIFO, terminal/idle races, restored
+ambient admission, independent agent queues, bounded capacity, explicit Stop,
+restart/unknown recovery without replay, and failed session restoration.
+The steering browser suite runs the HTTPS app through Chromium and checks the
+working composer, a lost send acknowledgment across reload, unchanged approval,
+truthful delivery labels, explicit recovery by both UI and programmatic control,
+and mobile layout. These fixtures do not call a model or exercise live services.

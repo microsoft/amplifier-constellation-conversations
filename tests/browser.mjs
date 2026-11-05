@@ -82,6 +82,9 @@ try{
 
   await page.setViewportSize({width:390,height:844});await page.locator('#menu').click();await page.locator('#new-conversation').click();await waitFor(async()=>(await page.locator('#conversation-title').innerText())==='New conversation','mobile new conversation failed');assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));check('mobile layout and conversation navigation');
   await page.locator('#message').fill('wait forever');await page.locator('#send').click();await page.locator('#stop:not([hidden])').waitFor();await page.locator('#stop').click();await waitFor(async()=>(await page.locator('#turn-status-text').innerText()).includes('stopped'),'stop did not reach client');check('stop active work');
+  // The delivery-recovery suite covers reviewing interrupted work. Use a fresh
+  // conversation here to test the independent voice send path.
+  await page.evaluate(()=>window.agentConversationsControl.perform({action:'new'}));
   await page.evaluate(()=>window.agentConversationsControl.setView({voice_enabled:true}));
   await waitFor(async()=>await page.locator('#voice-status').innerText().then(t=>t.includes('Press Start voice')),'remote voice request should need local consent');
   assert.equal(await page.locator('#voice-toggle').innerText(),'Start voice');
@@ -91,6 +94,7 @@ try{
   await page.evaluate(()=>window.agentConversationsControl.voice.transcript('A dictated message through ordinary ACP'));
   assert.equal(await page.locator('#message').inputValue(),'A dictated message through ordinary ACP');
   await page.evaluate(()=>window.agentConversationsControl.voice.transcript('Workshop, send message'));
+  await waitFor(async()=>(await page.locator('#messages').innerText()).includes('Fixture response: A dictated message through ordinary ACP'),'voice reply did not arrive');
   await waitFor(async()=>await page.locator('#turn-status').isHidden(),'voice command did not complete');
   assert((await page.locator('#messages').innerText()).includes('A dictated message through ordinary ACP'));check('voice command path uses normal draft and ACP send APIs');
   await page.evaluate(()=>window.agentConversationsControl.voice.transcript('Workshop, show activity'));

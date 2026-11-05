@@ -20,9 +20,9 @@ use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio::sync::watch;
 
 pub fn router(state: Arc<AppState>) -> Router {
+    crate::delivery::resume(&state);
     Router::new()
         .route(
             "/markdown-notices.txt",
@@ -131,6 +131,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/conversations/{id}/messages",
             get(message_history).post(send),
+        )
+        .route(
+            "/api/v1/conversations/{id}/deliveries",
+            get(crate::delivery::read),
+        )
+        .route(
+            "/api/v1/conversations/{id}/deliveries/{input}/resolve",
+            post(crate::delivery::resolve),
         )
         .route("/api/v1/conversations/{id}/cancel", post(cancel))
         .route(
@@ -536,14 +544,20 @@ async fn send(
         return Err(ApiError::bad("Address only agents who are in this room"));
     }
     let targets = serde_json::to_string(&msg.target_agent_ids).unwrap();
+    let was_working;
     {
-        let db = s.db.lock().unwrap();
-        let old:Option<(String,String,String,String)>=db.query_row("SELECT conversation_id,text,actor,targets FROM messages WHERE id=?1 AND role='user'",[&msg.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        // Intake and worker finalization both take running before the database.
+        // The durable row therefore belongs to a live worker or its successor.
+        let running = s.running.lock().unwrap();
+        was_working = running.contains_key(&id);
+        let mut db = s.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let old:Option<(String,String,String,String)>=tx.query_row("SELECT conversation_id,text,actor,targets FROM messages WHERE id=?1 AND role='user'",[&msg.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         if let Some((room, text, actor, old_targets)) = old {
-            let mut q = db.prepare("SELECT id FROM attachments WHERE message_id=?1 ORDER BY id")?;
-            let old_files = q
-                .query_map([&msg.request_id], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let old_files: Vec<String> = tx
+                .prepare("SELECT id FROM attachments WHERE message_id=?1 ORDER BY id")?
+                .query_map([&msg.request_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
             let mut files = msg.attachment_ids.clone();
             files.sort();
             if room != id
@@ -561,21 +575,6 @@ async fn send(
                 Json(json!({"accepted":true,"duplicate":true,"message_id":msg.request_id})),
             ));
         }
-    }
-    let permit = s.turn_gate.clone().try_acquire_owned().map_err(|_| {
-        ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Several rooms are working. Try again shortly.".into(),
-        )
-    })?;
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        let mut running = s.running.lock().unwrap();
-        if running.contains_key(&id) {
-            return Err(ApiError::busy());
-        }
-        let mut db = s.db.lock().unwrap();
-        let tx = db.transaction()?;
         let member: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM room_members WHERE conversation_id=?1 AND username=?2)",
             params![id, p.actor],
@@ -584,68 +583,78 @@ async fn send(
         if !member {
             return Err(ApiError::missing());
         }
+        let mut bytes = msg.text.len() as i64;
         for attachment in &msg.attachment_ids {
-            let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attachments WHERE id=?1 AND conversation_id=?2 AND created_by=?3 AND message_id IS NULL)",params![attachment,id,p.actor],|r|r.get(0))?;
-            if !valid {
-                return Err(ApiError::bad(
-                    "Use your own unsent attachments from this conversation",
-                ));
-            }
+            let size:Option<i64>=tx.query_row("SELECT bytes FROM attachments WHERE id=?1 AND conversation_id=?2 AND created_by=?3 AND message_id IS NULL",params![attachment,id,p.actor],|r|r.get(0)).optional()?;
+            bytes += size.ok_or_else(|| {
+                ApiError::bad("Use your own unsent attachments from this conversation")
+            })?;
         }
+        let (count,queued_bytes):(i64,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(text AS BLOB))+(SELECT COALESCE(SUM(bytes),0) FROM attachments WHERE message_id=m.id)),0) FROM messages m WHERE m.id IN (SELECT message_id FROM input_deliveries WHERE conversation_id=?1 AND state IN ('received','promptRequired','preparing','offering','submitted','received_remote','remoteQueued','unknown','notAccepted','ack_pending'))",[&id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if count >= 32 || queued_bytes + bytes > 8 * 1024 * 1024 {
+            return Err(ApiError(StatusCode::TOO_MANY_REQUESTS,"This conversation has reached its pending-message capacity. Review delivery status or wait before retrying; this message was not accepted.".into()));
+        }
+        let agents: Vec<String> = tx
+            .prepare("SELECT agent_id FROM room_agents WHERE conversation_id=?1 ORDER BY agent_id")?
+            .query_map([&id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if msg.target_agent_ids.iter().any(|a| !agents.contains(a)) {
+            return Err(ApiError::bad(
+                "The selected agent is no longer in this room",
+            ));
+        }
+        let people: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM room_members WHERE conversation_id=?1",
+            [&id],
+            |r| r.get(0),
+        )?;
+        let direct = people == 1 && agents.len() == 1;
         let at = now_ms();
         tx.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,targets) VALUES(?1,?2,'user',?3,'complete',?4,?4,?5,?6)",params![msg.request_id,id,msg.text,at,p.actor,targets])?;
+        let token_hash = h
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(auth::digest);
+        tx.execute(
+            "INSERT INTO input_authority(message_id,browser_hash,token_hash) VALUES(?1,?2,?3)",
+            params![msg.request_id, p.session_hash, token_hash],
+        )?;
         for attachment in &msg.attachment_ids {
             tx.execute(
                 "UPDATE attachments SET message_id=?2 WHERE id=?1",
                 params![attachment, msg.request_id],
             )?;
         }
-        tx.execute("UPDATE conversations SET status='working',note='Checking who can help…',updated_at=?2 WHERE id=?1",params![id,at])?;
-        tx.commit()?;
-        running.insert(id.clone(), cancel_tx);
-    }
-    s.changed();
-    let state = s.clone();
-    let response = json!({"accepted":true,"message_id":msg.request_id});
-    tokio::spawn(async move {
-        let _permit = permit;
-        let outcome = driver::round(
-            state.clone(),
-            id.clone(),
-            p.actor,
-            msg.request_id,
-            msg.text,
-            msg.target_agent_ids,
-            msg.attachment_ids,
-        )
-        .await;
-        match outcome {
-            Ok(()) => {
-                let _ = state.status(&id, "idle", "");
-            }
-            Err(error) => {
-                let auth_note =
-                    crate::acp_auth::authentication_required(&error).then(|| error.to_string());
-                let note = if *cancel_rx.borrow() {
-                    "You stopped this turn. Work already performed is not undone."
-                } else if let Some(ref note) = auth_note {
-                    note.as_str()
-                } else {
-                    "An agent could not finish. Check Activity or its connection, then continue."
-                };
-                let _=state.db.lock().unwrap().execute("UPDATE messages SET status='interrupted' WHERE conversation_id=?1 AND status='streaming'",[&id]);
-                if auth_note.is_none() {
-                    let _ = state.db.lock().unwrap().execute("UPDATE room_agents SET session_id=NULL,endpoint=NULL,last_seq=0 WHERE conversation_id=?1",[&id]);
-                }
-                let _ = state.audit("turn.interrupted", Some(&id), json!({"reason":note}));
-                let _ = state.status(&id, "error", note);
-            }
+        for agent in agents
+            .iter()
+            .filter(|a| msg.target_agent_ids.is_empty() || msg.target_agent_ids.contains(a))
+        {
+            let participation = if direct || msg.target_agent_ids.contains(agent) {
+                "direct"
+            } else {
+                "ambient"
+            };
+            tx.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES(?1,?2,?3,?4,?5,'received',?6)",params![uuid::Uuid::new_v4().to_string(),msg.request_id,id,agent,participation,at])?;
         }
-        state.running.lock().unwrap().remove(&id);
-        state.changed();
-    });
-    Ok((StatusCode::ACCEPTED, Json(response)))
+        tx.execute("UPDATE conversations SET status='working',note=CASE WHEN ?3 THEN note ELSE 'Message received; waiting for an agent…' END,updated_at=?2 WHERE id=?1",params![id,at,was_working])?;
+        tx.commit()?;
+    }
+    s.audit(
+        "input.received",
+        Some(&id),
+        json!({"message_id":msg.request_id,"actor":p.actor,"during_work":was_working}),
+    )?;
+    crate::delivery::launch(&s, &id);
+    s.changed();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            json!({"accepted":true,"message_id":msg.request_id,"delivery":"received","during_work":was_working}),
+        ),
+    ))
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PermissionDecision {
@@ -777,6 +786,10 @@ struct ViewState {
     selected_conversation_id: Option<String>,
     panel: String,
     draft: String,
+    #[serde(default)]
+    draft_request_id: String,
+    #[serde(default)]
+    draft_request_sha256: String,
     search: String,
     #[serde(default)]
     dialog: Option<String>,
@@ -838,6 +851,15 @@ async fn view_put(
     view_id(&id)?;
     if !["conversation", "connection", "activity"].contains(&v.state.panel.as_str())
         || v.state.draft.len() > 60_000
+        || (!v.state.draft_request_id.is_empty()
+            && uuid::Uuid::parse_str(&v.state.draft_request_id).is_err())
+        || (!v.state.draft_request_sha256.is_empty()
+            && (v.state.draft_request_sha256.len() != 64
+                || !v
+                    .state
+                    .draft_request_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit())))
         || v.state.search.len() > 200
         || v.state.dialog.as_deref().is_some_and(|d| d != "rename")
         || v.state.title_draft.chars().count() > 120

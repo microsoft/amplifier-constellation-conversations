@@ -17,8 +17,10 @@ All paths below start with `/api/v1`.
 | `/check` | POST | ACP initialization only; no model prompt or session creation. |
 | `/conversations` | GET, POST | List accessible conversations with `limit` (max 200), `search`, and `before` cursor. POST `{title,agent_ids?}` creates a private native conversation; omitted agents defaults to `["default"]`. |
 | `/conversations/{id}` | GET, PATCH, DELETE | GET includes latest 100 messages, people, agents, owner and shared status. PATCH `{title}` renames native conversations. DELETE removes this stored transcript and source grants, but not the agent's private memory. |
-| `/conversations/{id}/messages` | GET, POST | GET accepts `limit` (max 100), `before` sequence cursor, `search`, returning `items,next_cursor`. POST `{text,request_id,target_agent_ids?,attachment_ids?}`; request_id is a UUID. Returns 202 while work proceeds. A repeated identical request returns 200 without another turn. |
-| `/conversations/{id}/cancel` | POST | Stops this client's active turn and attached subprocess. Work already performed is not undone. |
+| `/conversations/{id}/messages` | GET, POST | GET accepts `limit` (max 100), `before` sequence cursor, `search`, returning `items,next_cursor`. POST `{text,request_id,target_agent_ids?,attachment_ids?}`; request_id is a UUID. Saves source and recipient delivery rows transactionally, including during active work; returns 202. Capacity rejection returns 429 without accepting the source. A repeated identical request returns 200 without another turn. |
+| `/conversations/{id}/cancel` | POST | Explicitly stops this client's active turn, attached subprocess and unsent queued messages. Work already performed is not undone. |
+| `/conversations/{id}/deliveries` | GET | Latest 256 per-agent delivery records plus every unresolved row; also included in conversation GET. Requires observe plus current membership. |
+| `/conversations/{id}/deliveries/{input}/resolve` | POST | Source author acknowledges unknown/notAccepted with `{disposition:"proceed_without_replay"}` while idle. Requires chat and current membership. Retains source/receipt, never resubmits it, and allows saved newer messages to proceed. |
 | `/activity` | GET | Latest 100 turn/tool/context/error records. No view-change acknowledgments. |
 | `/events` | GET | SSE `change` notifications, then fetch the needed state. Credentials are rechecked during the stream. |
 | `/import-sources` | GET, POST | Owner-only source listing; POST `{source,surface}` creates an independently scoped importer. |
@@ -26,7 +28,9 @@ All paths below start with `/api/v1`.
 | `/import-sources/{source}` | DELETE | Revokes the source credential immediately; retains imported conversations. |
 | `/imports/{source}/{session_id}` | PUT | Append-only transcript snapshots from an authorized external ACP experience. See README. |
 
-At most one bounded round per conversation and four rounds per web installation run concurrently. A group round visits each eligible independent agent once; direct targets receive a response request and ambient participants may pass. A message is at most 60 KB. Relevant ACP progress is exposed as status and activity; private one-to-one replies stream into a persisted message; group drafts are buffered until complete. Unknown-session notifications are ignored. If the endpoint cannot resume a session, a bounded transcript (100 messages / 60 KB) reconstructs the working context and activity records the rebuild. This is conversation data, not a new agent persona.
+At most one agent prompt per room and four per installation run concurrently. Follow-ups for the currently active agent use negotiated `_session/steering` with `idleBehavior: promptRequired`; ordinary ACP queues them until that prompt finishes. Other recipients retain their own ordered queue. Each ordinary next prompt takes a fair turn among waiting rooms; steering retains the active turn's original deadline. A message is at most 60 KB; pending input is bounded to 32 source messages and 8 MiB including attachments per room. See [input continuity](input-continuity.md) for receipts, unknown outcomes, restored attention, and generic ACP limits.
+
+Relevant ACP progress is exposed as status and activity; private one-to-one replies stream into a persisted message; group drafts are buffered until complete. Unknown-session notifications are ignored. Agents without session loading receive a bounded public transcript (100 messages / 60 KB). A failed attempt to load a saved session retains that binding and reports failure rather than silently replaying work in a new session. This is conversation data, not a new agent persona.
 
 Conversation records include `surface` and `read_only`. Imported records cannot be prompted or renamed through the native web actions. Their source updater can append additional transcript messages.
 
@@ -66,6 +70,8 @@ Each token permits only `PUT /imports/{its-source}/{session_id}` with its config
     "selected_conversation_id": "conversation UUID or null",
     "panel": "conversation",
     "draft": "A prepared message",
+    "draft_request_id": "",
+    "draft_request_sha256": "",
     "search": "",
     "dialog": null,
     "title_draft": "",
@@ -87,6 +93,8 @@ Each token permits only `PUT /imports/{its-source}/{session_id}` with its config
 ```
 
 Panels: `conversation`, `connection`, `activity`. Dialog: `null` or `rename`. Focus targets: `composer`, `search`, `rename_title`, `history_search`, `invite_username`, `invite_agent_id`. Scroll actions use `{id,kind:"scroll",target:"messages",position:0}`; position `-1` means bottom. Give each focus/scroll action a new ID so the browser executes it once. Other optional view fields default to closed/empty. A revision conflict returns 409; reread before reconciling. Changing a view or draft never sends a message. Sending, cancellation, rename submission, and connection checks remain separate explicit API operations.
+
+The browser persists `draft_request_id` (UUID) and `draft_request_sha256` before transmitting a message. An unchanged draft after a lost HTTP response reuses its source ID; a successful acknowledgment clears these fields. They contain no credentials. Older unresolved messages remain reachable through `window.agentConversationsControl.perform({action:"delivery_show",id})`, which updates the ordinary history view. Delivery recovery is also available through `window.agentConversationsControl.perform({action:"delivery_resolve",id})`; this calls the same authenticated resolution API as the button.
 
 Example voice flow: read the active view, select a conversation and populate `draft`, request focus on the composer, then send through the message API only when authorized. The browser observes the same results through SSE. Rename dialog, its editable title, mobile navigation, and connection-details expansion are also controlled by this view state.
 
