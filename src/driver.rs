@@ -912,9 +912,9 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 continue;
             }
             let result = &v["result"];
-            let bad_id = result["_meta"]["steering"]["inputId"]
-                .as_str()
-                .is_some_and(|id| id != pending.input.id);
+            let bad_id = result["_meta"]["steering"]
+                .get("inputId")
+                .is_some_and(|id| id.as_str() != Some(pending.input.id.as_str()));
             if v.get("error").is_none() && !bad_id && result["outcome"] == "injected" {
                 // This acknowledgment proves intake only. A later receipt may
                 // establish inclusion in model context.
@@ -943,6 +943,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 )?;
                 steering_open = false;
             } else if v["error"]["code"] == -32601
+                && v.get("result").is_none()
                 && pending.params["_meta"]
                     .get(crate::attention::META)
                     .is_none()

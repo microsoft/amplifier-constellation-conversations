@@ -67,6 +67,13 @@ while True:
         if mode in ('idle','attention_idle') and active is not None:
             complete();write({'id':value['id'],'result':{'outcome':'promptRequired','_meta':{'com.microsoft.amplifier.attention':{'ticketState':'restored'}}}})
         elif active is None:write({'id':value['id'],'result':{'outcome':'promptRequired'}})
+        elif mode.startswith('bad-ack-'):
+            result={'outcome':'injected','_meta':{'steering':{'inputId':id}}}
+            if mode in ('bad-ack-type','bad-ack-id'):
+                result['_meta']['steering']['inputId']=42 if mode=='bad-ack-type' else 'different-input'
+                write({'id':value['id'],'result':result})
+            else:
+                write({'id':value['id'],'result':result,'error':{'code':-32601 if mode=='bad-ack-conflict' else -32000,'message':'Conflicting acknowledgment'}})
         else:
             if id not in inputs:inputs.append(id)
             receipt(id,'remoteQueued' if mode in ('unsettled','regress-queued') else 'received')

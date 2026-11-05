@@ -258,6 +258,93 @@ async fn burst_is_durable_ordered_deduplicated_and_keeps_approval_and_effect() {
 }
 
 #[tokio::test]
+async fn malformed_acknowledgments_stay_unknown_without_replaying_or_changing_approval() {
+    for mode in [
+        "bad-ack-type",
+        "bad-ack-id",
+        "bad-ack-error",
+        "bad-ack-conflict",
+    ] {
+        let f = Fixture::new(mode, true, false);
+        f.send("Original with approval").await;
+        f.frames_at_least("session/prompt", 1).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let permission = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Missing approval: {mode}"
+            );
+            if let Some(row) = f.state.permissions.list(&f.room, "owner").first() {
+                break row["id"].as_str().unwrap().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let source = f.send("Uncertain correction").await;
+        f.frames_at_least("_session/steering", 1).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let state = loop {
+            let rows = f.deliveries();
+            let row = rows.iter().find(|d| d["message_id"] == source).unwrap();
+            if row["state"] != "submitted" {
+                break row["state"].clone();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Missing acknowledgment: {mode}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(state, "unknown", "{mode}");
+        assert_eq!(
+            f.state.permissions.list(&f.room, "owner")[0]["id"],
+            permission
+        );
+        f.send("Keep this queued").await;
+        assert_eq!(
+            f.request(
+                "POST",
+                &format!("permissions/{permission}"),
+                json!({"option_id":"yes"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        f.release();
+        f.idle().await;
+        let rows = f.deliveries();
+        assert_eq!(
+            rows.iter().find(|d| d["message_id"] == source).unwrap()["state"],
+            "unknown"
+        );
+        assert_eq!(rows[0]["state"], "received");
+        let frames = f.frames();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|v| v["method"] == "session/prompt")
+                .count(),
+            1
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|v| v["method"] == "_session/steering")
+                .count(),
+            1
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|v| v["effect"] == "write-once")
+                .count(),
+            1
+        );
+        assert!(!frames.iter().any(|v| v["method"] == "session/cancel"));
+    }
+}
+
+#[tokio::test]
 async fn ordinary_acp_queues_without_cancelling_or_overlapping() {
     let f = Fixture::new("generic", false, false);
     f.send("Original").await;
