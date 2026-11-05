@@ -830,7 +830,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         .write(json!({"jsonrpc":"2.0","id":request_id,"method":"session/prompt","params":params}))
         .await?;
     let mut output = String::new();
-    let mut upstream_message: Option<String> = None;
+    let mut answer = crate::answer::Answer::default();
     let mut steering_open = crate::delivery::supported(&init);
     let mut pending_input: Option<PendingInput> = None;
     let mut terminal: Option<Value> = None;
@@ -1033,21 +1033,10 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                         &agent.label,
                         &u["content"],
                     )?;
-                    if let Some(mid) = u["messageId"].as_str()
-                        && upstream_message.as_deref() != Some(mid)
-                    {
-                        output.clear();
-                        upstream_message = Some(mid.to_owned());
-                    }
-                    if let Some(t) = u["content"]["text"].as_str() {
-                        ensure!(
-                            output.len() + t.len() <= 2 * 1024 * 1024,
-                            "The agent response is too large"
-                        );
-                        output.push_str(t);
-                        if !shared {
-                            state.update_message(&message_id, &output, "streaming")?;
-                        }
+                    answer.observe(u)?;
+                    output = answer.text().to_owned();
+                    if !shared {
+                        state.update_message(&message_id, &output, "streaming")?;
                     }
                 }
                 Some("tool_call") | Some("tool_call_update") => {
