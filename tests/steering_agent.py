@@ -24,11 +24,11 @@ def complete():
     global active,inputs
     if active is None:return
     for id in inputs:
-        if mode=='unsettled':continue
+        if mode in ('unsettled','regress-queued'):continue
         r=receipt(id,'incorporated')
         write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':''},'_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipt':r}}}}})
     write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Completed the work once.'}}}})
-    write({'id':active,'result':{'stopReason':'end_turn','_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipts':[receipts[id] for id in inputs]}}}})
+    write({'id':active,'result':{'stopReason':'end_turn','_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipts':[] if mode=='regress-queued' else [receipts[id] for id in inputs]}}}})
     active=None;inputs=[]
 
 while True:
@@ -69,7 +69,10 @@ while True:
         elif active is None:write({'id':value['id'],'result':{'outcome':'promptRequired'}})
         else:
             if id not in inputs:inputs.append(id)
-            receipt(id,'remoteQueued' if mode=='unsettled' else 'received')
+            receipt(id,'remoteQueued' if mode in ('unsettled','regress-queued') else 'received')
+            if mode=='regress-queued':
+                for state in ['remoteQueued','received','submitted']:
+                    write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':''},'_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipt':{'inputId':id,'state':state}}}}}})
             if mode=='preack':
                 r=receipt(id,'incorporated')
                 write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':''},'_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipt':r}}}}})

@@ -631,8 +631,8 @@ async fn each_agent_receives_only_its_ordered_room_inputs() {
 }
 
 #[tokio::test]
-async fn a_terminal_result_does_not_disguise_a_still_remote_queued_update() {
-    let f = Fixture::new("unsettled", false, false);
+async fn delayed_receipts_and_terminal_never_disguise_a_still_remote_queued_update() {
+    let f = Fixture::new("regress-queued", false, false);
     f.send("Original").await;
     f.frames_at_least("session/prompt", 1).await;
     f.send("Still queued remotely").await;

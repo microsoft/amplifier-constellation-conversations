@@ -51,7 +51,7 @@ with sqlite3.connect(sys.argv[1]+'/state.sqlite3') as db:
   db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES(?,?,?,'recovery','direct','completed',1)",(key,key,sys.argv[2]))`,cfg.home,r.id]);
  await page.reload();await page.getByRole('button',{name:/Review earlier message/}).first().click();await page.getByRole('button',{name:'Continue without resending',exact:true}).first().waitFor();checks.push('older unresolved delivery remains reachable after newer history');
  assert.match(await page.locator('#messages').innerText(),/Outcome unknown/);
- await send('An unrelated next question');await wait(async()=>(await room()).status==='error','blocked new question did not settle');
+ await send('An unrelated next question');await wait(async()=>{const r=await room();return r.messages.some(m=>m.text==='An unrelated next question')&&r.status==='error';},'accepted blocked question did not settle');
  assert.equal((await frames('recovery')).filter(v=>v.method==='session/prompt').length,1);
  await writeFile(`${cfg.home}/recovery-release`,'1');
  const pending=(await room()).deliveries.filter(d=>d.state==='unknown');assert.equal(pending.length,2);

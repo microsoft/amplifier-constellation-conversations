@@ -104,7 +104,7 @@ pub fn receipt(state: &AppState, turn: &str, value: &Value) -> Result<()> {
             .map(|s| s.chars().take(1024).collect::<String>())
     };
     let safe = json!({"inputId":id,"state":status,"turnId":identifier("turnId"),"sequence":value["sequence"].as_u64(),"responseId":identifier("responseId"),"recorded":value["recorded"].as_bool()});
-    state.db.lock().unwrap().execute("UPDATE input_deliveries SET state=?3,receipt=?4,updated_at=?5 WHERE id=?1 AND target_turn=?2 AND state IN ('submitted','received_remote','remoteQueued','incorporated') AND (state<>'incorporated' OR ?3 IN ('unknown','notAccepted','incorporated'))",params![id,turn,status,safe.to_string(),now_ms()])?;
+    state.db.lock().unwrap().execute("UPDATE input_deliveries SET state=?3,receipt=?4,updated_at=?5 WHERE id=?1 AND target_turn=?2 AND state IN ('submitted','received_remote','remoteQueued','incorporated') AND (state<>'incorporated' OR ?3 IN ('unknown','notAccepted','incorporated')) AND (state<>'remoteQueued' OR ?3 IN ('remoteQueued','unknown','notAccepted','incorporated'))",params![id,turn,status,safe.to_string(),now_ms()])?;
     state.changed();
     Ok(())
 }
