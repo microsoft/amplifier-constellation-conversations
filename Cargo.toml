@@ -1,6 +1,6 @@
 [package]
 name = "agent-conversations"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -9,6 +9,7 @@ repository = "https://github.com/microsoft/amplifier-constellation-conversations
 description = "Browser conversations, people and agents, threads, approvals, and source context."
 
 [dependencies]
+amplifier-acp-connection = { git = "https://github.com/microsoft/amplifier-constellation", rev = "e0d6a03fd342b295d349b633d400376efbbe2c40" }
 anyhow = "1"
 base64 = "0.22"
 axum = { version = "0.8.9", features = ["macros"] }

@@ -5,10 +5,7 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{process::Stdio, sync::Arc, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-};
+use tokio::process::{Child, Command};
 
 #[derive(Clone, Copy)]
 struct SetupInteraction<'a> {
@@ -21,12 +18,9 @@ struct SetupInteraction<'a> {
     deadline: tokio::time::Instant,
 }
 struct Peer {
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    next: u64,
+    connection: amplifier_acp_connection::Connection,
     auth_methods: Value,
     auth_attempted: bool,
-    read_buffer: Vec<u8>,
 }
 impl Peer {
     async fn session_request(
@@ -85,36 +79,16 @@ impl Peer {
         self.setup_request(method, params, ctx, cancel).await
     }
     async fn write(&mut self, v: Value) -> Result<()> {
-        self.input.write_all(format!("{v}\n").as_bytes()).await?;
-        self.input.flush().await?;
-        Ok(())
+        self.connection.sender.send(v)
     }
     async fn read(&mut self) -> Result<Value> {
-        loop {
-            let b = self.output.fill_buf().await?;
-            ensure!(!b.is_empty(), "The agent disconnected");
-            let n = b
-                .iter()
-                .position(|b| *b == b'\n')
-                .map(|n| n + 1)
-                .unwrap_or(b.len());
-            ensure!(
-                self.read_buffer.len() + n <= 24 * 1024 * 1024,
-                "The agent sent an oversized response"
-            );
-            self.read_buffer.extend_from_slice(&b[..n]);
-            self.output.consume(n);
-            if self.read_buffer.last() == Some(&b'\n') {
-                break;
-            }
-        }
-        let data = std::mem::take(&mut self.read_buffer);
-        let v: Value = serde_json::from_slice(&data)?;
-        ensure!(
-            v["jsonrpc"] == "2.0",
-            "The agent sent an invalid ACP response"
-        );
-        Ok(v)
+        self.connection
+            .recv()
+            .await?
+            .context("The agent disconnected")
+    }
+    fn send_request(&self, method: &str, params: Value) -> Result<Value> {
+        self.connection.sender.request(method, params)
     }
     async fn reject(&mut self, v: &Value) -> Result<()> {
         if v["method"] == "elicitation/create" {
@@ -131,7 +105,7 @@ impl Peer {
             self.write(json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32601,"message":"This client does not offer that capability"}})).await
         }
     }
-    async fn cancel(&mut self, id: u64, sid: &str) {
+    async fn cancel(&mut self, id: Value, sid: &str) {
         let _ = self
             .write(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}}))
             .await;
@@ -158,10 +132,7 @@ impl Peer {
         if let Some(sid) = params["sessionId"].as_str() {
             ctx.callbacks.bind_session(sid)?;
         }
-        self.next += 1;
-        let id = self.next;
-        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await?;
+        let id = self.send_request(method, params)?;
         let mut pending = tokio::task::JoinSet::new();
         let mut forms = crate::elicitation::Callbacks::default();
         loop {
@@ -275,10 +246,7 @@ impl Peer {
         }
     }
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.next += 1;
-        let id = self.next;
-        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await?;
+        let id = self.send_request(method, params)?;
         loop {
             let v = self.read().await?;
             if v.get("method").is_none() && v["id"] == id {
@@ -333,17 +301,19 @@ impl Client {
             .context("The ACP command could not be started")?;
         let pid = child.id().context("The ACP command exited during launch")?;
         let input = child.stdin.take().context("Missing agent input")?;
-        let output = BufReader::new(child.stdout.take().context("Missing agent output")?);
+        let output = child.stdout.take().context("Missing agent output")?;
         Ok(Self {
             child,
             pid,
             peer: Peer {
-                input,
-                output,
-                next: 0,
+                connection: amplifier_acp_connection::Connection::client(
+                    output,
+                    input,
+                    24 * 1024 * 1024,
+                )
+                .await?,
                 auth_methods: json!([]),
                 auth_attempted: false,
-                read_buffer: Vec::new(),
             },
         })
     }
@@ -500,11 +470,15 @@ struct Turn {
     reconcile_only: bool,
 }
 struct PendingInput {
-    id: u64,
+    id: Value,
     input: crate::delivery::Input,
     params: Value,
     attention: bool,
+    acknowledge_by: tokio::time::Instant,
 }
+// Steering acknowledges delivery, not model completion. An absent or invalid
+// acknowledgment cannot justify replay or cancellation of the original prompt.
+const STEERING_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 fn steering_params(
     state: &AppState,
     input: &crate::delivery::Input,
@@ -815,8 +789,6 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         &attachments,
         &init["agentCapabilities"],
     )?);
-    c.peer.next += 1;
-    let request_id = c.peer.next;
     let mut params = json!({"sessionId":sid,"prompt":blocks,"_meta":{"com.microsoft.amplifier.conversations":{"messageId":user_message,"author":actor,"sequence":source_seq,"conversationId":conversation}}});
     if let Some(offer) = attention_offer {
         params["_meta"][crate::attention::META] = offer;
@@ -826,9 +798,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         bail!("The source authorization expired or was revoked before delivery");
     }
     crate::delivery::set(&state, &input_id, "submitted")?;
-    c.peer
-        .write(json!({"jsonrpc":"2.0","id":request_id,"method":"session/prompt","params":params}))
-        .await?;
+    let request_id = c.peer.send_request("session/prompt", params)?;
     let mut output = String::new();
     let mut answer = crate::answer::Answer::default();
     let mut steering_open = crate::delivery::supported(&init);
@@ -841,6 +811,12 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         } else {
             tokio::select! {
                 _=intake.tick()=>{
+                    if pending_input.as_ref().is_some_and(|p| !p.attention && tokio::time::Instant::now() >= p.acknowledge_by) {
+                        let pending = pending_input.take().unwrap();
+                        crate::delivery::set(&state,&pending.input.id,"unknown")?;
+                        steering_open=false;
+                        continue;
+                    }
                     if steering_open && pending_input.is_none() && terminal.is_none() {
                         let next={let db=state.db.lock().unwrap();crate::delivery::next(&db,&conversation,Some(&agent_id))?};
                         if let Some(input)=next {
@@ -848,17 +824,16 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                             if !crate::delivery::authorized(&state,&input.message_id,&input.actor)? {crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;continue;}
                             let prepared=steering_params(&state,&input,&sid,&init);
                             let mut params=match prepared {Ok(params)=>params,Err(_)=>{crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;continue;}};
-                            c.peer.next+=1;let id=c.peer.next;
                             let attention=input.participation=="ambient"&&crate::attention::supported(&init);
                             crate::delivery::bind(&state,&input.id,&message_id,&sid,&endpoint,"steering",if attention{"offering"}else{"submitted"})?;
-                            if attention {
+                            let id = if attention {
                                 let (evidence,at)=crate::attention::evidence(&conversation,&agent_id,&agent.label,&input.message_id,&crate::delivery::safe_history(&state,&conversation,&agent_id,input.seq)?)?;
-                                c.peer.write(json!({"jsonrpc":"2.0","id":id,"method":crate::attention::METHOD,"params":{"sessionId":sid,"occurredAt":at,"context":evidence}})).await?;
+                                c.peer.send_request(crate::attention::METHOD, json!({"sessionId":sid,"occurredAt":at,"context":evidence}))?
                             }else{
                                 params["_meta"]["steering"]["inputId"]=json!(input.id);
-                                c.peer.write(json!({"jsonrpc":"2.0","id":id,"method":crate::delivery::METHOD,"params":params})).await?;
-                            }
-                            pending_input=Some(PendingInput{id,input,params,attention});
+                                c.peer.send_request(crate::delivery::METHOD,params.clone())?
+                            };
+                            pending_input=Some(PendingInput{id,input,params,attention,acknowledge_by:tokio::time::Instant::now()+STEERING_ACK_TIMEOUT});
                         }
                     }
                     continue;
@@ -904,10 +879,11 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 pending.params["_meta"][crate::attention::META] = admission;
                 pending.params["_meta"]["steering"]["inputId"] = json!(pending.input.id);
                 crate::delivery::set(&state, &pending.input.id, "submitted")?;
-                c.peer.next += 1;
-                pending.id = c.peer.next;
                 pending.attention = false;
-                c.peer.write(json!({"jsonrpc":"2.0","id":pending.id,"method":crate::delivery::METHOD,"params":pending.params})).await?;
+                pending.acknowledge_by = tokio::time::Instant::now() + STEERING_ACK_TIMEOUT;
+                pending.id = c
+                    .peer
+                    .send_request(crate::delivery::METHOD, pending.params.clone())?;
                 pending_input = Some(pending);
                 continue;
             }
