@@ -824,16 +824,15 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                             if !crate::delivery::authorized(&state,&input.message_id,&input.actor)? {crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;continue;}
                             let prepared=steering_params(&state,&input,&sid,&init);
                             let mut params=match prepared {Ok(params)=>params,Err(_)=>{crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;continue;}};
-                            let id;
                             let attention=input.participation=="ambient"&&crate::attention::supported(&init);
                             crate::delivery::bind(&state,&input.id,&message_id,&sid,&endpoint,"steering",if attention{"offering"}else{"submitted"})?;
-                            if attention {
+                            let id = if attention {
                                 let (evidence,at)=crate::attention::evidence(&conversation,&agent_id,&agent.label,&input.message_id,&crate::delivery::safe_history(&state,&conversation,&agent_id,input.seq)?)?;
-                                id = c.peer.send_request(crate::attention::METHOD, json!({"sessionId":sid,"occurredAt":at,"context":evidence}))?;
+                                c.peer.send_request(crate::attention::METHOD, json!({"sessionId":sid,"occurredAt":at,"context":evidence}))?
                             }else{
                                 params["_meta"]["steering"]["inputId"]=json!(input.id);
-                                id = c.peer.send_request(crate::delivery::METHOD,params.clone())?;
-                            }
+                                c.peer.send_request(crate::delivery::METHOD,params.clone())?
+                            };
                             pending_input=Some(PendingInput{id,input,params,attention,acknowledge_by:tokio::time::Instant::now()+STEERING_ACK_TIMEOUT});
                         }
                     }
