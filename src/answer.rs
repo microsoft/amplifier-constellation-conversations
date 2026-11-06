@@ -72,7 +72,6 @@ impl Answer {
             .iter()
             .rev()
             .find(|p| !p.commentary && !p.text.is_empty())
-            .or_else(|| self.messages.iter().rev().find(|p| !p.text.is_empty()))
             .map(|p| p.text.as_str())
             .unwrap_or("")
     }
@@ -146,5 +145,13 @@ mod tests {
         }
         answer.observe(&chunk("answer", "Complete")).unwrap();
         assert_eq!(answer.text(), "Complete");
+    }
+    #[test]
+    fn public_progress_alone_is_not_a_final_answer() {
+        let mut answer = Answer::default();
+        let mut progress = chunk("progress", "Checking the repository now.");
+        progress["_meta"]["com.microsoft.amplifier.message"]["phase"] = "commentary".into();
+        answer.observe(&progress).unwrap();
+        assert_eq!(answer.text(), "");
     }
 }
