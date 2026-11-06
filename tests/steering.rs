@@ -264,6 +264,7 @@ async fn malformed_acknowledgments_stay_unknown_without_replaying_or_changing_ap
         "bad-ack-id",
         "bad-ack-error",
         "bad-ack-conflict",
+        "bad-ack-silent",
     ] {
         let f = Fixture::new(mode, true, false);
         f.send("Original with approval").await;
@@ -281,7 +282,7 @@ async fn malformed_acknowledgments_stay_unknown_without_replaying_or_changing_ap
         };
         let source = f.send("Uncertain correction").await;
         f.frames_at_least("_session/steering", 1).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let state = loop {
             let rows = f.deliveries();
             let row = rows.iter().find(|d| d["message_id"] == source).unwrap();

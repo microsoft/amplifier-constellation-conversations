@@ -69,7 +69,9 @@ while True:
         elif active is None:write({'id':value['id'],'result':{'outcome':'promptRequired'}})
         elif mode.startswith('bad-ack-'):
             result={'outcome':'injected','_meta':{'steering':{'inputId':id}}}
-            if mode in ('bad-ack-type','bad-ack-id'):
+            if mode=='bad-ack-silent':
+                pass
+            elif mode in ('bad-ack-type','bad-ack-id'):
                 result['_meta']['steering']['inputId']=42 if mode=='bad-ack-type' else 'different-input'
                 write({'id':value['id'],'result':result})
             else:
