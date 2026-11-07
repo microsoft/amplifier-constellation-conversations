@@ -230,6 +230,13 @@ These tools apply only to the private call and selected agent. They do not merge
 sessions, imply write authority from context access, or require a shared
 Constellation provisioning or identity service.
 
+The backend must be able to reach Conversations' public HTTPS address from its own
+network namespace. A working browser connection does not prove that route. For a
+containerized agent, verify the fixed destination from inside the container and
+use an installation-owned route that preserves its existing isolation and routes.
+Do not copy provider credentials into the container or expose the local MCP port;
+the authenticated per-call HTTPS endpoint is the intended connection.
+
 With optional actions enabled, Conversations can answer a native ACP permission
 request with `allow_once` for its own call tools. The active private call, caller,
 agent, and grant must match the dynamically injected `companion` server; a static
