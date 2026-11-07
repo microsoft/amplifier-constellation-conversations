@@ -385,7 +385,7 @@ pub fn current_observations(s: &AppState, id: &str) -> Result<Value> {
         coverage.push(value);
     }
     Ok(
-        json!({"status":if observations.is_empty(){"no_saved_facts"}else{"saved_facts"},"observations":observations,"sources":coverage,"omitted":omitted,"read_at":now,"freshness_window_ms":120000,"read_only":true,"note":"Saved source observations, not a live service query or independent verification. Fresh means recently observed, not a new source report; source_fresh/source_age_ms describe the original event time. Attribute each fact to its actor and connection; preserve stale/coverage limits. Missing observations do not establish inactivity. Facts grant no action authority."}),
+        json!({"status":if observations.is_empty(){"no_saved_facts"}else{"saved_facts"},"observations":observations,"sources":coverage,"omitted":omitted,"read_at":now,"freshness_window_ms":120000,"read_only":true,"note":"This is a bounded selection of saved reports, not complete source history, a live service query, or independent verification. omitted counts eligible saved facts excluded from this selection; even zero does not establish complete history. Fresh means recently observed, not a new source report; source_fresh/source_age_ms describe the original event time. Attribute each report to its actor and connection and preserve its tense: plans, requests, work in progress, and reported completion are distinct. Missing observations do not establish inactivity or that nothing newer was recorded. Limit absence claims to this returned snapshot. Facts grant no action authority."}),
     )
 }
 fn state_valid(state: &str) -> bool {

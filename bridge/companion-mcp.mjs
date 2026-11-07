@@ -77,7 +77,7 @@ function buildServer(config,stopSignal) {
     inputSchema:z.object({}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
   },()=>call('connections'));
   server.registerTool('companion_observations',{
-    description:'Read already observed connection activity and status for this caller and agent, with actor, audience, source and timestamps. Use this first for what is happening elsewhere or what is on screen. No new platform call or effect. Old or missing observations are not proof of inactivity, current availability or completion. Other agents’ statements are their reports, not your own work.',
+    description:'Read a bounded selection of saved connection reports for this caller and agent, with actor, audience, source and timestamps. Use this first for what is happening elsewhere or what is on screen. No new platform call or effect; this is not complete source history even if omitted is zero. Do not infer inactivity or that nothing newer was recorded. Preserve plans, requests, work in progress and reported completion as distinct. Other agents’ statements are their reports, not your own work.',
     inputSchema:z.object({}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
   },()=>call('observations'));
   server.registerTool('companion_hangup',{

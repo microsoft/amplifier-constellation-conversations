@@ -454,6 +454,14 @@ that every described task is still current. Missing observations do not prove
 inactivity. Source, owner, audience, or call identity changes close access;
 stored coverage and cursors cannot cross a changed policy scope.
 
+Interpretation guidance preserves the source's actor and tense: a planned
+meeting or transfer remains a plan, and reported completion remains a report.
+Even zero omitted saved facts does not establish complete source history or
+current inactivity. Spoken summaries should bound absence claims to the returned
+snapshot. The voice speaks as the selected agent while keeping other reporters
+distinct. These are model instructions, not semantic verification or a filter
+that rewrites the recorded result or speech.
+
 Thinking appends are quiet-context intent, not a promise that their contents can
 never be spoken. Both thinking and commentary appends cancel pending provider
 automatic delegation acknowledgments, so this implementation guards newly created
