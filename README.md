@@ -8,6 +8,13 @@ This repository contains an ACP client, a private conversation store, a browser 
 
 The service supports explicitly allowed local users, private conversations, and shared rooms with several independently configured ACP agents. Existing conversations stay private on upgrade. See [shared rooms](docs/shared-rooms.md) for setup, participation, attachments, and audience boundaries. Multiple conversations can run concurrently against the configured endpoints. Imported transcripts from other experiences are viewable here, with their original surface identified, but remain read-only.
 
+## Companion preview
+
+[Constellation Companion](docs/companion.md) adds full-duplex GPT-Live calls to
+existing ACP agents, with per-agent voices and separate background work. It has
+its own `/companion` interface and optional server-side bridge; existing text
+conversations and browser dictation keep their current behavior.
+
 ## Phone and voice
 
 The responsive browser experience can be added to a phone or desktop home screen

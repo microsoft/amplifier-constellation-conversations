@@ -4,6 +4,7 @@ pub mod attachments;
 pub mod attention;
 pub mod auth;
 pub mod client_callbacks;
+pub mod companion;
 pub mod config;
 pub mod context;
 pub mod delivery;
