@@ -655,6 +655,95 @@ fn observation_read_is_cached_bounded_current_policy_and_honest_about_coverage()
 }
 
 #[test]
+fn observation_read_balances_connections_and_prioritizes_current_tasks_and_recent_reports() {
+    let f = fixture();
+    rewrite_policy(&f, |c| {
+        let mut slack = c["agents"]["default"][0].clone();
+        slack["id"] = json!("slack");
+        slack["label"] = json!("Team chat");
+        c["agents"]["default"].as_array_mut().unwrap().push(slack);
+    });
+    let (cfg, fingerprint) = config(&f.s).unwrap().unwrap();
+    let minecraft = &cfg.agents["default"][0];
+    let slack = &cfg.agents["default"][1];
+    let now = now_ms();
+    let mut task = source_event();
+    task["id"] = json!("current-game-task");
+    task["kind"] = json!("task_observation");
+    task["occurred_at"] = json!(timestamp(now - 3_600_000));
+    task["text"] = json!("Current Minecraft task: reviewing the stocked supermarket.");
+    record_source_event(&f.s, &f.id, minecraft, &task, &fingerprint, false).unwrap();
+    // Backfill arrives in reverse event order; retention/poll order must not
+    // outrank the actual source time within either connection.
+    for index in (0..20).rev() {
+        for source in [minecraft, slack] {
+            let mut event = source_event();
+            event["id"] = json!(format!("{}-message-{index}", source.id));
+            event["kind"] = json!("message");
+            event["occurred_at"] = json!(timestamp(now - 60_000 + index * 1000));
+            record_event(&f.s, &f.id, source, &event, &fingerprint).unwrap();
+        }
+    }
+    let mut revised = source_event();
+    revised["id"] = json!("minecraft-message-19");
+    revised["kind"] = json!("message");
+    revised["revision"] = json!("corrected");
+    revised["occurred_at"] = json!(timestamp(now - 41_000));
+    revised["text"] = json!("Rook reports the inspection is still in progress.");
+    record_event(&f.s, &f.id, minecraft, &revised, &fingerprint).unwrap();
+    let mut unrelated = source_event();
+    unrelated["id"] = json!("unrelated-private-fact");
+    unrelated["audience"] = json!({"kind":"private","owner":"someone-else"});
+    record_event(&f.s, &f.id, minecraft, &unrelated, &fingerprint).unwrap();
+    f.s.db.lock().unwrap().execute(
+        "UPDATE companion_awareness SET last_observed_at=?2 WHERE call_id=?1 AND connection_id='slack'",
+        params![f.id, now + 1000],
+    ).unwrap();
+    let reply = current_observations(&f.s, &f.id).unwrap();
+    let facts = reply["observations"].as_array().unwrap();
+    assert_eq!(facts.len(), 16);
+    assert_eq!(reply["omitted"], 25);
+    assert_eq!(facts[0]["source"], task);
+    for connection in ["minecraft", "slack"] {
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact["attribution"]["connection_id"] == connection)
+                .count(),
+            8
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact["source"]["id"] == format!("{connection}-message-19"))
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact["source"]["id"] == format!("{connection}-message-0"))
+        );
+    }
+    assert_eq!(
+        facts
+            .iter()
+            .find(|fact| fact["source"]["id"] == "minecraft-message-19")
+            .unwrap()["source"],
+        revised
+    );
+    assert!(
+        !facts
+            .iter()
+            .any(|fact| fact["source"]["id"] == "unrelated-private-fact")
+    );
+    assert!(serde_json::to_vec(&reply).unwrap().len() <= 256 * 1024);
+    rewrite_policy(&f, |c| c["agents"]["default"][0]["audiences"] = json!([]));
+    let revoked = current_observations(&f.s, &f.id).unwrap();
+    assert!(revoked["observations"].as_array().unwrap().is_empty());
+    assert!(calls(&f, "decision").is_empty());
+    assert!(calls(&f, "observer").is_empty());
+}
+
+#[test]
 fn observation_read_bounds_serialized_bytes_without_clipping_any_included_fact() {
     let f = fixture();
     rewrite_policy(&f, |c| {

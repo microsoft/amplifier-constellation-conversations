@@ -447,7 +447,10 @@ calibrated accuracy or a delivery guarantee.
 `companion_observations` takes no arguments and reads only this call's saved,
 currently authorized facts. It does not contact a service or model. It reports
 the latest retained revision per source event, original attribution, observation
-freshness, source age, coverage, and omissions. Missing observations do not prove
+freshness, source age, coverage, and omissions. Bounded selection rotates across
+connections, preferring task/action reports and then recent original event times;
+a busy chat baseline cannot consume every slot. These are saved reports, not proof
+that every described task is still current. Missing observations do not prove
 inactivity. Source, owner, audience, or call identity changes close access;
 stored coverage and cursors cannot cross a changed policy scope.
 

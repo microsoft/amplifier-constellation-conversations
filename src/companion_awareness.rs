@@ -300,17 +300,21 @@ pub fn current_observations(s: &AppState, id: &str) -> Result<Value> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut seen = std::collections::HashSet::new();
+    let mut candidates = sources
+        .iter()
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<(bool, i64, Value, usize)>>>();
     let mut observations = Vec::new();
-    let mut omitted = 0;
     // Bound serialized bytes, not just fact count: JSON escaping and retaining
     // both original evidence and readable text can substantially expand a fact.
     // Keep whole records and leave room for eight bounded coverage summaries
     // inside the Companion MCP transport's 256 KiB response limit.
     let mut observation_bytes = 0;
     for (key, connection, data, retained_at, presentation_state, observed_at) in rows {
-        let Some(source) = sources.iter().find(|source| source.id == connection) else {
+        let Some(source_index) = sources.iter().position(|source| source.id == connection) else {
             continue;
         };
+        let source = sources[source_index];
         let event: Value = serde_json::from_str(&data)?;
         let private_action = event["kind"] == "action_status"
             && event["audience"] == json!({"kind":"private","owner":owner})
@@ -327,19 +331,49 @@ pub fn current_observations(s: &AppState, id: &str) -> Result<Value> {
         if !seen.insert((connection.clone(), event["id"].clone().to_string())) {
             continue;
         }
-        if observations.len() >= 16 {
-            omitted += 1;
-            continue;
-        }
         let observation = json!({"awareness_id":key,"attribution":attribution(source,&event),"source":event,"text":event["text"],"retained_at":retained_at,"observed_at":observed_at,"age_ms":(now-observed_at).max(0),"fresh":observed_at>0&&now-observed_at<=120000,"source_age_ms":(now-occurred_at).max(0),"source_fresh":fresh(&event,call_at,now),"presentation_state":presentation_state,"observed_only":true,"authority":false});
         let bytes = serde_json::to_vec(&observation)?.len() + 1;
-        if observation_bytes + bytes > 192 * 1024 {
-            omitted += 1;
-            continue;
-        }
-        observation_bytes += bytes;
-        observations.push(observation);
+        let task_or_action = matches!(
+            event["kind"].as_str(),
+            Some("task_observation" | "action_status")
+        );
+        candidates[source_index].push((task_or_action, occurred_at, observation, bytes));
     }
+    let eligible = candidates.iter().map(Vec::len).sum::<usize>();
+    let mut queues = candidates
+        .into_iter()
+        .map(|mut facts| {
+            // Keep the latest observed revision selected above. Within each
+            // connection, prefer task/action reports and original event time,
+            // not the order in which a poll returned a historical baseline.
+            // Stable ties retain the deterministic database ordering.
+            facts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+            facts.into_iter()
+        })
+        .collect::<Vec<_>>();
+    // Round-robin prevents a busy or later-polled connection from consuming all
+    // slots. These remain saved reports, not proof that every task is current.
+    while observations.len() < 16 {
+        let mut progressed = false;
+        for queue in &mut queues {
+            let Some((_, _, observation, bytes)) = queue.next() else {
+                continue;
+            };
+            progressed = true;
+            if observation_bytes + bytes > 192 * 1024 {
+                continue;
+            }
+            observation_bytes += bytes;
+            observations.push(observation);
+            if observations.len() == 16 {
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let omitted = eligible - observations.len();
     let mut coverage = Vec::new();
     for source in sources {
         let saved:Option<(String,i64)> = db.query_row("SELECT coverage,updated_at FROM companion_observers WHERE call_id=?1 AND connection_id=?2 AND policy_hash=?3",params![id,source.id,fingerprint],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
