@@ -45,6 +45,28 @@ pub fn router(state: Arc<AppState>) -> Router {
                 )
             }),
         )
+        .route(
+            "/companion",
+            get(|| async { Html(include_str!("../ui/companion.html")) }),
+        )
+        .route(
+            "/companion.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/companion.js"),
+                )
+            }),
+        )
+        .route(
+            "/companion.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../ui/companion.css"),
+                )
+            }),
+        )
         .route("/", get(index))
         .route("/app.js", get(js))
         .route(
@@ -88,6 +110,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/login", post(auth::login))
         .route("/auth/session", get(auth::session))
         .route("/auth/logout", post(auth::logout))
+        .route("/api/v1/companion", get(crate::companion::catalog))
+        .route("/api/v1/companion/calls", post(crate::companion::create))
+        .route("/api/v1/companion/calls/{id}", get(crate::companion::read))
+        .route(
+            "/api/v1/companion/calls/{id}/heartbeat",
+            post(crate::companion::heartbeat),
+        )
+        .route(
+            "/api/v1/companion/calls/{id}/close",
+            post(crate::companion::close),
+        )
         .route("/api/v1/meta", get(meta))
         .route("/api/v1/config", get(config_get).put(config_put))
         .route("/api/v1/check", post(check))
@@ -197,12 +230,18 @@ async fn headers(
     {
         request.headers_mut().insert(header::HOST, value);
     }
+    let companion_page = request.uri().path() == "/companion";
     let mut response = next.run(request).await;
     let h = response.headers_mut();
     h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     h.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
-    h.insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' {}; form-action 'self'",state.config.embed_origins.join(" ")).parse().unwrap());
+    let media_policy = if companion_page {
+        "img-src 'self' data: blob:; media-src 'self' blob:;"
+    } else {
+        "img-src 'self' data:;"
+    };
+    h.insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; {media_policy} object-src 'none'; base-uri 'none'; frame-ancestors 'self' {}; form-action 'self'",state.config.embed_origins.join(" ")).parse().unwrap());
     response
 }
 async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -492,15 +531,15 @@ async fn remove(
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Send {
-    text: String,
-    request_id: String,
+pub(crate) struct Send {
+    pub(crate) text: String,
+    pub(crate) request_id: String,
     #[serde(default)]
-    target_agent_ids: Vec<String>,
+    pub(crate) target_agent_ids: Vec<String>,
     #[serde(default)]
-    attachment_ids: Vec<String>,
+    pub(crate) attachment_ids: Vec<String>,
 }
-async fn send(
+pub(crate) async fn send(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
     Path(id): Path<String>,
@@ -508,6 +547,11 @@ async fn send(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let p = auth::check(&s, &h, "chat", true)?;
     s.require_member(&id, &p)?;
+    if !crate::companion::room_identity_valid(&s, &id)? {
+        return Err(ApiError::bad(
+            "This call's participant or connection changed. Start a new call to the intended agent.",
+        ));
+    }
     if (msg.text.trim().is_empty() && msg.attachment_ids.is_empty())
         || msg.text.len() > 60_000
         || uuid::Uuid::parse_str(&msg.request_id).is_err()

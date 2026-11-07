@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f4ef">
+  <meta name="color-scheme" content="light">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/companion.css">
+  <script type="module" src="/companion.js"></script>
+  <title>Companion · Constellation</title>
+</head>
+<body>
+  <header class="masthead">
+    <a class="brand" href="/companion" aria-label="Companion home"><span class="brand-mark" aria-hidden="true">c<span>·</span></span><span>Companion<small>CONSTELLATION</small></span></a>
+    <nav aria-label="Companion navigation"><a href="/">Conversations <span aria-hidden="true">↗</span></a><button id="sign-out" class="text-button" hidden>Sign out</button></nav>
+  </header>
+  <main>
+    <section id="loading" class="loading" role="status"><span class="quiet-dot" aria-hidden="true"></span> Opening your contacts…</section>
+    <section id="login" class="login-layout" hidden>
+      <div class="login-intro"><p class="eyebrow">ROOM TO THINK TOGETHER</p><h1>A familiar voice.<br>Wherever you are.</h1><p>Call your agent, talk something through, and give your hands a little freedom.</p></div>
+      <form id="login-form" class="login-card"><h2>Welcome back.</h2><p>Sign in with your account on this service’s host.</p><label for="username">Username</label><input id="username" autocomplete="username" required><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required><p id="login-error" class="error-text" role="alert" hidden></p><button id="sign-in" class="primary" type="submit">Sign in <span aria-hidden="true">→</span></button></form>
+    </section>
+    <div id="app" hidden>
+      <div id="notice" class="notice" role="alert" hidden><p id="notice-text"></p><button id="dismiss-notice" class="text-button" aria-label="Dismiss notice">Dismiss</button></div>
+      <section id="phonebook" aria-labelledby="phonebook-title">
+        <div class="phonebook-heading"><div><p class="eyebrow">YOUR AGENTS, A CALL AWAY</p><h1 id="phonebook-title">Who’s on your mind?</h1><p class="lede">A conversation for the desk, the workbench, or wherever the day takes you.</p></div><span class="private-badge"><span aria-hidden="true">◌</span> One person. One agent.</span></div>
+        <div id="availability" class="availability" role="status" hidden></div>
+        <div id="contacts" class="contacts" aria-label="Your agent contacts"></div>
+        <p id="empty-contacts" class="empty-state" hidden>No contacts are configured yet. Your installation’s owner can connect an existing agent.</p>
+        <section class="call-note" aria-label="Before you call"><span class="note-icon" aria-hidden="true">↗</span><div><h2>The same agent. A place to talk.</h2><p>Voice is processed by OpenAI GPT-Live. Your selected agent handles delegated work through its configured runtime. Even an agent with local reasoning uses cloud audio on this call.</p><p class="small">Keep this page open during a call. Your microphone starts only when you choose Call. Camera use is always optional.</p></div></section>
+      </section>
+      <section id="call-screen" class="call-layout" aria-labelledby="call-name" hidden>
+        <div class="presence-panel">
+          <div class="call-topline"><span class="call-label">PRIVATE CALL</span><time id="call-duration" aria-label="Call duration">00:00</time></div>
+          <div id="presence" class="presence" data-status="connecting"><span class="presence-ring" aria-hidden="true"></span><div id="call-avatar" class="call-avatar" aria-hidden="true">A</div><span class="sound-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span></div>
+          <h1 id="call-name">Your agent</h1><p id="call-description" class="call-description"></p>
+          <div id="call-status" class="call-status" role="status"><span class="status-dot" aria-hidden="true"></span><span id="call-status-text">Connecting…</span></div>
+          <p id="call-detail" class="call-detail">Opening a conversation.</p>
+          <div id="latest-caption" class="latest-caption" aria-live="off"><span id="caption-speaker"></span><p id="caption-text">Take your time. There’s room for a pause.</p></div>
+          <div class="audio-state"><span id="mic-state">Microphone starting</span><span aria-hidden="true">·</span><span id="speaker-state">Speaker waiting</span></div>
+          <button id="enable-audio" class="secondary" hidden>Tap to hear the call</button>
+          <div class="call-controls" aria-label="Call controls">
+            <button id="mute" class="round-control" aria-pressed="false" disabled><span class="control-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3M8 22h8"/></svg></span><span id="mute-label">Mute mic</span></button>
+            <button id="camera-toggle" class="round-control" aria-pressed="false" disabled><span class="control-symbol camera-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m15 9 6-4v14l-6-4"/><rect x="2" y="6" width="13" height="12" rx="2"/></svg></span><span id="camera-label">Camera</span></button>
+            <button id="hangup" class="round-control end-control"><span class="control-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 13c5-5 13-5 18 0l-2 5-4-1v-3a12 12 0 0 0-6 0v3l-4 1Z"/></svg></span><span>End call</span></button>
+          </div>
+          <p class="call-footnote">Ending this call releases your microphone and camera. Already-authorized agent work can continue.</p>
+          <a id="continue-work" class="work-link" href="/" target="_blank" rel="noopener" hidden>Open conversation &amp; work controls <span aria-hidden="true">↗</span></a>
+          <p id="foreground-note" class="small">Keep this page in the foreground. A screen lock or app switch may interrupt audio.</p>
+        </div>
+        <div class="shared-panel">
+          <div class="shared-tabs" role="tablist" aria-label="Conversation detail"><button id="space-tab" role="tab" aria-selected="true" aria-controls="space-panel">Shared space <span id="card-count" class="count" hidden>0</span></button><button id="transcript-tab" role="tab" aria-selected="false" aria-controls="transcript-panel" tabindex="-1">Transcript</button></div>
+          <section id="camera-panel" class="camera-panel" aria-label="Optional camera" hidden>
+            <div class="camera-heading"><h2>Your camera</h2><span class="preview-badge">LOCAL PREVIEW</span></div>
+            <video id="camera-preview" autoplay playsinline muted aria-label="Local camera preview"></video>
+            <p id="camera-note" class="small">This preview stays on your device. Capture a photo, then choose whether to send it.</p>
+            <button id="capture-photo" class="secondary">Capture photo</button>
+            <form id="photo-form" hidden><img id="photo-preview" alt="Your captured photo, not yet sent"><label for="photo-question">Ask about this photo</label><textarea id="photo-question" rows="2" maxlength="2000" placeholder="What would you like to know?">What do you notice in this photo?</textarea><p id="photo-capability-note" class="small">The photo goes to this agent’s conversation. Its runtime checks image support; a local model may not support it. GPT-Live does not receive the camera feed.</p><div class="photo-actions"><button id="send-photo" class="primary" type="submit">Send photo &amp; question</button><button id="discard-photo" class="text-button" type="button">Discard</button></div><p id="photo-status" role="status"></p></form>
+          </section>
+          <section id="space-panel" role="tabpanel" aria-labelledby="space-tab" tabindex="0"><div id="space-empty" class="space-empty"><div class="space-illustration" aria-hidden="true"><span></span><span></span><span></span></div><h2>A little space to see things.</h2><p>Useful answers and results from your agent will appear here while you talk.</p></div><div id="cards" class="cards" aria-live="polite" aria-relevant="additions"></div><div id="work-status" class="work-status" role="status" hidden></div></section>
+          <section id="transcript-panel" role="tabpanel" aria-labelledby="transcript-tab" tabindex="0" hidden><p class="transcript-note">Live transcript fragments may contain mistakes. Generated text does not confirm what you heard.</p><div id="transcript" class="transcript" role="log" aria-label="Call transcript" aria-live="off"></div><p id="transcript-empty" class="empty-state">The conversation will appear here.</p></section>
+        </div>
+      </section>
+      <section id="call-ended" class="ended-card" hidden><p class="eyebrow">BACK WHEN YOU NEED THEM</p><h1 id="ended-title">Call ended.</h1><p id="ended-detail">Your microphone and camera are off.</p><div class="ended-actions"><button id="back-to-contacts" class="primary">Back to contacts</button><a id="ended-work-link" class="secondary" href="/" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a></div><button id="recover-call" class="secondary" hidden>Resolve unconfirmed call</button></section>
+    </div>
+  </main>
+  <audio id="remote-audio" autoplay playsinline></audio>
+  <footer class="site-footer"><span>Companion · Constellation</span><span>Your voice. Your agent. A little more room.</span></footer>
+</body>
+</html>

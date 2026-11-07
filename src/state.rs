@@ -19,6 +19,7 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 pub struct AppState {
+    pub companion: crate::companion::Runtime,
     pub permissions: crate::permissions::Permissions,
     pub elicitations: crate::elicitation::Elicitations,
     pub home: PathBuf,
@@ -50,6 +51,7 @@ impl AppState {
             CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY);")?;
         crate::rooms::migrate(&db, &config)?;
         crate::delivery::migrate(&db)?;
+        crate::companion::migrate(&db)?;
         db.execute("UPDATE conversations SET status='error',note='The service restarted during this turn. Review delivery status before continuing; work was not replayed.' WHERE status='working'", [])?;
         db.execute(
             "UPDATE messages SET status='interrupted' WHERE status='streaming'",
@@ -81,6 +83,7 @@ impl AppState {
         }
         crate::imports::migrate_legacy(&home, &config, &db)?;
         Ok(Arc::new(Self {
+            companion: crate::companion::Runtime::default(),
             permissions: crate::permissions::Permissions::default(),
             elicitations: crate::elicitation::Elicitations::default(),
             home,

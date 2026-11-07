@@ -354,6 +354,10 @@ pub async fn deliver(state: Arc<AppState>, input: crate::delivery::Input) -> Res
         crate::delivery::set(&state, &input.id, "notAccepted")?;
         bail!("The source authorization expired or was revoked before delivery");
     }
+    if !crate::companion::room_identity_valid(&state, &input.room)? {
+        crate::delivery::set(&state, &input.id, "notAccepted")?;
+        bail!("The selected call participant or endpoint changed before delivery");
+    }
     let agent = match state.agent(&input.agent)? {
         Some(a) => a,
         None => {
@@ -562,8 +566,11 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         "Unsupported ACP protocol version"
     );
     let can_load = init["agentCapabilities"]["loadSession"] == true;
-    let token = context::grant(&state, &conversation)?;
-    let mut params = json!({"cwd":agent.session_cwd.as_ref().unwrap_or(&agent.cwd),"mcpServers":agent.mcp_servers,"_meta":{"io.github.bkrabach.conversation":{"provider_id":state.config.provider_id(),"grant":token}}});
+    let mut params = json!({"cwd":agent.session_cwd.as_ref().unwrap_or(&agent.cwd),"mcpServers":agent.mcp_servers});
+    if crate::companion::context_registered(&state, &conversation)? {
+        let token = context::grant(&state, &conversation)?;
+        params["_meta"] = json!({"io.github.bkrabach.conversation":{"provider_id":state.config.provider_id(),"grant":token}});
+    }
     let prior:Option<(String,i64)>=state.db.lock().unwrap().query_row("SELECT session_id,last_seq FROM room_agents WHERE conversation_id=?1 AND agent_id=?2 AND endpoint=?3 AND session_id IS NOT NULL",params![conversation,agent_id,endpoint],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let last_seq = prior.as_ref().map(|p| p.1).unwrap_or(0);
     let prior = prior.map(|p| p.0).filter(|_| can_load);
