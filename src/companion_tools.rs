@@ -155,18 +155,22 @@ pub fn permission_once(
         return Ok(None);
     }
     let permitted = match raw.tool.as_str() {
-        "companion_view" | "companion_capture" | "companion_surface_status" => {
-            crate::companion_surface::permission_valid(
-                s,
-                &call,
-                actor,
-                agent,
-                room,
-                &raw.tool,
-                raw.arguments,
-            )?
+        "companion_view"
+        | "companion_capture"
+        | "companion_surface_status"
+        | "companion_hangup"
+        | "companion_feedback" => crate::companion_surface::permission_valid(
+            s,
+            &call,
+            actor,
+            agent,
+            room,
+            &raw.tool,
+            raw.arguments,
+        )?,
+        "companion_connections" | "companion_observations" => {
+            raw.arguments.as_object().is_some_and(|a| a.is_empty())
         }
-        "companion_connections" => raw.arguments.as_object().is_some_and(|a| a.is_empty()),
         "companion_shared" => raw.arguments.as_object().is_some_and(|a| {
             a.is_empty()
                 || (a.len() == 1
@@ -333,6 +337,19 @@ pub async fn connections(
         json!({"connections":c.agents.get(&agent).into_iter().flatten().map(|x|json!({"id":x.id,"label":x.label,"description":x.description})).collect::<Vec<_>>(),"policy":"Use only for the caller's explicit request. Submission is not completion. Unknown sends must not be retried."}),
     ))
 }
+/// Saved connection observations require no new platform action or native MCP
+/// permission. The observer independently enforces current owner/audience policy.
+pub async fn observations(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&s, &id, &h)?;
+    Ok(Json(crate::companion_awareness::current_observations(
+        &s, &id,
+    )?))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Action {

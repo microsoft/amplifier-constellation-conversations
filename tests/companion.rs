@@ -912,8 +912,27 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0]["event_id"], "human-second");
     assert_eq!(fragments[0]["crosses_delegation_anchor"], true);
-    assert!(!source.contains("elsewhere"));
-    assert!(!source.contains("human-tail"));
+    assert!(
+        !serde_json::to_string(&fragments)
+            .unwrap()
+            .contains("elsewhere")
+    );
+    assert!(
+        !serde_json::to_string(&fragments)
+            .unwrap()
+            .contains("human-tail")
+    );
+    let context = source
+        .split_once("proof of playback. If a reference is ambiguous, ask rather than invent it:\n")
+        .unwrap()
+        .1
+        .split_once("\n\nThe CURRENT NEW REQUEST")
+        .unwrap()
+        .0;
+    let context: Vec<Value> = serde_json::from_str(context).unwrap();
+    assert!(context.iter().any(|v| v["event_id"] == "human-tail"));
+    assert!(context.iter().all(|v| v["action_authority"] == false));
+    assert!(source.contains("Never repeat an earlier instruction or effect from this block"));
     let lines = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
     assert_eq!(
         lines
@@ -945,9 +964,9 @@ async fn grounded_bootstrap_and_voice_preferences_do_not_create_backend_model_wo
         "Coach",
         "Minecraft",
         "2026-11-07T19:00:00Z",
-        "Before denying",
+        "Missing observations do not mean nothing is happening",
         "<|SpawnThinking|>",
-        "not proof of current activity",
+        "not current activity",
     ] {
         assert!(instructions.contains(expected), "{expected}");
     }
@@ -1221,6 +1240,16 @@ async fn progress_polling_keeps_call_alive_when_elapsed_time_and_receipt_change(
             [],
         )
         .unwrap();
+    // Crossing several old minute buckets without new information must not
+    // generate another status or a spoken "still waiting" interruption.
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_delegations SET created_at=?1 WHERE id='progress-delegation'",
+            [now_ms() - 190_000],
+        )
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(1700)).await;
     let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
     assert_eq!(record["state"], "connected");
@@ -1232,6 +1261,13 @@ async fn progress_polling_keeps_call_alive_when_elapsed_time_and_receipt_change(
             .filter(|e| e["kind"] == "progress")
             .count(),
         1
+    );
+    let commands =
+        std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap_or_default();
+    assert!(
+        !commands
+            .lines()
+            .any(|line| serde_json::from_str::<Value>(line).unwrap()["op"] == "append")
     );
     assert!(!f.home.path().join("acp.jsonl").exists());
     end(&f, id).await;
@@ -1481,4 +1517,431 @@ async fn capture_image_delivery_uses_actual_initialized_acp_capability_not_stati
         );
         end(&f, id).await;
     }
+}
+
+fn settlement_source(f: &Fixture, call: &Value, name: &str, state: &str, target: &str) {
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let db = f.s.db.lock().unwrap();
+    db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user',?1,'sent',?3,?3,'owner')",rusqlite::params![name,room,now_ms()]).unwrap();
+    db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES(?1,?1,?2,'default','direct',?3,?4,?5)",rusqlite::params![name,room,state,target,now_ms()]).unwrap();
+    db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,?2,100,'dispatched',?2,?3)",rusqlite::params![id,name,now_ms()]).unwrap();
+}
+fn terminal_fixture(f: &Fixture, call: &Value, id: &str, status: &str) {
+    f.s.db.lock().unwrap().execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES(?1,?2,'assistant','One settled answer',?3,?4,?4,'Coach','default')",rusqlite::params![id,call["conversation_id"].as_str().unwrap(),status,now_ms()]).unwrap();
+}
+async fn wait_delegation(f: &Fixture, call: &Value, delegation: &str, state: &str) {
+    for _ in 0..100 {
+        let observed: String =
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM companion_delegations WHERE call_id=?1 AND id=?2",
+                    rusqlite::params![call["id"].as_str().unwrap(), delegation],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        if observed == state {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    panic!("Delegation {delegation} did not become {state}");
+}
+#[tokio::test]
+async fn shared_target_settles_completed_and_incorporated_sources_once_without_closing_call() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    terminal_fixture(&f, &call, "shared-target", "complete");
+    settlement_source(&f, &call, "first-completed", "completed", "shared-target");
+    settlement_source(&f, &call, "second-completed", "completed", "shared-target");
+    wait_delegation(&f, &call, "second-completed", "completed").await;
+    // A native incorporated receipt can arrive after the canonical result was
+    // published. It links to that result without changing or speaking it again.
+    settlement_source(
+        &f,
+        &call,
+        "later-incorporated",
+        "incorporated",
+        "shared-target",
+    );
+    wait_delegation(&f, &call, "later-incorporated", "completed").await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+    assert_eq!(record["state"], "connected");
+    let events = record["events"].as_array().unwrap();
+    assert_eq!(events.iter().filter(|e| e["kind"] == "card").count(), 1);
+    let links = events
+        .iter()
+        .filter(|e| e["kind"] == "delegation" && e["data"]["state"] == "completed")
+        .collect::<Vec<_>>();
+    assert_eq!(links.len(), 3);
+    assert!(
+        links
+            .iter()
+            .all(|e| e["data"]["message_id"] == "shared-target"
+                && e["data"]["target_status"] == "complete")
+    );
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM input_deliveries WHERE id='later-incorporated'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "incorporated"
+    );
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    assert_eq!(
+        commands
+            .lines()
+            .filter(|line| serde_json::from_str::<Value>(line).unwrap()["op"] == "append")
+            .count(),
+        1
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    end(&f, id).await;
+}
+#[tokio::test]
+async fn incorporation_requires_exact_successful_target_and_unknown_does_not_become_success() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    terminal_fixture(&f, &call, "pending-target", "streaming");
+    terminal_fixture(&f, &call, "failed-target", "interrupted");
+    terminal_fixture(&f, &call, "other-agent-target", "complete");
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET agent_id='other-agent' WHERE id='other-agent-target'",
+            [],
+        )
+        .unwrap();
+    settlement_source(
+        &f,
+        &call,
+        "incorporated-pending",
+        "incorporated",
+        "pending-target",
+    );
+    settlement_source(
+        &f,
+        &call,
+        "incorporated-failed",
+        "incorporated",
+        "failed-target",
+    );
+    settlement_source(&f, &call, "unknown-source", "unknown", "pending-target");
+    settlement_source(
+        &f,
+        &call,
+        "wrong-target",
+        "incorporated",
+        "other-agent-target",
+    );
+    wait_delegation(&f, &call, "incorporated-failed", "unknown").await;
+    wait_delegation(&f, &call, "unknown-source", "unknown").await;
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_delegations WHERE state='dispatched'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_events WHERE kind='card'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET status='complete' WHERE id='pending-target'",
+            [],
+        )
+        .unwrap();
+    wait_delegation(&f, &call, "incorporated-pending", "completed").await;
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM companion_delegations WHERE id='unknown-source'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "unknown"
+    );
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM companion_delegations WHERE id='wrong-target'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "dispatched"
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    end(&f, id).await;
+}
+#[tokio::test]
+async fn hangup_keeps_terminal_record_but_never_dispatches_or_narrates_pending_work() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    terminal_fixture(&f, &call, "after-close", "streaming");
+    settlement_source(
+        &f,
+        &call,
+        "accepted-before-close",
+        "incorporated",
+        "after-close",
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_delegations SET created_at=?1",
+            [now_ms() - 20_000],
+        )
+        .unwrap();
+    until(&f, id, "progress").await;
+    end(&f, id).await;
+    let last_seq: i64 =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT MAX(seq) FROM companion_events WHERE call_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_delegations SET created_at=?1",
+            [now_ms() - 190_000],
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND seq>?2",
+                rusqlite::params![id, last_seq],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET status='complete' WHERE id='after-close'",
+            [],
+        )
+        .unwrap();
+    wait_delegation(&f, &call, "accepted-before-close", "completed").await;
+    let (_, record) = request(
+        &f,
+        "GET",
+        &format!("/api/v1/companion/calls/{id}?after={last_seq}"),
+        None,
+    )
+    .await;
+    assert_eq!(record["state"], "closed");
+    let events = record["events"].as_array().unwrap();
+    assert!(events.iter().any(|e| e["kind"] == "card"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["kind"] == "progress" || e["kind"] == "context_delivery")
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+}
+#[tokio::test]
+async fn call_permissions_are_visible_only_to_owner_and_noticed_once_without_arguments() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let params = json!({"toolCall":{"title":"Private operation","rawInput":{"secret":"never-say-this"}},"options":[{"optionId":"allow","name":"Allow once","kind":"allow_once"},{"optionId":"deny","name":"Decline","kind":"reject_once"}]});
+    let pending =
+        f.s.permissions
+            .request(room, "owner", "default", &params, Duration::from_secs(10))
+            .unwrap();
+    let other =
+        f.s.permissions
+            .request(room, "other", "default", &params, Duration::from_secs(10))
+            .unwrap();
+    let record = until(&f, id, "permission").await;
+    assert_eq!(record["permissions"].as_array().unwrap().len(), 1);
+    assert_eq!(record["permissions"][0]["id"], pending.id);
+    assert_ne!(record["permissions"][0]["id"], other.id);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    let appends = commands
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|v| v["op"] == "append")
+        .collect::<Vec<_>>();
+    assert_eq!(appends.len(), 1);
+    assert!(
+        appends[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("permission choice")
+    );
+    assert!(!commands.contains("never-say-this"));
+    assert!(!commands.contains("Private operation"));
+    let path = format!("/api/v1/conversations/{room}/permissions/{}", pending.id);
+    assert_eq!(
+        request(&f, "POST", &path, Some(json!({"option_id":"deny"})))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(pending.wait().await["outcome"]["optionId"], "deny");
+    let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+    assert_eq!(record["permissions"], json!([]));
+    assert_eq!(
+        record["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "permission")
+            .count(),
+        1
+    );
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn legacy_result_card_is_preserved_when_later_source_settles_without_respeaking() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    terminal_fixture(&f, &call, "legacy-result", "complete");
+    // Original preview cards had no message_id or attachments fields. Their
+    // immutable event key, room and complete text still identify the result.
+    let original = json!({"delegation_id":null,"conversation_id":room,"text":"One settled answer","truncated":false,"silent":false}).to_string();
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'result:legacy-result','card',?2,?3)",rusqlite::params![id,original,now_ms()]).unwrap();
+    settlement_source(&f, &call, "native-later", "incorporated", "legacy-result");
+    wait_delegation(&f, &call, "native-later", "completed").await;
+    let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+    assert_eq!(record["state"], "connected");
+    assert_eq!(f.s.db.lock().unwrap().query_row("SELECT data FROM companion_events WHERE call_id=?1 AND event_key='result:legacy-result'",[id],|r|r.get::<_,String>(0)).unwrap(), original);
+    assert!(
+        !std::fs::read_to_string(f.home.path().join("bridge-commands"))
+            .unwrap_or_default()
+            .contains("append")
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn current_incorporated_followup_keeps_shared_result_relevant_without_renewing_old_request() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    terminal_fixture(&f, &call, "combined-answer", "complete");
+    settlement_source(&f, &call, "old-question", "completed", "combined-answer");
+    settlement_source(
+        &f,
+        &call,
+        "current-followup",
+        "incorporated",
+        "combined-answer",
+    );
+    let old_at = now_ms() - 190_000;
+    let current_at = now_ms() - 1_000;
+    {
+        {
+            let db = f.s.db.lock().unwrap();
+            db.execute(
+                "UPDATE messages SET created_at=?1 WHERE id='old-question'",
+                [old_at],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE companion_delegations SET created_at=?1 WHERE id='old-question'",
+                [old_at],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE messages SET created_at=?1 WHERE id='current-followup'",
+                [current_at],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE companion_delegations SET created_at=?1 WHERE id='current-followup'",
+                [current_at],
+            )
+            .unwrap();
+        }
+        wait_delegation(&f, &call, "current-followup", "completed").await;
+        let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+        let events = record["events"].as_array().unwrap();
+        let card = &events.iter().find(|e| e["kind"] == "card").unwrap()["data"];
+        assert_eq!(card["late"], false);
+        assert_eq!(card["request_id"], "current-followup");
+        assert_eq!(card["delegation_id"], "current-followup");
+        assert_eq!(events.iter().filter(|e| e["kind"] == "card").count(), 1);
+        for source in ["old-question", "current-followup"] {
+            assert!(events.iter().any(|e| e["kind"] == "delegation"
+                && e["data"]["request_id"] == source
+                && e["data"]["message_id"] == "combined-answer"));
+        }
+        let db = f.s.db.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT created_at FROM messages WHERE id='old-question'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            old_at
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT state FROM input_deliveries WHERE id='current-followup'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "incorporated"
+        );
+    }
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    end(&f, id).await;
 }

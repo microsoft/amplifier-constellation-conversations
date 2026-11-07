@@ -478,7 +478,7 @@ async fn official_nested_append_error_requires_unambiguous_identity_and_never_re
 }
 
 #[tokio::test]
-async fn speaking_recent_transcript_or_pending_delegation_defers_even_high_confidence_notice() {
+async fn speaking_recent_transcript_or_new_delegation_defers_even_high_confidence_notice() {
     for blocked in ["speaking", "transcript", "delegation", "stale-browser"] {
         let f = fixture();
         std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
@@ -513,6 +513,323 @@ async fn speaking_recent_transcript_or_pending_delegation_defers_even_high_confi
         assert_eq!(states(&f), vec!["ready"], "{blocked}");
         assert_eq!(cards(&f).len(), 1);
     }
+}
+
+#[tokio::test]
+async fn old_running_work_does_not_starve_context_but_new_delegation_rearms_guard() {
+    let f = fixture();
+    let mut rx = quiet_browser(&f);
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'long-running',0,'dispatched','retained-work',?2)",params![f.id,now_ms()-60000]).unwrap();
+    run(&f).await.unwrap();
+    assert_eq!(rx.try_recv().unwrap()["channel"], "thinking");
+    let mut second = source_event();
+    second["id"] = json!("another-fact");
+    observations(&f, vec![second]);
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'fresh-request',100,'waiting_transcript','new-work',?2)",params![f.id,now_ms()]).unwrap();
+    run(&f).await.unwrap();
+    assert!(rx.try_recv().is_err());
+    assert!(states(&f).contains(&"ready".to_owned()));
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_delegations SET created_at=?2 WHERE call_id=?1",
+            params![f.id, now_ms() - 7000],
+        )
+        .unwrap();
+    run(&f).await.unwrap();
+    assert_eq!(rx.try_recv().unwrap()["channel"], "thinking");
+    assert_eq!(calls(&f, "decision").len(), 2);
+    let work: String =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM companion_delegations WHERE call_id=?1 AND id='long-running'",
+                [&f.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(work, "dispatched");
+}
+
+#[tokio::test]
+async fn peer_source_attribution_reaches_decisions_cards_and_voice_without_actor_substitution() {
+    let f = fixture();
+    let mut event = source_event();
+    event["actor"] = json!("Rook");
+    event["kind"] = json!("message");
+    event["text"] = json!("I am checking the roof; the result is not verified.");
+    observations(&f, vec![event.clone()]);
+    let mut rx = quiet_browser(&f);
+    run(&f).await.unwrap();
+    let request = &calls(&f, "decision")[0]["event"];
+    assert_eq!(request["actor"], "Rook");
+    assert_eq!(request["connection_id"], "minecraft");
+    let card = &cards(&f)[0];
+    assert!(card["title"].as_str().unwrap().contains("Rook"));
+    assert_eq!(card["text"], event["text"]);
+    assert_eq!(card["attribution"]["actor"], "Rook");
+    assert_eq!(card["attribution"]["scope"], "message");
+    assert_eq!(card["source"], event);
+    let append = rx.try_recv().unwrap();
+    let content = append["content"].as_str().unwrap();
+    for required in ["Rook", "minecraft", "message", "not verified"] {
+        assert!(content.contains(required), "{content}");
+    }
+    assert!(!content.contains("Coach"));
+    let current = current_observations(&f.s, &f.id).unwrap();
+    assert_eq!(current["observations"][0]["source"], event);
+    assert_eq!(current["observations"][0]["attribution"]["actor"], "Rook");
+    assert_eq!(calls(&f, "decision").len(), 1);
+    assert_eq!(calls(&f, "observer").len(), 1);
+}
+
+#[test]
+fn observation_read_is_cached_bounded_current_policy_and_honest_about_coverage() {
+    let f = fixture();
+    let empty = current_observations(&f.s, &f.id).unwrap();
+    assert_eq!(empty["status"], "no_saved_facts");
+    assert_eq!(empty["sources"][0]["status"], "no_observation");
+    assert!(
+        empty["note"]
+            .as_str()
+            .unwrap()
+            .contains("do not establish inactivity")
+    );
+    assert!(current_observations(&f.s, "another-call").is_err());
+    let (cfg, fingerprint) = config(&f.s).unwrap().unwrap();
+    let source = &cfg.agents["default"][0];
+    for index in 0..20 {
+        let mut event = source_event();
+        event["id"] = json!(format!("event-{index}"));
+        event["actor"] = json!("Rook");
+        record_event(&f.s, &f.id, source, &event, &fingerprint).unwrap();
+    }
+    let mut updated = source_event();
+    updated["id"] = json!("event-19");
+    updated["revision"] = json!("new-revision");
+    updated["text"] = json!("Corrected report: the last check failed.");
+    record_event(&f.s, &f.id, source, &updated, &fingerprint).unwrap();
+    let mut private = source_event();
+    private["id"] = json!("private-unrelated");
+    private["audience"] = json!({"kind":"private","owner":"other"});
+    record_event(&f.s, &f.id, source, &private, &fingerprint).unwrap();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_awareness SET state='ignored' WHERE call_id=?1",
+            [&f.id],
+        )
+        .unwrap();
+    let current = current_observations(&f.s, &f.id).unwrap();
+    assert_eq!(current["observations"].as_array().unwrap().len(), 16);
+    assert_eq!(current["omitted"], 4);
+    assert_eq!(current["observations"][0]["source"], updated);
+    assert_eq!(
+        current["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["source"]["id"] == "event-19")
+            .count(),
+        1
+    );
+    assert!(
+        current["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["source"]["id"] != "private-unrelated")
+    );
+    rewrite_policy(&f, |c| c["agents"]["default"][0]["audiences"] = json!([]));
+    assert!(
+        current_observations(&f.s, &f.id).unwrap()["observations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(calls(&f, "decision").is_empty());
+    assert!(calls(&f, "observer").is_empty());
+}
+
+#[test]
+fn observation_read_bounds_serialized_bytes_without_clipping_any_included_fact() {
+    let f = fixture();
+    rewrite_policy(&f, |c| {
+        let template = c["agents"]["default"][0].clone();
+        c["agents"]["default"] = json!(
+            (0..8)
+                .map(|index| {
+                    let mut source = template.clone();
+                    source["id"] = json!(format!("connection-{index}"));
+                    source["label"] = json!("\u{1}".repeat(80));
+                    source
+                })
+                .collect::<Vec<_>>()
+        );
+    });
+    let (cfg, fingerprint) = config(&f.s).unwrap().unwrap();
+    let mut original = BTreeMap::new();
+    let coverage = json!({"detail":"\\".repeat(2000)}).to_string();
+    assert!(coverage.len() <= 4096);
+    for source in &cfg.agents["default"] {
+        for index in 0..2 {
+            let mut event = source_event();
+            event["id"] = json!(format!("{}-{index}", source.id));
+            event["text"] = json!(format!("Reported: {}", "\n".repeat(3500)));
+            event["actor"] = json!("R".repeat(160));
+            assert!(event_valid(&event));
+            original.insert(event["id"].as_str().unwrap().to_owned(), event.clone());
+            record_event(&f.s, &f.id, source, &event, &fingerprint).unwrap();
+        }
+        f.s.db.lock().unwrap().execute(
+            "INSERT INTO companion_observers(call_id,connection_id,cursor,coverage,updated_at,policy_hash) VALUES(?1,?2,'null',?3,?4,?5)",
+            params![f.id,source.id,coverage,now_ms(),fingerprint],
+        ).unwrap();
+    }
+    let reply = current_observations(&f.s, &f.id).unwrap();
+    assert!(serde_json::to_vec(&reply).unwrap().len() <= 256 * 1024);
+    let facts = reply["observations"].as_array().unwrap();
+    assert!(!facts.is_empty());
+    assert!(
+        facts.len() < 16,
+        "Serialized-byte bound, not the count bound, must apply"
+    );
+    assert_eq!(
+        facts.len() + reply["omitted"].as_u64().unwrap() as usize,
+        16
+    );
+    for fact in facts {
+        let expected = &original[fact["source"]["id"].as_str().unwrap()];
+        assert_eq!(fact["source"], *expected);
+        assert_eq!(fact["text"], expected["text"]);
+        assert_eq!(fact["attribution"]["actor"], expected["actor"]);
+    }
+    assert_eq!(reply["sources"].as_array().unwrap().len(), 8);
+    assert!(calls(&f, "decision").is_empty());
+    assert!(calls(&f, "observer").is_empty());
+}
+
+#[test]
+fn observation_read_preserves_stale_time_and_revokes_closed_or_changed_call_identity() {
+    let f = fixture();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET created_at=?2 WHERE id=?1",
+            params![f.id, now_ms() - 300000],
+        )
+        .unwrap();
+    let (cfg, fingerprint) = config(&f.s).unwrap().unwrap();
+    let mut event = source_event();
+    event["occurred_at"] = json!(timestamp(now_ms() - 180000));
+    record_event(&f.s, &f.id, &cfg.agents["default"][0], &event, &fingerprint).unwrap();
+    let saved = current_observations(&f.s, &f.id).unwrap();
+    assert_eq!(saved["observations"][0]["fresh"], true);
+    assert_eq!(saved["observations"][0]["source_fresh"], false);
+    assert_eq!(
+        saved["observations"][0]["source"]["occurred_at"],
+        event["occurred_at"]
+    );
+    assert!(saved["observations"][0]["source_age_ms"].as_i64().unwrap() >= 180000);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_awareness SET last_observed_at=?2 WHERE call_id=?1",
+            params![f.id, now_ms() - 180000],
+        )
+        .unwrap();
+    assert_eq!(
+        current_observations(&f.s, &f.id).unwrap()["observations"][0]["fresh"],
+        false
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&f.id],
+        )
+        .unwrap();
+    assert!(current_observations(&f.s, &f.id).is_err());
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='connected',endpoint_hash='changed' WHERE id=?1",
+            [&f.id],
+        )
+        .unwrap();
+    assert!(current_observations(&f.s, &f.id).is_err());
+    assert!(calls(&f, "decision").is_empty());
+    assert!(calls(&f, "observer").is_empty());
+}
+
+#[tokio::test]
+async fn baseline_old_tasks_and_chat_are_available_only_to_explicit_reads_without_replay() {
+    let f = fixture();
+    let mut task = source_event();
+    task["id"] = json!("existing-task");
+    task["kind"] = json!("task_observation");
+    task["occurred_at"] = json!(timestamp(now_ms() - 3600000));
+    task["actor"] = json!("Rook");
+    task["text"] = json!("Task status was running; last reported progress was an hour ago.");
+    let mut chat = task.clone();
+    chat["id"] = json!("old-chat");
+    chat["kind"] = json!("message");
+    chat["text"] = json!("I started the roof earlier.");
+    observations(&f, vec![task.clone(), chat.clone()]);
+    let mut rx = quiet_browser(&f);
+    run(&f).await.unwrap();
+    assert_eq!(states(&f), vec!["observed", "observed"]);
+    assert!(cards(&f).is_empty());
+    assert!(calls(&f, "decision").is_empty());
+    assert!(rx.try_recv().is_err());
+    let saved = current_observations(&f.s, &f.id).unwrap();
+    assert_eq!(saved["observations"].as_array().unwrap().len(), 2);
+    for fact in saved["observations"].as_array().unwrap() {
+        assert_eq!(fact["source"]["occurred_at"], task["occurred_at"]);
+        assert_eq!(fact["attribution"]["actor"], "Rook");
+        assert_eq!(fact["fresh"], true);
+        assert_eq!(fact["source_fresh"], false);
+        assert!(fact["source_age_ms"].as_i64().unwrap() >= 3600000);
+    }
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_awareness SET last_observed_at=1 WHERE call_id=?1",
+            [&f.id],
+        )
+        .unwrap();
+    run(&f).await.unwrap();
+    assert!(
+        current_observations(&f.s, &f.id).unwrap()["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["fresh"] == true)
+    );
+    assert!(calls(&f, "decision").is_empty());
+    assert!(rx.try_recv().is_err());
+    rewrite_policy(&f, |c| c["agents"]["default"][0]["audiences"] = json!([]));
+    let revoked = current_observations(&f.s, &f.id).unwrap();
+    assert!(revoked["observations"].as_array().unwrap().is_empty());
+    assert_eq!(revoked["sources"][0]["status"], "no_observation");
+    run(&f).await.unwrap();
+    assert_eq!(calls(&f, "observer").last().unwrap()["cursor"], Value::Null);
+    assert!(
+        current_observations(&f.s, &f.id).unwrap()["observations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(cards(&f).is_empty());
+    assert!(calls(&f, "decision").is_empty());
 }
 
 #[tokio::test]

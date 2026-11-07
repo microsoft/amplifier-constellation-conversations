@@ -778,6 +778,7 @@ async fn scoped_native_permission_policy_requires_exact_source_and_never_title_o
     };
     for (tool, args) in [
         ("companion_connections", json!({})),
+        ("companion_observations", json!({})),
         ("companion_shared", json!({})),
         ("companion_shared", json!({"awareness_id":"a1".repeat(32)})),
         (

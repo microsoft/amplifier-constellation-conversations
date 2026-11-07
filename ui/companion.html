@@ -54,8 +54,10 @@
         <div class="shared-panel" aria-label="Shared conversation space">
           <div class="shared-tabs" role="tablist" aria-label="Conversation detail"><button id="space-tab" role="tab" aria-selected="true" aria-controls="space-panel">Shared space <span id="card-count" class="count" hidden>0</span></button><button id="transcript-tab" role="tab" aria-selected="false" aria-controls="transcript-panel" tabindex="-1">Transcript</button></div>
           <p id="connection-status" class="small connection-status" hidden></p>
+          <button id="permission-alert" class="secondary permission-alert" type="button" hidden>Review requested action</button>
           <div id="work-status" class="work-status" role="status" hidden></div>
           <section id="space-panel" role="tabpanel" aria-labelledby="space-tab" tabindex="0">
+            <div id="call-permissions" aria-live="polite"></div>
             <div class="share-toolbar"><p>Drop or paste text, images, or PDFs here.</p><button id="choose-files" class="secondary" type="button" disabled>Share files</button><input id="share-files" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,.md,.txt,.csv,.json" hidden></div>
             <p id="share-capability" class="small">Images and PDFs can be saved; inspection depends on this agent’s capabilities.</p>
             <section id="camera-panel" class="camera-panel" aria-label="Optional camera" hidden>

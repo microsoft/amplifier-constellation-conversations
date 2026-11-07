@@ -223,8 +223,10 @@ the expected channel and message timestamp, not completion of a task described i
 the message. Both helpers return uncertain delivery as `unknown` without retries.
 
 When enabled, the per-call bridge uses the official MCP SDK to expose
-`companion_connections`, `companion_request_action`, `companion_action_status`,
-`companion_show`, and `companion_shared`. Conversations supplies the descriptor
+`companion_connections`, `companion_observations`, `companion_request_action`,
+`companion_action_status`, `companion_show`, `companion_shared`,
+`companion_view`, `companion_capture`, `companion_surface_status`,
+`companion_hangup`, and `companion_feedback`. Conversations supplies the descriptor
 through ordinary ACP `mcpServers`; the agent must advertise HTTP MCP support.
 These tools apply only to the private call and selected agent. They do not merge
 sessions, imply write authority from context access, or require a shared
@@ -296,8 +298,9 @@ name, and source stable, and supply one to four owned attachment IDs only for
 saved state from `voice_awareness: "queued" | "not_queued"`.
 
 Optional MCP uses `POST /companion/calls/{id}/mcp`. Its host callbacks under
-`/companion/calls/{id}/tools/` are `GET connections`, `POST actions`,
-`GET actions/{request}`, and `GET`/`POST shared`. These use a call-scoped bearer grant,
+`/companion/calls/{id}/tools/` include `GET connections`, `GET observations`,
+`POST actions`, `GET actions/{request}`, `GET`/`POST shared`, `POST view`,
+`POST capture`, `POST hangup`, `POST feedback`, and `GET surface/{operation}`. These use a call-scoped bearer grant,
 not browser session authorization, and reject browser Origin requests. The MCP
 SDK owns protocol framing; these are Companion application routes, not ACP
 extensions. `companion_request_action` takes `connection_id`, `instruction`, the
@@ -404,7 +407,12 @@ not silently clipped; oversized facts are omitted with coverage information.
 
 Observations are collected only during an active, authorized private call.
 Unsolicited events must match the installed audience policy and be newer than
-this call. Private action status is visible only for that call's own exact
+this call. Older authorized messages and task snapshots remain available for
+explicit questions through the read-only `companion_observations` tool; they do
+not trigger Decisions, cards, or voice appends. The original source time remains
+separate from the time the connector last observed it. A recently observed old
+task report is not a new progress report or proof that work is still running.
+Private action status is visible only for that call's own exact
 request. Disabling or changing the policy withdraws pending presentation work;
 revoked credentials, changed room membership, or a changed agent endpoint close
 the path. Ending the call stops observations; it does not cancel accepted work.
@@ -418,24 +426,35 @@ and owner guidance. Decisions receive no credentials and grant no action
 permission. The host records intent before the single provider request, deduplicates
 immutable revisions, disables retries, and keeps uncertain outcomes uncertain.
 Provider failure/refusal/invalid output retains a quiet card. At most two new
-facts are evaluated per worker cycle, with a 240-fact bound per call.
+facts are evaluated per worker cycle, with a 240-presentation-fact bound per call
+and at most 512 saved facts including observation-only baseline records.
 
 Full relevant facts are retained as shared cards. Short facts may enter voice
-context; long facts use a pointer to the exact call's saved shared space rather
+context with their original actor, connection, scope, and time; an unknown actor
+is not attributed to the selected voice agent. Long facts use a pointer to the exact call's saved shared space rather
 than a clipped summary. Pass the pointer's exact `awareness_id` (64 lowercase
 hexadecimal characters) to `companion_shared` to retrieve that card even after it
 leaves the recent-card list. This optional lookup stays within the current call;
 an unknown ID returns missing rather than substituting another card.
-Automatic context appends wait for fresh browser quiet
-hints, no recent transcript, and no pending reasoning delegation. This is a
-conservative opportunity to speak, not proof that a human turn ended. An unavailable
+Automatic context appends wait for fresh browser quiet hints and six seconds
+without a transcript fragment or a newly created delegation. This protects the
+short automatic-acknowledgment scheduling window without blocking for the full
+lifetime of background work. It is a conservative presentation heuristic, not
+proof that an acknowledgment played or a human turn ended. An unavailable
 observer does not block the others. Model scores are pilot thresholds, not
 calibrated accuracy or a delivery guarantee.
 
+`companion_observations` takes no arguments and reads only this call's saved,
+currently authorized facts. It does not contact a service or model. It reports
+the latest retained revision per source event, original attribution, observation
+freshness, source age, coverage, and omissions. Missing observations do not prove
+inactivity. Source, owner, audience, or call identity changes close access;
+stored coverage and cursors cannot cross a changed policy scope.
+
 Thinking appends are quiet-context intent, not a promise that their contents can
 never be spoken. Both thinking and commentary appends cancel pending provider
-automatic delegation acknowledgments, so this implementation defers background
-appends while a delegation is active. Matching provider acknowledgments record
+automatic delegation acknowledgments, so this implementation guards newly created
+delegations as described above. Matching provider acknowledgments record
 **context accepted**, not audio playback or completed work. Uncertain appends are
 never replayed automatically. These are Companion/MCP application policies, not
 new ACP fields or a replacement agent runtime.
@@ -443,3 +462,65 @@ new ACP fields or a replacement agent runtime.
 References: [OpenAI Decisions](https://developers.openai.com/api/docs/guides/decisions),
 [Live conversations](https://developers.openai.com/api/docs/guides/live-conversations),
 [Live delegation](https://developers.openai.com/api/docs/guides/live-delegation).
+
+## Conversation reliability and evaluation
+
+The speaking prompt follows the GPT-Live role, backchannel, interruption and
+client-delegation structure. Detailed procedures stay with the existing ACP
+agent. A short, role-labelled recent transcript window supplies conversational
+references; it is explicitly context, not a replay of earlier instructions.
+The current delegated source remains separate. Runtime identity comes from the
+installation profile, distinct from the cloud voice interface.
+
+Multiple inputs can be incorporated into one backend turn. The host settles each
+exact source only when its linked target has completed successfully and publishes
+that answer once. Source incorporation alone is not completion. Repeated elapsed
+time does not generate repeated waiting speech. After hang-up, accepted work can
+finish and retain its result, but cannot dispatch another voice request or append
+more voice context.
+
+Native permissions outside the narrowly validated Companion tool policy appear
+as single-request choices on the call screen. They are still actor- and
+conversation-bound; the voice model does not approve arbitrary native tools.
+The call supplies one permission notice instead of describing a hidden approval
+wait as service failure.
+
+`companion_hangup` stops this caller's media and requests graceful closure; it
+never cancels accepted agent work. The browser retains a silent transport until
+terminal confirmation or bounded cleanup. `companion_feedback` saves a concise,
+source-bound note privately in the installation and returns a durable receipt.
+It does not send a developer message, create an external issue, or copy the whole
+transcript. `companion_surface_status` can recover that exact saved receipt after
+a lost response. The camera shutter cue is emitted at actual frame capture;
+blocked browser sound is shown explicitly, and capture is separate from analysis.
+
+Provider command rejection, speech interruption and transport loss are distinct.
+The official SDK emits a server error through both event and error callbacks;
+that does not by itself close a session. Rejected appends are not retried. Actual
+transport failure or provider terminal state follows the existing bounded close
+path. Context acknowledgment, backend success, and audio playback remain separate
+observations.
+
+Use repeatable scenarios at three levels:
+
+| Scenario | Observable pass criteria |
+| --- | --- |
+| Several questions merge into one backend answer | All exact linked successful sources settle; one immutable answer; no duplicate speech or call interruption. |
+| Slow or permission-gated tool followed by a new topic | Visible actual permission, no recurring stale waiting speech, no inferred success. |
+| Background activity while another task runs | Actor, connection, original time and observation freshness retained; useful context can arrive at a quiet opportunity. |
+| Photo, feedback, navigation and hang-up | Real operation receipt, one execution, correct private scope, released devices and separately confirmed provider closure. |
+| Interrupted connection or lost acknowledgment | Unknown outcome retained; no automatic effect replay or invented completion. |
+| Spoken correction or short reference | Latest source intent preserved; prior context does not authorize another action. |
+
+Run Rust lifecycle/authority tests, official MCP/Live SDK boundary tests, and the
+Chromium control-flow scenarios before a bounded real voice check. For paid or
+human calls record source audio timing, delegation/permission/tool/result times,
+context acknowledgments, media evidence, and final application state separately.
+Report sample counts and evidence limits; one successful call is not a latency or
+naturalness benchmark. Evaluate repeated multi-turn calls, corrections and
+interruption handling as prompts or models evolve.
+
+References: [GPT-Live prompting](https://developers.openai.com/api/docs/guides/live-prompting),
+[delegation](https://developers.openai.com/api/docs/guides/live-delegation),
+[session lifecycle](https://developers.openai.com/api/docs/guides/live-conversations),
+and the [voice evaluation Cookbook](https://developers.openai.com/cookbook/examples/audio/voice_agent_evaluation).

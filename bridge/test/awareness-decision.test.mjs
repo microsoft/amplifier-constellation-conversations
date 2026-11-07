@@ -48,6 +48,20 @@ test('evidence cannot become privileged messages or remote image fetch instructi
   assert.equal(fixture.calls[0].body.input[1].content[0].data.event.text,value.event.text);
 });
 
+test('official SDK preserves a peer actor or explicit unknown instead of attributing it to the voice agent',async()=>{
+  for(const actor of ['Rook',null]){
+    const fixture=provider(response('quiet')),value=request();value.event.actor=actor;
+    const result=await evaluate(value,fixture);
+    assert.equal(result.status,'decided');assert.equal(fixture.calls.length,1);
+    const evidence=fixture.calls[0].body.input[1].content[0].data.event;
+    assert.equal(evidence.actor,actor);assert.equal(evidence.connection_id,value.event.connection_id);
+    assert.equal(evidence.kind,value.event.kind);assert.equal(evidence.occurred_at,value.event.occurred_at);
+    assert.match(fixture.calls[0].body.input[0].content,/missing actor is unknown/);
+  }
+  const fixture=provider(),value=request();value.event.actor='x'.repeat(161);
+  assert.equal((await evaluate(value,fixture)).reason,'invalid_input');assert.equal(fixture.calls.length,0);
+});
+
 test('large semantic event is evaluated whole including trailing limitations, not rewritten for speech',async()=>{
   const fixture=provider(response('quiet')),value=request();
   value.event.text=`${'A known source reported progress. '.repeat(90)} The final step FAILED; do not announce completion.`;

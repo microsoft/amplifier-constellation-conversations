@@ -29,7 +29,7 @@ async function fixture(t,handler) {
 test('official MCP client discovers only bounded tools and callbacks stay in this call',async t=>{
   const {client,requests}=await fixture(t);
   const {tools}=await client.listTools();
-  assert.deepEqual(tools.map(v=>v.name).sort(),['companion_action_status','companion_capture','companion_connections','companion_request_action','companion_shared','companion_show','companion_surface_status','companion_view']);
+  assert.deepEqual(tools.map(v=>v.name).sort(),['companion_action_status','companion_capture','companion_connections','companion_feedback','companion_hangup','companion_observations','companion_request_action','companion_shared','companion_show','companion_surface_status','companion_view']);
   const id=randomUUID();
   for(const [name,args] of [
     ['companion_connections',{}],
@@ -174,4 +174,24 @@ test('unsupported ACP image input retains the saved artifact without image bytes
   receipt.image={mimeType:'image/png',data:'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3XcAAAAASUVORK5CYII='};
   const malformed=await client.callTool({name:'companion_surface_status',arguments:{operation_id:randomUUID()}});
   assert.equal(malformed.isError,true);assert.ok(malformed.content.every(v=>v.type==='text'));assert.equal(requests.length,2);
+});
+
+test('observations hangup and feedback use fixed own-call routes without arbitrary targets',async t=>{
+ const {client,requests}=await fixture(t);const id=randomUUID();
+ for(const [name,args] of [
+  ['companion_observations',{}],
+  ['companion_hangup',{operation_id:id,delegation_id:'delegate-1'}],
+  ['companion_feedback',{operation_id:id,delegation_id:'delegate-1',text:'Please play a shutter sound.'}],
+ ])assert.notEqual((await client.callTool({name,arguments:args})).isError,true);
+ const root=`/api/v1/companion/calls/${callId}/tools/`;
+ assert.deepEqual(requests.map(r=>[r.method,r.path]),[['GET',root+'observations'],['POST',root+'hangup'],['POST',root+'feedback']]);
+ const count=requests.length;
+ for(const [name,args] of [
+  ['companion_observations',{agent_id:'other'}],
+  ['companion_hangup',{operation_id:id,delegation_id:'delegate-1',call_id:randomUUID()}],
+  ['companion_hangup',{operation_id:id,delegation_id:'delegate-1',cancel_work:true}],
+  ['companion_feedback',{operation_id:id,delegation_id:'delegate-1',text:'hello',recipient:'external'}],
+  ['companion_feedback',{operation_id:id,delegation_id:'delegate-1',text:'漢'.repeat(1334)}],
+ ])assert.equal((await client.callTool({name,arguments:args})).isError,true);
+ assert.equal(requests.length,count);
 });
