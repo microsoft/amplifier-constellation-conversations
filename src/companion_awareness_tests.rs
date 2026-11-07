@@ -433,6 +433,51 @@ async fn append_settlement_requires_matching_call_id_and_channel_without_claimin
 }
 
 #[tokio::test]
+async fn official_nested_append_error_requires_unambiguous_identity_and_never_retries() {
+    for (error_type, expected) in [
+        ("invalid_request_error", "context_rejected"),
+        ("server_error", "unknown"),
+        ("rate_limit_error", "unknown"),
+    ] {
+        let f = fixture();
+        let mut rx = quiet_browser(&f);
+        run(&f).await.unwrap();
+        let command = rx.try_recv().unwrap();
+        let event_id = command["event_id"].as_str().unwrap();
+        let nested = json!({"type":"error","error":{"type":error_type,"client_event_id":event_id}});
+        provider_event(&f.s, "another-call", &nested).unwrap();
+        assert_eq!(states(&f), vec!["context_queued"]);
+        for outer in [Value::Null, json!(false), json!("awareness-unrelated")] {
+            let mut ambiguous = nested.clone();
+            ambiguous["client_event_id"] = outer;
+            provider_event(&f.s, &f.id, &ambiguous).unwrap();
+            assert_eq!(states(&f), vec!["context_queued"]);
+        }
+        let mut wrong_nested = nested.clone();
+        wrong_nested["client_event_id"] = json!(event_id);
+        wrong_nested["error"]["client_event_id"] = json!("awareness-unrelated");
+        provider_event(&f.s, &f.id, &wrong_nested).unwrap();
+        assert_eq!(states(&f), vec!["context_queued"]);
+        let mut matching = nested.clone();
+        if error_type == "rate_limit_error" {
+            matching["client_event_id"] = json!(event_id);
+        }
+        provider_event(&f.s, &f.id, &matching).unwrap();
+        assert_eq!(states(&f), vec![expected]);
+        provider_event(
+            &f.s,
+            &f.id,
+            &json!({"type":"session.thinking.appended","client_event_id":event_id}),
+        )
+        .unwrap();
+        run(&f).await.unwrap();
+        assert_eq!(states(&f), vec![expected]);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(calls(&f, "decision").len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn speaking_recent_transcript_or_pending_delegation_defers_even_high_confidence_notice() {
     for blocked in ["speaking", "transcript", "delegation", "stale-browser"] {
         let f = fixture();
@@ -563,6 +608,71 @@ async fn action_observation_revisions_are_immutable_ordered_and_never_replace_su
             )
             .unwrap();
     assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), original);
+}
+
+#[tokio::test]
+async fn observation_copy_omits_internal_request_ids_without_losing_receipts_or_overstating_outcomes()
+ {
+    for (scope, state, verified, phrase) in [
+        ("message_delivery", "completed", true, "message delivered"),
+        (
+            "message_delivery",
+            "unknown",
+            false,
+            "message delivery is unconfirmed",
+        ),
+        (
+            "message_delivery",
+            "completed",
+            false,
+            "message delivery is unconfirmed",
+        ),
+        ("task", "reported_complete", false, "work reported complete"),
+        ("task", "unknown", false, "task status is unknown"),
+    ] {
+        let f = fixture();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let receipt = json!({"request_id":request_id,"state":"queued","receipt":{"source_id":"original-source"}});
+        f.s.db.lock().unwrap().execute("INSERT INTO companion_actions(call_id,request_id,delegation_id,connection_id,instruction,source,state,result,created_at) VALUES(?1,?2,'delegation-1','minecraft','Original human request.','{}','queued',?3,?4)",params![f.id,request_id,receipt.to_string(),now_ms()]).unwrap();
+        let update = json!({"request_id":request_id,"connection_id":"minecraft","revision":"copy-v1","state":state,"scope":scope,"verified":verified,"observed_at":timestamp(now_ms()),"receipt":{"channel":"C0123456789","ts":"1794050000.000001"},"provenance":{"transport":"fixture"}});
+        std::fs::write(f.home.path().join("observer-result.json"), json!({"version":1,"connection_id":"minecraft","availability":"available","events":[],"actions":[update],"cursor":null,"coverage":{}}).to_string()).unwrap();
+        run(&f).await.unwrap();
+        let rendered = cards(&f);
+        assert_eq!(rendered.len(), 1);
+        let text = rendered[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Workshop: "));
+        assert!(text.contains(phrase), "{text}");
+        assert!(!text.contains(&request_id));
+        assert_eq!(rendered[0]["source"]["id"], format!("action:{request_id}"));
+        assert_eq!(
+            calls(&f, "decision")[0]["event"]["id"],
+            format!("action:{request_id}")
+        );
+        assert_eq!(
+            action_observation(&f.s, &f.id, &request_id).unwrap(),
+            Some(update)
+        );
+        if scope == "task" {
+            assert!(text.contains("not independent verification"));
+        } else {
+            assert!(
+                text.contains("further work is not verified")
+                    || text.contains("Further work is not verified")
+            );
+            assert_eq!(text.contains("confirms the message arrived"), verified);
+        }
+        let saved: String =
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT result FROM companion_actions WHERE call_id=?1 AND request_id=?2",
+                    params![f.id, request_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), receipt);
+    }
 }
 
 #[tokio::test]

@@ -971,7 +971,64 @@ fn provider_event(s: &AppState, id: &str, room: &str, owner: &str, v: &Value) ->
     } else {
         event(s, id, key, "provider", v.clone())?;
     }
+    append_receipt(s, id, key, v)?;
     crate::companion_awareness::provider_event(s, id, v)?;
+    Ok(())
+}
+/// Correlate provider evidence with an append actually queued by this call.
+/// This describes voice context delivery, never the outcome of backend work.
+fn append_receipt(s: &AppState, id: &str, key: &str, v: &Value) -> Result<()> {
+    let kind = v["type"].as_str().unwrap_or("");
+    if !matches!(
+        kind,
+        "error" | "session.thinking.appended" | "session.commentary.appended"
+    ) {
+        return Ok(());
+    }
+    let outer = v["client_event_id"].as_str();
+    let nested = if kind == "error" {
+        v["error"]["client_event_id"].as_str()
+    } else {
+        None
+    };
+    if outer.zip(nested).is_some_and(|(a, b)| a != b) {
+        return Ok(());
+    }
+    let Some(client) = nested.or(outer).filter(|x| !x.is_empty() && x.len() <= 160) else {
+        return Ok(());
+    };
+    let queued:Option<String> = s.db.lock().unwrap().query_row("SELECT data FROM companion_events WHERE call_id=?1 AND kind='context_delivery' AND json_extract(data,'$.event_id')=?2 AND json_extract(data,'$.state')='queued' ORDER BY seq LIMIT 1",params![id,client],|r|r.get(0)).optional()?;
+    let Some(queued) = queued else {
+        return Ok(());
+    };
+    let mut data: Value = serde_json::from_str(&queued)?;
+    if kind != "error"
+        && kind
+            != format!(
+                "session.{}.appended",
+                data["channel"].as_str().unwrap_or("")
+            )
+    {
+        return Ok(());
+    }
+    data["state"] = json!(if kind != "error" {
+        "accepted"
+    } else if v["error"]["type"] == "invalid_request_error" {
+        "rejected"
+    } else {
+        "provider_error"
+    });
+    data["provider_event_id"] = json!(key);
+    if kind == "error" {
+        data["error"] = json!({"code":v["error"]["code"],"type":v["error"]["type"],"param":v["error"]["param"]});
+    }
+    event(
+        s,
+        id,
+        &format!("append-receipt:{key}"),
+        "context_delivery",
+        data,
+    )?;
     Ok(())
 }
 async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Result<()> {

@@ -249,6 +249,32 @@ fn observation_valid(v: &Value, known: &[Value]) -> bool {
         && (v["state"] != "completed" || v["scope"] == "message_delivery")
         && (v["scope"] != "task" || v["verified"] == false)
 }
+fn observation_text(label: &str, update: &Value) -> String {
+    if update["scope"] == "message_delivery" {
+        return if update["verified"] == true
+            && matches!(update["state"].as_str(), Some("completed" | "delivered"))
+        {
+            format!(
+                "{label}: message delivered. This confirms the message arrived; further work is not verified."
+            )
+        } else {
+            format!("{label}: message delivery is unconfirmed. Further work is not verified.")
+        };
+    }
+    let status = match update["state"].as_str() {
+        Some("accepted") => "task accepted",
+        Some("running") => "work is in progress",
+        Some("waiting") => "work is waiting",
+        Some("blocked") => "work is blocked",
+        Some("reported_complete") => "work reported complete",
+        Some("stopped") => "work stopped",
+        Some("budget_exhausted") => "work stopped at its limit",
+        Some("needs_review") => "work needs review",
+        Some("superseded") => "task is no longer current",
+        _ => "task status is unknown",
+    };
+    format!("{label}: {status}. This is the connector's task report, not independent verification.")
+}
 fn record_event(
     s: &AppState,
     id: &str,
@@ -465,17 +491,7 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
                     "action_observation",
                     json!({"connection_id":source.id,"label":source.label,"observation":update}),
                 )?;
-                let text = format!(
-                    "{} request {}: {}. {}",
-                    source.label,
-                    update["request_id"].as_str().unwrap(),
-                    update["state"].as_str().unwrap(),
-                    if update["scope"] == "task" {
-                        "This is the connector's task report, not independent verification."
-                    } else {
-                        "This receipt confirms only message delivery, not completion of further work."
-                    }
-                );
+                let text = observation_text(&source.label, update);
                 let event = json!({"id":format!("action:{}",update["request_id"].as_str().unwrap()),"revision":update["revision"],"kind":"action_status","text":text,"occurred_at":update["observed_at"],"audience":{"kind":"private","owner":owner},"provenance":update["provenance"]});
                 record_event(s, id, source, &event, &fingerprint)?;
             }
@@ -639,7 +655,28 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
 
 /// Provider acknowledgment establishes context acceptance only, never audio playback.
 pub(crate) fn provider_event(s: &AppState, id: &str, event: &Value) -> Result<()> {
-    let Some(client) = event["client_event_id"].as_str() else {
+    let kind = event["type"].as_str().unwrap_or("");
+    if !matches!(
+        kind,
+        "error" | "session.thinking.appended" | "session.commentary.appended"
+    ) {
+        return Ok(());
+    }
+    let outer = event.get("client_event_id");
+    let nested = if kind == "error" {
+        event["error"].get("client_event_id")
+    } else {
+        None
+    };
+    if outer.into_iter().chain(nested).any(|v| !v.is_string()) {
+        return Ok(());
+    }
+    let outer = outer.and_then(Value::as_str);
+    let nested = nested.and_then(Value::as_str);
+    if outer.zip(nested).is_some_and(|(a, b)| a != b) {
+        return Ok(());
+    }
+    let Some(client) = nested.or(outer) else {
         return Ok(());
     };
     let Some(key) = client.strip_prefix("awareness-") else {
@@ -665,9 +702,10 @@ pub(crate) fn provider_event(s: &AppState, id: &str, event: &Value) -> Result<()
     {
         return Ok(());
     }
-    let next = match event["type"].as_str() {
-        Some("session.thinking.appended" | "session.commentary.appended") => "context_accepted",
-        Some("error") => "context_rejected",
+    let next = match kind {
+        "session.thinking.appended" | "session.commentary.appended" => "context_accepted",
+        "error" if event["error"]["type"] == "invalid_request_error" => "context_rejected",
+        "error" => "unknown",
         _ => return Ok(()),
     };
     s.db.lock().unwrap().execute("UPDATE companion_awareness SET state=?3 WHERE call_id=?1 AND event_key=?2 AND state IN ('appending','context_queued')",params![id,key,next])?;
