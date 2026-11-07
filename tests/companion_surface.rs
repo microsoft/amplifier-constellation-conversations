@@ -245,6 +245,326 @@ async fn surface_status(f: &Fixture, c: &Call, operation: &str) -> Value {
     assert_eq!(status, StatusCode::OK, "{value}");
     value
 }
+
+#[tokio::test]
+async fn voice_hangup_is_exact_call_bound_once_only_and_preserves_background_work() {
+    let f = fixture();
+    let c = call(&f);
+    let other = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    let operation = uuid::Uuid::new_v4().to_string();
+    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation"});
+    delegation(&f, &c, "user");
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "POST",
+            "hangup",
+            Some(body.clone()),
+            &c.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    presence(&f, &c, &browser, false, false).await;
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "POST",
+            "hangup",
+            Some(body.clone()),
+            &other.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, queued) = request(
+        &f,
+        &c,
+        "POST",
+        "hangup",
+        Some(body.clone()),
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(queued["kind"], "hangup");
+    assert_eq!(queued["state"], "queued");
+    assert_eq!(
+        request(&f, &c, "POST", "hangup", Some(body), &c.token, false)
+            .await
+            .1,
+        queued
+    );
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "accepted", vec![])
+            .await
+            .1["execute"],
+        true
+    );
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "accepted", vec![])
+            .await
+            .1["execute"],
+        false
+    );
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "executed", vec![])
+            .await
+            .1["state"],
+        "executed"
+    );
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "failed", vec![]).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        surface_status(&f, &c, &operation).await["state"],
+        "executed"
+    );
+    let db = f.s.db.lock().unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM input_deliveries WHERE conversation_id=?1",
+            [&c.room],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "submitted"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM companion_calls WHERE id=?1",
+            [&other.id],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "connected"
+    );
+}
+
+#[tokio::test]
+async fn feedback_has_a_durable_private_idempotent_receipt_without_external_submission() {
+    let f = fixture();
+    let c = call(&f);
+    let other = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    let operation = uuid::Uuid::new_v4().to_string();
+    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","text":"Please add a shutter sound when the photo is captured."});
+    delegation(&f, &c, "user");
+    presence(&f, &c, &browser, false, false).await;
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "POST",
+            "feedback",
+            Some(body.clone()),
+            &other.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, receipt) = request(
+        &f,
+        &c,
+        "POST",
+        "feedback",
+        Some(body.clone()),
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["state"], "saved");
+    assert_eq!(receipt["scope"], "private_installation");
+    assert_eq!(receipt["submitted_externally"], false);
+    assert_eq!(surface_status(&f, &c, &operation).await, receipt);
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "POST",
+            "feedback",
+            Some(body.clone()),
+            &c.token,
+            false
+        )
+        .await
+        .1,
+        receipt
+    );
+    let mut duplicate = body.clone();
+    duplicate["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        request(&f, &c, "POST", "feedback", Some(duplicate), &c.token, false)
+            .await
+            .1,
+        receipt
+    );
+    let mut changed = body.clone();
+    changed["text"] = json!("Different feedback under the same request");
+    assert_eq!(
+        request(&f, &c, "POST", "feedback", Some(changed), &c.token, false)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let mut long = body.clone();
+    long["text"] = json!("é".repeat(2001));
+    assert_eq!(
+        request(&f, &c, "POST", "feedback", Some(long), &c.token, false)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let mut external = body.clone();
+    external["external_channel"] = json!("Slack");
+    assert_eq!(
+        request(&f, &c, "POST", "feedback", Some(external), &c.token, false)
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let (status, _) = request(
+        &f,
+        &other,
+        "GET",
+        &format!("surface/{operation}"),
+        None,
+        &other.token,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    {
+        let db = f.s.db.lock().unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM companion_feedback", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
+                [&c.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        agent_conversations::companion_surface::migrate(&db).unwrap();
+    }
+    assert_eq!(surface_status(&f, &c, &operation).await, receipt);
+}
+
+#[tokio::test]
+async fn feedback_and_hangup_require_current_user_source_and_cannot_expand_authority() {
+    let f = fixture();
+    let c = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    presence(&f, &c, &browser, false, false).await;
+    delegation(&f, &c, "assistant");
+    let base = json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation"});
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "POST",
+            "hangup",
+            Some(base.clone()),
+            &c.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let mut feedback = base.clone();
+    feedback["text"] = json!("Private feedback");
+    assert_eq!(
+        request(&f, &c, "POST", "feedback", Some(feedback), &c.token, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let mut expanded = base;
+    expanded["cancel_work"] = json!(true);
+    assert_eq!(
+        request(&f, &c, "POST", "hangup", Some(expanded), &c.token, false)
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
+async fn surface_and_feedback_operations_share_one_unambiguous_receipt_namespace() {
+    let f = fixture();
+    let c = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    presence(&f, &c, &browser, false, false).await;
+    delegation(&f, &c, "user");
+    let operation = uuid::Uuid::new_v4().to_string();
+    let base = json!({"operation_id":operation,"delegation_id":"fixture-delegation"});
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "POST",
+            "hangup",
+            Some(base.clone()),
+            &c.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let mut feedback = base;
+    feedback["text"] = json!("Feedback cannot replace a hangup receipt.");
+    assert_eq!(
+        request(&f, &c, "POST", "feedback", Some(feedback), &c.token, false)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(surface_status(&f, &c, &operation).await["kind"], "hangup");
+    let operation = uuid::Uuid::new_v4().to_string();
+    let base = json!({"operation_id":operation,"delegation_id":"fixture-delegation"});
+    let mut feedback = base.clone();
+    feedback["text"] = json!("Feedback is still privately saved.");
+    assert_eq!(
+        request(&f, &c, "POST", "feedback", Some(feedback), &c.token, false)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&f, &c, "POST", "hangup", Some(base), &c.token, false)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(surface_status(&f, &c, &operation).await["state"], "saved");
+}
+
 fn expire(f: &Fixture, c: &Call, operation: &str) {
     f.s.db.lock().unwrap().execute("UPDATE companion_surface_commands SET expires_at=?3 WHERE call_id=?1 AND operation_id=?2",params![c.id,operation,now_ms()-1]).unwrap();
 }
@@ -627,6 +947,19 @@ async fn exact_native_surface_permission_remains_once_only_and_requires_browser_
     assert!(check("companion_capture", capture.clone()).is_none());
     presence(&f, &c, &browser, false, false).await;
     assert!(check("companion_capture", capture.clone()).is_none());
+    assert_eq!(
+        check("companion_hangup", capture.clone()).unwrap()["outcome"]["optionId"],
+        "once"
+    );
+    assert_eq!(check("companion_feedback",json!({"operation_id":operation,"delegation_id":"fixture-delegation","text":"Please add a shutter cue."})).unwrap()["outcome"]["optionId"],"once");
+    assert!(
+        check(
+            "companion_hangup",
+            json!({"operation_id":operation,"delegation_id":"other"})
+        )
+        .is_none()
+    );
+    assert!(check("companion_feedback",json!({"operation_id":operation,"delegation_id":"fixture-delegation","text":"Feedback","external_channel":"Slack"})).is_none());
     assert_eq!(check("companion_view",json!({"operation_id":operation,"delegation_id":"fixture-delegation","action":"scroll_down"})).unwrap()["outcome"]["optionId"],"once");
     presence(&f, &c, &browser, true, true).await;
     assert!(check("companion_capture", capture.clone()).is_some());

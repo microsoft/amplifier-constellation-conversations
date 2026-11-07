@@ -178,7 +178,15 @@ export class LiveBridge {
         if (safe) this.emit({type:'event',event:safe});
         if (safe && event.type==='session.closed' && event.session?.id===this.sessionId) this.finish(true);
       });
-      this.sideband.on('error',error=>{if(!this.finished){this.emit(safeError(error));this.close();}});
+      this.sideband.on('error',error=>{
+        if(this.finished)return;
+        // The official SDK emits a server error both as an event and through
+        // this callback. A rejected append or interrupted speech is not a
+        // failed transport: retain the projected receipt and keep listening
+        // for an actual session.closed. Never resend the rejected command.
+        if(error.error?.type==='error')return;
+        this.emit(safeError(error));void this.close();
+      });
       this.sideband.on('close',()=>{if(!this.finished)this.finish(false);});
       const socket=this.sideband.socket;
       await new Promise((resolve,reject)=>{

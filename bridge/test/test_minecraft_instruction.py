@@ -118,6 +118,18 @@ class MinecraftInstructionTests(unittest.TestCase):
                 self.assertEqual(len(opener.calls), 1)
                 self.assertNotIn(TOKEN, json.dumps(result))
 
+    def test_http_refusal_evidence_is_preserved_without_claiming_admission_or_retry(self):
+        for status in [400, 401, 409, 429, 500, 503]:
+            error = helper.urllib.error.HTTPError("http://secret.invalid/" + TOKEN, status,
+                TOKEN, {"Authorization": TOKEN}, io.BytesIO(TOKEN.encode()))
+            opener = Opener(error=error)
+            result = helper.submit(self.home, self.input, opener)
+            self.assertEqual(result["state"], "unknown")
+            self.assertEqual(result["http_status"], status)
+            self.assertEqual(result["diagnostic"], "connector_http_error")
+            self.assertEqual(len(opener.calls), 1)
+            self.assertNotIn(TOKEN, json.dumps(result))
+
     def test_invalid_authority_and_oversize_utf8_fail_before_dispatch(self):
         opener = Opener()
         for changes in [{"request_id": "bad"}, {"version": 2}, {"instruction": " "},

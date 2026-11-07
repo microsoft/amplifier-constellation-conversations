@@ -51,11 +51,14 @@ test('SDK provider-error event and error callback preserve diagnostics without r
  const provider={type:'error',event_id:'provider-error',error:{type:'invalid_request_error',code:'invalid_value',param:'delegation_id',client_event_id:'append-1',message:'private context'}};
  sideband.emit('event',provider);
  const sdkError=new Error('private context');Object.defineProperty(sdkError,'error',{value:provider,enumerable:false});
- sideband.emit('error',sdkError);await bridge.done;
+ sideband.emit('error',sdkError);assert.equal(bridge.state,'active');
  assert.equal(events.find(e=>e.type==='event').event.error.client_event_id,'append-1');
  assert.equal(sideband.sent.filter(e=>e.type==='session.commentary.append').length,1);
- assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,1);
+ assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,0);
  assert.equal(JSON.stringify(events).includes('private context'),false);
+ sideband.emit('event',{type:'session.output_transcript.delta',event_id:'later',delta:'I can keep listening.',start_ms:10,end_ms:20});
+ assert.ok(events.some(e=>e.event?.event_id==='later'));
+ await bridge.close();
 });
 test('duplicate append IDs are not resent; changed ID payload rejected',async()=>{
  const {bridge,sideband,events,requests}=fixture();await bridge.command(create);
@@ -154,4 +157,17 @@ test('host voice whitelist exactly matches the SDK-checked bridge whitelist',asy
  const names=host.match(/const VOICES:[\s\S]*?= &\[([\s\S]*?)\];/)[1].match(/"([a-z]+)"/g).map(v=>JSON.parse(v));
  for (const voice of names) assert.equal(sessionOptions({...create,voice}).session.audio.output.voice,voice);
  assert.equal(names.length,23);
+});
+
+test('uncorrelated provider errors do not imply closure but transport failures do',async()=>{
+ const {bridge,sideband,events}=fixture();await bridge.command(create);
+ const provider={type:'error',event_id:'speech-error',error:{type:'server_error',code:null,message:'private diagnostic'}};
+ sideband.emit('event',provider);
+ const sdkError=new Error('private diagnostic');Object.defineProperty(sdkError,'error',{value:provider});
+ sideband.emit('error',sdkError);assert.equal(bridge.state,'active');
+ assert.equal(sideband.sent.length,0);assert.equal(events.filter(e=>e.type==='closed').length,0);
+ sideband.emit('error',new Error('secret socket failure'));await bridge.done;
+ assert.equal(events.at(-1).confirmed,false);assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,1);
+ assert.equal(JSON.stringify(events).includes('private diagnostic'),false);
+ assert.equal(JSON.stringify(events).includes('secret socket failure'),false);
 });

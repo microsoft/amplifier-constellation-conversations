@@ -7,7 +7,7 @@ import {randomUUID} from 'node:crypto';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const files = new Map(await Promise.all(['companion.html','companion.js','companion.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
 const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
-const surfaces = new Map(), surfaceCommands = new Map();
+const surfaces = new Map(), surfaceCommands = new Map(), permissions = new Map();
 let holdNextSurfaceAck = false, heldSurfaceAck = null;
 let failNextResult = false;
 const fullResultText = "Complete saved answer. " + "Source fact. ".repeat(6000) + " FINAL QUALIFIER: broader testing remains incomplete. <script>window.fullResultInjected=true</script> [Source](https://example.com/source)";
@@ -83,14 +83,21 @@ const server = createServer(async (request,response) => {
     if (controlFails) { send(503,{error:'fixture control outage'}); return; }
     if (callPath[2] === 'close') {
       if (call.state !== 'closed') { call.state='closing'; call.closeChecks=2; }
-      if (holdNextClose) { holdNextClose=false; heldClose=()=>send(503,{error:'fixture delayed close failure'}); return; }
+      if (holdNextClose) { holdNextClose=false; heldClose=(status=503)=>send(status,status===200?{state:call.state}:{error:'fixture delayed close failure'}); return; }
       send(200,{state:call.state}); return;
     }
     if (callPath[2] === 'heartbeat') { send(200,{}); return; }
     if (pollFails) { send(503,{error:'fixture network outage'}); return; }
     if (call.state === 'closing' && --call.closeChecks <= 0) call.state=call.request.agent_id==='jarvis'?'interrupted':'closed';
     const after = Number(url.searchParams.get('after') || 0);
-    send(200,{...call,state:['closing','closed','interrupted'].includes(call.state)?call.state:'connected',events:events.filter(event => event.seq > after),next_cursor:events.at(-1)?.seq || 0}); return;
+    send(200,{...call,permissions:[...permissions.values()].filter(p=>p.conversation_id===call.conversation_id),state:['closing','closed','interrupted'].includes(call.state)?call.state:'connected',events:events.filter(event => event.seq > after),next_cursor:events.at(-1)?.seq || 0}); return;
+  }
+  const permissionPath = url.pathname.match(/^\/api\/v1\/conversations\/([^/]+)\/permissions\/([^/]+)$/);
+  if (permissionPath) {
+    const permission=permissions.get(permissionPath[2]);
+    if(!permission || permission.conversation_id!==permissionPath[1] || ![...calls.values()].some(call=>call.conversation_id===permission.conversation_id&&call.owner===authOwner)) {send(404,{error:'missing permission'});return;}
+    if(body.option_id!==null&&!permission.options.some(o=>o.optionId===body.option_id)) {send(400,{error:'unoffered option'});return;}
+    permissions.delete(permission.id);send(200,{ok:true});return;
   }
   if (/\/attachments$/.test(url.pathname)) {
     if (rejectNextUpload) { rejectNextUpload=false; send(400,{error:'Fixture upload rejected.'}); return; }
@@ -111,7 +118,7 @@ const browser = await chromium.launch({headless:true,executablePath:process.env.
 const context = await browser.newContext({viewport:{width:1280,height:900}});
 const page = await context.newPage(), errors=[]; page.on('pageerror', error => errors.push(error.message));
 await page.addInitScript(() => {
-  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,draws:0};
+  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,draws:0,shutters:0};
   const actualNow=Date.now;fixture.clockOffset=0;Date.now=()=>actualNow()+fixture.clockOffset;
   const makeStream = kind => {
     const track = new EventTarget(); track.kind=kind; track.enabled=true; track.stopped=false; track.readyState='live';track.stop=()=>{track.stopped=true;track.readyState='ended';}; fixture.tracks.push(track);
@@ -137,10 +144,12 @@ await page.addInitScript(() => {
   }
   window.RTCPeerConnection=FakePeer;
   window.AudioContext=class {
-    constructor(){this.closed=false;this.state='running';fixture.audioContexts.push(this);}
-    async resume(){} async close(){this.closed=true;this.state='closed';}
+    constructor(){this.closed=false;this.state='running';this.sampleRate=48000;this.destination={};fixture.audioContexts.push(this);}
+    async resume(){this.state='running';} async suspend(){this.state='suspended';} async close(){this.closed=true;this.state='closed';}
     createMediaStreamSource(){return {connect(){},disconnect(){}};}
     createAnalyser(){return {fftSize:256,getByteTimeDomainData(values){values.fill(128+fixture.level);}};}
+    createBuffer(channels,length,rate){const samples=new Float32Array(length);return {getChannelData:()=>samples};}
+    createBufferSource(){return {connect(){},disconnect(){},start(){if(this.buffer.getChannelData(0).some(x=>x!==0))fixture.shutters++;}};}
   };
   const playing=new WeakSet();
   Object.defineProperty(HTMLMediaElement.prototype,'paused',{get(){return !playing.has(this);}});
@@ -210,6 +219,22 @@ try {
   assert.match(await page.locator('.output-card p').innerText(),/<script>/);
   await page.waitForTimeout(1100); assert.equal(await page.locator('.output-card').count(),1);assert.equal(await page.locator('#work-status').isHidden(),true);
   checks.push('durable transcript/result events deduplicate; only actual audio energy animates speaking');
+
+  emit('provider',{type:'error',error:{client_event_id:'append-fixture',code:'private-error-code',message:'PRIVATE PROVIDER DETAILS'}});
+  await wait(async()=>/voice update could not be confirmed/.test(await page.locator('#notice-text').innerText()),'rejected voice update was invisible');
+  await page.evaluate(()=>{fixture.noticeChanges=0;fixture.noticeObserver=new MutationObserver(()=>fixture.noticeChanges++);fixture.noticeObserver.observe(document.getElementById('notice-text'),{childList:true,characterData:true,subtree:true});});
+  emit('context_delivery',{state:'provider_error',event_id:'append-fixture'});
+  emit('transcript',{role:'assistant',text:'Conversation continues after the rejected update.',fragment:true,playback:'unconfirmed',start_ms:4000,end_ms:4500});
+  await wait(async()=>/Conversation continues/.test(await page.locator('#caption-text').innerText()),'transcripts stopped after a server error');
+  assert.equal(await page.evaluate(()=>fixture.noticeChanges),0,'the correlated receipt must not duplicate the provider notice');
+  assert.equal(await page.locator('.output-card').count(),1);assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
+  assert(await page.evaluate(()=>!fixture.peers[0].closed));assert(!requests.some(request=>request.path.endsWith('/close')));
+  assert.doesNotMatch(await page.locator('#notice-text').innerText(),/PRIVATE PROVIDER DETAILS|private-error-code/);
+  emit('provider',{type:'error',error:{message:'OTHER PRIVATE DETAILS'}});
+  await wait(async()=>/voice service reported a problem/.test(await page.locator('#notice-text').innerText()),'uncorrelated server error was invisible');
+  assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
+  await page.evaluate(()=>fixture.noticeObserver.disconnect());await page.locator('#dismiss-notice').click();
+  checks.push('provider errors show one nonfatal safe notice; correlated receipts stay quiet, saved results remain, and later speech continues without retry or hangup');
 
   assert.equal(await page.locator('.output-card a[href="https://example.com/project"]').count(),1);
   assert.equal(await page.locator('.output-card a[href^="javascript:"]').count(),0);
@@ -320,6 +345,7 @@ try {
 
   await wait(async()=>surfaces.get('call-1')?.camera_enabled===false,'browser surface presence missing');
   let beforeDraws=await page.evaluate(()=>fixture.draws),beforeStorage=attachments.size;
+  const beforeUnconsentedShutters=await page.evaluate(()=>fixture.shutters);
   const beforeSensorRequests=await page.evaluate(()=>fixture.media.length);
   const disabledCapture=surfaceCommand('capture',{photos:1,max_bytes:524288});
   await wait(async()=>requests.some(r=>r.path.endsWith(`/${disabledCapture.operation_id}/ack`)),'disabled capture was not handled');
@@ -331,18 +357,22 @@ try {
   const noConsent=surfaceCommand('capture',{photos:1,max_bytes:524288});
   await wait(async()=>requests.some(r=>r.path.endsWith(`/${noConsent.operation_id}/ack`)),'unconsented capture was not handled');
   assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws);assert.equal(attachments.size,beforeStorage);
+  assert.equal(await page.evaluate(()=>fixture.shutters),beforeUnconsentedShutters,'an unconsented request must not sound like a captured photo');
   await page.locator('#voice-photos').check();await wait(async()=>surfaces.get('call-1')?.capture_consent===true,'explicit voice photo consent missing');
   checks.push('a voice capture cannot enable a camera or take a frame before the browser’s explicit consent');
 
+  const shuttersBefore=await page.evaluate(()=>fixture.shutters);
   const photoCommand=surfaceCommand('capture',{photos:1,max_bytes:524288});
   await wait(async()=>photoCommand.state==='uploaded','voice photo was not saved and acknowledged');
   assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);assert.equal(attachments.size,beforeStorage+1);
   assert.deepEqual(requests.filter(r=>r.path.endsWith(`/${photoCommand.operation_id}/ack`)).map(r=>r.body.state),['accepted','executed','uploaded']);
   const photoEvents=[...uploads.values()].filter(v=>v.upload_id===photoCommand.operation_id);
   assert.deepEqual(photoEvents.map(v=>v.state),['captured','uploading','available']);assert(photoEvents.every(v=>v.source==='camera'));
+  assert.equal(await page.evaluate(()=>fixture.shutters),shuttersBefore+1,'captured frame must play one shutter cue');
   assert.deepEqual(photoCommand.artifact_ids,photoEvents.at(-1).attachment_ids);
   const saved=attachments.get(photoCommand.artifact_ids[0]);assert.equal(saved.mime_type,'image/jpeg');assert(Buffer.from(saved.data,'base64').length<=524288);
   emit('surface_command',{...photoCommand,state:'queued'});await page.waitForTimeout(1100);
+  assert.equal(await page.evaluate(()=>fixture.shutters),shuttersBefore+1,'replayed command must not replay a shutter cue');
   assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);assert.equal(attachments.size,beforeStorage+1);
   assert.equal(requests.filter(r=>r.path.endsWith(`/${photoCommand.operation_id}/ack`)&&r.body.state==='accepted').length,1);assert.equal(messages.size,0);
   checks.push('one consented voice photo uses the operation UUID for saved upload evidence and duplicate commands never recapture or force a new summary');
@@ -353,12 +383,14 @@ try {
   await wait(async()=>lostAccept.state==='accepted','lost acceptance fixture did not reach backend');await page.waitForTimeout(100);
   emit('surface_command',{...lostAccept,state:'queued'});await page.waitForTimeout(1100);
   assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws);assert.equal(attachments.size,beforeStorage);
+  assert.equal(await page.evaluate(()=>fixture.shutters),shuttersBefore+1,'an unconfirmed acceptance must not sound like a captured photo');
   assert.equal(requests.filter(r=>r.path.endsWith(`/${lostAccept.operation_id}/ack`)&&r.body.state==='accepted').length,1);
   const lostExecuted=surfaceCommand('capture',{photos:1,max_bytes:524288});
   await page.route(`**/surface/commands/${lostExecuted.operation_id}/ack`,async route=>{if(route.request().postDataJSON().state==='executed'){await route.fetch();await route.abort('failed');}else await route.continue();});
   await wait(async()=>lostExecuted.state==='executed','lost execution receipt fixture did not capture');await page.waitForTimeout(100);
   emit('surface_command',{...lostExecuted,state:'queued'});await page.waitForTimeout(1100);
   assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);assert.equal(attachments.size,beforeStorage);
+  assert.equal(await page.evaluate(()=>fixture.shutters),shuttersBefore+2,'a lost execution receipt must not replay the shutter');
   const expired=surfaceCommand('capture',{photos:1,max_bytes:524288},{expires_at:Date.now()-1});await page.waitForTimeout(1100);
   assert.ok(!requests.some(r=>r.path.endsWith(`/${expired.operation_id}/ack`)));assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);
   holdNextSurfaceAck=true;const staleAccepted=surfaceCommand('capture',{photos:1,max_bytes:524288},{expires_at:Date.now()+1800});
@@ -388,6 +420,38 @@ try {
   assert.equal(await page.evaluate(()=>scrollY),0);const afterView=await page.locator('#hangup').boundingBox();assert(Math.abs(desktopAfter.y-afterView.y)<1);
   assert.equal(await page.evaluate(()=>fixture.media.length),beforeViewSensors);assert.equal(await page.evaluate(()=>fixture.draws),beforeViewFrames);
   checks.push('agent view controls focus owned cards and switch or scroll only the contained pane without moving hangup or opening media');
+  const permission={id:randomUUID(),conversation_id:'room-coach',agent:'Coach',expires_at:Date.now()+60000,tool_call:{title:'Check Minecraft status',rawInput:{command:'<img src=x onerror="window.permissionInjected=true">'}},options:[{optionId:'always',name:'Always',kind:'allow_always'},{optionId:'once',name:'Read basic status',kind:'allow_once'},{optionId:'detail',name:'Read detailed status',kind:'allow_once'},{optionId:'no',name:'Reject once',kind:'reject_once'}]};
+  permissions.set(permission.id,permission);
+  await page.locator('#transcript-tab').click();
+  await page.locator('#permission-alert:not([hidden])').waitFor();await page.locator('#permission-alert').click();
+  const approval=page.locator('.call-permission');await approval.locator('summary').click();
+  assert.match(await approval.locator('pre').innerText(),/<img src=x/);assert.equal(await page.evaluate(()=>window.permissionInjected),undefined);
+  assert.equal(await approval.getByRole('button',{name:'Always',exact:true}).count(),0);
+  assert.equal(await approval.getByRole('button',{name:'Read detailed status (this request only)',exact:true}).count(),1);
+  await approval.getByRole('button',{name:'Read basic status (this request only)',exact:true}).click();
+  await wait(async()=>permissions.size===0,'permission decision was not received');
+  const decision=requests.find(r=>r.path.endsWith(`/permissions/${permission.id}`));assert.deepEqual(decision.body,{option_id:'once'});assert.equal(decision.csrf,csrf);
+  await page.locator('#permission-alert').waitFor({state:'hidden'});
+  checks.push('native approval is visible during a call; safe action details preserve distinct offered choices and an exact single-use decision uses the existing private permission endpoint');
+  const uncertainPermission={...permission,id:randomUUID(),tool_call:{title:'Read another status'},options:[{optionId:'once',name:'Allow once',kind:'allow_once'}]};
+  permissions.set(uncertainPermission.id,uncertainPermission);
+  let uncertainDecisionAttempts=0;
+  await page.route(`**/permissions/${uncertainPermission.id}`,async route=>{
+    uncertainDecisionAttempts++; await route.fetch();
+    // Simulate a stale pending snapshot while the decision reply is lost.
+    permissions.set(uncertainPermission.id,uncertainPermission);await route.abort('failed');
+  });
+  const uncertainCard=page.locator(`.call-permission[data-permission-id="${uncertainPermission.id}"]`);
+  await uncertainCard.getByRole('button',{name:'Allow once (this request only)',exact:true}).click();
+  await wait(async()=>/receipt is unconfirmed/.test(await uncertainCard.innerText()),'lost decision response must stay uncertain');
+  assert(await uncertainCard.getByRole('button',{name:'Allow once (this request only)',exact:true}).isDisabled());
+  const anotherPermission={...uncertainPermission,id:randomUUID(),tool_call:{title:'Independent pending action'}};
+  permissions.set(anotherPermission.id,anotherPermission);
+  await page.locator(`.call-permission[data-permission-id="${anotherPermission.id}"]`).waitFor();
+  assert(await uncertainCard.getByRole('button',{name:'Allow once (this request only)',exact:true}).isDisabled(),'a rerender must not re-enable an uncertain decision');
+  assert.equal(uncertainDecisionAttempts,1);permissions.clear();
+  await page.locator('#permission-alert').waitFor({state:'hidden'});
+  checks.push('a lost permission decision response remains uncertain across later snapshots and never retries or re-enables its choices');
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-desktop-shared.png'),fullPage:true});
 
   pollFails=true;
@@ -413,15 +477,22 @@ try {
 
   holdNextSurfaceAck=true;const lateView=surfaceCommand('view',{action:'show_shared',card_id:null});
   await wait(async()=>heldSurfaceAck!==null,'late surface acceptance fixture not ready');
-  await page.locator('#hangup').click();await page.locator('#call-ended:not([hidden])').waitFor();
+  holdNextClose=true;
+  const voiceHangup=surfaceCommand('hangup',{action:'end_call'});
+  await page.locator('#call-ended:not([hidden])').waitFor();
+  await wait(async()=>voiceHangup.state==='executed','voice hangup did not acknowledge released media');
+  await wait(async()=>heldClose!==null,'graceful close was not requested');
+  assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)));
+  assert(await page.evaluate(()=>fixture.peers.every(peer=>!peer.closed)&&fixture.channels.every(channel=>!channel.closed)&&fixture.audioContexts.every(context=>!context.closed)),'silent transport must remain until terminal close');
+  heldClose(200);heldClose=null;
   heldSurfaceAck();heldSurfaceAck=null;await page.waitForTimeout(100);
   assert.ok(!requests.some(r=>r.path.endsWith(`/${lateView.operation_id}/ack`)&&r.body.state==='executed'));
   assert.match(await page.locator('#ended-detail').innerText(),/Closing/);
   await wait(async()=>calls.get('call-1').state==='closed','close not reported');
-  assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)&&fixture.channels.every(channel=>channel.closed)&&fixture.wakeLocks.every(lock=>lock.released)&&fixture.audioContexts.every(context=>context.closed)));
+  await wait(async()=>page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)&&fixture.channels.every(channel=>channel.closed)&&fixture.wakeLocks.every(lock=>lock.released)&&fixture.audioContexts.every(context=>context.closed)),'terminal close did not release retained transports');
   assert(!requests.some(request=>/cancel|stop/.test(request.path)));
   assert.equal(await page.evaluate(()=>Object.keys(localStorage).length),0);
-  checks.push('hangup releases devices, peer, audio and wake lock; close acceptance is not terminal; backend work is not cancelled');
+  checks.push('voice hangup releases devices, peer, audio and wake lock; close acceptance is not terminal; backend work is not cancelled');
 
   await page.locator('#back-to-contacts').click();events.length=0;
   let lostCreate = false;
@@ -440,9 +511,14 @@ try {
   await page.getByRole('button',{name:'Call Jarvis',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','Jarvis fixture did not connect');
   await wait(async()=>/cannot inspect/.test(await page.locator('#share-capability').innerText()),'effective capability missing before capture');
-  await page.locator('#camera-toggle').click();await page.locator('#capture-photo').click();
+  await page.locator('#camera-toggle').click();
+  const shuttersBeforeSuspended=await page.evaluate(async()=>{await fixture.audioContexts.at(-1).suspend();return fixture.shutters;});
+  await page.locator('#capture-photo').click();
   await wait(async()=>await page.locator('.upload-card[data-state="available"]').count()===1,'unsupported-image storage missing');
   assert.match(await page.locator('.upload-card').innerText(),/cannot inspect images/);assert.equal(messages.size,0);
+  assert.match(await page.locator('#notice-text').innerText(),/Photo captured.*shutter sound is unavailable/);
+  assert.equal(await page.evaluate(()=>fixture.shutters),shuttersBeforeSuspended);
+  checks.push('a suspended audio context shows that the photo was captured and sound was unavailable, without repeating a cue or preventing storage');
   await page.locator('#hangup').click();await wait(async()=>calls.get('call-3').state==='interrupted','Jarvis close not settled');
   await wait(async()=>/provider closure was not confirmed/.test(await page.locator('#ended-detail').innerText()),'unconfirmed provider closure was misreported');
   checks.push('effective image limitation appears before capture; saving remains available without claiming the agent can see it');
@@ -452,6 +528,7 @@ try {
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','outage fixture did not connect');
   controlFails=true;await page.evaluate(()=>{fixture.clockOffset+=16000;});
   await page.locator('#call-ended:not([hidden])').waitFor();
+  await wait(async()=>page.evaluate(()=>fixture.peers.every(peer=>peer.closed)),'failed close did not release retained transports');
   assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)));
   assert.equal(calls.size,4);await wait(async()=>await page.locator('#recover-call').isEnabled(),'outage close uncertainty was not retained');
   assert.match(await page.locator('#ended-detail').innerText(),/not yet confirmed/);

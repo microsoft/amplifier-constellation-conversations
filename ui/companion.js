@@ -8,7 +8,7 @@ const element = (tag, className, text) => {
   return node;
 };
 const initials = label => (label || 'Agent').trim().split(/\s+/).map(p => p[0]).slice(0, 2).join('').toUpperCase();
-const state = {session:null, contacts:[], available:false, call:null, generation:0, authGeneration:0, recovery:null, voiceContact:null};
+const state = {session:null, contacts:[], available:false, call:null, generation:0, authGeneration:0, recovery:null, voiceContact:null, finalizingCalls:new Set()};
 const audio = $('remote-audio');
 
 async function api(path, method = 'GET', body, options = {}) {
@@ -28,6 +28,11 @@ async function api(path, method = 'GET', body, options = {}) {
       throw error;
     }
     return value;
+  } catch (error) {
+    // A transport failure can happen after a mutation was applied. Only an
+    // explicit rejection establishes that the operation failed definitively.
+    if (method !== 'GET' && error.uncertain === undefined) error.uncertain = true;
+    throw error;
   } finally { clearTimeout(timer); }
 }
 function notice(message) { $('notice').hidden = !message; $('notice-text').textContent = message || ''; }
@@ -67,10 +72,12 @@ async function openContacts() {
 }
 function showLogin() {
   if (state.call) endCall('Your sign-in expired. Your microphone and camera are off.');
+  for (const call of state.finalizingCalls) releaseTransport(call);
   // A later login must not inherit private presentation or recovery state. Old
   // asynchronous callbacks may close their media, but cannot repopulate it.
   state.authGeneration++; state.recovery = null; state.contacts = [];
   $('voice-settings').close(); state.voiceContact = null; $('voice-choice').replaceChildren(); $('voice-settings-status').textContent = ''; $('cards').replaceChildren(); $('transcript').replaceChildren(); $('contacts').replaceChildren();
+  $('call-permissions').replaceChildren(); $('permission-alert').hidden = true;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = ''; notice('');
   $('ended-detail').textContent = '';
   $('call-ended').hidden = true; $('call-screen').hidden = true; $('phonebook').hidden = false; $('recover-call').hidden = true;
@@ -142,6 +149,7 @@ async function startCall(contact) {
   $('call-avatar').textContent = initials(contact.label); $('call-name').textContent = contact.label || 'Your agent';
   $('call-description').textContent = contact.description || 'The same agent. Another place to talk.';
   $('call-duration').textContent = '00:00'; $('cards').replaceChildren(); $('transcript').replaceChildren();
+  $('call-permissions').replaceChildren(); $('permission-alert').hidden = true;
   $('transcript-empty').hidden = false; $('space-empty').hidden = false; $('work-status').hidden = true;
   $('connection-status').hidden = true; $('connection-status').textContent = '';
   $('card-count').hidden = true; $('card-count').textContent = '0'; $('continue-work').hidden = true;
@@ -257,6 +265,7 @@ async function poll(call) {
     call.networkError = false; call.lastControlAt = Date.now();
     call.providerConnected = result.state === 'connected';
     for (const event of result.events || []) renderEvent(call, event);
+    renderCallPermissions(call, result.permissions);
     pollSurface(call);
     if (Number.isSafeInteger(result.next_cursor) && result.next_cursor >= call.cursor) call.cursor = result.next_cursor;
     if (['closed','interrupted'].includes(result.state)) { endCall(result.state === 'interrupted' ? 'The voice connection was interrupted. Accepted work stays in the conversation.' : 'Your microphone and camera are off. Accepted work can continue.', false); return; }
@@ -268,6 +277,49 @@ async function poll(call) {
   }
   if (current(call)) call.pollTimer = setTimeout(() => poll(call), call.networkError ? 2500 : 900);
 }
+function renderCallPermissions(call, permissions) {
+  const pending = (Array.isArray(permissions) ? permissions : []).filter(p => p.conversation_id === call.conversationId
+    && typeof p.id === 'string' && Number.isSafeInteger(p.expires_at) && p.expires_at > Date.now());
+  const signature = JSON.stringify(pending);
+  if (call.permissionSignature === signature) return;
+  call.permissionSignature = signature;
+  call.permissionDecisions ||= new Map();
+  $('permission-alert').hidden = pending.length === 0;
+  $('permission-alert').textContent = pending.length === 1 ? 'An action needs your approval · Review' : `${pending.length} actions need your approval · Review`;
+  $('call-permissions').replaceChildren(...pending.map(permission => {
+    const card = element('section', 'output-card call-permission'); card.dataset.permissionId = permission.id;
+    card.append(element('h2', null, `${permission.agent || call.contact.label} needs your approval`),
+      element('p', null, permission.tool_call?.title || 'Review the requested action'),
+      element('small', null, `Only this request. Expires ${new Date(permission.expires_at).toLocaleTimeString()}.`));
+    const details = element('details'), preview = element('pre', 'permission-detail', JSON.stringify(permission.tool_call || {}, null, 2));
+    details.append(element('summary', null, 'Action details'), preview); card.append(details);
+    const actions = element('div', 'permission-actions'), status = element('p', 'small', call.permissionDecisions.get(permission.id) || ''); status.setAttribute('role', 'status');
+    // This surface offers only a decision for the exact pending request.
+    const options = (permission.options || []).filter(o => ['allow_once','reject_once'].includes(o.kind));
+    for (const option of [...options, {optionId:null,name:'Cancel request',kind:'cancel'}]) {
+      const button = element('button', 'secondary', option.kind === 'cancel' ? option.name : `${option.name} (this request only)`);
+      button.type = 'button'; button.disabled = call.permissionDecisions.has(permission.id);
+      button.onclick = async () => {
+        if (!current(call) || call.permissionDecisions.has(permission.id)) return;
+        if (Date.now() >= permission.expires_at) { status.textContent = 'This approval request has expired.'; return; }
+        call.permissionDecisions.set(permission.id, 'Sending this decision…');
+        actions.querySelectorAll('button').forEach(b => { b.disabled = true; });
+        try {
+          await api(`/api/v1/conversations/${encodeURIComponent(call.conversationId)}/permissions/${encodeURIComponent(permission.id)}`, 'POST', {option_id:option.optionId});
+          if (current(call)) { status.textContent = 'Decision received.'; call.permissionDecisions.set(permission.id, status.textContent); }
+        } catch (error) {
+          if (!current(call)) return;
+          status.textContent = error.uncertain ? 'Decision receipt is unconfirmed. Check the conversation before deciding again.' : error.message;
+          if (error.uncertain) call.permissionDecisions.set(permission.id, status.textContent);
+          else { call.permissionDecisions.delete(permission.id); if (Date.now() < permission.expires_at) actions.querySelectorAll('button').forEach(b => { b.disabled = false; }); }
+        }
+      };
+      actions.append(button);
+    }
+    card.append(actions, status); return card;
+  }));
+}
+$('permission-alert').onclick = () => { setTab('space'); $('space-panel').scrollTop = 0; $('call-permissions').querySelector('button')?.focus({preventScroll:true}); };
 function renderEvent(call, event) {
   if (!Number.isSafeInteger(event.seq) || event.seq <= call.cursor || call.seen.has(event.seq)) return;
   call.seen.add(event.seq);
@@ -312,6 +364,12 @@ function renderEvent(call, event) {
     $('connection-status').hidden = false;
   } else if (event.kind === 'upload' && typeof data.upload_id === 'string') {
     renderShareEvent(call, data);
+  } else if (event.kind === 'provider' && data.type === 'error') {
+    // The correlated context receipt describes the same rejection and stays
+    // quiet. A server error alone neither closes the call nor retries work.
+    const correlated = typeof data.client_event_id === 'string' || typeof data.error?.client_event_id === 'string';
+    notice(correlated ? 'A voice update could not be confirmed. You can keep talking; saved results remain available.'
+      : 'The voice service reported a problem. Your saved results remain available.');
   } else if (event.kind === 'error') {
     notice(typeof data.message === 'string' ? data.message : 'The voice service reported an error. Check the conversation before repeating a request.');
   } else if (event.kind === 'closed') {
@@ -480,6 +538,23 @@ async function toggleCamera() {
   } catch (error) { notice(error.name === 'NotAllowedError' ? 'Camera permission was not granted. The voice call is unchanged.' : 'The camera could not be opened. Your voice call can continue.'); stopCamera(call); }
   finally { if (current(call)) $('camera-toggle').disabled = false; }
 }
+function captureCue(call) {
+  // A short mechanical double click belongs to the actual captured frame, not
+  // an agent's promise or an upload/inspection result. No microphone input.
+  const context = call.audioContext;
+  if (!current(call)) return;
+  const unavailable = () => notice('Photo captured. The shutter sound is unavailable in this browser.');
+  if (context?.state !== 'running') { unavailable(); return; }
+  try {
+    const rate = context.sampleRate, buffer = context.createBuffer(1, Math.ceil(rate * .12), rate), samples = buffer.getChannelData(0);
+    for (let i = 0; i < samples.length; i++) {
+      const t = i / rate, local = t < .035 ? t : t - .065;
+      if (local >= 0 && local < .035) samples[i] = (Math.random() * 2 - 1) * .22 * Math.exp(-local * 140);
+    }
+    const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination);
+    source.onended = () => source.disconnect(); source.start();
+  } catch { unavailable(); /* A blocked cue must not lose or repeat the captured photo. */ }
+}
 async function capturePhoto() {
   const call = state.call, video = $('camera-preview');
   if (!current(call) || !call.cameraStream || !video.videoWidth || call.capturing) { notice('Wait for the camera preview before capturing a photo.'); return; }
@@ -491,6 +566,7 @@ async function capturePhoto() {
     const blob = await new Promise(resolve => canvas.toBlob(resolve,'image/jpeg',.85));
     if (!current(call)) return;
     if (!blob) throw new Error('The camera could not capture this photo.');
+    captureCue(call);
     await shareFile(call, new File([blob], 'companion-photo.jpg', {type:'image/jpeg'}), 'camera');
   } catch (error) { if (current(call)) notice(error.message); }
   finally { call.capturing = false; if (current(call)) $('capture-photo').disabled = false; }
@@ -625,12 +701,21 @@ $('close-voice-settings').onclick = () => $('voice-settings').close();
 $('voice-settings').addEventListener('close', () => { state.voiceContact = null; });
 $('call-voice-settings').onclick = () => { if (current(state.call)) openVoiceSettings(state.call.contact); };
 
-function releaseMedia(call) {
+function releaseTransport(call) {
+  if (call.transportReleased) return;
+  call.transportReleased = true; clearTimeout(call.transportCloseTimer); state.finalizingCalls.delete(call);
+  call.channel?.close(); call.peer?.close(); call.audioSource?.disconnect(); call.audioContext?.close().catch(() => {});
+}
+function releaseMedia(call, retainTransport = false) {
   clearInterval(call.surfaceTimer); clearInterval(call.micMeterTimer); call.micSource?.disconnect();
   clearTimeout(call.pollTimer); clearInterval(call.heartbeatTimer); clearInterval(call.durationTimer); clearInterval(call.meterTimer); clearInterval(call.controlTimer);
   call.stream?.getTracks().forEach(track => track.stop()); call.remoteStream?.getTracks().forEach(track => track.stop());
-  stopCamera(call); for (const share of call.shares.values()) { if (share.previewUrl) URL.revokeObjectURL(share.previewUrl); } $('share-files').value = ''; call.channel?.close(); call.peer?.close();
-  audio.pause(); audio.srcObject = null; call.audioSource?.disconnect(); call.audioContext?.close().catch(() => {});
+  stopCamera(call); for (const share of call.shares.values()) { if (share.previewUrl) URL.revokeObjectURL(share.previewUrl); } $('share-files').value = '';
+  audio.pause(); audio.srcObject = null; call.audioContext?.suspend().catch(() => {});
+  // Keep only the silent transport until the server observes the matching close
+  // event. Devices stop immediately; an unavailable service cannot retain it.
+  if (retainTransport) { state.finalizingCalls.add(call); call.transportCloseTimer = setTimeout(() => releaseTransport(call), 15000); }
+  else releaseTransport(call);
   call.wakeLock?.release().catch(() => {}); call.wakeLock = null; $('presence').classList.remove('speaking');
 }
 async function confirmClose(id, result) {
@@ -642,7 +727,7 @@ async function confirmClose(id, result) {
   throw new Error('Your devices are off. The service is still closing the voice connection; check the same call again shortly.');
 }
 async function closeKnownCall(call) {
-  if (!call.id || call.authGeneration !== state.authGeneration) return;
+  if (!call.id || call.authGeneration !== state.authGeneration) { releaseTransport(call); return; }
   const recovery = state.recovery || {callId:call.id,request:null};
   recovery.callId = call.id; state.recovery = recovery; recovery.checking = true; showRecovery();
   try {
@@ -662,6 +747,7 @@ async function closeKnownCall(call) {
     // retry. The server's heartbeat lease also bounds orphaned voice sessions.
     if (call.authGeneration === state.authGeneration) { state.recovery = {callId:call.id,request:null}; showRecovery(); }
   }
+  finally { releaseTransport(call); }
 }
 function showRecovery() {
   $('recover-call').hidden = !state.recovery;
@@ -673,9 +759,9 @@ function showRecovery() {
       ? 'This page has not connected your microphone or camera. End the earlier voice call before starting another. Work your agent already accepted can continue in its conversation.'
       : 'Your microphone and camera are off. The service has not yet confirmed that this voice call closed. Resolve it before opening another call.';
 }
-function endCall(message = 'Your microphone and camera are off. Accepted work can continue.', sendClose = true) {
+function endCall(message = 'Your microphone and camera are off. Accepted work can continue.', sendClose = true, retainTransport = sendClose) {
   const call = state.call; if (!call) return;
-  call.ended = true; state.call = null; state.generation++; releaseMedia(call); document.body.classList.remove('call-active');
+  call.ended = true; state.call = null; state.generation++; releaseMedia(call, retainTransport && Boolean(call.id)); document.body.classList.remove('call-active');
   $('call-screen').hidden = true; $('phonebook').hidden = true; $('call-ended').hidden = false;
   $('ended-title').textContent = call.connected ? 'Until next time.' : 'Call ended.';
   $('ended-detail').textContent = message;
@@ -782,7 +868,7 @@ async function executeSurface(call, receipt) {
   const op = receipt?.operation_id;
   if (!current(call) || receipt.browser_id !== call.browserId || typeof op !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(op)
       || receipt.state !== 'queued' || !Number.isSafeInteger(receipt.expires_at) || receipt.expires_at <= Date.now()
-      || call.surfaceSeen.has(op) || !['view','capture'].includes(receipt.kind)) return;
+      || call.surfaceSeen.has(op) || !['view','capture','hangup'].includes(receipt.kind)) return;
   call.surfaceSeen.add(op);
   const ack = (state,attachments) => api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/commands/${encodeURIComponent(op)}/ack`, 'POST', {browser_id:call.browserId,state,...(attachments ? {attachment_ids:attachments} : {})});
   try {
@@ -794,6 +880,11 @@ async function executeSurface(call, receipt) {
         || accepted.expires_at !== receipt.expires_at || accepted.expires_at <= Date.now()) return;
     if (receipt.kind === 'view') {
       applyView(call,receipt.command); await ack('executed');
+    } else if (receipt.kind === 'hangup') {
+      // Release this call's media before acknowledging the effect. Closing a
+      // voice session never cancels separately authorized background work.
+      endCall('Your microphone and camera are off. Closing the voice call…', false, true);
+      try { await ack('executed'); } finally { closeKnownCall(call); }
     } else {
       if (!cameraReady() || call.capturing || document.hidden) { await ack('failed'); return; }
       call.capturing = true; $('capture-photo').disabled = true;
@@ -804,7 +895,10 @@ async function executeSurface(call, receipt) {
         canvas.width = Math.round(video.videoWidth*scale); canvas.height = Math.round(video.videoHeight*scale);
         canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
         const blob = await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.75));
-        if (!blob || blob.size>524288) throw new Error('This photo could not be shared within the image limit.');
+        if (!blob) throw new Error('The camera could not capture this photo.');
+        if (!current(call)) return;
+        captureCue(call);
+        if (blob.size>524288) throw new Error('This photo could not be shared within the image limit.');
         // The frame is captured once. An unknown upload never recaptures it.
         await ack('executed');
         if (!current(call)) return;

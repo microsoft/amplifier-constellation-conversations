@@ -1314,3 +1314,4 @@ video.shared-media,audio.shared-media {width:100%}
 .full-result-button {display:block;margin-top:4px}
 
 .camera-consent{display:flex;align-items:center;gap:.65rem;font-size:.9rem;line-height:1.5;margin:.75rem 0}.camera-consent input{width:1.1rem;height:1.1rem;flex:none;accent-color:var(--accent,#32685d)}.output-card.surface-focused{outline:2px solid #32685d;outline-offset:3px}.connection-status{padding:0 1rem;margin:.5rem 0}
+.permission-alert{margin:.5rem 1rem;flex:none}.call-permission{border:1px solid var(--accent,#32685d);margin-bottom:1rem}.call-permission details{margin:.75rem 0}.permission-detail{white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;font-size:12px}.permission-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem}

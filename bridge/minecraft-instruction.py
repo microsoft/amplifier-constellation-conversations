@@ -68,9 +68,19 @@ def submit(home, value, opener=None):
         return {"request_id": rid, "state": "queued", "scope": "private_operator_instruction",
                 "receipt": {"request_id": receipt["request_id"], "queued": True},
                 "message": "Queued for the existing game controller. This does not prove task acceptance, execution or completion. Minecraft records Operator; original caller attribution is retained in Companion."}
+    except urllib.error.HTTPError as error:
+        # Retain bounded transport evidence without echoing a response body,
+        # headers, URL, or token. A status alone does not establish whether an
+        # earlier attempt was admitted. The domain connector owns that receipt.
+        return {"request_id": rid, "state": "unknown",
+                "diagnostic": "connector_http_error", "http_status": error.code,
+                "message": "The game connector returned an HTTP error instead of a queue receipt. The instruction is not confirmed; do not retry automatically."}
+    except (TimeoutError, urllib.error.URLError, OSError):
+        return {"request_id": rid, "state": "unknown", "diagnostic": "connector_transport_unconfirmed",
+                "message": "No confirmed queue receipt. Do not submit this instruction again automatically."}
     except Exception:
-        # A timeout can occur after the endpoint enqueues the instruction.
-        return {"request_id": rid, "state": "unknown", "message": "No confirmed queue receipt. Do not submit this instruction again automatically."}
+        return {"request_id": rid, "state": "unknown", "diagnostic": "connector_receipt_invalid",
+                "message": "The game connector response did not contain a valid queue receipt. Do not submit this instruction again automatically."}
 
 
 def main():

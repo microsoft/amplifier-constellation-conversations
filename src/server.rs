@@ -116,6 +116,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(crate::companion_tools::mcp),
         )
         .route(
+            "/api/v1/companion/calls/{id}/tools/observations",
+            get(crate::companion_tools::observations),
+        )
+        .route(
+            "/api/v1/companion/calls/{id}/tools/hangup",
+            post(crate::companion_surface::hangup),
+        )
+        .route(
+            "/api/v1/companion/calls/{id}/tools/feedback",
+            post(crate::companion_surface::feedback),
+        )
+        .route(
             "/api/v1/companion/calls/{id}/tools/view",
             post(crate::companion_surface::view),
         )

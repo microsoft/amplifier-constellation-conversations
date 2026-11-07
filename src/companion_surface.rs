@@ -31,6 +31,7 @@ const VIEW_ACTIONS: &[&str] = &[
 ];
 
 pub fn migrate(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS companion_feedback(call_id TEXT NOT NULL REFERENCES companion_calls(id) ON DELETE CASCADE,operation_id TEXT NOT NULL,delegation_id TEXT NOT NULL,owner TEXT NOT NULL,text TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(call_id,operation_id),UNIQUE(call_id,delegation_id));")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS companion_surface_capabilities(call_id TEXT PRIMARY KEY REFERENCES companion_calls(id) ON DELETE CASCADE,image_input INTEGER,observed_at INTEGER NOT NULL);")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS companion_surfaces(call_id TEXT PRIMARY KEY REFERENCES companion_calls(id) ON DELETE CASCADE,browser_id TEXT NOT NULL,session_hash TEXT NOT NULL,camera_enabled INTEGER NOT NULL,capture_consent INTEGER NOT NULL,user_speaking INTEGER,agent_speaking INTEGER,updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS companion_surface_commands(call_id TEXT NOT NULL REFERENCES companion_calls(id) ON DELETE CASCADE,operation_id TEXT NOT NULL,delegation_id TEXT NOT NULL,browser_id TEXT NOT NULL,session_hash TEXT NOT NULL,kind TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,accepted_at INTEGER,attachment_ids TEXT NOT NULL DEFAULT '[]',PRIMARY KEY(call_id,operation_id)); CREATE UNIQUE INDEX IF NOT EXISTS companion_one_capture_per_delegation ON companion_surface_commands(call_id,delegation_id) WHERE kind='capture';")?;
     let columns = db
@@ -83,6 +84,19 @@ pub struct Capture {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Hangup {
+    operation_id: String,
+    delegation_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Feedback {
+    operation_id: String,
+    delegation_id: String,
+    text: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserQuery {
     browser_id: String,
 }
@@ -97,6 +111,11 @@ pub struct Ack {
 
 fn valid_identity(operation: &str, delegation: &str) -> bool {
     uuid::Uuid::parse_str(operation).is_ok() && !delegation.is_empty() && delegation.len() <= 160
+}
+fn valid_feedback(f: &Feedback) -> bool {
+    valid_identity(&f.operation_id, &f.delegation_id)
+        && !f.text.trim().is_empty()
+        && f.text.len() <= 4000
 }
 fn valid_view(v: &View) -> bool {
     valid_identity(&v.operation_id, &v.delegation_id)
@@ -212,6 +231,24 @@ pub fn permission_valid(
             };
             (c.delegation_id, true)
         }
+        "companion_hangup" => {
+            let Ok(h) = serde_json::from_value::<Hangup>(args) else {
+                return Ok(false);
+            };
+            if !valid_identity(&h.operation_id, &h.delegation_id) {
+                return Ok(false);
+            }
+            (h.delegation_id, false)
+        }
+        "companion_feedback" => {
+            let Ok(f) = serde_json::from_value::<Feedback>(args) else {
+                return Ok(false);
+            };
+            if !valid_feedback(&f) {
+                return Ok(false);
+            }
+            (f.delegation_id, false)
+        }
         _ => return Ok(false),
     };
     Ok(surface(s, id, capture)?.is_some()
@@ -300,6 +337,13 @@ fn enqueue(
     }
     let mut db = s.db.lock().unwrap();
     let tx = db.transaction()?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM companion_feedback WHERE call_id=?1 AND operation_id=?2)",
+        params![id, operation],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Err(ApiError::busy());
+    }
     if let Some(old) = row(&tx, id, operation)? {
         if old["kind"] != kind || old["delegation_id"] != delegation || old["command"] != command {
             return Err(ApiError::busy());
@@ -377,6 +421,97 @@ pub async fn capture(
         "capture",
         json!({"photos":1,"max_bytes":IMAGE_LIMIT,"upload_id":c.operation_id}),
     )?))
+}
+pub async fn hangup(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    Json(request): Json<Hangup>,
+) -> ApiResult<Json<Value>> {
+    let (owner, agent, room) = crate::companion_tools::authorize(&s, &id, &h)?;
+    if !valid_identity(&request.operation_id, &request.delegation_id) {
+        return Err(ApiError::bad(
+            "Use an operation UUID and the exact active delegation",
+        ));
+    }
+    Ok(Json(enqueue(
+        &s,
+        &id,
+        (&owner, &agent, &room),
+        &request.operation_id,
+        &request.delegation_id,
+        "hangup",
+        json!({"action":"end_call"}),
+    )?))
+}
+
+fn feedback_receipt(operation: &str, delegation: &str, text: &str, at: i64) -> Value {
+    json!({"operation_id":operation,"delegation_id":delegation,"state":"saved","scope":"private_installation","submitted_externally":false,"text":text,"created_at":at,"guidance":"Feedback is durably saved privately on this installation. It has not been sent to developers or any external service."})
+}
+
+pub async fn feedback(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    Json(request): Json<Feedback>,
+) -> ApiResult<Json<Value>> {
+    let (owner, agent, room) = crate::companion_tools::authorize(&s, &id, &h)?;
+    if !valid_feedback(&request) {
+        return Err(ApiError::bad(
+            "Use an operation UUID, the exact active delegation, and 1–4000 UTF-8 bytes of feedback",
+        ));
+    }
+    if surface(&s, &id, false)?.is_none()
+        || !source_authorized(&s, &id, &owner, &agent, &room, &request.delegation_id)?
+    {
+        return Err(ApiError::forbidden());
+    }
+    let mut db = s.db.lock().unwrap();
+    let tx = db.transaction()?;
+    if tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_surface_commands WHERE call_id=?1 AND operation_id=?2)",params![id,request.operation_id],|r|r.get::<_,bool>(0))? {
+        return Err(ApiError::busy());
+    }
+    let previous: Option<(String, String, String, i64)> = tx.query_row(
+        "SELECT operation_id,delegation_id,text,created_at FROM companion_feedback WHERE call_id=?1 AND (operation_id=?2 OR delegation_id=?3) ORDER BY operation_id=?2 DESC LIMIT 1",
+        params![id,request.operation_id,request.delegation_id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional()?;
+    if let Some((operation, delegation, text, at)) = previous {
+        if delegation != request.delegation_id || text != request.text {
+            return Err(ApiError::busy());
+        }
+        return Ok(Json(feedback_receipt(&operation, &delegation, &text, at)));
+    }
+    let total: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM companion_feedback WHERE call_id=?1",
+        [&id],
+        |r| r.get(0),
+    )?;
+    if total >= 64 {
+        return Err(ApiError::bad("Feedback limit reached for this call"));
+    }
+    let at = now_ms();
+    tx.execute("INSERT INTO companion_feedback(call_id,operation_id,delegation_id,owner,text,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![id,request.operation_id,request.delegation_id,owner,request.text,at])?;
+    let receipt = feedback_receipt(
+        &request.operation_id,
+        &request.delegation_id,
+        &request.text,
+        at,
+    );
+    let card = json!({"title":"Feedback saved privately","text":format!("{}\n\nSaved on this installation. Not sent externally.",request.text),"conversation_id":room,"feedback_receipt":receipt,"observed_only":true});
+    tx.execute(
+        "INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'card',?3,?4)",
+        params![
+            id,
+            format!("feedback:{}", request.operation_id),
+            card.to_string(),
+            at
+        ],
+    )?;
+    tx.commit()?;
+    drop(db);
+    s.changed();
+    Ok(Json(receipt))
 }
 pub async fn pending(
     State(s): State<Arc<AppState>>,
@@ -473,7 +608,7 @@ pub async fn ack(
             }
         } else if previous["state"] == "uploaded"
             || previous["state"] == "failed"
-            || (previous["kind"] == "view" && previous["state"] == "executed")
+            || (previous["kind"] != "capture" && previous["state"] == "executed")
         {
             return Err(ApiError::busy());
         } else {
@@ -502,6 +637,13 @@ pub async fn status(
 ) -> ApiResult<Json<Value>> {
     let (owner, _, room) = crate::companion_tools::authorize(&s, &id, &h)?;
     let db = s.db.lock().unwrap();
+    let feedback: Option<(String, String, i64)> = db.query_row(
+        "SELECT delegation_id,text,created_at FROM companion_feedback WHERE call_id=?1 AND operation_id=?2 AND owner=?3",
+        params![id,operation,owner], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional()?;
+    if let Some((delegation, text, at)) = feedback {
+        return Ok(Json(feedback_receipt(&operation, &delegation, &text, at)));
+    }
     let mut receipt = row(&db, &id, &operation)?.ok_or_else(ApiError::missing)?;
     if receipt["state"] == "uploaded" {
         let capability: Option<(Option<bool>,i64)> = db.query_row("SELECT image_input,observed_at FROM companion_surface_capabilities WHERE call_id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
