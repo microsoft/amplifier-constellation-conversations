@@ -231,7 +231,8 @@ sessions, imply write authority from context access, or require a shared
 Constellation provisioning or identity service.
 
 An action requires an active, authenticated caller delegation and a configured
-connection. The host records a durable receipt before invoking its fixed helper.
+connection. Use the exact `delegation_id` supplied with that caller instruction;
+later steering must not silently substitute a different request. The host records a durable receipt before invoking its fixed helper.
 The helper receives one JSON document on stdin with `version: 1`, `request_id`,
 `instruction`, and private `source` provenance: caller, call, conversation,
 delegation, message, original text, timestamp, and revision. It returns one JSON
@@ -279,8 +280,8 @@ Optional MCP uses `POST /companion/calls/{id}/mcp`. Its host callbacks under
 `GET actions/{request}`, and `GET`/`POST shared`. These use a call-scoped bearer grant,
 not browser session authorization, and reject browser Origin requests. The MCP
 SDK owns protocol framing; these are Companion application routes, not ACP
-extensions. `companion_request_action` takes `connection_id`, `instruction`, and a
-UUID `request_id`; `companion_show` takes an HTTP(S) `url`, `title`, and optional
+extensions. `companion_request_action` takes `connection_id`, `instruction`, the
+original `delegation_id` (a provider ID of 1–160 characters), and a UUID `request_id`; `companion_show` takes an HTTP(S) `url`, `title`, and optional
 `kind` (`auto`, `link`, `image`, or `video`). Showing a link is neither platform
 publication nor evidence that the media loaded.
 
