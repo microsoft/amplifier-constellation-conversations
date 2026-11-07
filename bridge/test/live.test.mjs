@@ -34,6 +34,29 @@ test('provider errors and session snapshots cannot expose credentials/instructio
  assert.deepEqual(publicEvent({type:'session.started',event_id:'s',session:{id:'live_one',instructions:secret}}),{type:'session.started',event_id:'s',session:{id:'live_one'}});
  assert.equal(publicEvent({type:'private.reasoning',text:secret}),null);
 });
+test('provider error diagnostics retain bounded protocol fields and nested command identity only',()=>{
+ const source={type:'error',event_id:'provider-error',error:{type:'invalid_request_error',code:'unknown_parameter',param:'delegation_id',client_event_id:'append-1',message:'sk-private-KEY',headers:{authorization:'sk-private-KEY'},session:{instructions:'private'}}};
+ assert.deepEqual(publicEvent(source,new Set(['append-1'])),{type:'error',event_id:'provider-error',error:{type:'invalid_request_error',code:'unknown_parameter',param:'delegation_id',client_event_id:'append-1',message:'The voice service reported an error.'}});
+ assert.equal(publicEvent(source).error.client_event_id,undefined);
+ const conflicting=publicEvent({...source,client_event_id:'append-2'},new Set(['append-1','append-2']));
+ assert.equal(conflicting.client_event_id,undefined);assert.equal(conflicting.error.client_event_id,undefined);
+ for(const bad of ['sk-private-KEY','x'.repeat(161),'private text','https://private.invalid']) {
+  const result=publicEvent({...source,client_event_id:bad,error:{...source.error,code:bad,type:bad,param:bad,client_event_id:bad}});
+  assert.deepEqual(result,{type:'error',event_id:'provider-error',error:{code:'voice_service_error',message:'The voice service reported an error.'}});
+ }
+});
+test('SDK provider-error event and error callback preserve diagnostics without replaying the append',async()=>{
+ const {bridge,sideband,events}=fixture();await bridge.command(create);
+ await bridge.command({op:'append',channel:'commentary',event_id:'append-1',delegation_id:'delegate-1',content:'The saved result is available.'});
+ const provider={type:'error',event_id:'provider-error',error:{type:'invalid_request_error',code:'invalid_value',param:'delegation_id',client_event_id:'append-1',message:'private context'}};
+ sideband.emit('event',provider);
+ const sdkError=new Error('private context');Object.defineProperty(sdkError,'error',{value:provider,enumerable:false});
+ sideband.emit('error',sdkError);await bridge.done;
+ assert.equal(events.find(e=>e.type==='event').event.error.client_event_id,'append-1');
+ assert.equal(sideband.sent.filter(e=>e.type==='session.commentary.append').length,1);
+ assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,1);
+ assert.equal(JSON.stringify(events).includes('private context'),false);
+});
 test('duplicate append IDs are not resent; changed ID payload rejected',async()=>{
  const {bridge,sideband,events,requests}=fixture();await bridge.command(create);
  assert.equal(events[0].type,'ready');assert.equal(requests[0].opts.maxRetries,0);

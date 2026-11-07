@@ -135,7 +135,7 @@ function updateDuration(call) {
 async function startCall(contact) {
   if (state.call || state.recovery || !state.available) return;
   const call = {generation:++state.generation, authGeneration:state.authGeneration, contact, id:null, request:null, ended:false, connected:false,
-    cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
+    browserId:crypto.randomUUID(), surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
   state.call = call;
   document.body.classList.add('call-active');
   notice(''); $('phonebook').hidden = true; $('call-ended').hidden = true; $('call-screen').hidden = false;
@@ -143,6 +143,7 @@ async function startCall(contact) {
   $('call-description').textContent = contact.description || 'The same agent. Another place to talk.';
   $('call-duration').textContent = '00:00'; $('cards').replaceChildren(); $('transcript').replaceChildren();
   $('transcript-empty').hidden = false; $('space-empty').hidden = false; $('work-status').hidden = true;
+  $('connection-status').hidden = true; $('connection-status').textContent = '';
   $('card-count').hidden = true; $('card-count').textContent = '0'; $('continue-work').hidden = true;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = 'Take your time. There’s room for a pause.';
   $('speaker-state').textContent = 'Speaker waiting'; $('enable-audio').hidden = true;
@@ -170,7 +171,7 @@ async function startCall(contact) {
       refreshStatus(call);
     });
     const AudioContext = window.AudioContext || window.webkitAudioContext;
-    if (AudioContext) { try { call.audioContext = new AudioContext(); call.audioContext.resume().catch(() => {}); } catch { /* Playback still works without the meter. */ } }
+    if (AudioContext) { try { call.audioContext = new AudioContext(); call.audioContext.resume().catch(() => {}); startMicrophoneMeter(call); } catch { /* Playback still works without the meter. */ } }
     refreshStatus(call);
     await peer.setLocalDescription(await peer.createOffer()); await waitForIce(peer, call);
     if (!current(call)) return;
@@ -187,6 +188,7 @@ async function startCall(contact) {
     await peer.setRemoteDescription({type:'answer',sdp:result.sdp});
     call.lastControlAt = Date.now();
     call.durationTimer = setInterval(() => updateDuration(call), 1000);
+    call.surfaceTimer = setInterval(() => surfacePresence(call), 2000); surfacePresence(call);
     call.heartbeatTimer = setInterval(() => heartbeat(call), 5000);
     call.controlTimer = setInterval(() => {
       if (!current(call)) return;
@@ -224,6 +226,7 @@ function attachRemoteAudio(call, stream) {
         // A continuous WebRTC track can be playing silence. Animate speaking
         // only when audio is actually playing and carries measured energy.
         const speaking = !audio.paused && !audio.muted && audio.volume > 0 && level > .012;
+        call.agentSpeaking = call.audioContext.state === 'running' && !audio.paused ? speaking : null;
         $('presence').classList.toggle('speaking', speaking);
         $('speaker-state').textContent = speaking ? `${call.contact.label} speaking` : audio.paused ? 'Speaker paused' : 'Speaker on';
       }, 100);
@@ -254,6 +257,7 @@ async function poll(call) {
     call.networkError = false; call.lastControlAt = Date.now();
     call.providerConnected = result.state === 'connected';
     for (const event of result.events || []) renderEvent(call, event);
+    pollSurface(call);
     if (Number.isSafeInteger(result.next_cursor) && result.next_cursor >= call.cursor) call.cursor = result.next_cursor;
     if (['closed','interrupted'].includes(result.state)) { endCall(result.state === 'interrupted' ? 'The voice connection was interrupted. Accepted work stays in the conversation.' : 'Your microphone and camera are off. Accepted work can continue.', false); return; }
     refreshStatus(call);
@@ -298,7 +302,14 @@ function renderEvent(call, event) {
   } else if (event.kind === 'progress' && call.working.has(data.delegation_id)) {
     call.progress.set(data.delegation_id, data); refreshWorkStatus(call);
   } else if (event.kind === 'card' && typeof data.text === 'string') {
-    addCard(call, typeof data.title === 'string' && data.title ? data.title.slice(0,300) : `From ${call.contact.label}`, data.text, data.conversation_id || call.conversationId, data);
+    addCard(call, typeof data.title === 'string' && data.title ? data.title.slice(0,300) : `From ${call.contact.label}`, data.text, data.conversation_id || call.conversationId, {...data,card_id:String(event.seq)});
+  } else if (event.kind === 'surface_command') {
+    executeSurface(call, data);
+  } else if (event.kind === 'action_observation') {
+    const observation = data.observation || {}, state = observation.state;
+    const wording = ({accepted:'accepted your request',running:'is working on your request',waiting:'is waiting',blocked:'reported a blocker',reported_complete:'reports the work ready for your review',stopped:'stopped the work',budget_exhausted:'reached the work limit',needs_review:'needs your review',superseded:'has a newer task; the earlier receipt remains saved',unknown:'has no confirmed new status',delivered:'confirmed message delivery',completed:'confirmed message delivery'})[state] || 'has a new observed status';
+    $('connection-status').textContent = `${data.label || 'The connection'} ${wording}. ${observation.scope === 'task' ? 'Reported status; not independently verified.' : 'Delivery confirms the message only.'}`;
+    $('connection-status').hidden = false;
   } else if (event.kind === 'upload' && typeof data.upload_id === 'string') {
     renderShareEvent(call, data);
   } else if (event.kind === 'error') {
@@ -386,6 +397,7 @@ function appendCard(call, card) {
 function addCard(call, title, text, conversationId, data = {}) {
   if (!current(call)) return;
   const card = element('article', 'output-card');
+  if (data.card_id) card.dataset.cardId = String(data.card_id);
   const heading = element('h2', null, title); heading.append(element('small', null, new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})));
   card.append(heading);
   if (data.late) card.append(element('p', 'card-context', 'Answer to your earlier request'));
@@ -436,6 +448,7 @@ for (const name of ['space','transcript']) {
 
 function stopCamera(call) {
   call?.cameraStream?.getTracks().forEach(track => track.stop()); if (call) call.cameraStream = null;
+  $('voice-photos').checked = false; if (current(call)) surfacePresence(call);
   $('camera-preview').srcObject = null; $('camera-toggle').setAttribute('aria-pressed', 'false'); $('camera-label').textContent = 'Camera';
   $('camera-panel').hidden = true;
 }
@@ -462,7 +475,8 @@ async function toggleCamera() {
     if (!current(call)) { stream.getTracks().forEach(track => track.stop()); return; }
     call.cameraStream = stream; $('camera-preview').srcObject = stream; $('camera-panel').hidden = false; setTab('space');
     $('camera-toggle').setAttribute('aria-pressed', 'true'); $('camera-label').textContent = 'Camera off';
-    await $('camera-preview').play(); $('space-panel').scrollTop = 0;
+    await $('camera-preview').play(); $('space-panel').scrollTop = 0; surfacePresence(call);
+    for (const track of stream.getTracks()) track.addEventListener('ended', () => { if (current(call) && call.cameraStream === stream) stopCamera(call); });
   } catch (error) { notice(error.name === 'NotAllowedError' ? 'Camera permission was not granted. The voice call is unchanged.' : 'The camera could not be opened. Your voice call can continue.'); stopCamera(call); }
   finally { if (current(call)) $('camera-toggle').disabled = false; }
 }
@@ -515,11 +529,11 @@ async function announceAvailable(call, share) {
     if (current(call)) { shareStatus(share, 'available', availableText(call, share) + ' Voice notification is unconfirmed.'); share.retry.hidden = false; }
   }
 }
-async function shareFile(call, file, source) {
+async function shareFile(call, file, source, uploadId = null) {
   if (!current(call) || !call.conversationId) return;
   const mime = fileMime(file), allowed = ['image/png','image/jpeg','image/gif','image/webp','application/pdf','text/plain','text/markdown','text/csv','application/json'];
   const name = (file.name || 'shared-file').replace(/[\\/"\u0000-\u001f\u007f]/g,'_').slice(0,150);
-  const share = shareCard(call, crypto.randomUUID(), name); Object.assign(share,{source,mime,sending:true,local:true});
+  const share = shareCard(call, uploadId || crypto.randomUUID(), name); Object.assign(share,{source,mime,sending:true,local:true});
   share.retry.onclick = () => announceAvailable(call, share);
   shareStatus(share,'captured',source === 'camera' ? 'Captured. Preparing to share…' : 'Selected. Preparing to share…');
   if (!allowed.includes(mime) || !file.size || file.size > (mime.startsWith('text/') || mime === 'application/json' ? 200000 : 2*1024*1024)) {
@@ -552,6 +566,7 @@ async function shareFile(call, file, source) {
       notifyShare(call,share,'failed').catch(() => {});
     }
   } finally { share.sending = false; }
+  return share;
 }
 function renderShareEvent(call, data) {
   let share = call.shares.get(data.upload_id);
@@ -611,6 +626,7 @@ $('voice-settings').addEventListener('close', () => { state.voiceContact = null;
 $('call-voice-settings').onclick = () => { if (current(state.call)) openVoiceSettings(state.call.contact); };
 
 function releaseMedia(call) {
+  clearInterval(call.surfaceTimer); clearInterval(call.micMeterTimer); call.micSource?.disconnect();
   clearTimeout(call.pollTimer); clearInterval(call.heartbeatTimer); clearInterval(call.durationTimer); clearInterval(call.meterTimer); clearInterval(call.controlTimer);
   call.stream?.getTracks().forEach(track => track.stop()); call.remoteStream?.getTracks().forEach(track => track.stop());
   stopCamera(call); for (const share of call.shares.values()) { if (share.previewUrl) URL.revokeObjectURL(share.previewUrl); } $('share-files').value = ''; call.channel?.close(); call.peer?.close();
@@ -719,3 +735,109 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', () => { if (state.call) endCall(); });
 start();
+
+// Browser-owned surface controls. A host request can neither enable a sensor
+// nor execute twice after an uncertain acknowledgment.
+function startMicrophoneMeter(call) {
+  try {
+    call.micSource = call.audioContext.createMediaStreamSource(call.stream);
+    call.micAnalyser = call.audioContext.createAnalyser(); call.micAnalyser.fftSize = 256;
+    call.micSource.connect(call.micAnalyser); const values = new Uint8Array(256);
+    call.micMeterTimer = setInterval(() => {
+      if (!current(call)) return;
+      if (call.audioContext.state !== 'running') { call.userSpeaking = null; return; }
+      call.micAnalyser.getByteTimeDomainData(values);
+      const level = Math.sqrt(values.reduce((sum,x) => sum + ((x-128)/128)**2,0)/values.length);
+      // Energy is an activity hint, not speaker identity or a completed turn.
+      if (level > .02 && !call.muted) call.lastMicEnergy = Date.now();
+      call.userSpeaking = !call.muted && Date.now() - (call.lastMicEnergy || 0) < 2000;
+    },100);
+  } catch { call.userSpeaking = null; }
+}
+async function surfacePresence(call) {
+  if (!current(call) || !call.id || call.surfaceUpdating) return;
+  call.surfaceUpdating = true;
+  try {
+    await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/presence`, 'POST', {
+      browser_id:call.browserId,camera_enabled:Boolean(call.cameraStream?.getVideoTracks().some(t=>t.readyState === 'live')),
+      capture_consent:Boolean(call.cameraStream && $('voice-photos').checked),
+      user_speaking:document.hidden ? null : call.userSpeaking,
+      agent_speaking:document.hidden ? null : call.agentSpeaking,
+    });
+    if (current(call)) call.surfaceReady = true;
+  } catch { if (current(call)) call.surfaceReady = false; }
+  finally { call.surfaceUpdating = false; }
+}
+$('voice-photos').onchange = () => surfacePresence(state.call);
+async function pollSurface(call) {
+  if (!current(call) || !call.surfaceReady || call.surfacePolling) return;
+  call.surfacePolling = true;
+  try {
+    const result = await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/commands?browser_id=${encodeURIComponent(call.browserId)}`);
+    if (current(call)) for (const command of result.commands || []) executeSurface(call,command);
+  } catch { /* Commands are durable; a lost connection never triggers local replay. */ }
+  finally { call.surfacePolling = false; }
+}
+async function executeSurface(call, receipt) {
+  const op = receipt?.operation_id;
+  if (!current(call) || receipt.browser_id !== call.browserId || typeof op !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(op)
+      || receipt.state !== 'queued' || !Number.isSafeInteger(receipt.expires_at) || receipt.expires_at <= Date.now()
+      || call.surfaceSeen.has(op) || !['view','capture'].includes(receipt.kind)) return;
+  call.surfaceSeen.add(op);
+  const ack = (state,attachments) => api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/commands/${encodeURIComponent(op)}/ack`, 'POST', {browser_id:call.browserId,state,...(attachments ? {attachment_ids:attachments} : {})});
+  try {
+    const cameraReady = () => call.cameraStream?.getVideoTracks().some(track=>track.readyState === 'live') && $('voice-photos').checked;
+    if (receipt.kind === 'capture' && (!cameraReady() || call.capturing)) { await ack('failed'); return; }
+    const accepted = await ack('accepted');
+    if (!current(call) || accepted.execute !== true || accepted.operation_id !== op || accepted.browser_id !== call.browserId
+        || accepted.kind !== receipt.kind || accepted.state !== 'accepted' || !Number.isSafeInteger(accepted.expires_at)
+        || accepted.expires_at !== receipt.expires_at || accepted.expires_at <= Date.now()) return;
+    if (receipt.kind === 'view') {
+      applyView(call,receipt.command); await ack('executed');
+    } else {
+      if (!cameraReady() || call.capturing || document.hidden) { await ack('failed'); return; }
+      call.capturing = true; $('capture-photo').disabled = true;
+      try {
+        const video = $('camera-preview');
+        if (!video.videoWidth || !video.videoHeight) throw new Error('The camera preview is not ready.');
+        const canvas = document.createElement('canvas'), scale = Math.min(1,1024/video.videoWidth,1024/video.videoHeight);
+        canvas.width = Math.round(video.videoWidth*scale); canvas.height = Math.round(video.videoHeight*scale);
+        canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
+        const blob = await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.75));
+        if (!blob || blob.size>524288) throw new Error('This photo could not be shared within the image limit.');
+        // The frame is captured once. An unknown upload never recaptures it.
+        await ack('executed');
+        if (!current(call)) return;
+        const share = await shareFile(call,new File([blob],'voice-photo.jpg',{type:'image/jpeg'}),'camera',op);
+        if (share?.attachmentIds?.length === 1) await ack('uploaded',share.attachmentIds);
+        else if (share && !share.uploadStarted) await ack('failed');
+      } finally { call.capturing = false; if (current(call)) $('capture-photo').disabled = false; }
+    }
+  } catch (error) {
+    // Losing an execute/upload receipt leaves an unknown outcome on the host.
+    // Never infer that the command did not happen, and never run it again.
+    if (current(call)) notice('That screen or photo request could not be confirmed. Check the shared space before asking again.');
+  }
+}
+function applyView(call, command) {
+  if (!current(call) || !command) throw new Error('The call is no longer active.');
+  if (command.action === 'show_shared') { setTab('space'); return; }
+  if (command.action === 'show_transcript') { setTab('transcript'); return; }
+  const panel = $('space-panel').hidden ? $('transcript-panel') : $('space-panel');
+  if (['scroll_up','scroll_down'].includes(command.action)) {
+    panel.scrollBy({top:Math.max(160,panel.clientHeight*.75)*(command.action === 'scroll_up' ? -1 : 1),behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'}); return;
+  }
+  const cards = [...$('cards').querySelectorAll('[data-card-id]')];
+  let target;
+  if (command.action === 'focus_card') target = cards.find(card=>card.dataset.cardId === command.card_id);
+  else if (['next_card','previous_card'].includes(command.action)) {
+    const index = cards.findIndex(card=>card.dataset.cardId === call.focusedCard);
+    const next = index<0 ? (command.action === 'previous_card' ? cards.length-1 : 0) : Math.max(0,Math.min(cards.length-1,index+(command.action === 'previous_card' ? -1 : 1)));
+    target = cards[next];
+  }
+  if (!target) throw new Error('That shared card is not currently on this screen.');
+  setTab('space'); call.focusedCard = target.dataset.cardId;
+  // Scroll only the contained shared pane, never the whole call surface.
+  $('space-panel').scrollTop += target.getBoundingClientRect().top - $('space-panel').getBoundingClientRect().top - 12;
+  target.classList.add('surface-focused'); setTimeout(()=>target.classList.remove('surface-focused'),1800);
+}

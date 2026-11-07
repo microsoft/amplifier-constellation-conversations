@@ -47,7 +47,7 @@ if voice not in ('quiet','connecting','upload_delegate'):
   emit({'type':'event','event':event});emit({'type':'event','event':event})
  if voice in ('anchor','anchors'):emit({'type':'event','event':{'type':'session.input_transcript.delta','event_id':'human-tail','delta':' elsewhere','start_ms':13000,'end_ms':13200}})
  if voice=='overlap_ack':emit({'type':'event','event':{'type':'session.output_transcript.delta','event_id':'assistant-ack','delta':'Let me check.','start_ms':90,'end_ms':110}})
- if voice in ('delegate','missing','overlap_ack','anchor','anchors'):
+ if voice in ('delegate','missing','overlap_ack','anchor','anchors','append_error'):
   event={'type':'session.delegation.created','event_id':'delegation-1','offset_ms':100,'delegation':{'id':'delegate-1','target':'client'}}
   if voice in ('anchor','anchors'):event['offset_ms']=13000
   emit({'type':'event','event':event});emit({'type':'event','event':event})
@@ -58,6 +58,14 @@ for line in sys.stdin:
  if c['op']=='close':emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});break
  if c['op']=='append':
   if not c['content'].strip():emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
+  if voice=='append_error':
+   if second_sent:continue
+   second_sent=True
+   for suffix,client,outer in [('unrelated','never-queued',None),('conflict',c['event_id'],'another-command'),('matched',c['event_id'],None)]:
+    event={'type':'error','event_id':'provider-'+suffix,'error':{'code':'invalid_value','type':'invalid_request_error','param':'delegation_id','client_event_id':client,'message':'The voice service reported an error.'}}
+    if outer:event['client_event_id']=outer
+    emit({'type':'event','event':event})
+   emit({'type':'error','code':'voice_transport_failed','message':'Generic close'});continue
   emit({'type':'event','event':{'type':'session.'+c['channel']+'.appended','event_id':'ack-'+c['event_id'],'client_event_id':c['event_id'],'start_ms':100,'end_ms':110}})
   if voice=='upload_delegate' and 'is available.' in c['content'] and not second_sent:
    second_sent=True
@@ -165,6 +173,59 @@ async fn end(f: &Fixture, id: &str) {
     )
     .await;
     until(f, id, "closed").await;
+}
+#[tokio::test]
+async fn provider_append_rejection_is_correlated_without_replaying_settled_delegation() {
+    let f = fixture("append_error");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let result = until(&f, id, "closed").await;
+    let events = result["events"].as_array().unwrap();
+    let queued = events
+        .iter()
+        .find(|e| e["kind"] == "context_delivery" && e["data"]["state"] == "queued")
+        .unwrap();
+    let receipts = events
+        .iter()
+        .filter(|e| e["kind"] == "context_delivery" && e["data"]["state"] != "queued")
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1);
+    let rejection = &receipts[0]["data"];
+    assert_eq!(rejection["state"], "rejected");
+    assert_eq!(rejection["event_id"], queued["data"]["event_id"]);
+    assert_eq!(rejection["delegation_id"], "delegate-1");
+    assert_eq!(rejection["channel"], queued["data"]["channel"]);
+    assert_eq!(rejection["provider_event_id"], "provider-matched");
+    assert_eq!(rejection["error"]["param"], "delegation_id");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "delegation" && e["data"]["state"] == "completed")
+    );
+    assert!(events.iter().any(|e| e["kind"] == "card"));
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    let append_ids = commands
+        .lines()
+        .map(|v| serde_json::from_str::<Value>(v).unwrap())
+        .filter(|v| v["op"] == "append")
+        .map(|v| v["event_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(!append_ids.is_empty());
+    assert_eq!(
+        append_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        append_ids.len()
+    );
+    let acp = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    assert_eq!(
+        acp.lines()
+            .map(|v| serde_json::from_str::<Value>(v).unwrap())
+            .filter(|v| v["method"] == "session/prompt")
+            .count(),
+        1
+    );
 }
 #[tokio::test]
 async fn duplicate_create_never_opens_second_paid_session_and_hangup_does_not_cancel_work() {
@@ -1370,4 +1431,54 @@ async fn static_companion_name_collision_is_rejected_before_session_setup() {
     assert!(!log.contains("session/new"));
     assert!(!log.contains("session/prompt"));
     end(&f, id).await;
+}
+
+#[tokio::test]
+async fn capture_image_delivery_uses_actual_initialized_acp_capability_not_static_profile() {
+    for image in [false, true] {
+        let f = fixture("delegate");
+        configure_call_permission_fixture(&f, "none", false);
+        let mut agent = f.s.agent("default").unwrap().unwrap();
+        if image {
+            agent.env.insert("FIXTURE_IMAGES".into(), "1".into());
+        }
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+                [serde_json::to_string(&agent).unwrap()],
+            )
+            .unwrap();
+        let path = f.home.path().join("companion.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["profiles"]["default"]["image_input"] = json!(!image);
+        std::fs::write(path, config.to_string()).unwrap();
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        until(&f, id, "card").await;
+        let (actual,at):(bool,i64)=f.s.db.lock().unwrap().query_row("SELECT image_input,observed_at FROM companion_surface_capabilities WHERE call_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(actual, image);
+        assert!(at > 0);
+        let events = std::fs::read_to_string(f.home.path().join("acp.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|v| v["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|v| v["method"] == "session/prompt")
+                .count(),
+            1
+        );
+        end(&f, id).await;
+    }
 }

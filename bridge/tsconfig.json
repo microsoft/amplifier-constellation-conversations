@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["live.mjs", "test/sdk-contract.test.ts"]
+  "include": ["live.mjs", "awareness-decision.mjs", "slack-observe.mjs", "companion-mcp.mjs", "test/sdk-contract.test.ts"]
 }

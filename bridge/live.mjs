@@ -18,6 +18,14 @@ export const BROWSER_EVENTS = Object.freeze(/** @satisfies {Array<ServerEvent['t
 ]));
 const PUBLIC_EVENTS = new Set([...BROWSER_EVENTS, 'session.delegation.created',
   'session.thinking.appended', 'session.commentary.appended']);
+// Parameter names are protocol identifiers, never provider-supplied values.
+const ERROR_PARAMS = new Set(['type','event_id','delegation_id','content','session',
+  'session.model','session.instructions','session.input','session.voice','session.audio',
+  'session.audio.output.voice','session.delegation','session.delegation.type']);
+/** @param {unknown} value */
+const machineName=value=>typeof value==='string' && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : undefined;
+/** @param {unknown} value */
+const commandId=value=>typeof value==='string' && /^[a-zA-Z0-9_.:-]{1,160}$/.test(value) ? value : undefined;
 /** @type {Set<string>} */
 const VOICES = new Set(/** @satisfies {Array<import('openai/resources/live/live').BuiltInVoice>} */ (['alloy','ash','ballad','beacon','bossa','cedar','cinder','coral','delta','echo','gleam','marin','meridian','quartz','ripple','sage','shida','shimmer','stone','tempo','verse','vesper','willow']));
 
@@ -62,13 +70,27 @@ export function safeError(error) {
 }
 
 /** Positive projection deliberately excludes provider configuration and extras.
- * @param {ServerEvent} event @returns {Record<string, unknown> | null}
+ * @param {ServerEvent} event
+ * @param {{has:(id:string)=>boolean}} [knownCommands]
+ * @returns {Record<string, unknown> | null}
  */
-export function publicEvent(event) {
+export function publicEvent(event,knownCommands=new Set()) {
   if (!PUBLIC_EVENTS.has(event?.type)) return null;
   const id='event_id' in event && typeof event.event_id==='string' ? event.event_id : undefined;
   const base={type:event.type,...(id ? {event_id:id}:{}),...('client_event_id' in event && typeof event.client_event_id==='string' ? {client_event_id:event.client_event_id}:{})};
-  if (event.type==='error') return {...base,error:{code:'voice_service_error',message:'The voice service reported an error.'}};
+  if (event.type==='error') {
+    const code=machineName(event.error?.code),type=machineName(event.error?.type);
+    const param=typeof event.error?.param==='string' && ERROR_PARAMS.has(event.error.param) ? event.error.param : undefined;
+    const nestedId=commandId(event.error?.client_event_id),outerId=commandId(event.client_event_id);
+    const conflict=nestedId && outerId && nestedId!==outerId;
+    const client=!conflict && nestedId && knownCommands.has(nestedId) ? nestedId : undefined;
+    const outer=!conflict && outerId && knownCommands.has(outerId) ? outerId : undefined;
+    // Keep the official nested correlation field; never copy raw message,
+    // configuration, headers, or SDK cause. A conflict remains distinguishable.
+    return {type:event.type,...(id?{event_id:id}:{}),...(outer?{client_event_id:outer}:{}),
+      error:{code:code||'voice_service_error',message:'The voice service reported an error.',
+        ...(type?{type}:{}),...(param?{param}:{}),...(client?{client_event_id:client}:{})}};
+  }
   if (event.type==='session.started' || event.type==='session.closed') {
     if (typeof event.session?.id!=='string') return null;
     if (event.type==='session.closed' && (!['close_requested','expired','content','remote_hangup','connection_lost'].includes(event.reason) || typeof event.usage?.seconds!=='number' || !Number.isFinite(event.usage.seconds))) return null;
@@ -152,7 +174,7 @@ export class LiveBridge {
         if (this.finished || !event || typeof event!=='object') return;
         if ((event.type==='session.started' || event.type==='session.closed') && event.session?.id!==this.sessionId) return;
         // Never mirror private reasoning, raw audio, or session configuration.
-        const safe=publicEvent(event);
+        const safe=publicEvent(event,this.seenCommands);
         if (safe) this.emit({type:'event',event:safe});
         if (safe && event.type==='session.closed' && event.session?.id===this.sessionId) this.finish(true);
       });

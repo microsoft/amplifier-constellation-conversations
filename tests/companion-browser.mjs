@@ -3,9 +3,12 @@
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const files = new Map(await Promise.all(['companion.html','companion.js','companion.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
 const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
+const surfaces = new Map(), surfaceCommands = new Map();
+let holdNextSurfaceAck = false, heldSurfaceAck = null;
 let failNextResult = false;
 const fullResultText = "Complete saved answer. " + "Source fact. ".repeat(6000) + " FINAL QUALIFIER: broader testing remains incomplete. <script>window.fullResultInjected=true</script> [Source](https://example.com/source)";
 let rejectNextUpload = false, holdNextUpload = false, heldUpload = null;
@@ -58,6 +61,22 @@ const server = createServer(async (request,response) => {
     if (failNextResult) { failNextResult=false; send(503,{error:'Fixture result temporarily unavailable.'}); return; }
     send(200,{message_id:resultPath[2],text:fullResultText}); return;
   }
+  const surfacePath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)\/surface\/(presence|commands)(?:\/([^/]+)\/ack)?$/);
+  if (surfacePath) {
+    const call=calls.get(surfacePath[1]);if(!call || call.owner!==authOwner){send(404,{error:'missing call'});return;}
+    if(surfacePath[2]==='presence') {surfaces.set(call.id,body);send(200,{...body,expires_at:Date.now()+30000});return;}
+    if(request.method==='GET') {send(200,{commands:[...surfaceCommands.values()].filter(v=>v.callId===call.id&&v.browser_id===url.searchParams.get('browser_id')&&v.state==='queued')});return;}
+    const command=surfaceCommands.get(surfacePath[3]);if(!command||command.callId!==call.id||command.browser_id!==body.browser_id){send(403,{error:'wrong command browser'});return;}
+    if(body.state==='accepted') {
+      const execute=command.state==='queued'&&command.expires_at>Date.now()&&!['closing','closed','interrupted'].includes(call.state);
+      if(execute)command.state='accepted';const result={...command,execute};
+      if(holdNextSurfaceAck){holdNextSurfaceAck=false;heldSurfaceAck=()=>send(200,result);return;}
+      send(200,result);return;
+    }
+    if(body.state==='failed'&&command.state==='queued'){send(400,{error:'not accepted'});return;}
+    if(body.state==='uploaded'&&(!uploads.has(command.operation_id+':available')||!body.attachment_ids?.every(id=>attachments.has(id)))){send(400,{error:'image not saved'});return;}
+    command.state=body.state;command.artifact_ids=body.attachment_ids||[];send(200,{...command,execute:false});return;
+  }
   const callPath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)(?:\/(heartbeat|close))?$/);
   if (callPath) {
     const call = calls.get(callPath[1]); if (!call) { send(404,{error:'missing call'}); return; }
@@ -92,11 +111,11 @@ const browser = await chromium.launch({headless:true,executablePath:process.env.
 const context = await browser.newContext({viewport:{width:1280,height:900}});
 const page = await context.newPage(), errors=[]; page.on('pageerror', error => errors.push(error.message));
 await page.addInitScript(() => {
-  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false};
+  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,draws:0};
   const actualNow=Date.now;fixture.clockOffset=0;Date.now=()=>actualNow()+fixture.clockOffset;
   const makeStream = kind => {
-    const track = new EventTarget(); track.kind=kind; track.enabled=true; track.stopped=false; track.stop=()=>{track.stopped=true;}; fixture.tracks.push(track);
-    const stream = new MediaStream(); Object.defineProperties(stream,{getTracks:{value:()=>[track]},getAudioTracks:{value:()=>kind==='audio'?[track]:[]}}); return stream;
+    const track = new EventTarget(); track.kind=kind; track.enabled=true; track.stopped=false; track.readyState='live';track.stop=()=>{track.stopped=true;track.readyState='ended';}; fixture.tracks.push(track);
+    const stream = new MediaStream(); Object.defineProperties(stream,{getTracks:{value:()=>[track]},getAudioTracks:{value:()=>kind==='audio'?[track]:[]},getVideoTracks:{value:()=>kind==='video'?[track]:[]}}); return stream;
   };
   Object.defineProperty(navigator,'mediaDevices',{configurable:true,value:{getUserMedia:async constraints=>{
     fixture.media.push(constraints);
@@ -118,8 +137,8 @@ await page.addInitScript(() => {
   }
   window.RTCPeerConnection=FakePeer;
   window.AudioContext=class {
-    constructor(){this.closed=false;fixture.audioContexts.push(this);}
-    async resume(){} async close(){this.closed=true;}
+    constructor(){this.closed=false;this.state='running';fixture.audioContexts.push(this);}
+    async resume(){} async close(){this.closed=true;this.state='closed';}
     createMediaStreamSource(){return {connect(){},disconnect(){}};}
     createAnalyser(){return {fftSize:256,getByteTimeDomainData(values){values.fill(128+fixture.level);}};}
   };
@@ -129,13 +148,18 @@ await page.addInitScript(() => {
   HTMLMediaElement.prototype.pause=function(){playing.delete(this);this.dispatchEvent(new Event('pause'));};
   Object.defineProperty(HTMLVideoElement.prototype,'videoWidth',{get(){return 640;}});
   Object.defineProperty(HTMLVideoElement.prototype,'videoHeight',{get(){return 480;}});
-  CanvasRenderingContext2D.prototype.drawImage=function(){};
+  CanvasRenderingContext2D.prototype.drawImage=function(){fixture.draws++;};
 });
 const wait = async (condition,message) => {
   for (let i=0;i<150;i++) { if (await condition()) return; await page.waitForTimeout(50); }
   throw new Error(message);
 };
 const emit = (kind,data) => events.push({seq:(events.at(-1)?.seq || 0)+1,kind,data});
+const surfaceCommand = (kind,command,options={}) => {
+  const callId=options.callId||'call-1';
+  const receipt={callId,operation_id:randomUUID(),delegation_id:'fixture-current-delegation',browser_id:surfaces.get(callId)?.browser_id,kind,command,state:'queued',created_at:Date.now(),expires_at:Date.now()+30000,artifact_ids:[],inspection:false,...options};
+  surfaceCommands.set(receipt.operation_id,receipt);emit('surface_command',{...receipt});return receipt;
+};
 try {
   await page.goto(url + '/companion'); await page.locator('#login:not([hidden])').waitFor();
   assert.equal(await page.evaluate(()=>fixture.media.length),0);
@@ -294,6 +318,55 @@ try {
   assert.equal(await page.locator('.upload-card[data-state="unconfirmed"] button:not([hidden])').count(),0);
   checks.push('paste/drop share UTF-8 text, images, and PDFs; unsupported and rejected files are distinct; unknown upload outcomes are never replayed');
 
+  await wait(async()=>surfaces.get('call-1')?.camera_enabled===false,'browser surface presence missing');
+  let beforeDraws=await page.evaluate(()=>fixture.draws),beforeStorage=attachments.size;
+  const beforeSensorRequests=await page.evaluate(()=>fixture.media.length);
+  const disabledCapture=surfaceCommand('capture',{photos:1,max_bytes:524288});
+  await wait(async()=>requests.some(r=>r.path.endsWith(`/${disabledCapture.operation_id}/ack`)),'disabled capture was not handled');
+  assert.equal(await page.evaluate(()=>fixture.media.length),beforeSensorRequests);assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws);
+  assert.ok(!requests.some(r=>r.path.endsWith(`/${disabledCapture.operation_id}/ack`)&&r.body.state==='accepted'));
+  await page.locator('#camera-toggle').click();await page.locator('#camera-panel:not([hidden])').waitFor();
+  await wait(async()=>surfaces.get('call-1')?.camera_enabled===true,'camera-ready presence missing');
+  assert.equal(surfaces.get('call-1').capture_consent,false);
+  const noConsent=surfaceCommand('capture',{photos:1,max_bytes:524288});
+  await wait(async()=>requests.some(r=>r.path.endsWith(`/${noConsent.operation_id}/ack`)),'unconsented capture was not handled');
+  assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws);assert.equal(attachments.size,beforeStorage);
+  await page.locator('#voice-photos').check();await wait(async()=>surfaces.get('call-1')?.capture_consent===true,'explicit voice photo consent missing');
+  checks.push('a voice capture cannot enable a camera or take a frame before the browser’s explicit consent');
+
+  const photoCommand=surfaceCommand('capture',{photos:1,max_bytes:524288});
+  await wait(async()=>photoCommand.state==='uploaded','voice photo was not saved and acknowledged');
+  assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);assert.equal(attachments.size,beforeStorage+1);
+  assert.deepEqual(requests.filter(r=>r.path.endsWith(`/${photoCommand.operation_id}/ack`)).map(r=>r.body.state),['accepted','executed','uploaded']);
+  const photoEvents=[...uploads.values()].filter(v=>v.upload_id===photoCommand.operation_id);
+  assert.deepEqual(photoEvents.map(v=>v.state),['captured','uploading','available']);assert(photoEvents.every(v=>v.source==='camera'));
+  assert.deepEqual(photoCommand.artifact_ids,photoEvents.at(-1).attachment_ids);
+  const saved=attachments.get(photoCommand.artifact_ids[0]);assert.equal(saved.mime_type,'image/jpeg');assert(Buffer.from(saved.data,'base64').length<=524288);
+  emit('surface_command',{...photoCommand,state:'queued'});await page.waitForTimeout(1100);
+  assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);assert.equal(attachments.size,beforeStorage+1);
+  assert.equal(requests.filter(r=>r.path.endsWith(`/${photoCommand.operation_id}/ack`)&&r.body.state==='accepted').length,1);assert.equal(messages.size,0);
+  checks.push('one consented voice photo uses the operation UUID for saved upload evidence and duplicate commands never recapture or force a new summary');
+
+  beforeDraws=await page.evaluate(()=>fixture.draws);beforeStorage=attachments.size;
+  const lostAccept=surfaceCommand('capture',{photos:1,max_bytes:524288});
+  await page.route(`**/surface/commands/${lostAccept.operation_id}/ack`,async route=>{if(route.request().postDataJSON().state==='accepted'){await route.fetch();await route.abort('failed');}else await route.continue();});
+  await wait(async()=>lostAccept.state==='accepted','lost acceptance fixture did not reach backend');await page.waitForTimeout(100);
+  emit('surface_command',{...lostAccept,state:'queued'});await page.waitForTimeout(1100);
+  assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws);assert.equal(attachments.size,beforeStorage);
+  assert.equal(requests.filter(r=>r.path.endsWith(`/${lostAccept.operation_id}/ack`)&&r.body.state==='accepted').length,1);
+  const lostExecuted=surfaceCommand('capture',{photos:1,max_bytes:524288});
+  await page.route(`**/surface/commands/${lostExecuted.operation_id}/ack`,async route=>{if(route.request().postDataJSON().state==='executed'){await route.fetch();await route.abort('failed');}else await route.continue();});
+  await wait(async()=>lostExecuted.state==='executed','lost execution receipt fixture did not capture');await page.waitForTimeout(100);
+  emit('surface_command',{...lostExecuted,state:'queued'});await page.waitForTimeout(1100);
+  assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);assert.equal(attachments.size,beforeStorage);
+  const expired=surfaceCommand('capture',{photos:1,max_bytes:524288},{expires_at:Date.now()-1});await page.waitForTimeout(1100);
+  assert.ok(!requests.some(r=>r.path.endsWith(`/${expired.operation_id}/ack`)));assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);
+  holdNextSurfaceAck=true;const staleAccepted=surfaceCommand('capture',{photos:1,max_bytes:524288},{expires_at:Date.now()+1800});
+  await wait(async()=>heldSurfaceAck!==null,'delayed accept fixture did not reach backend');await page.waitForTimeout(1850);heldSurfaceAck();heldSurfaceAck=null;await page.waitForTimeout(150);
+  assert.equal(await page.evaluate(()=>fixture.draws),beforeDraws+1);assert.equal(attachments.size,beforeStorage);
+  checks.push('lost accepted/executed receipts and expired queued/accepted commands never replay a frame or an upload');
+  await page.locator('#camera-toggle').click();assert.equal(await page.locator('#voice-photos').isChecked(),false);
+
   const desktopControls = await page.locator('#hangup').boundingBox();
   const cardsBeforeAccumulation=await page.locator('.output-card').count();
   for(let i=0;i<30;i++) emit('card',{text:'Result '+i+'\n'+ 'Long result content. '.repeat(50),conversation_id:'room-coach'});
@@ -305,6 +378,16 @@ try {
   assert(await page.locator('#space-panel').evaluate(node=>node.scrollTop>0));
   assert(await page.evaluate(()=>document.documentElement.scrollHeight<=innerHeight));
   checks.push('long result lists scroll inside a bounded desktop shared pane with fixed call controls');
+  const focusId=await page.locator('.output-card[data-card-id]').first().getAttribute('data-card-id');
+  const beforeViewSensors=await page.evaluate(()=>fixture.media.length),beforeViewFrames=await page.evaluate(()=>fixture.draws);
+  const focus=surfaceCommand('view',{action:'focus_card',card_id:focusId});await wait(async()=>focus.state==='executed','focus-card command did not execute');
+  assert.equal(await page.locator(`.output-card[data-card-id="${focusId}"].surface-focused`).count(),1);
+  const transcript=surfaceCommand('view',{action:'show_transcript',card_id:null});await wait(async()=>transcript.state==='executed','transcript command missing');assert.equal(await page.locator('#transcript-tab').getAttribute('aria-selected'),'true');
+  const shared=surfaceCommand('view',{action:'show_shared',card_id:null});await wait(async()=>shared.state==='executed','shared pane command missing');
+  const scroll=surfaceCommand('view',{action:'scroll_down',card_id:null});await wait(async()=>scroll.state==='executed','bounded scroll command missing');
+  assert.equal(await page.evaluate(()=>scrollY),0);const afterView=await page.locator('#hangup').boundingBox();assert(Math.abs(desktopAfter.y-afterView.y)<1);
+  assert.equal(await page.evaluate(()=>fixture.media.length),beforeViewSensors);assert.equal(await page.evaluate(()=>fixture.draws),beforeViewFrames);
+  checks.push('agent view controls focus owned cards and switch or scroll only the contained pane without moving hangup or opening media');
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-desktop-shared.png'),fullPage:true});
 
   pollFails=true;
@@ -328,7 +411,11 @@ try {
   checks.push('network recovery observes the same call; mobile controls and panels fit the viewport');
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT,fullPage:true});
 
+  holdNextSurfaceAck=true;const lateView=surfaceCommand('view',{action:'show_shared',card_id:null});
+  await wait(async()=>heldSurfaceAck!==null,'late surface acceptance fixture not ready');
   await page.locator('#hangup').click();await page.locator('#call-ended:not([hidden])').waitFor();
+  heldSurfaceAck();heldSurfaceAck=null;await page.waitForTimeout(100);
+  assert.ok(!requests.some(r=>r.path.endsWith(`/${lateView.operation_id}/ack`)&&r.body.state==='executed'));
   assert.match(await page.locator('#ended-detail').innerText(),/Closing/);
   await wait(async()=>calls.get('call-1').state==='closed','close not reported');
   assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)&&fixture.channels.every(channel=>channel.closed)&&fixture.wakeLocks.every(lock=>lock.released)&&fixture.audioContexts.every(context=>context.closed)));
