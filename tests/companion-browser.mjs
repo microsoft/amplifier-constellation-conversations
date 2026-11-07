@@ -202,10 +202,11 @@ try {
   assert.equal(await page.locator('#call-screen').isVisible(),true); await workPage.close();
   checks.push('answer links stay safe and clickable; media is opt-in without HTML; conversation links reuse one work tab without ending audio');
 
-  emit('card',{title:'Complete answer',text:'A shortened saved answer.',truncated:true,message_id:'full-result-1',result_url:'/api/v1/companion/calls/call-1/results/full-result-1',conversation_id:'room-coach',late:true,request_text:'Earlier research question'});
+  emit('card',{title:'Complete answer',text:'A shortened saved answer.',truncated:true,message_id:'full-result-1',result_url:'/api/v1/companion/calls/call-1/results/full-result-1',conversation_id:'room-coach',late:true,request_text:'The live voice conversation delegated help at 00:42.\nDelegation ID: private-delegation-1\nCaller request: Earlier research question'});
   await page.getByRole('button',{name:'Show full result',exact:true}).waitFor();
   const fullCard=page.locator('.output-card').nth(1);
-  assert.match(await fullCard.locator('.card-context').innerText(),/Earlier research question/);
+  assert.equal(await fullCard.locator('.card-context').innerText(),'Answer to your earlier request');
+  assert.doesNotMatch(await page.locator('body').innerText(),/The live voice conversation delegated help at|private-delegation-1|Earlier research question/);
   failNextResult=true;await fullCard.getByRole('button',{name:'Show full result'}).click();
   await wait(async()=>/temporarily unavailable/.test(await fullCard.locator('.result-status').innerText()),'full result failure missing');
   assert.match(await fullCard.locator('.card-answer').innerText(),/shortened/);

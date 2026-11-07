@@ -388,7 +388,7 @@ function addCard(call, title, text, conversationId, data = {}) {
   const card = element('article', 'output-card');
   const heading = element('h2', null, title); heading.append(element('small', null, new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})));
   card.append(heading);
-  if (data.late) card.append(element('p', 'card-context', `Earlier request${typeof data.request_text === 'string' ? ': ' + data.request_text.slice(0,240) : ''}`));
+  if (data.late) card.append(element('p', 'card-context', 'Answer to your earlier request'));
   const answer = element('div', 'card-answer'), explicitMedia = safeLink(data.url, conversationId);
   appendRichText(answer, text, conversationId, !explicitMedia); card.append(answer);
   if (explicitMedia) appendMedia(card, {url:explicitMedia,name:typeof data.title === 'string' ? data.title : 'Shared media',kind:data.kind}, conversationId);
