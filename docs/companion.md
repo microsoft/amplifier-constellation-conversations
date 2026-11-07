@@ -342,7 +342,7 @@ A capture receipt progresses through queued, accepted, executed (one frame), and
 uploaded (saved bytes). The browser executes only after its first confirmed
 atomic acceptance; uncertain acknowledgments never recapture or resend a photo.
 The status tool can return the actual owned JPEG/PNG as MCP image content for a
-vision-capable reasoning engine. Uploaded does not mean inspected. Camera images
+reasoning engine only when this call's actual ACP initialization advertises image input. Unsupported or unconfirmed support retains the saved artifact and omits image bytes. Uploaded does not mean inspected. Camera images
 from this path are capped at 512 KiB. A local-only engine remains local-only; the
 connector does not add a cloud vision fallback.
 
