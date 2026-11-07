@@ -5,7 +5,10 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const files = new Map(await Promise.all(['companion.html','companion.js','companion.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
-const requests = [], calls = new Map(), messages = new Map(), events = [], checks = [];
+const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
+let failNextResult = false;
+const fullResultText = "Complete saved answer. " + "Source fact. ".repeat(6000) + " FINAL QUALIFIER: broader testing remains incomplete. <script>window.fullResultInjected=true</script> [Source](https://example.com/source)";
+let rejectNextUpload = false, holdNextUpload = false, heldUpload = null;
 let loggedIn = false, pollFails = false, controlFails = false, catalogAvailable = true, nextCall = 1;
 let authOwner = 'fixture-user', holdNextClose = false, heldClose = null;
 const csrf = 'fixture-csrf';
@@ -16,6 +19,8 @@ const server = createServer(async (request,response) => {
     const name = url.pathname === '/companion' ? 'companion.html' : url.pathname.slice(1);
     response.writeHead(200,{'Content-Type':name.endsWith('.html')?'text/html':name.endsWith('.css')?'text/css':'text/javascript'}); response.end(files.get(name)); return;
   }
+  if (url.pathname === '/') { response.writeHead(200,{'Content-Type':'text/html'}); response.end('<!doctype html><title>Fixture work</title><p>Conversation work surface</p>'); return; }
+  if (/\/attachments\/[^/]+$/.test(url.pathname) && request.method === 'GET') { response.writeHead(200,{'Content-Type':'image/png'}); response.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==','base64')); return; }
   if (url.pathname === '/icon.svg') { response.writeHead(204); response.end(); return; }
   let input=''; for await (const chunk of request) input += chunk;
   let body; try { body = input ? JSON.parse(input) : null; } catch { send(400,{error:'bad JSON'}); return; }
@@ -26,13 +31,32 @@ const server = createServer(async (request,response) => {
   if (url.pathname === '/auth/logout') { loggedIn=false; send(200,{}); return; }
   if (url.pathname === '/api/v1/companion') {
     const active=[...calls.values()].find(call=>call.owner===authOwner&&['starting','connecting','connected','closing'].includes(call.state));
-    send(200,{available:catalogAvailable,active_call:active?{id:active.id,conversation_id:active.conversation_id,state:active.state}:null,contacts:[{id:'coach',label:'Coach',voice:'marin',description:'A thoughtful native teammate.'},{id:'rook',label:'Rook',voice:'cedar',description:'<img src=x onerror="window.injection=true"> Codex teammate.'},{id:'jarvis',label:'Jarvis',voice:'ash',description:'Local reasoning, cloud voice.',image_input:false}]}); return;
+    send(200,{available:catalogAvailable,active_call:active?{id:active.id,conversation_id:active.conversation_id,state:active.state}:null,contacts:[{id:'coach',label:'Coach',voice:voices.get('coach') || 'marin',description:'A thoughtful native teammate.'},{id:'rook',label:'Rook',voice:'cedar',description:'<img src=x onerror="window.injection=true"> Codex teammate.'},{id:'jarvis',label:'Jarvis',voice:'ash',description:'Local reasoning, cloud voice.',image_input:false}]}); return;
+  }
+  const agentPath = url.pathname.match(/^\/api\/v1\/companion\/agents\/([^/]+)\/(voice-settings|capabilities)$/);
+  if (agentPath) {
+    if (agentPath[2] === 'capabilities') { send(200,{image_input:agentPath[1] !== 'jarvis',capabilities_available:true}); return; }
+    if (request.method === 'PUT') voices.set(agentPath[1],body.voice);
+    send(200,{voice:voices.get(agentPath[1]) || 'marin',available_voices:['marin','cedar','ash'],applies_to:'next_call'}); return;
+  }
+  const uploadPath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)\/uploads$/);
+  if (uploadPath) {
+    const key = body.upload_id + ':' + body.state;
+    if (!uploads.has(key)) {
+      uploads.set(key,body); events.push({seq:(events.at(-1)?.seq || 0)+1,kind:'upload',data:{...body,conversation_id:calls.get(uploadPath[1]).conversation_id}});
+    }
+    send(200,{ok:true,upload_id:body.upload_id,state:body.state,voice_awareness:'queued'}); return;
   }
   if (url.pathname === '/api/v1/companion/calls' && request.method === 'POST') {
     let call = [...calls.values()].find(value => value.request.request_id === body.request_id);
     if (call && JSON.stringify(call.request) !== JSON.stringify(body)) { send(409,{error:'changed request'}); return; }
     if (!call) { call = {id:'call-' + nextCall++,owner:authOwner,request:body,conversation_id:'room-' + body.agent_id,session_id:'fixture-live',sdp:'fixture-answer',state:'connecting'}; calls.set(call.id,call); }
     send(200,call); return;
+  }
+  const resultPath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)\/results\/([^/]+)$/);
+  if (resultPath) {
+    if (failNextResult) { failNextResult=false; send(503,{error:'Fixture result temporarily unavailable.'}); return; }
+    send(200,{message_id:resultPath[2],text:fullResultText}); return;
   }
   const callPath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)(?:\/(heartbeat|close))?$/);
   if (callPath) {
@@ -49,7 +73,12 @@ const server = createServer(async (request,response) => {
     const after = Number(url.searchParams.get('after') || 0);
     send(200,{...call,state:['closing','closed','interrupted'].includes(call.state)?call.state:'connected',events:events.filter(event => event.seq > after),next_cursor:events.at(-1)?.seq || 0}); return;
   }
-  if (/\/attachments$/.test(url.pathname)) { send(200,{id:'fixture-photo'}); return; }
+  if (/\/attachments$/.test(url.pathname)) {
+    if (rejectNextUpload) { rejectNextUpload=false; send(400,{error:'Fixture upload rejected.'}); return; }
+    const id='fixture-attachment-' + (attachments.size+1); attachments.set(id,body);
+    if (holdNextUpload) { holdNextUpload=false; heldUpload=()=>send(200,{id}); return; }
+    send(200,{id}); return;
+  }
   if (/\/messages$/.test(url.pathname)) {
     const prior=messages.get(body.request_id);
     if(prior&&JSON.stringify(prior)!==JSON.stringify(body)){send(409,{error:'changed message'});return;}
@@ -117,6 +146,13 @@ try {
   assert.equal(await page.evaluate(()=>fixture.media.length),0); checks.push('login and contact rendering never acquire media; untrusted text stays text');
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-contacts.png'),fullPage:true});
 
+  await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
+  await page.locator('#voice-choice:not([disabled])').waitFor(); await page.locator('#voice-choice').selectOption('ash'); await page.locator('#save-voice').click();
+  await wait(async()=>/next call/.test(await page.locator('#voice-settings-status').innerText()),'voice save missing');
+  assert.equal(voices.get('coach'),'ash'); assert.equal(requests.find(request=>request.method==='PUT').csrf,csrf);
+  assert.equal(await page.evaluate(()=>fixture.media.length),0); await page.locator('#close-voice-settings').click();
+  checks.push('discoverable per-agent voice choice persists through authenticated API and applies to the next call');
+
   await page.getByRole('button',{name:'Call Coach',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','call did not connect');
   assert.deepEqual(await page.evaluate(()=>fixture.peers[0].order),['track','channel','offer']);
@@ -136,41 +172,155 @@ try {
   assert.doesNotMatch(await page.locator('#transcript').innerText(),/DUPLICATE/);
   await page.evaluate(()=>{fixture.level=20;}); await page.locator('.presence.speaking').waitFor();
   await page.evaluate(()=>{fixture.level=0;}); await wait(async()=>await page.locator('.presence.speaking').count()===0,'speaker meter did not settle');
-  emit('card',{delegation_id:'d1',text:'<script>window.injected=true</script> A useful result.',conversation_id:'room-coach'});
+  const captionBeforeProgress=await page.locator('#caption-text').innerText();
+  emit('progress',{delegation_id:'d1',request_id:'request-1',state:'submitted',elapsed_seconds:65});
+  await wait(async()=>/65 seconds/.test(await page.locator('#work-status').innerText()),'quiet pending receipt missing');
+  assert.equal(await page.locator('#caption-text').innerText(),captionBeforeProgress);assert.equal(await page.locator('.transcript-entry').count(),1);
+  emit('progress',{delegation_id:'d1',request_id:'request-1',state:'awaiting_permission',elapsed_seconds:75});
+  await wait(async()=>/waiting for your decision/.test(await page.locator('#work-status').innerText()),'permission receipt missing');
+  checks.push('durable progress updates remain quiet status, preserve captions, and distinguish a pending result from a decision');
+  emit('card',{delegation_id:'d1',text:'<script>window.injected=true</script> A useful result. [Project](https://example.com/project) [Bad](javascript:alert(1)) https://media.example/clip.mp4',media:[{url:'data:text/html,<script>alert(1)</script>',mime_type:'video/mp4'},{url:'/auth/logout',mime_type:'image/png'}],conversation_id:'room-coach'});
   emit('delegation',{id:'d1',state:'completed'});
   await wait(async()=>await page.locator('.output-card').count()===1,'result card missing');
   assert.equal(await page.locator('.output-card script').count(),0); assert.equal(await page.evaluate(()=>window.injected),undefined);
   assert.match(await page.locator('.output-card p').innerText(),/<script>/);
-  await page.waitForTimeout(1100); assert.equal(await page.locator('.output-card').count(),1);
+  await page.waitForTimeout(1100); assert.equal(await page.locator('.output-card').count(),1);assert.equal(await page.locator('#work-status').isHidden(),true);
   checks.push('durable transcript/result events deduplicate; only actual audio energy animates speaking');
+
+  assert.equal(await page.locator('.output-card a[href="https://example.com/project"]').count(),1);
+  assert.equal(await page.locator('.output-card a[href^="javascript:"]').count(),0);
+  assert.equal(await page.locator('.output-card iframe,.output-card img[src="/auth/logout"]').count(),0);
+  assert.equal(await page.locator('.output-card video').count(),0);
+  assert.equal(await page.getByRole('button',{name:'Load video preview',exact:true}).count(),1);
+  let remoteMediaLoads=0; await page.route('https://media.example/**',async route=>{remoteMediaLoads++;await route.fulfill({status:200,contentType:'video/mp4',body:''});});
+  await page.getByRole('button',{name:'Load video preview',exact:true}).click();
+  assert.equal(await page.locator('.output-card video').getAttribute('src'),'https://media.example/clip.mp4');
+  assert.equal(await page.locator('.output-card video').getAttribute('autoplay'),null);
+  const popup = context.waitForEvent('page'); await page.locator('#continue-work').click(); const workPage = await popup; await workPage.waitForLoadState();
+  await page.locator('.conversation-link').first().click(); await page.waitForTimeout(100);
+  assert.equal(context.pages().length,2); assert.match(workPage.url(),/conversation=room-coach/);
+  assert.equal(await page.locator('#call-screen').isVisible(),true); await workPage.close();
+  checks.push('answer links stay safe and clickable; media is opt-in without HTML; conversation links reuse one work tab without ending audio');
+
+  emit('card',{title:'Complete answer',text:'A shortened saved answer.',truncated:true,message_id:'full-result-1',result_url:'/api/v1/companion/calls/call-1/results/full-result-1',conversation_id:'room-coach',late:true,request_text:'Earlier research question'});
+  await page.getByRole('button',{name:'Show full result',exact:true}).waitFor();
+  const fullCard=page.locator('.output-card').nth(1);
+  assert.match(await fullCard.locator('.card-context').innerText(),/Earlier research question/);
+  failNextResult=true;await fullCard.getByRole('button',{name:'Show full result'}).click();
+  await wait(async()=>/temporarily unavailable/.test(await fullCard.locator('.result-status').innerText()),'full result failure missing');
+  assert.match(await fullCard.locator('.card-answer').innerText(),/shortened/);
+  await fullCard.getByRole('button',{name:'Show full result'}).click();
+  await wait(async()=>/Full saved result shown/.test(await fullCard.locator('.result-status').innerText()),'full saved result did not load');
+  assert.match(await fullCard.locator('.card-answer').innerText(),/FINAL QUALIFIER: broader testing remains incomplete/);
+  assert.equal(await fullCard.locator('script').count(),0);assert.equal(await page.evaluate(()=>window.fullResultInjected),undefined);
+  assert.equal(await fullCard.locator('a[href="https://example.com/source"]').count(),1);
+  assert.equal(requests.filter(request=>request.path.endsWith('/results/full-result-1')).length,2);
+  emit('card',{title:'Invalid result URL',text:'Short result.',truncated:true,message_id:'full-result-2',result_url:'https://media.example/full-result',conversation_id:'room-coach'});
+  emit('card',{title:'Video demonstration',text:'https://media.example/watch?id=demo',url:'https://media.example/watch?id=demo',kind:'video',conversation_id:'room-coach'});
+  emit('card',{title:'Reference only',text:'https://media.example/clip.mp4',url:'https://media.example/clip.mp4',kind:'link',conversation_id:'room-coach'});
+  await wait(async()=>await page.locator('.output-card').count()===5,'explicit media cards missing');
+  assert.equal(await page.locator('.output-card').nth(2).locator('.full-result-button').count(),0);
+  const explicitVideo=page.locator('.output-card').nth(3);
+  assert.match(await explicitVideo.locator('h2').innerText(),/Video demonstration/);
+  assert.equal(await explicitVideo.locator('video').count(),0);
+  await explicitVideo.getByRole('button',{name:'Load video preview',exact:true}).click();
+  assert.equal(await explicitVideo.locator('video').getAttribute('src'),'https://media.example/watch?id=demo');
+  assert.equal(await explicitVideo.locator('video').getAttribute('autoplay'),null);
+  assert.equal(await page.locator('.output-card').nth(4).locator('.media-preview-button,video,iframe').count(),0);
+  checks.push('full saved results load only from this call’s authenticated route and remain safe text; explicit extensionless video previews need a click and link-only cards stay links');
+
 
   await page.locator('#mute').click();assert.equal(await page.evaluate(()=>fixture.tracks[0].enabled),false);assert.equal(await page.locator('#mute').getAttribute('aria-pressed'),'true');
   await page.locator('#mute').click();assert.equal(await page.evaluate(()=>fixture.tracks[0].enabled),true);
   await page.locator('#camera-toggle').click();await page.locator('#camera-panel:not([hidden])').waitFor();
   assert.equal(requests.filter(request=>/\/attachments$/.test(request.path)).length,0);
-  await page.locator('#capture-photo').click();await page.locator('#photo-form:not([hidden])').waitFor();
-  assert.match(await page.locator('#photo-status').innerText(),/Not sent/);
-  assert.equal(requests.filter(request=>/\/attachments$/.test(request.path)).length,0);
-  let lostPhoto=false;
-  await page.route('**/api/v1/conversations/*/messages',async route=>{
-    if(!lostPhoto){lostPhoto=true;await route.fetch();await route.abort('failed');}else await route.continue();
+  let lostNotification=false;
+  await page.route('**/api/v1/companion/calls/*/uploads',async route=>{
+    if (!lostNotification && route.request().postDataJSON().state === 'available') { lostNotification=true; await route.fetch(); await route.abort('failed'); }
+    else await route.continue();
   });
-  await page.locator('#photo-question').fill('What is on my workbench?');await page.locator('#send-photo').click();
-  await wait(async()=>await page.locator('#send-photo').innerText()==='Check the same send','lost photo receipt not surfaced');
-  await page.locator('#photo-question').fill('Changed question');await page.locator('#send-photo').click();
-  assert.match(await page.locator('#notice').innerText(),/original question/);
-  await page.locator('#photo-question').fill('What is on my workbench?');await page.locator('#send-photo').click();
-  await wait(async()=>await page.locator('#send-photo').innerText()==='Photo sent','photo was not sent');
-  const photoRequest=requests.find(request=>/\/messages$/.test(request.path));
-  assert.deepEqual(photoRequest.body.target_agent_ids,['coach']);assert.deepEqual(photoRequest.body.attachment_ids,['fixture-photo']);assert.equal(photoRequest.csrf,csrf);
-  assert.equal(messages.size,1);assert.equal(requests.filter(request=>/\/attachments$/.test(request.path)).length,1);
-  checks.push('camera stays local until explicit send; lost photo acknowledgment reuses the same message identity');
+  holdNextUpload=true;await page.locator('#capture-photo').click();
+  await wait(async()=>heldUpload!==null,'capture did not start upload');
+  assert.equal(await page.locator('.upload-card').first().getAttribute('data-state'),'uploading');
+  heldUpload();heldUpload=null;
+  const photo = page.locator('.upload-card').first();
+  await wait(async()=>/notification is unconfirmed/.test(await photo.innerText()),'lost availability receipt not surfaced');
+  assert.equal(await page.locator('#photo-question').count(),0);
+  assert.equal(await photo.getAttribute('data-state'),'available');
+  await photo.getByRole('button',{name:'Check voice notification'}).click();
+  await wait(async()=>/notification queued/.test(await photo.innerText()),'same availability was not acknowledged');
+  assert.equal(attachments.size,1); assert.equal(messages.size,0);
+  assert.deepEqual([...uploads.values()].map(upload=>upload.state),['captured','uploading','available']);
+  const sharedPhoto = [...uploads.values()].find(upload=>upload.state==='available');
+  assert.equal(sharedPhoto.source,'camera'); assert.deepEqual(sharedPhoto.attachment_ids,['fixture-attachment-1']);
+  const notices=requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available');
+  assert.deepEqual(notices[0].body,notices[1].body); assert(notices.every(request=>request.csrf===csrf));
+  assert.equal([...uploads.values()].filter(upload=>upload.state==='available').length,1);
+  checks.push('Capture immediately uploads without a question; same-ID voice notice recovers a lost acknowledgment without duplicate storage or forced summary');
+  await page.locator('#camera-toggle').click();
+
+  await page.evaluate(()=>{
+    const clipboardData=new DataTransfer(); clipboardData.setData('text/plain','Notes pasted while talking.');
+    document.getElementById('space-panel').dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData}));
+  });
+  await wait(async()=>attachments.size===2,'pasted text was not shared');
+  await page.evaluate(()=>{
+    const dataTransfer=new DataTransfer(); dataTransfer.items.add(new File(['%PDF-1.7\nfixture'],'notes.pdf',{type:'application/pdf'}));
+    document.getElementById('space-panel').dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer}));
+  });
+  await wait(async()=>attachments.size===3,'dropped PDF was not shared');
+  await page.evaluate(()=>{
+    const clipboardData=new DataTransfer(); clipboardData.items.add(new File([Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg=='),c=>c.charCodeAt(0))],'pasted.png',{type:'image/png'}));
+    document.getElementById('space-panel').dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData}));
+  });
+  await wait(async()=>attachments.size===4,'pasted image was not shared');
+  assert.equal(attachments.get('fixture-attachment-2').mime_type,'text/plain');
+  assert.equal(Buffer.from(attachments.get('fixture-attachment-2').data,'base64').toString(),'Notes pasted while talking.');
+  assert.equal(attachments.get('fixture-attachment-3').mime_type,'application/pdf');
+  assert.equal(attachments.get('fixture-attachment-4').mime_type,'image/png');
+  await page.locator('#share-files').setInputFiles({name:'not-allowed.html',mimeType:'text/html',buffer:Buffer.from('<script>bad()</script>')});
+  await wait(async()=>await page.locator('.upload-card[data-state="failed"]').count()===1,'unsupported file state missing');
+  assert.equal(attachments.size,4);
+  rejectNextUpload=true;
+  await page.locator('#share-files').setInputFiles({name:'rejected.txt',mimeType:'text/plain',buffer:Buffer.from('Reject this fixture.')});
+  await wait(async()=>await page.locator('.upload-card[data-state="failed"]').count()===2,'rejected upload state missing');
+  assert.equal(attachments.size,4);
+  let lostUpload=false;
+  await page.route('**/api/v1/conversations/*/attachments',async route=>{if(!lostUpload){lostUpload=true;await route.fetch();await route.abort('failed');}else await route.continue();});
+  await page.locator('#share-files').setInputFiles({name:'uncertain.txt',mimeType:'text/plain',buffer:Buffer.from('Uncertain receipt.')});
+  await wait(async()=>await page.locator('.upload-card[data-state="unconfirmed"]').count()===1,'uncertain upload state missing');
+  assert.equal(attachments.size,5); await page.waitForTimeout(250); assert.equal(attachments.size,5);
+  assert.equal(await page.locator('.upload-card[data-state="unconfirmed"] button:not([hidden])').count(),0);
+  checks.push('paste/drop share UTF-8 text, images, and PDFs; unsupported and rejected files are distinct; unknown upload outcomes are never replayed');
+
+  const desktopControls = await page.locator('#hangup').boundingBox();
+  const cardsBeforeAccumulation=await page.locator('.output-card').count();
+  for(let i=0;i<30;i++) emit('card',{text:'Result '+i+'\n'+ 'Long result content. '.repeat(50),conversation_id:'room-coach'});
+  await wait(async()=>await page.locator('.output-card').count()===Math.min(40,cardsBeforeAccumulation+30),'accumulated cards did not arrive');
+  const desktopAfter = await page.locator('#hangup').boundingBox(); assert(Math.abs(desktopControls.y-desktopAfter.y)<1);
+  assert(desktopAfter.y+desktopAfter.height<=900);
+  assert(await page.locator('#space-panel').evaluate(node=>node.scrollHeight>node.clientHeight));
+  await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  assert(await page.locator('#space-panel').evaluate(node=>node.scrollTop>0));
+  assert(await page.evaluate(()=>document.documentElement.scrollHeight<=innerHeight));
+  checks.push('long result lists scroll inside a bounded desktop shared pane with fixed call controls');
+  if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-desktop-shared.png'),fullPage:true});
 
   pollFails=true;
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connection interrupted','network interruption not visible');
   assert.equal(requests.filter(request=>request.path==='/api/v1/companion/calls').length,1);
   pollFails=false;await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','existing call did not recover');
   await page.setViewportSize({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  assert(await page.evaluate(()=>document.documentElement.scrollHeight<=innerHeight));
+  const mobileHangup=await page.locator('#hangup').boundingBox();assert(mobileHangup.y>=0&&mobileHangup.y+mobileHangup.height<=844);
+  assert(await page.locator('#space-panel').evaluate(node=>node.scrollHeight>node.clientHeight));
+  await page.locator('#space-panel').evaluate(node=>{node.scrollTop=0;});
+  const mobileAfter=await page.locator('#hangup').boundingBox();assert(Math.abs(mobileHangup.y-mobileAfter.y)<1);
+  if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-mobile-shared.png'),fullPage:true});
+  await page.setViewportSize({width:844,height:390});
+  const landscapeHangup=await page.locator('#hangup').boundingBox();assert(landscapeHangup.y>=0&&landscapeHangup.y+landscapeHangup.height<=390);
+  assert(await page.evaluate(()=>document.documentElement.scrollHeight<=innerHeight&&document.documentElement.scrollWidth<=innerWidth));
+  await page.setViewportSize({width:390,height:844});
   const controls=await page.locator('.control-symbol').evaluateAll(nodes=>nodes.map(node=>({width:node.getBoundingClientRect().width,height:node.getBoundingClientRect().height})));
   assert(controls.every(size=>size.width>=44&&size.height>=44));
   await page.locator('#transcript-tab').click();assert.equal(await page.locator('#transcript-tab').getAttribute('aria-selected'),'true');
@@ -201,12 +351,13 @@ try {
   await page.locator('#back-to-contacts').click();
   await page.getByRole('button',{name:'Call Jarvis',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','Jarvis fixture did not connect');
+  await wait(async()=>/cannot inspect/.test(await page.locator('#share-capability').innerText()),'effective capability missing before capture');
   await page.locator('#camera-toggle').click();await page.locator('#capture-photo').click();
-  await page.locator('#photo-form:not([hidden])').waitFor();assert.equal(await page.locator('#send-photo').isDisabled(),true);
-  assert.match(await page.locator('#photo-capability-note').innerText(),/does not currently accept image/);assert.equal(messages.size,1);
+  await wait(async()=>await page.locator('.upload-card[data-state="available"]').count()===1,'unsupported-image storage missing');
+  assert.match(await page.locator('.upload-card').innerText(),/cannot inspect images/);assert.equal(messages.size,0);
   await page.locator('#hangup').click();await wait(async()=>calls.get('call-3').state==='interrupted','Jarvis close not settled');
   await wait(async()=>/provider closure was not confirmed/.test(await page.locator('#ended-detail').innerText()),'unconfirmed provider closure was misreported');
-  checks.push('known unsupported image input disables sending while retaining local camera preview');
+  checks.push('effective image limitation appears before capture; saving remains available without claiming the agent can see it');
 
   await page.locator('#back-to-contacts').click();
   await page.getByRole('button',{name:'Call Coach',exact:true}).click();
@@ -248,18 +399,22 @@ try {
   emit('transcript',{role:'user',text:'Private prior caller text.',fragment:true,start_ms:0,end_ms:100});
   emit('card',{text:'Private prior caller result.',conversation_id:'room-coach'});
   await wait(async()=>await page.locator('.output-card').count()===1,'logout fixture result missing');
+  holdNextUpload=true;await page.locator('#share-files').setInputFiles({name:'late-private.txt',mimeType:'text/plain',buffer:Buffer.from('Private pending upload.')});
+  await wait(async()=>heldUpload!==null,'late upload fixture did not reach storage');
+  const availableBeforeLogout = requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available').length;
   holdNextClose=true;await page.locator('#sign-out').click();
   await page.locator('#login:not([hidden])').waitFor();await wait(async()=>heldClose!==null,'close was not pending at sign-out');
   assert.equal(await page.locator('.transcript-entry').count(),0);assert.equal(await page.locator('.output-card').count(),0);
   assert.equal(await page.locator('#continue-work').getAttribute('href'),'/');assert.equal(await page.locator('#ended-work-link').getAttribute('href'),'/');
   assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)));
   await page.locator('#username').fill('next-fixture-user');await page.locator('#password').fill('fixture-only');await page.locator('#sign-in').click();
-  await page.locator('#app:not([hidden])').waitFor();heldClose();heldClose=null;await page.waitForTimeout(200);
+  await page.locator('#app:not([hidden])').waitFor();heldClose();heldClose=null;heldUpload();heldUpload=null;await page.waitForTimeout(200);
+  assert.equal(requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available').length,availableBeforeLogout);
   assert.equal(await page.locator('#recover-call').isHidden(),true);assert.equal(await page.locator('#call-ended').isHidden(),true);
   assert.equal(await page.getByRole('button',{name:'Call Coach',exact:true}).isEnabled(),true);
   assert.doesNotMatch(await page.locator('body').textContent(),/Private prior caller/);
   assert.equal(await page.evaluate(()=>Object.keys(localStorage).length+Object.keys(sessionStorage).length),0);
-  checks.push('sign-out clears private presentation and devices; a delayed old close failure cannot contaminate the next owner’s login');
+  checks.push('sign-out clears private presentation and devices; delayed old upload receipts and close failures cannot contaminate the next owner’s login');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:checks.length,checks,scope:'real Chromium UI; fake API, media, and provider; no paid calls'},null,2));
 } finally { await browser.close(); await new Promise(resolve=>server.close(resolve)); }

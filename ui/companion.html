@@ -14,7 +14,7 @@
 <body>
   <header class="masthead">
     <a class="brand" href="/companion" aria-label="Companion home"><span class="brand-mark" aria-hidden="true">c<span>·</span></span><span>Companion<small>CONSTELLATION</small></span></a>
-    <nav aria-label="Companion navigation"><a href="/">Conversations <span aria-hidden="true">↗</span></a><button id="sign-out" class="text-button" hidden>Sign out</button></nav>
+    <nav aria-label="Companion navigation"><a href="/" target="constellation-work">Conversations <span aria-hidden="true">↗</span></a><button id="sign-out" class="text-button" hidden>Sign out</button></nav>
   </header>
   <main>
     <section id="loading" class="loading" role="status"><span class="quiet-dot" aria-hidden="true"></span> Opening your contacts…</section>
@@ -47,25 +47,31 @@
             <button id="hangup" class="round-control end-control"><span class="control-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 13c5-5 13-5 18 0l-2 5-4-1v-3a12 12 0 0 0-6 0v3l-4 1Z"/></svg></span><span>End call</span></button>
           </div>
           <p class="call-footnote">Ending this call releases your microphone and camera. Already-authorized agent work can continue.</p>
-          <a id="continue-work" class="work-link" href="/" target="_blank" rel="noopener" hidden>Open conversation &amp; work controls <span aria-hidden="true">↗</span></a>
+          <a id="continue-work" class="work-link" href="/" target="constellation-work" hidden>Open conversation &amp; work controls <span aria-hidden="true">↗</span></a>
+          <button id="call-voice-settings" class="text-button" type="button">Voice settings · next call</button>
           <p id="foreground-note" class="small">Keep this page in the foreground. A screen lock or app switch may interrupt audio.</p>
         </div>
-        <div class="shared-panel">
+        <div class="shared-panel" aria-label="Shared conversation space">
           <div class="shared-tabs" role="tablist" aria-label="Conversation detail"><button id="space-tab" role="tab" aria-selected="true" aria-controls="space-panel">Shared space <span id="card-count" class="count" hidden>0</span></button><button id="transcript-tab" role="tab" aria-selected="false" aria-controls="transcript-panel" tabindex="-1">Transcript</button></div>
-          <section id="camera-panel" class="camera-panel" aria-label="Optional camera" hidden>
-            <div class="camera-heading"><h2>Your camera</h2><span class="preview-badge">LOCAL PREVIEW</span></div>
-            <video id="camera-preview" autoplay playsinline muted aria-label="Local camera preview"></video>
-            <p id="camera-note" class="small">This preview stays on your device. Capture a photo, then choose whether to send it.</p>
-            <button id="capture-photo" class="secondary">Capture photo</button>
-            <form id="photo-form" hidden><img id="photo-preview" alt="Your captured photo, not yet sent"><label for="photo-question">Ask about this photo</label><textarea id="photo-question" rows="2" maxlength="2000" placeholder="What would you like to know?">What do you notice in this photo?</textarea><p id="photo-capability-note" class="small">The photo goes to this agent’s conversation. Its runtime checks image support; a local model may not support it. GPT-Live does not receive the camera feed.</p><div class="photo-actions"><button id="send-photo" class="primary" type="submit">Send photo &amp; question</button><button id="discard-photo" class="text-button" type="button">Discard</button></div><p id="photo-status" role="status"></p></form>
+          <div id="work-status" class="work-status" role="status" hidden></div>
+          <section id="space-panel" role="tabpanel" aria-labelledby="space-tab" tabindex="0">
+            <div class="share-toolbar"><p>Drop or paste text, images, or PDFs here.</p><button id="choose-files" class="secondary" type="button" disabled>Share files</button><input id="share-files" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,.md,.txt,.csv,.json" hidden></div>
+            <p id="share-capability" class="small">Images and PDFs can be saved; inspection depends on this agent’s capabilities.</p>
+            <section id="camera-panel" class="camera-panel" aria-label="Optional camera" hidden>
+              <div class="camera-heading"><h2>Your camera</h2><span class="preview-badge">LOCAL PREVIEW</span></div>
+              <video id="camera-preview" autoplay playsinline muted aria-label="Local camera preview"></video>
+              <p id="camera-note" class="small">The preview stays on your device. Capture &amp; share saves one photo and lets your agent know it is available. The live camera feed is never shared.</p>
+              <button id="capture-photo" class="secondary">Capture &amp; share</button>
+            </section>
+            <div id="space-empty" class="space-empty"><div class="space-illustration" aria-hidden="true"><span></span><span></span><span></span></div><h2>A little space to see things.</h2><p>Share something while you talk. Useful answers and results will appear here too.</p></div><div id="cards" class="cards" aria-live="polite" aria-relevant="additions text"></div>
           </section>
-          <section id="space-panel" role="tabpanel" aria-labelledby="space-tab" tabindex="0"><div id="space-empty" class="space-empty"><div class="space-illustration" aria-hidden="true"><span></span><span></span><span></span></div><h2>A little space to see things.</h2><p>Useful answers and results from your agent will appear here while you talk.</p></div><div id="cards" class="cards" aria-live="polite" aria-relevant="additions"></div><div id="work-status" class="work-status" role="status" hidden></div></section>
           <section id="transcript-panel" role="tabpanel" aria-labelledby="transcript-tab" tabindex="0" hidden><p class="transcript-note">Live transcript fragments may contain mistakes. Generated text does not confirm what you heard.</p><div id="transcript" class="transcript" role="log" aria-label="Call transcript" aria-live="off"></div><p id="transcript-empty" class="empty-state">The conversation will appear here.</p></section>
         </div>
       </section>
-      <section id="call-ended" class="ended-card" hidden><p class="eyebrow">BACK WHEN YOU NEED THEM</p><h1 id="ended-title">Call ended.</h1><p id="ended-detail">Your microphone and camera are off.</p><div class="ended-actions"><button id="back-to-contacts" class="primary">Back to contacts</button><a id="ended-work-link" class="secondary" href="/" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a></div><button id="recover-call" class="secondary" hidden>Resolve unconfirmed call</button></section>
+      <section id="call-ended" class="ended-card" hidden><p class="eyebrow">BACK WHEN YOU NEED THEM</p><h1 id="ended-title">Call ended.</h1><p id="ended-detail">Your microphone and camera are off.</p><div class="ended-actions"><button id="back-to-contacts" class="primary">Back to contacts</button><a id="ended-work-link" class="secondary" href="/" target="constellation-work" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a></div><button id="recover-call" class="secondary" hidden>Resolve unconfirmed call</button></section>
     </div>
   </main>
+  <dialog id="voice-settings" class="voice-settings" aria-labelledby="voice-settings-title"><form id="voice-settings-form"><h2 id="voice-settings-title">Voice settings</h2><p id="voice-settings-note">Your selection applies to the next call.</p><label for="voice-choice">Voice</label><select id="voice-choice" disabled></select><p id="voice-settings-status" role="status"></p><div class="photo-actions"><button id="save-voice" class="primary" type="submit" disabled>Save voice</button><button id="close-voice-settings" class="text-button" type="button">Close</button></div></form></dialog>
   <audio id="remote-audio" autoplay playsinline></audio>
   <footer class="site-footer"><span>Companion · Constellation</span><span>Your voice. Your agent. A little more room.</span></footer>
 </body>

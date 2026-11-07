@@ -4,6 +4,7 @@
 import OpenAI from 'openai';
 import {SidebandWS} from 'openai/resources/live/sideband/ws';
 import {pathToFileURL} from 'node:url';
+import {startCompanionMcp} from './companion-mcp.mjs';
 
 /** @typedef {import('openai/resources/live/live').LiveCreateParams} LiveCreateParams */
 /** @typedef {import('openai/resources/live/sideband/sideband').ConnectServerEvent} ServerEvent */
@@ -40,20 +41,12 @@ export function sessionOptions(command) {
   };
 }
 
-// UTF-8 byte bound is a conservative tokenizer-independent upper bound. The
-// whole result remains in the host's authenticated display, never silently lost.
+// The host supplies complete semantic fragments. Clipping here can change a
+// fact (for example, deleting "on ARM64"), so enforce the budget without edits.
 /** @param {unknown} text */
 export function spokenExcerpt(text, limit=480) {
-  if (typeof text !== 'string' || !text.trim() || Buffer.byteLength(text) > 65536) throw new Error('invalid_content');
-  if (Buffer.byteLength(text) <= limit) return text;
-  const suffix = ' … Full result is on screen.';
-  let result = '', bytes = 0;
-  for (const c of text) {
-    const n = Buffer.byteLength(c);
-    if (bytes + n > limit - Buffer.byteLength(suffix)) break;
-    result += c; bytes += n;
-  }
-  return result.trimEnd() + suffix;
+  if (typeof text !== 'string' || !text.trim() || Buffer.byteLength(text) > limit) throw new Error('invalid_content');
+  return text;
 }
 
 /** @param {unknown} error */
@@ -103,6 +96,7 @@ export function publicEvent(event) {
 }
 
 export class LiveBridge {
+  /** @type {Awaited<ReturnType<typeof startCompanionMcp>> | undefined} */ mcp;
   /** @type {SidebandWS | undefined} */ sideband;
   /** @type {string | undefined} */ sessionId;
   /** @type {ReturnType<typeof setTimeout> | undefined} */ expiry;
@@ -144,6 +138,12 @@ export class LiveBridge {
     const setupDeadline=Date.now()+this.setupMs;
     this.state='creating';this.createPending=true;
     try {
+      if (command.mcp !== undefined) {
+        if (!command.mcp || typeof command.mcp!=='object' || Array.isArray(command.mcp)) throw new Error('invalid_mcp');
+        const config=/** @type {Record<string, unknown>} */(command.mcp);
+        if (typeof config.api_base!=='string' || typeof config.call_id!=='string' || typeof config.token!=='string') throw new Error('invalid_mcp');
+        this.mcp=await startCompanionMcp({apiBase:config.api_base,callId:config.call_id,token:config.token,port:0});
+      }
       const result=await this.client.live.create(options,{timeout:this.setupMs,maxRetries:0});
       this.sessionId=result.session?.id;
       if (typeof this.sessionId!=='string' || result.transport?.type!=='webrtc' || typeof result.transport.sdp!=='string') throw new Error('invalid_answer');
@@ -173,7 +173,7 @@ export class LiveBridge {
       if(this.state==='closing') {this.startClosing();return;}
       this.state='active';
       this.expiry=setTimeout(()=>this.close(),this.maxCallMs);
-      this.emit({type:'ready',session_id:this.sessionId,sdp:result.transport.sdp});
+      this.emit({type:'ready',session_id:this.sessionId,sdp:result.transport.sdp,...(this.mcp?{mcp_port:this.mcp.port}:{})});
     } catch(error) {
       if (!this.finished) this.emit(safeError(error));
       this.close();
@@ -204,6 +204,7 @@ export class LiveBridge {
     if(this.finished)return;
     this.finished=true;this.state='closed';clearTimeout(this.expiry);clearTimeout(this.finalizer);
     this.emit({type:'closed',confirmed,session_id:this.sessionId??null});
+    this.mcp?.close();
     this.sideband?.close(); this.resolveDone();
   }
 }

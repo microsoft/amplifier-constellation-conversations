@@ -111,8 +111,44 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/session", get(auth::session))
         .route("/auth/logout", post(auth::logout))
         .route("/api/v1/companion", get(crate::companion::catalog))
+        .route(
+            "/api/v1/companion/calls/{id}/mcp",
+            post(crate::companion_tools::mcp),
+        )
+        .route(
+            "/api/v1/companion/calls/{id}/tools/connections",
+            get(crate::companion_tools::connections),
+        )
+        .route(
+            "/api/v1/companion/calls/{id}/tools/actions",
+            post(crate::companion_tools::action),
+        )
+        .route(
+            "/api/v1/companion/calls/{id}/tools/actions/{request}",
+            get(crate::companion_tools::status),
+        )
+        .route(
+            "/api/v1/companion/calls/{id}/tools/shared",
+            get(crate::companion_tools::shared).post(crate::companion_tools::show),
+        )
+        .route(
+            "/api/v1/companion/agents/{id}/voice-settings",
+            get(crate::companion::voice_settings).put(crate::companion::save_voice_settings),
+        )
+        .route(
+            "/api/v1/companion/agents/{id}/capabilities",
+            get(crate::companion::capabilities),
+        )
         .route("/api/v1/companion/calls", post(crate::companion::create))
         .route("/api/v1/companion/calls/{id}", get(crate::companion::read))
+        .route(
+            "/api/v1/companion/calls/{id}/uploads",
+            post(crate::companion::upload_awareness),
+        )
+        .route(
+            "/api/v1/companion/calls/{id}/results/{message}",
+            get(crate::companion::result),
+        )
         .route(
             "/api/v1/companion/calls/{id}/heartbeat",
             post(crate::companion::heartbeat),

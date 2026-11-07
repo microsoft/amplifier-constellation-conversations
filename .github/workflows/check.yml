@@ -24,6 +24,7 @@ jobs:
           node-version: 22
       - run: npm ci --ignore-scripts --prefix bridge
       - run: npm test --prefix bridge
+      - run: python3 -m unittest discover -s bridge/test -p 'test_*.py'
       - run: node tests/voice.mjs
       - run: cargo build --locked
       - run: npm ci && npx playwright install --with-deps chromium

@@ -567,6 +567,13 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     );
     let can_load = init["agentCapabilities"]["loadSession"] == true;
     let mut params = json!({"cwd":agent.session_cwd.as_ref().unwrap_or(&agent.cwd),"mcpServers":agent.mcp_servers});
+    if let Some(tool) = crate::companion_tools::descriptor(&state, &conversation)? {
+        ensure!(
+            init["agentCapabilities"]["mcpCapabilities"]["http"] == true,
+            "This call's shared-space tools require advertised HTTP MCP support"
+        );
+        params["mcpServers"].as_array_mut().unwrap().push(tool);
+    }
     if crate::companion::context_registered(&state, &conversation)? {
         let token = context::grant(&state, &conversation)?;
         params["_meta"] = json!({"io.github.bkrabach.conversation":{"provider_id":state.config.provider_id(),"grant":token}});
