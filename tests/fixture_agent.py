@@ -26,6 +26,19 @@ def ask_form(scope, withdraw=False):
             stream.write(json.dumps(response) + "\n")
     return response.get("result", {})
 
+def companion_permission(sid, suffix, tool, arguments=None, server="companion"):
+    ident="companion-permission-"+suffix
+    write({"id":ident,"method":"session/request_permission","params":{"sessionId":sid,
+      "toolCall":{"toolCallId":ident,"title":"companion / "+tool,"kind":"other","status":"pending",
+        "rawInput":{"server":server,"tool":tool,"arguments":arguments or {}}},
+      "options":[{"optionId":"allow_always","name":"Always","kind":"allow_always"},
+                 {"optionId":"allow_once","name":"Once","kind":"allow_once"},
+                 {"optionId":"reject_once","name":"Reject","kind":"reject_once"}]}})
+    reply=json.loads(sys.stdin.readline())
+    if os.environ.get("FIXTURE_LOG"):
+        with open(os.environ["FIXTURE_LOG"],"a") as stream:stream.write(json.dumps(reply)+"\n")
+    return reply
+
 authenticated=False
 for line in sys.stdin:
     value = json.loads(line)
@@ -48,10 +61,20 @@ for line in sys.stdin:
     elif method in ("session/new", "session/load"):
         if os.environ.get("FIXTURE_AUTH") and not authenticated:
             write({"id":value["id"],"error":{"code":-32000,"message":"Sign-in required"}});continue
-        write({"id": value["id"], "result": {"sessionId": params.get("sessionId", str(uuid.uuid4()))}})
+        sid=params.get("sessionId",str(uuid.uuid4()))
+        if os.environ.get("FIXTURE_COMPANION_PERMISSIONS")=="known":
+            companion_permission(sid,"setup","companion_connections")
+        write({"id": value["id"], "result": {"sessionId":sid}})
     elif method == "session/prompt":
         sid = params["sessionId"]
         text = params["prompt"][0]["text"]
+        if os.environ.get("FIXTURE_COMPANION_PERMISSIONS")=="known":
+            companion_permission(sid,"read","companion_shared")
+            companion_permission(sid,"display","companion_show",{"url":"https://example.test/demo","title":"Demo","kind":"video"})
+            companion_permission(sid,"status","companion_action_status",{"request_id":str(uuid.uuid4())})
+            companion_permission(sid,"action","companion_request_action",{"request_id":str(uuid.uuid4()),"delegation_id":"delegate-1","connection_id":"minecraft","instruction":"Perform the caller's requested fixture action."})
+        elif os.environ.get("FIXTURE_COMPANION_PERMISSIONS")=="other":
+            companion_permission(sid,"other","companion_connections",server="unrelated-server")
         if text == "wait forever":
             time.sleep(120)
         write({"method": "session/update", "params": {"sessionId": "wrong-session", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "WRONG CONVERSATION"}}}})

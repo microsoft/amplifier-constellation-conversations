@@ -1,21 +1,53 @@
 # Constellation Companion (preview)
 
-Companion is a foreground, web-first voice experience for an existing ACP agent.
-Open `/companion`, choose a saved contact, and start a call. One person calls one
-agent at a time. Each call has its own private conversation and backend session;
-it does not reuse or replace a Slack, Minecraft, or another person's session.
+Companion is a foreground web voice experience for an existing ACP agent. Open
+`/companion`, choose a saved contact, and start a call. One person calls one agent
+at a time. It is the same agent identity, with a new private conversation and
+backend session for each call. A call does not replace its Slack, Minecraft, or
+another person's session.
 
-The first provider is OpenAI GPT-Live (`gpt-live-1`), with **client delegation**.
-GPT-Live handles the spoken conversation while the selected agent handles work
-through the same official ACP SDK connection used by Conversations. The chosen
-agent runtime is preserved. A local-model agent still uses cloud audio and
-selected text context for this voice provider; this is not a fully local call.
+OpenAI GPT-Live (`gpt-live-1`) handles the spoken conversation through client
+delegation. The selected agent handles work through Conversations' existing
+ordinary ACP connection. Its runtime and model remain selected by its own
+installation. Even a local-model agent uses cloud audio and selected text context
+for this voice provider; this is not a fully local call.
+
+## Using a call
+
+Microphone access starts only after **Call**. Camera access is optional and starts
+only after **Camera**. **Capture & share** immediately uploads one photo and queues
+an availability notice for voice. It does not require a typed question or force an
+automatic summary. The live camera preview stays on the device.
+
+Drop files or paste text and images into **Shared space**, or choose **Share files**.
+Images and PDFs can be up to 2 MB each; UTF-8 text, Markdown, CSV, and JSON can be up
+to 200 KB each. Share up to four files at a time. These inputs use the same saved
+attachment path as camera captures. The ongoing conversation determines whether
+the agent inspects an item or asks a useful follow-up question.
+
+The shared pane and transcript scroll independently of the call controls, on
+desktop and mobile. Conversation and work-control links reuse a separate work tab
+so the call can remain open. Answer links are clickable. Supported saved media
+can appear inline; remote HTTP(S) media previews require a click. An ordinary
+page or repository link remains a link, and a displayed video does not prove it
+was played or watched. Answer text is never executed as HTML or JavaScript.
+
+Choose **Voice** on a contact, or **Voice settings · next call** during a call.
+Preferences are saved for the signed-in person and selected agent. A change takes
+effect on their next call; it does not change the current voice, ACP identity,
+model, or working session.
+
+Hanging up releases microphone, camera, audio, and the call's optional tools. It
+closes the voice connection but does not cancel already submitted connector work
+or accepted ACP work. Use the linked conversation and the connector's controls to
+review or stop that work. Muting changes only microphone input; interrupting
+speech does not retract an operation.
 
 ## Installation
 
 Use a separate Conversations installation for the preview. Existing text rooms
 and browser dictation remain available. Build Conversations normally, and install
-the voice bridge using Node 22.6 or later:
+the bridge using Node 22.6 or later:
 
 ```sh
 cd bridge
@@ -23,130 +55,272 @@ npm ci --ignore-scripts
 npm test
 ```
 
-Place `bridge/` and its locked dependencies in an installation-owned directory.
-Set `OPENAI_API_KEY` in the **service** environment, preferably from a private
-service environment/credential file. It is never sent to the browser or copied
-into an ACP agent's environment. The official OpenAI SDK owns HTTP/WebSocket
-transport. The Rust Conversations client uses the official ACP SDK through
-`amplifier-acp-connection`; this feature adds no ACP wire methods.
+Keep the bridge and its locked dependencies in an installation-owned directory.
+Set `OPENAI_API_KEY` in the service environment, preferably through a private
+credential file. It is not sent to the browser or copied into the ACP agent's
+environment. The official OpenAI SDK owns provider transport. The Rust client uses
+the official ACP SDK through `amplifier-acp-connection`; Companion adds no ACP wire
+methods.
 
-Register the existing ACP endpoints through Conversations' saved-agent API.
-Remote agents can use fixed SSH stdio attach commands; use credential files on
-the agent's own host instead of putting secrets in command arguments. Add
-`companion.json` to this installation home, using its actual saved agent IDs:
+Register existing ACP endpoints through Conversations' saved-agent API. Remote
+agents may use fixed SSH stdio attach commands, with credentials kept on their
+own host. Add `companion.json` to this installation's home. Paths below are examples;
+use installed paths and actual saved agent IDs:
 
 ```json
 {
   "enabled": true,
-  "node": "/absolute/path/to/node",
-  "bridge": "/absolute/path/to/bridge/live.mjs",
+  "node": "/opt/companion/bin/node",
+  "bridge": "/opt/companion/bridge/live.mjs",
   "max_call_seconds": 1800,
   "profiles": {
     "coach": {
       "voice": "marin",
       "description": "Native reasoning · OpenAI cloud voice",
-      "context_registered": false
-    },
-    "rook": {
-      "voice": "cedar",
-      "description": "Codex reasoning · OpenAI cloud voice",
-      "context_registered": false
-    },
-    "jarvis": {
-      "voice": "ash",
-      "description": "Local reasoning · OpenAI cloud voice",
+      "identity": "Coach, an existing agent with connected experiences.",
+      "observed_at": "2026-11-07T00:00:00Z",
+      "connections": [
+        {
+          "name": "Minecraft",
+          "description": "An existing connected experience. Consult the agent for current activity and available controls."
+        }
+      ],
       "context_registered": false
     }
   }
 }
 ```
 
-Voice profiles are separate from ACP endpoint configuration: changing a voice
-must not reset an agent's working sessions. Voices are fixed for a call; changes
-apply to the next call. There is no silent provider or voice fallback.
+`identity`, `observed_at`, and `connections` supply a bounded installation snapshot
+at call startup. Update them when the installation changes. The timestamp states
+when those facts were observed; the snapshot does not prove current activity,
+current permissions, or live tool availability. Missing connections are unknown.
+Voice is instructed to consult the existing agent before denying uncertain
+knowledge, connections, or capabilities. Starting a call does not itself prompt
+the backend model to retrieve live knowledge.
 
 `context_registered` stays false until this installation's optional transcript
-provider has actually been registered and made reachable by that agent. It is
-not a request to provision a provider. With false, call transcripts remain local
-and bounded relevant speech accompanies explicit delegation over ordinary ACP.
-The agent retains access to its already-authorized sources. Automatic awareness
-subscriptions across other experiences are not part of this preview.
+provider has actually been registered and made reachable by the agent. With false,
+call transcripts remain local and relevant speech accompanies explicit delegation
+over ordinary ACP. The agent retains access to already authorized sources. This
+flag says nothing about whether its other Slack or Minecraft context is available.
+Automatic subscriptions to activity in other experiences are not enabled here.
 
-Serve behind trusted HTTPS, including on phones. Browser microphone and camera
-permissions are granted locally. The host's normal PAM login protects access;
-opening the page is not microphone consent. This is a foreground call, not a
-promise of iOS/Android background operation. Active silent or muted GPT-Live
-sessions may still incur provider charges. The preview closes calls after its
-configured maximum duration or when browser heartbeats stop.
+Serve behind trusted HTTPS, including on phones. The host's normal PAM login
+protects browser access. Opening the page does not grant microphone consent, and
+the signed-in person authorizes the microphone channel without speaker identity
+being inferred from voice. Existing agent permissions and work controls still
+apply. Screen locking or switching apps may interrupt audio; background operation
+is not guaranteed. Silent or muted provider sessions may still incur charges.
+Maximum call duration and browser heartbeats bound unattended sessions.
 
-The signed-in person authorizes the microphone channel; this preview does not
-identify speakers by voice. Existing agent permissions and work controls still
-apply to delegated requests. Multi-person speaker identity is a later boundary,
-not something inferred from a transcript's wording.
+## Sharing, capabilities, and receipts
 
-## What each signal means
+Sharing reports separate facts:
 
-- **Connected:** media and voice control are established, not proof that the
-  backend has accepted work.
-- **Delegated:** a timed provider request was linked to the call's authenticated
-  user and transcript, then submitted through the ordinary ACP delivery path.
-- **Result available:** a public backend answer settled. The full answer remains
-  on screen; a short excerpt can be injected into voice context.
-- **Context acknowledged:** the provider accepted an append. This does not prove
-  that it spoke it or that the person heard it.
-- **Audio playing:** the browser observed output playback. Transcript generation
-  alone is not a playback receipt.
+- **Captured/selected:** the item exists locally; bytes are not yet saved.
+- **Uploading:** transfer is in progress.
+- **Available:** the service confirmed saved bytes in this private conversation.
+- **Voice notification queued:** the host accepted an awareness notice. Provider
+  acknowledgment, speech, playback, and inspection are separate facts.
+- **Failed or unconfirmed:** availability could not be established. An uncertain
+  upload may have saved bytes; inspect the conversation before sharing again.
 
-Provider transcript events are fragments, not complete-turn markers. They are
-retained with their original event IDs and timeline positions. Delegation events
-contain an ID and timeline offset, **not a task description**. The host assembles
-bounded call context and holds ambiguous/missing input rather than inventing a
-request. Durable delegation IDs prevent duplicate backend submission. Unknown
-admission is never automatically replayed.
+Saved items can accompany a subsequent delegation through the existing attachment
+path. No generic photo question or independent summary message is sent.
+A lost awareness acknowledgment can be checked using the same upload identity.
+An unknown storage outcome is never automatically uploaded again.
 
-Hanging up closes the voice session and releases local media. It does **not**
-cancel already accepted work. The linked conversation has the existing controls
-for reviewing permissions and stopping work. Muting only changes microphone
-input. Native voice interruption does not itself retract an already submitted
-ACP operation.
+The UI probes the selected endpoint's ACP initialization capabilities. Images may
+still be saved when image inspection is unavailable or unverified. GPT-Live does
+not receive the camera feed or inspect the image directly. PDF inspection depends
+on the endpoint's embedded-document support; text has a readable fallback. Saving
+an artifact never licenses a claim that it has been seen or read.
 
-## Camera and display
+For the native Constellation runtime, `provider.native.image_input` controls the
+enabled image path. An omitted or disabled setting can make an image-capable model
+advertise `image: false`; that flag alone does not establish the model's abilities.
+The optional `image_input` in `companion.json` is informational, not an override of
+ACP capabilities. Enable a supported path in the agent installation, reconnect,
+then verify fresh initialization and an actual image prompt. Preserve the selected
+model and credentials; changing the model is not implied. There is no automatic
+cloud vision fallback for a local-model agent.
 
-Camera access is optional and starts only after a local action. A preview is not
-proof of image understanding. GPT-Live does not accept images/video directly.
-An explicitly submitted snapshot follows the existing attachment/ACP capability
-path, so an unsupported backend cannot pretend it saw it. There is no automatic
-cloud vision fallback for local-model agents. The conversation remains the
-review surface for full answers, generated artifacts, and permission requests.
+## Work, results, and uncertainty
 
-## Boundaries for the next iteration
+**Connected** means audio and control are established, not that backend work has
+been accepted. **Delegated** means a timed provider request was associated with the
+authenticated caller's transcript and submitted through the ordinary ACP delivery
+path. Transcript events are fragments, not complete-turn markers, and delegation
+events contain an ID and offset rather than a task description. Missing or
+ambiguous requests are held instead of invented. Durable identities prevent
+repeating accepted submissions; unknown admission is never automatically replayed.
 
-The bridge is independent of browser layout. A future local STT → agent → TTS
-provider should implement the same call, transcript, delegation, interruption,
-and playback concepts without changing ACP runtime ownership. The newline JSON
-between Rust and its fixed child bridge is a private application control channel,
-not an ACP extension or an arbitrary host-command API.
+Settled public results retain their request identity and full text in the
+conversation. The card projection is bounded; **Show full result** loads the complete saved
+answer through its authenticated result URL. A quiet status field reports pending
+work or a required decision without adding a chat message. Short current results can enter spoken context directly. Longer
+results use bounded sentence or paragraph fragments, retaining qualifiers within
+each included fragment and explicitly reporting omissions. Voice is instructed
+not to fill in missing material. Delayed results are marked as answers to an
+earlier request and enter quiet context rather than an instruction to interrupt
+the current topic. Generated text and provider context acknowledgments are not
+proof that audio played or the caller heard it.
 
-Future rooms will allocate one independent realtime session per agent. Joining a
-room will require explicit audience/history rules; current text-room membership
-is not an implicit voice invitation. No group media, voice in Slack/Minecraft,
-or continuous camera streaming is enabled here.
+## Optional connected-experience tools
 
-Meaningful awareness will need permission, provenance, freshness and duplicate
-checks before optional decision-model relevance and quiet voice-context
-injection. It must distinguish awareness from an instruction to speak and from
-authority to act. GPT-Live's Decisions triggers are an available provider feature;
-the preview leaves them off while the event policy is designed.
+An installation can opt into tools by adding `companion-actions.json` to its home.
+Each configured connection maps to a fixed executable and arguments chosen by the
+installation owner. No tool argument selects a host command, credential, arbitrary
+filesystem path, or callback origin. For example, use the bundled helpers with installation-owned configuration:
 
-## Validation
+```json
+{
+  "enabled": true,
+  "agents": {
+    "coach": [
+      {
+        "id": "minecraft",
+        "label": "Minecraft tasks",
+        "description": "Submit an explicitly requested task to the configured Minecraft presence.",
+        "command": ["/usr/bin/python3", "/opt/companion/bridge/minecraft-instruction.py", "--home", "/var/lib/acp-minecraft"]
+      },
+      {
+        "id": "slack",
+        "label": "Slack updates",
+        "description": "Post an explicitly requested update to the configured Slack destination.",
+        "command": ["/opt/companion/bin/node", "/opt/companion/bridge/slack-action.mjs", "--config", "/etc/companion/slack-action.json"]
+      }
+    ]
+  }
+}
+```
 
-`npm test --prefix bridge` exercises transport authority, duplicate commands,
-redacted errors, bounded spoken excerpts, and confirmed versus unknown closure.
-Rust Companion tests exercise authenticated ownership, durable delegation and
-source context. The browser fixture exercises media lifecycle without a paid
-provider call. Live API and physical-phone checks should be recorded separately
-from fixture success, including selected backend/runtime and actual terminal
-settlement.
+`minecraft-instruction.py --home /absolute/connector-home` runs on the Minecraft
+connector's host. It reads that installation's local control configuration and
+posts only to its fixed loopback `/task` route. A successful receipt means a new
+instruction was **queued**, not that a task was accepted, executed, or completed.
+Minecraft records its existing authenticated Operator source; the original voice
+caller remains attributed in Companion's private ledger. The helper does not
+itself replay game operations, renew tasks, or extend budgets.
+
+`slack-action.mjs --config /absolute/config.json` uses the official Slack SDK to
+post the instruction text to one fixed channel. Its configuration contains:
+
+```json
+{
+  "slack_home": "/var/lib/acp-slack",
+  "channel_id": "C0123456789",
+  "expected_bot_user_id": "U0123456789"
+}
+```
+
+Use the installation's actual channel and bot IDs. Credentials remain in its
+`secrets/slack.json`; the helper checks bot identity before posting. It preserves
+the message text and does not append private transcript provenance. Its
+`completed` receipt has `scope: "message_delivery"`: it confirms that Slack returned
+the expected channel and message timestamp, not completion of a task described in
+the message. Both helpers return uncertain delivery as `unknown` without retries.
+
+When enabled, the per-call bridge uses the official MCP SDK to expose
+`companion_connections`, `companion_request_action`, `companion_action_status`,
+`companion_show`, and `companion_shared`. Conversations supplies the descriptor
+through ordinary ACP `mcpServers`; the agent must advertise HTTP MCP support.
+These tools apply only to the private call and selected agent. They do not merge
+sessions, imply write authority from context access, or require a shared
+Constellation provisioning or identity service.
+
+The backend must be able to reach Conversations' public HTTPS address from its own
+network namespace. A working browser connection does not prove that route. For a
+containerized agent, verify the fixed destination from inside the container and
+use an installation-owned route that preserves its existing isolation and routes.
+Do not copy provider credentials into the container or expose the local MCP port;
+the authenticated per-call HTTPS endpoint is the intended connection.
+
+With optional actions enabled, Conversations can answer a native ACP permission
+request with `allow_once` for its own call tools. The active private call, caller,
+agent, and grant must match the dynamically injected `companion` server; a static
+server with that reserved name is rejected. The native `rawInput` must identify
+that server and a known tool with the exact argument schema, and its title must
+agree. A title alone never grants permission. Read/shared/status tools and valid
+HTTP(S) show requests qualify; an action also needs the exact authorized active
+delegation and a configured connection. The tool API repeats its authority and
+receipt checks. The selected agent still interprets the caller's intent; the host
+does not independently prove semantic action authorization from the utterance.
+Unknown request shapes, other MCP servers, commands, and file operations retain
+human approval. This does not create broad or persistent permission grants.
+
+An action requires an active, authenticated caller delegation and a configured
+connection. Use the exact `delegation_id` supplied with that caller instruction;
+later steering must not silently substitute a different request. The host records a durable receipt before invoking its fixed helper.
+The helper receives one JSON document on stdin with `version: 1`, `request_id`,
+`instruction`, and private `source` provenance: caller, call, conversation,
+delegation, message, original text, timestamp, and revision. It returns one JSON
+receipt on stdout with a `state` such as `queued`, `accepted`, `completed`, `failed`,
+or `unknown`. Platform setup and credentials belong to the helper's installation.
+Preserve source provenance privately rather than publishing the call transcript
+into another audience.
+
+A queued task is not evidence of acceptance or completion. An action status lookup
+reads the recorded receipt; it is not independent verification of downstream work.
+Reusing the same request ID returns the existing receipt rather than resubmitting;
+a changed payload is rejected. A timeout, lost response, or restart during
+submission leaves an unknown outcome that must not be retried automatically.
+Hanging up revokes call-tool access, including status access through that expired
+call. Already submitted connector work retains its original authority and must be
+inspected through the owning connector's controls.
+
+## API reference
+
+Browser routes use the host session and authenticated ownership checks. Mutations
+require the session's `X-CSRF-Token`. All paths below start with `/api/v1`.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /companion` | Contacts, effective voice preference, availability, and an existing open call. |
+| `GET /companion/agents/{id}/voice-settings` | `voice`, `available_voices`, and `applies_to: "next_call"`. |
+| `PUT /companion/agents/{id}/voice-settings` | Save `{ "voice": "marin" }` for this person and agent. |
+| `GET /companion/agents/{id}/capabilities` | Fresh initialization probe: `image_input`, `capabilities_available`, `checked_at`, `source`. No model prompt. |
+| `POST /companion/calls` | Create with `request_id` UUID, `agent_id`, and SDP `sdp`; retain the same request for uncertain-create reconciliation. |
+| `GET /companion/calls/{id}?after={cursor}` | Call state, durable events, and `next_cursor`. |
+| `POST /companion/calls/{id}/heartbeat` | Keep the existing call's browser lease alive. |
+| `POST /companion/calls/{id}/close` | Begin closure; poll for terminal `closed` or `interrupted`. |
+| `POST /conversations/{room}/attachments` | Save `{name, mime_type, data}` with base64 bytes. Returns the attachment ID. |
+| `POST /companion/calls/{id}/uploads` | Record `{upload_id, state, source, name, attachment_ids}`. |
+| `GET /companion/calls/{id}/results/{message}` | Retrieve a settled public result's full `{message_id, text}`. |
+
+Upload `state` is `captured`, `uploading`, `available`, or `failed`; `source` is
+`camera`, `drop`, `paste`, or `file`. Start with capture or upload, keep the UUID,
+name, and source stable, and supply one to four owned attachment IDs only for
+`available`. Exact duplicate state notices are idempotent. The response separates
+saved state from `voice_awareness: "queued" | "not_queued"`.
+
+Optional MCP uses `POST /companion/calls/{id}/mcp`. Its host callbacks under
+`/companion/calls/{id}/tools/` are `GET connections`, `POST actions`,
+`GET actions/{request}`, and `GET`/`POST shared`. These use a call-scoped bearer grant,
+not browser session authorization, and reject browser Origin requests. The MCP
+SDK owns protocol framing; these are Companion application routes, not ACP
+extensions. `companion_request_action` takes `connection_id`, `instruction`, the
+original `delegation_id` (a provider ID of 1–160 characters), and a UUID `request_id`; `companion_show` takes an HTTP(S) `url`, `title`, and optional
+`kind` (`auto`, `link`, `image`, or `video`). Showing a link is neither platform
+publication nor evidence that the media loaded.
+
+## Validation and remaining boundaries
+
+`npm test --prefix bridge` checks provider controls, official MCP transport,
+fixed call authority, safe error results, and closure. Rust tests cover ownership,
+capability probes, saved voice preferences, upload state and deduplication,
+complete result fragments, and optional action receipts.
+`node tests/companion-browser.mjs` runs real Chromium with fake API and media: capture,
+paste/drop, uncertain receipts, safe rendering, tab reuse, bounded desktop/mobile
+layout, and call/privacy cleanup. These fixtures do not verify a paid provider
+call, physical phone, real model image acceptance, or platform action completion;
+record those checks separately.
+
+No group media, continuous camera streaming, or voice inside Slack/Minecraft is
+enabled here. A future local speech provider can reuse these call and delivery
+boundaries without changing ACP runtime ownership. Background awareness remains
+separate from an instruction to speak or authority to act.
 
 Official provider references: [Live](https://developers.openai.com/api/docs/guides/live),
 [delegation](https://developers.openai.com/api/docs/guides/live-delegation),

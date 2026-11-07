@@ -32,14 +32,15 @@ root=pathlib.Path(__file__).parent
 def emit(v): print(json.dumps(v),flush=True)
 c=json.loads(sys.stdin.readline())
 with (root/'bridge-starts').open('a') as f:f.write('start\n')
-voice=c['voice']
+(root/'bridge-initial.json').write_text(json.dumps(c))
+voice=(root/'bridge-mode').read_text()
 if voice=='closed_setup':
  emit({'type':'event','event':{'type':'session.closed','event_id':'early-closed','session':{'id':'live-fixture'},'reason':'close_requested','usage':{'seconds':15}}})
  emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});sys.exit(0)
 if voice=='early':emit({'type':'event','event':{'type':'session.started','event_id':'started','session':{'id':'live-fixture'}}})
-emit({'type':'ready','session_id':'live-fixture','sdp':'v=0\r\nfixture-answer'})
+emit({'type':'ready','session_id':'live-fixture','sdp':'v=0\r\nfixture-answer',**({'mcp_port':34567} if c.get('mcp') else {})})
 if voice not in ('early','connecting'):emit({'type':'event','event':{'type':'session.started','event_id':'started','session':{'id':'live-fixture'}}})
-if voice not in ('quiet','connecting'):
+if voice not in ('quiet','connecting','upload_delegate'):
  if voice!='missing':
   event={'type':'session.input_transcript.delta','event_id':'human-1','delta':'Please inspect the supplied test context and report it.','start_ms':10,'end_ms':90}
   if voice in ('anchor','anchors'):event.update({'delta':'Please inspect the existing work, without changing anything','start_ms':12000,'end_ms':12990})
@@ -58,6 +59,9 @@ for line in sys.stdin:
  if c['op']=='append':
   if not c['content'].strip():emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
   emit({'type':'event','event':{'type':'session.'+c['channel']+'.appended','event_id':'ack-'+c['event_id'],'client_event_id':c['event_id'],'start_ms':100,'end_ms':110}})
+  if voice=='upload_delegate' and 'is available.' in c['content'] and not second_sent:
+   second_sent=True
+   emit({'type':'event','event':{'type':'session.delegation.created','event_id':'upload-delegation','offset_ms':100,'delegation':{'id':'delegate-upload','target':'client'}}})
   if voice=='anchors' and not second_sent:
    second_sent=True
    emit({'type':'event','event':{'type':'session.input_transcript.delta','event_id':'human-second','delta':'Now give me a separate summary.','start_ms':15000,'end_ms':15200}})
@@ -97,7 +101,8 @@ for line in sys.stdin:
         },
     };
     c.save(home.path()).unwrap();
-    std::fs::write(home.path().join("companion.json"),json!({"enabled":true,"node":python,"bridge":bridge,"profiles":{"default":{"voice":mode,"description":"Fixture agent"}},"max_call_seconds":1800}).to_string()).unwrap();
+    std::fs::write(home.path().join("bridge-mode"), mode).unwrap();
+    std::fs::write(home.path().join("companion.json"),json!({"enabled":true,"node":python,"bridge":bridge,"profiles":{"default":{"voice":"alloy","description":"Fixture agent"}},"max_call_seconds":1800}).to_string()).unwrap();
     let s = AppState::open(home.path().into()).unwrap();
     let app = server::router(s.clone());
     let token = std::fs::read_to_string(home.path().join("secrets/control-token")).unwrap();
@@ -427,7 +432,17 @@ async fn explicit_camera_or_typed_question_uses_existing_delivery_and_returns_on
     assert!(cards[0]["data"]["delegation_id"].is_null());
     tokio::time::sleep(Duration::from_millis(650)).await;
     let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
-    assert_eq!(commands.lines().filter(|l| l.contains("append")).count(), 1);
+    let appends: Vec<Value> = commands
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|c: &Value| c["op"] == "append")
+        .collect();
+    assert!(!appends.is_empty());
+    assert!(
+        appends
+            .iter()
+            .all(|c| c["content"].as_str().unwrap().len() <= 480)
+    );
     end(&f, id).await;
 }
 
@@ -848,5 +863,511 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
             .count(),
         2
     );
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn grounded_bootstrap_and_voice_preferences_do_not_create_backend_model_work() {
+    let f = fixture("quiet");
+    let path = f.home.path().join("companion.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["profiles"]["default"]["identity"] = json!("Coach, the existing personal agent");
+    config["profiles"]["default"]["observed_at"] = json!("2026-11-07T19:00:00Z");
+    config["profiles"]["default"]["connections"] = json!([{"name":"Minecraft","description":"Known context connection; actions require their own authorized path."}]);
+    std::fs::write(path, config.to_string()).unwrap();
+    let (_, call) = start(&f).await;
+    let initial: Value =
+        serde_json::from_slice(&std::fs::read(f.home.path().join("bridge-initial.json")).unwrap())
+            .unwrap();
+    let instructions = initial["instructions"].as_str().unwrap();
+    for expected in [
+        "Coach",
+        "Minecraft",
+        "2026-11-07T19:00:00Z",
+        "Before denying",
+        "<|SpawnThinking|>",
+        "not proof of current activity",
+    ] {
+        assert!(instructions.contains(expected), "{expected}");
+    }
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    let settings = "/api/v1/companion/agents/default/voice-settings";
+    let (status, setting) = request(&f, "PUT", settings, Some(json!({"voice":"marin"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(setting["applies_to"], "next_call");
+    assert_eq!(
+        request(&f, "PUT", settings, Some(json!({"voice":"invented"})))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, current) = request(
+        &f,
+        "GET",
+        &format!("/api/v1/companion/calls/{}", call["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(current["voice"], "alloy");
+    end(&f, call["id"].as_str().unwrap()).await;
+    let (_, next) = start(&f).await;
+    assert_eq!(next["voice"], "marin");
+    assert_eq!(request(&f, "GET", settings, None).await.1["voice"], "marin");
+    end(&f, next["id"].as_str().unwrap()).await;
+}
+
+#[tokio::test]
+async fn capability_probe_reads_effective_acp_without_starting_a_model_session() {
+    let f = fixture("quiet");
+    {
+        let db = f.s.db.lock().unwrap();
+        let mut a: Value = serde_json::from_str(
+            &db.query_row(
+                "SELECT config FROM agent_endpoints WHERE id='default'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        a["env"]["FIXTURE_IMAGES"] = json!("1");
+        db.execute(
+            "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+            [a.to_string()],
+        )
+        .unwrap();
+    }
+    let (_, catalog) = request(&f, "GET", "/api/v1/companion", None).await;
+    assert!(catalog["contacts"][0]["image_input"].is_null());
+    let (status, capabilities) = request(
+        &f,
+        "GET",
+        "/api/v1/companion/agents/default/capabilities",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities["image_input"], true);
+    let events = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    assert!(events.contains("initialize"));
+    assert!(!events.contains("session/new"));
+    assert!(!events.contains("session/prompt"));
+}
+
+#[tokio::test]
+async fn upload_awareness_is_owned_durable_idempotent_and_does_not_auto_prompt() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let path = format!("/api/v1/companion/calls/{id}/uploads");
+    let upload = uuid::Uuid::new_v4().to_string();
+    let mut event =
+        json!({"upload_id":upload,"state":"captured","source":"paste","name":"notes.txt"});
+    assert_eq!(
+        request(&f, "POST", &path, Some(event.clone())).await.0,
+        StatusCode::OK
+    );
+    event["state"] = json!("uploading");
+    assert_eq!(
+        request(&f, "POST", &path, Some(event.clone())).await.0,
+        StatusCode::OK
+    );
+    let (status, attachment) = request(
+        &f,
+        "POST",
+        &format!("/api/v1/conversations/{room}/attachments"),
+        Some(json!({"name":"notes.txt","mime_type":"text/plain","data":"aGVsbG8="})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    event["state"] = json!("available");
+    event["attachment_ids"] = json!([attachment["id"]]);
+    let (_, receipt) = request(&f, "POST", &path, Some(event.clone())).await;
+    assert_eq!(receipt["voice_awareness"], "queued");
+    let (_, again) = request(&f, "POST", &path, Some(event.clone())).await;
+    assert_eq!(again["duplicate"], true);
+    assert_eq!(again["voice_awareness"], "queued");
+    event["state"] = json!("failed");
+    event["attachment_ids"] = json!([]);
+    assert_eq!(
+        request(&f, "POST", &path, Some(event)).await.0,
+        StatusCode::CONFLICT
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    {
+        let db = f.s.db.lock().unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM input_deliveries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        let pending: bool = db
+            .query_row(
+                "SELECT message_id IS NULL FROM attachments WHERE id=?1",
+                [attachment["id"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(pending);
+        let events: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='upload'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 3);
+    }
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn delayed_result_preserves_qualifiers_full_lookup_and_delegation_without_interrupting() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let text = format!(
+        "{}The local test videos run on ARM64; these are local files, not YouTube videos.\n{}",
+        "This is a complete introductory fact. ".repeat(20),
+        "Further complete detail. ".repeat(3000)
+    );
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('late-source',?1,'user','Find local test videos','sent',?2,?2,'owner')",rusqlite::params![room,now_ms()-190_000]).unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES('late-result',?1,'assistant',?2,'complete',?3,?3,'Coach','default')",rusqlite::params![room,text,now_ms()]).unwrap();
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES('late-delivery','late-source',?1,'default','direct','completed','late-result',?2)",rusqlite::params![room,now_ms()]).unwrap();
+        db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'late-delegation',100,'dispatched','late-source',?2)",rusqlite::params![id,now_ms()-190_000]).unwrap();
+    }
+    let v = until(&f, id, "card").await;
+    let card = &v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "card")
+        .unwrap()["data"];
+    assert_eq!(card["late"], true);
+    assert_eq!(card["request_id"], "late-source");
+    assert_eq!(card["truncated"], true);
+    let (status, full) = request(&f, "GET", card["result_url"].as_str().unwrap(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(full["text"], text);
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    let appends: Vec<Value> = commands
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &Value| v["op"] == "append")
+        .collect();
+    assert!(!appends.is_empty());
+    assert!(appends.iter().all(|v| v["channel"] == "thinking"
+        && v["delegation_id"] == "late-delegation"
+        && v["content"].as_str().unwrap().len() <= 480));
+    assert!(appends.iter().any(|v| {
+        v["content"]
+            .as_str()
+            .unwrap()
+            .contains("on ARM64; these are local files, not YouTube videos.")
+    }));
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn saved_upload_is_sent_once_when_voice_delegates_without_a_mandatory_question() {
+    let f = fixture("upload_delegate");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let path = format!("/api/v1/companion/calls/{id}/uploads");
+    let upload = uuid::Uuid::new_v4().to_string();
+    let mut event =
+        json!({"upload_id":upload,"state":"uploading","source":"drop","name":"notes.txt"});
+    assert_eq!(
+        request(&f, "POST", &path, Some(event.clone())).await.0,
+        StatusCode::OK
+    );
+    let (_, attachment) = request(
+        &f,
+        "POST",
+        &format!("/api/v1/conversations/{room}/attachments"),
+        Some(json!({"name":"notes.txt","mime_type":"text/plain","data":"aGVsbG8="})),
+    )
+    .await;
+    event["state"] = json!("available");
+    event["attachment_ids"] = json!([attachment["id"]]);
+    assert_eq!(
+        request(&f, "POST", &path, Some(event.clone())).await.0,
+        StatusCode::OK
+    );
+    let v = until(&f, id, "card").await;
+    assert!(
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "delegation" && e["data"]["state"] == "completed")
+    );
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    let prompts: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|e: &Value| e["method"] == "session/prompt")
+        .collect();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0]["params"]["prompt"].to_string().contains("hello"));
+    assert!(
+        prompts[0]["params"]["prompt"]
+            .to_string()
+            .contains("do not automatically summarize")
+    );
+    assert_eq!(
+        request(&f, "POST", &path, Some(event)).await.1["duplicate"],
+        true
+    );
+    let target: Option<String> =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT message_id FROM attachments WHERE id=?1",
+                [attachment["id"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(target.is_some());
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn progress_polling_keeps_call_alive_when_elapsed_time_and_receipt_change() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('progress-source',?1,'user','Inspect the long task','sent',?2,?2,'owner')",rusqlite::params![room,now_ms()-20_000]).unwrap();
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('progress-delivery','progress-source',?1,'default','direct','submitted',?2)",rusqlite::params![room,now_ms()]).unwrap();
+        db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'progress-delegation',100,'dispatched','progress-source',?2)",rusqlite::params![id,now_ms()-20_000]).unwrap();
+    }
+    until(&f, id, "progress").await;
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE input_deliveries SET state='incorporated' WHERE id='progress-delivery'",
+            [],
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+    assert_eq!(record["state"], "connected");
+    assert_eq!(
+        record["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "progress")
+            .count(),
+        1
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn newly_shared_png_reaches_image_capable_backend_after_many_historical_uploads() {
+    let f = fixture("upload_delegate");
+    {
+        let mut agent = f.s.agent("default").unwrap().unwrap();
+        agent.env.insert("FIXTURE_IMAGES".into(), "1".into());
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+                [serde_json::to_string(&agent).unwrap()],
+            )
+            .unwrap();
+    }
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('historical-share',?1,'user','Previous shared document','complete',?2,?2,'owner')",rusqlite::params![room,now_ms()-60_000]).unwrap();
+        db.execute("INSERT INTO attachments(id,conversation_id,name,mime_type,data,bytes,created_by,created_at,message_id) VALUES('historical-artifact',?1,'previous.txt','text/plain',X'6869',2,'owner',?2,'historical-share')",rusqlite::params![room,now_ms()-60_000]).unwrap();
+        for _ in 0..21 {
+            let upload = uuid::Uuid::new_v4().to_string();
+            let data = json!({"upload_id":upload,"state":"available","source":"drop","name":"previous.txt","attachments":[{"id":"historical-artifact","name":"previous.txt","mime_type":"text/plain","bytes":2}],"conversation_id":room});
+            db.execute("INSERT INTO companion_uploads(call_id,upload_id,state,data,updated_at) VALUES(?1,?2,'available',?3,?4)",rusqlite::params![id,upload,data.to_string(),now_ms()-60_000]).unwrap();
+        }
+    }
+    let path = format!("/api/v1/companion/calls/{id}/uploads");
+    let upload = uuid::Uuid::new_v4().to_string();
+    let mut event =
+        json!({"upload_id":upload,"state":"uploading","source":"camera","name":"scene.png"});
+    assert_eq!(
+        request(&f, "POST", &path, Some(event.clone())).await.0,
+        StatusCode::OK
+    );
+    let image = "iVBORw0KGgo=";
+    let (_, artifact) = request(
+        &f,
+        "POST",
+        &format!("/api/v1/conversations/{room}/attachments"),
+        Some(json!({"name":"scene.png","mime_type":"image/png","data":image})),
+    )
+    .await;
+    event["state"] = json!("available");
+    event["attachment_ids"] = json!([artifact["id"]]);
+    assert_eq!(
+        request(&f, "POST", &path, Some(event)).await.0,
+        StatusCode::OK
+    );
+    until(&f, id, "card").await;
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    let prompts: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &Value| v["method"] == "session/prompt")
+        .collect();
+    assert_eq!(prompts.len(), 1);
+    let blocks = prompts[0]["params"]["prompt"].as_array().unwrap();
+    let supplied = blocks
+        .iter()
+        .find(|b| b["type"] == "image")
+        .expect("saved PNG bytes must reach the advertised ACP image path");
+    assert_eq!(supplied["mimeType"], "image/png");
+    assert_eq!(supplied["data"], image);
+    assert!(blocks.iter().any(|b| {
+        b["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("delegation_id is delegate-upload"))
+    }));
+    end(&f, id).await;
+}
+
+fn configure_call_permission_fixture(f: &Fixture, mode: &str, duplicate: bool) {
+    std::fs::write(f.home.path().join("companion-actions.json"),json!({"enabled":true,"agents":{"default":[{"id":"minecraft","label":"Fixture","description":"A fixed fixture route","command":["/bin/true"]}]}}).to_string()).unwrap();
+    let mut agent = f.s.agent("default").unwrap().unwrap();
+    agent
+        .env
+        .insert("FIXTURE_COMPANION_PERMISSIONS".into(), mode.into());
+    if duplicate {
+        agent.mcp_servers.push(json!({"type":"http","name":"companion","url":"https://example.test/unrelated","headers":[]}));
+    }
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+            [serde_json::to_string(&agent).unwrap()],
+        )
+        .unwrap();
+}
+#[tokio::test]
+async fn owned_companion_native_permissions_allow_once_in_setup_and_active_turn_only() {
+    let f = fixture("delegate");
+    configure_call_permission_fixture(&f, "known", false);
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    until(&f, id, "card").await;
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    let events: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let outcomes: Vec<_> = events
+        .iter()
+        .filter(|v| {
+            v["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("companion-permission-"))
+                && v.get("result").is_some()
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 5);
+    assert!(
+        outcomes
+            .iter()
+            .all(|v| v["result"]["outcome"]["optionId"] == "allow_once")
+    );
+    assert!(f.s.permissions.list(room, "owner").is_empty());
+    let setup = events
+        .iter()
+        .find(|v| v["method"] == "session/new")
+        .unwrap();
+    let descriptors = setup["params"]["mcpServers"].as_array().unwrap();
+    assert_eq!(
+        descriptors
+            .iter()
+            .filter(|m| m["name"] == "companion")
+            .count(),
+        1
+    );
+    assert!(descriptors.iter().any(|m| {
+        m["url"]
+            .as_str()
+            .is_some_and(|url| url.contains(&format!("/calls/{id}/mcp")))
+    }));
+    end(&f, id).await;
+}
+#[tokio::test]
+async fn unrelated_mcp_with_companion_title_still_waits_for_human_permission() {
+    let f = fixture("delegate");
+    configure_call_permission_fixture(&f, "other", false);
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let mut pending = None;
+    for _ in 0..100 {
+        if let Some(p) = f.s.permissions.list(room, "owner").first() {
+            pending = Some(p.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let pending = pending.expect("unrelated MCP must remain a human decision");
+    let path = format!(
+        "/api/v1/conversations/{room}/permissions/{}",
+        pending["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        request(&f, "POST", &path, Some(json!({"option_id":"reject_once"})))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    until(&f, id, "card").await;
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    let outcome: Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|v| v["id"] == "companion-permission-other" && v.get("result").is_some())
+        .unwrap();
+    assert_eq!(outcome["result"]["outcome"]["optionId"], "reject_once");
+    end(&f, id).await;
+}
+#[tokio::test]
+async fn static_companion_name_collision_is_rejected_before_session_setup() {
+    let f = fixture("delegate");
+    configure_call_permission_fixture(&f, "known", true);
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let mut interrupted = false;
+    for _ in 0..100 {
+        interrupted=f.s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE role='assistant' AND status='interrupted')",[],|r|r.get(0)).unwrap();
+        if interrupted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(interrupted);
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    assert!(!log.contains("session/new"));
+    assert!(!log.contains("session/prompt"));
     end(&f, id).await;
 }

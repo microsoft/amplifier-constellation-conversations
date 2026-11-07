@@ -22,9 +22,11 @@ test('client delegation, server authority and recording policy are fixed at star
  assert.equal(sessionOptions({...create,history:'The user asked about a project.'}).session.input[0].role,'user');
  assert.throws(()=>sessionOptions({...create,voice:'invented'}));
 });
-test('append is bounded by UTF8 bytes, original full result belongs to host display',()=>{
- const output=spokenExcerpt('🚀漢字'.repeat(500));
- assert.ok(Buffer.byteLength(output)<=480);assert.ok(output.endsWith('Full result is on screen.'));
+test('append rejects oversized content instead of cutting a sentence or qualifier',()=>{
+ assert.throws(()=>spokenExcerpt('🚀漢字'.repeat(500)), /invalid_content/);
+ const fact='The local test videos run on ARM64; they are not YouTube videos.';
+ assert.equal(spokenExcerpt(fact),fact);
+ assert.throws(()=>spokenExcerpt('x'.repeat(470)+' videos on ARM64.'), /invalid_content/);
  assert.equal(spokenExcerpt('Ready.'),'Ready.');
 });
 test('provider errors and session snapshots cannot expose credentials/instructions',()=>{
@@ -107,4 +109,26 @@ test('public event projections omit extra fields even on allowed event types',()
  const delegation=publicEvent({type:'session.delegation.created',event_id:'e3',delegation:{id:'d1',target:'client',...extra},offset_ms:2,...extra});
  assert.deepEqual(delegation,{type:'session.delegation.created',event_id:'e3',delegation:{id:'d1',target:'client'},offset_ms:2});
  assert.equal(publicEvent({type:'session.delegation.created',delegation:{id:'d1',target:'responses'},offset_ms:2}),null);
+});
+
+test('per-call MCP listener is private to the host and closes with bridge lifecycle',async()=>{
+ const {bridge,events,requests}=fixture();
+ const token='fixture-private-call-grant-0123456789';
+ await bridge.command({...create,mcp:{api_base:'http://127.0.0.1:49123',call_id:'e0f36409-a5a6-4c1a-9355-0cd5ed10ce10',token}});
+ const ready=events.find(e=>e.type==='ready');
+ assert.ok(Number.isInteger(ready.mcp_port));
+ assert.ok(!JSON.stringify(requests).includes(token));
+ assert.ok(!JSON.stringify(events).includes(token));
+ const endpoint=`http://127.0.0.1:${ready.mcp_port}/mcp`;
+ assert.equal((await fetch(endpoint,{method:'POST',body:'{}'})).status,401);
+ await bridge.close();
+ await assert.rejects(fetch(endpoint,{method:'POST',body:'{}'}));
+});
+
+test('host voice whitelist exactly matches the SDK-checked bridge whitelist',async()=>{
+ const {readFile}=await import('node:fs/promises');
+ const host=await readFile(new URL('../../src/companion.rs',import.meta.url),'utf8');
+ const names=host.match(/const VOICES:[\s\S]*?= &\[([\s\S]*?)\];/)[1].match(/"([a-z]+)"/g).map(v=>JSON.parse(v));
+ for (const voice of names) assert.equal(sessionOptions({...create,voice}).session.audio.output.voice,voice);
+ assert.equal(names.length,23);
 });

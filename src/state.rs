@@ -52,6 +52,7 @@ impl AppState {
         crate::rooms::migrate(&db, &config)?;
         crate::delivery::migrate(&db)?;
         crate::companion::migrate(&db)?;
+        crate::companion_tools::migrate(&db)?;
         db.execute("UPDATE conversations SET status='error',note='The service restarted during this turn. Review delivery status before continuing; work was not replayed.' WHERE status='working'", [])?;
         db.execute(
             "UPDATE messages SET status='interrupted' WHERE status='streaming'",
