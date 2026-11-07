@@ -98,6 +98,138 @@ pub fn descriptor(s: &AppState, room: &str) -> Result<Option<Value>> {
     let value: Option<(String,String)> = s.db.lock().unwrap().query_row("SELECT c.id,g.token FROM companion_calls c JOIN companion_tool_grants g ON c.id=g.call_id WHERE c.conversation_id=?1 AND c.state IN ('connecting','connected') AND g.port IS NOT NULL",[room],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     Ok(value.map(|(id,token)|json!({"type":"http","name":"companion","url":format!("{}/api/v1/companion/calls/{id}/mcp",s.config.public_url.trim_end_matches('/')),"headers":[{"name":"Authorization","value":format!("Bearer {token}")}]})))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMcpPermission {
+    server: String,
+    tool: String,
+    arguments: Value,
+}
+/// A single native ACP permission may use the installation's existing call
+/// authorization. This is not a general MCP, command, or filesystem policy.
+/// The driver must have injected this call's own reserved `companion` server.
+pub fn permission_once(
+    s: &AppState,
+    room: &str,
+    actor: &str,
+    agent: &str,
+    descriptor_injected: bool,
+    request: &Value,
+) -> Result<Option<Value>> {
+    if !descriptor_injected || request.to_string().len() > 65536 {
+        return Ok(None);
+    }
+    let cfg = match config(s) {
+        Ok(cfg) if cfg.enabled => cfg,
+        _ => return Ok(None),
+    };
+    let call:Option<String>=s.db.lock().unwrap().query_row("SELECT c.id FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.owner=?2 AND c.agent_id=?3 AND c.state IN ('connecting','connected') AND g.port>0",params![room,actor,agent],|r|r.get(0)).optional()?;
+    let Some(call) = call else { return Ok(None) };
+    if !crate::companion::room_identity_valid(s, room)?
+        || s.agent(agent)?
+            .is_none_or(|a| a.mcp_servers.iter().any(|m| m["name"] == "companion"))
+    {
+        return Ok(None);
+    }
+    let tool_call = &request["toolCall"];
+    if tool_call["kind"] != "other"
+        || tool_call["status"] != "pending"
+        || tool_call["toolCallId"]
+            .as_str()
+            .is_none_or(|v| v.is_empty() || v.len() > 256)
+    {
+        return Ok(None);
+    }
+    let raw: NativeMcpPermission = match serde_json::from_value(tool_call["rawInput"].clone()) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    if raw.server != "companion" || !raw.arguments.is_object() {
+        return Ok(None);
+    }
+    // Native MCP titles are derived from the actual server and tool. Treat the
+    // title only as a consistency check: built-ins carry model-authored raw
+    // arguments, which could otherwise imitate the strict MCP wrapper.
+    let expected_title = format!("companion / {}", raw.tool);
+    if tool_call["title"].as_str() != Some(expected_title.as_str()) {
+        return Ok(None);
+    }
+    let permitted = match raw.tool.as_str() {
+        "companion_connections" | "companion_shared" => {
+            raw.arguments.as_object().is_some_and(|a| a.is_empty())
+        }
+        "companion_action_status" => raw.arguments.as_object().is_some_and(|a| {
+            a.len() == 1
+                && a.get("request_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        }),
+        "companion_show" => {
+            serde_json::from_value::<Show>(raw.arguments).is_ok_and(|v| valid_show(&v))
+        }
+        "companion_request_action" => {
+            let action = match serde_json::from_value::<Action>(raw.arguments) {
+                Ok(a) if valid_action(&a) => a,
+                _ => return Ok(None),
+            };
+            if !cfg
+                .agents
+                .get(agent)
+                .is_some_and(|routes| routes.iter().any(|route| route.id == action.connection_id))
+            {
+                return Ok(None);
+            }
+            let source:Option<String>=s.db.lock().unwrap().query_row("SELECT d.message_id FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id=?2 AND d.state='dispatched' AND m.role='user' AND m.actor=?3 AND m.conversation_id=?4 AND EXISTS(SELECT 1 FROM input_deliveries i WHERE i.message_id=m.id AND i.state IN ('submitted','received_remote','incorporated'))",params![call,action.delegation_id,actor,room],|r|r.get(0)).optional()?;
+            match source {
+                Some(source) => crate::delivery::authorized(s, &source, actor)?,
+                None => false,
+            }
+        }
+        _ => false,
+    };
+    if !permitted {
+        return Ok(None);
+    }
+    let Some(options) = request["options"].as_array() else {
+        return Ok(None);
+    };
+    if options.is_empty()
+        || options.len() > 16
+        || options.iter().any(|o| {
+            o["optionId"]
+                .as_str()
+                .is_none_or(|id| id.is_empty() || id.len() > 256)
+                || o["name"]
+                    .as_str()
+                    .is_none_or(|name| name.is_empty() || name.len() > 512)
+                || !["allow_once", "allow_always", "reject_once", "reject_always"]
+                    .contains(&o["kind"].as_str().unwrap_or(""))
+        })
+        || options
+            .iter()
+            .map(|o| o["optionId"].as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != options.len()
+    {
+        return Ok(None);
+    }
+    let once = options
+        .iter()
+        .filter(|o| o["kind"] == "allow_once")
+        .collect::<Vec<_>>();
+    if once.len() != 1 {
+        return Ok(None);
+    }
+    s.audit(
+        "permission.companion.allowed",
+        Some(room),
+        json!({"agent_id":agent,"actor":actor,"call_id":call,"tool":raw.tool,"kind":"allow_once"}),
+    )?;
+    Ok(Some(
+        json!({"outcome":{"outcome":"selected","optionId":once[0]["optionId"]}}),
+    ))
+}
 fn authorize(s: &AppState, id: &str, h: &HeaderMap) -> ApiResult<(String, String, String)> {
     if !config(s)?.enabled {
         return Err(ApiError::forbidden());
@@ -186,6 +318,13 @@ pub struct Action {
     request_id: String,
     delegation_id: String,
 }
+fn valid_action(a: &Action) -> bool {
+    uuid::Uuid::parse_str(&a.request_id).is_ok()
+        && !a.instruction.trim().is_empty()
+        && a.instruction.len() <= 8000
+        && !a.delegation_id.is_empty()
+        && a.delegation_id.len() <= 160
+}
 fn action_row(s: &AppState, id: &str, rid: &str) -> Result<Option<Value>> {
     let db = s.db.lock().unwrap();
     // Helpers have a 30-second deadline. A disconnected HTTP task may disappear
@@ -211,12 +350,7 @@ pub async fn action(
     Json(a): Json<Action>,
 ) -> ApiResult<Json<Value>> {
     let (owner, agent, room) = authorize(&s, &id, &h)?;
-    if uuid::Uuid::parse_str(&a.request_id).is_err()
-        || a.instruction.trim().is_empty()
-        || a.instruction.len() > 8000
-        || a.delegation_id.is_empty()
-        || a.delegation_id.len() > 160
-    {
+    if !valid_action(&a) {
         return Err(ApiError::bad(
             "Use a UUID request_id, the exact delegation_id and a bounded explicit instruction",
         ));
@@ -344,6 +478,18 @@ pub struct Show {
     #[serde(default)]
     kind: Option<String>,
 }
+fn valid_show(v: &Show) -> bool {
+    reqwest::Url::parse(&v.url).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+    }) && v.url.len() <= 4000
+        && v.title.len() <= 300
+        && !v.title.contains(['\n', '\r'])
+        && v.kind
+            .as_deref()
+            .is_none_or(|kind| matches!(kind, "link" | "image" | "video" | "auto"))
+}
 pub async fn show(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -351,18 +497,7 @@ pub async fn show(
     Json(v): Json<Show>,
 ) -> ApiResult<Json<Value>> {
     let (_, _, room) = authorize(&s, &id, &h)?;
-    let url = reqwest::Url::parse(&v.url)
-        .map_err(|_| ApiError::bad("Use a valid HTTP(S) artifact URL"))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || v.url.len() > 4000
-        || v.title.len() > 300
-        || v.title.contains(['\n', '\r'])
-        || v.kind
-            .as_deref()
-            .is_some_and(|k| !matches!(k, "link" | "image" | "video" | "auto"))
-    {
+    if !valid_show(&v) {
         return Err(ApiError::bad("Unsupported shared artifact"));
     }
     let eid = uuid::Uuid::new_v4().to_string();

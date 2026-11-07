@@ -230,6 +230,19 @@ These tools apply only to the private call and selected agent. They do not merge
 sessions, imply write authority from context access, or require a shared
 Constellation provisioning or identity service.
 
+With optional actions enabled, Conversations can answer a native ACP permission
+request with `allow_once` for its own call tools. The active private call, caller,
+agent, and grant must match the dynamically injected `companion` server; a static
+server with that reserved name is rejected. The native `rawInput` must identify
+that server and a known tool with the exact argument schema, and its title must
+agree. A title alone never grants permission. Read/shared/status tools and valid
+HTTP(S) show requests qualify; an action also needs the exact authorized active
+delegation and a configured connection. The tool API repeats its authority and
+receipt checks. The selected agent still interprets the caller's intent; the host
+does not independently prove semantic action authorization from the utterance.
+Unknown request shapes, other MCP servers, commands, and file operations retain
+human approval. This does not create broad or persistent permission grants.
+
 An action requires an active, authenticated caller delegation and a configured
 connection. Use the exact `delegation_id` supplied with that caller instruction;
 later steering must not silently substitute a different request. The host records a durable receipt before invoking its fixed helper.

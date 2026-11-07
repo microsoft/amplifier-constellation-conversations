@@ -16,6 +16,7 @@ struct SetupInteraction<'a> {
     label: &'a str,
     agent_id: &'a str,
     deadline: tokio::time::Instant,
+    companion_injected: bool,
 }
 struct Peer {
     connection: amplifier_acp_connection::Connection,
@@ -198,6 +199,20 @@ impl Peer {
                     .is_ok();
             if !request_scoped && !session_scoped {
                 self.write(json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32602,"message":"Callback belongs to a different session or request"}})).await?;
+                continue;
+            }
+            if name == "session/request_permission"
+                && let Some(outcome) = crate::companion_tools::permission_once(
+                    ctx.state,
+                    ctx.room,
+                    ctx.actor,
+                    ctx.agent_id,
+                    ctx.companion_injected,
+                    &v["params"],
+                )?
+            {
+                self.write(json!({"jsonrpc":"2.0","id":v["id"],"result":outcome}))
+                    .await?;
                 continue;
             }
             if name == "elicitation/create" {
@@ -558,7 +573,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     let init = c.peer.setup_request(
         "initialize",
         json!({"protocolVersion":1,"clientInfo":{"name":"agent-conversations","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":capabilities}),
-        SetupInteraction {state:&state,callbacks:&callbacks,room:&conversation,actor:&actor,label:&agent.label,agent_id:&agent_id,deadline},
+        SetupInteraction {state:&state,callbacks:&callbacks,room:&conversation,actor:&actor,label:&agent.label,agent_id:&agent_id,deadline,companion_injected:false},
         &mut cancel_rx,
     ).await?;
     ensure!(
@@ -567,12 +582,18 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     );
     let can_load = init["agentCapabilities"]["loadSession"] == true;
     let mut params = json!({"cwd":agent.session_cwd.as_ref().unwrap_or(&agent.cwd),"mcpServers":agent.mcp_servers});
+    let mut companion_injected = false;
     if let Some(tool) = crate::companion_tools::descriptor(&state, &conversation)? {
+        ensure!(
+            !agent.mcp_servers.iter().any(|m| m["name"] == "companion"),
+            "The Companion call owns the reserved companion MCP server name; remove the static duplicate"
+        );
         ensure!(
             init["agentCapabilities"]["mcpCapabilities"]["http"] == true,
             "This call's shared-space tools require advertised HTTP MCP support"
         );
         params["mcpServers"].as_array_mut().unwrap().push(tool);
+        companion_injected = true;
     }
     if crate::companion::context_registered(&state, &conversation)? {
         let token = context::grant(&state, &conversation)?;
@@ -606,6 +627,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                     label: &agent.label,
                     agent_id: &agent_id,
                     deadline,
+                    companion_injected,
                 },
                 &mut cancel_rx,
             )
@@ -628,6 +650,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                     label: &agent.label,
                     agent_id: &agent_id,
                     deadline,
+                    companion_injected,
                 },
                 &mut cancel_rx,
             )
@@ -1064,6 +1087,19 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
             if v["method"] == "session/request_permission" {
                 if v["params"]["sessionId"] != sid {
                     c.peer.write(json!({"jsonrpc":"2.0","id":v["id"],"result":crate::permissions::cancelled()})).await?;
+                    continue;
+                }
+                if let Some(outcome) = crate::companion_tools::permission_once(
+                    &state,
+                    &conversation,
+                    &actor,
+                    &agent_id,
+                    companion_injected,
+                    &v["params"],
+                )? {
+                    c.peer
+                        .write(json!({"jsonrpc":"2.0","id":v["id"],"result":outcome}))
+                        .await?;
                     continue;
                 }
                 ensure!(

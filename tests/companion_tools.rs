@@ -647,3 +647,116 @@ async fn status_reconciles_abandoned_submission_to_unknown_without_replaying() {
         "queued"
     );
 }
+
+fn native_permission(tool: &str, arguments: Value) -> Value {
+    json!({"sessionId":"native-session","toolCall":{"toolCallId":"native-call","title":format!("companion / {tool}"),"kind":"other","status":"pending","rawInput":{"server":"companion","tool":tool,"arguments":arguments}},"options":[{"optionId":"persistent","name":"Always","kind":"allow_always"},{"optionId":"single","name":"Once","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]})
+}
+#[tokio::test]
+async fn scoped_native_permission_policy_requires_exact_source_and_never_title_only_or_persistent_approval()
+ {
+    let f = fixture();
+    let c = call(&f);
+    companion_tools::record_mcp_port(&f.s, &c.id, 34567).unwrap();
+    let allow = |p: &Value, injected| {
+        companion_tools::permission_once(&f.s, &c.room, "owner", "default", injected, p).unwrap()
+    };
+    for (tool, args) in [
+        ("companion_connections", json!({})),
+        ("companion_shared", json!({})),
+        (
+            "companion_action_status",
+            json!({"request_id":uuid::Uuid::new_v4().to_string()}),
+        ),
+        (
+            "companion_show",
+            json!({"url":"https://example.test/video","title":"Safe title","kind":"video"}),
+        ),
+    ] {
+        let permission = native_permission(tool, args);
+        assert_eq!(
+            allow(&permission, true).unwrap()["outcome"]["optionId"],
+            "single"
+        );
+        assert!(allow(&permission, false).is_none());
+    }
+    let valid = native_permission("companion_connections", json!({}));
+    assert!(
+        companion_tools::permission_once(&f.s, &c.room, "other", "default", true, &valid)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        companion_tools::permission_once(&f.s, &c.room, "owner", "other-agent", true, &valid)
+            .unwrap()
+            .is_none()
+    );
+    let config_path = f.home.path().join("companion-actions.json");
+    let original = std::fs::read(&config_path).unwrap();
+    let mut disabled: Value = serde_json::from_slice(&original).unwrap();
+    disabled["enabled"] = json!(false);
+    std::fs::write(&config_path, disabled.to_string()).unwrap();
+    assert!(allow(&valid, true).is_none());
+    std::fs::write(config_path, original).unwrap();
+    let mut wrong_server = valid.clone();
+    wrong_server["toolCall"]["title"] = json!("companion / companion_connections");
+    wrong_server["toolCall"]["rawInput"]["server"] = json!("other");
+    let mut title_only = valid.clone();
+    title_only["toolCall"]["rawInput"] = json!({"command":"echo arbitrary host operation"});
+    let mut forged_shell = valid.clone();
+    forged_shell["toolCall"]["rawInput"]["command"] = json!("echo arbitrary host operation");
+    let mut forged_builtin_arguments = valid.clone();
+    forged_builtin_arguments["toolCall"]["title"] = json!("workspace run");
+    let mut no_once = valid.clone();
+    no_once["options"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|o| o["kind"] != "allow_once");
+    for permission in [
+        wrong_server,
+        title_only,
+        forged_shell,
+        forged_builtin_arguments,
+        no_once,
+        native_permission("workspace_run", json!({"command":"echo arbitrary"})),
+        native_permission(
+            "companion_connections",
+            json!({"url":"http://127.0.0.1/other"}),
+        ),
+        native_permission(
+            "companion_show",
+            json!({"url":"javascript:alert(1)","title":"unsafe"}),
+        ),
+    ] {
+        assert!(allow(&permission, true).is_none());
+    }
+    let action_permission = native_permission(
+        "companion_request_action",
+        action(&uuid::Uuid::new_v4().to_string()),
+    );
+    assert!(allow(&action_permission, true).is_none());
+    let (_, mid, _) = delegation(&f, &c, "user");
+    assert!(allow(&action_permission, true).is_some());
+    let mut unknown_source = action_permission.clone();
+    unknown_source["toolCall"]["rawInput"]["arguments"]["delegation_id"] = json!("other-source");
+    assert!(allow(&unknown_source, true).is_none());
+    let mut unknown_connection = action_permission.clone();
+    unknown_connection["toolCall"]["rawInput"]["arguments"]["connection_id"] =
+        json!("not-enrolled");
+    assert!(allow(&unknown_connection, true).is_none());
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM input_authority WHERE message_id=?1", [mid])
+        .unwrap();
+    assert!(allow(&action_permission, true).is_none());
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    assert!(allow(&valid, true).is_none());
+    assert!(effects(&f).is_empty());
+}

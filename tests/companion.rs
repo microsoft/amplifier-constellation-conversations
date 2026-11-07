@@ -38,7 +38,7 @@ if voice=='closed_setup':
  emit({'type':'event','event':{'type':'session.closed','event_id':'early-closed','session':{'id':'live-fixture'},'reason':'close_requested','usage':{'seconds':15}}})
  emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});sys.exit(0)
 if voice=='early':emit({'type':'event','event':{'type':'session.started','event_id':'started','session':{'id':'live-fixture'}}})
-emit({'type':'ready','session_id':'live-fixture','sdp':'v=0\r\nfixture-answer'})
+emit({'type':'ready','session_id':'live-fixture','sdp':'v=0\r\nfixture-answer',**({'mcp_port':34567} if c.get('mcp') else {})})
 if voice not in ('early','connecting'):emit({'type':'event','event':{'type':'session.started','event_id':'started','session':{'id':'live-fixture'}}})
 if voice not in ('quiet','connecting','upload_delegate'):
  if voice!='missing':
@@ -1246,5 +1246,128 @@ async fn newly_shared_png_reaches_image_capable_backend_after_many_historical_up
             .as_str()
             .is_some_and(|text| text.contains("delegation_id is delegate-upload"))
     }));
+    end(&f, id).await;
+}
+
+fn configure_call_permission_fixture(f: &Fixture, mode: &str, duplicate: bool) {
+    std::fs::write(f.home.path().join("companion-actions.json"),json!({"enabled":true,"agents":{"default":[{"id":"minecraft","label":"Fixture","description":"A fixed fixture route","command":["/bin/true"]}]}}).to_string()).unwrap();
+    let mut agent = f.s.agent("default").unwrap().unwrap();
+    agent
+        .env
+        .insert("FIXTURE_COMPANION_PERMISSIONS".into(), mode.into());
+    if duplicate {
+        agent.mcp_servers.push(json!({"type":"http","name":"companion","url":"https://example.test/unrelated","headers":[]}));
+    }
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+            [serde_json::to_string(&agent).unwrap()],
+        )
+        .unwrap();
+}
+#[tokio::test]
+async fn owned_companion_native_permissions_allow_once_in_setup_and_active_turn_only() {
+    let f = fixture("delegate");
+    configure_call_permission_fixture(&f, "known", false);
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    until(&f, id, "card").await;
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    let events: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let outcomes: Vec<_> = events
+        .iter()
+        .filter(|v| {
+            v["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("companion-permission-"))
+                && v.get("result").is_some()
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 5);
+    assert!(
+        outcomes
+            .iter()
+            .all(|v| v["result"]["outcome"]["optionId"] == "allow_once")
+    );
+    assert!(f.s.permissions.list(room, "owner").is_empty());
+    let setup = events
+        .iter()
+        .find(|v| v["method"] == "session/new")
+        .unwrap();
+    let descriptors = setup["params"]["mcpServers"].as_array().unwrap();
+    assert_eq!(
+        descriptors
+            .iter()
+            .filter(|m| m["name"] == "companion")
+            .count(),
+        1
+    );
+    assert!(descriptors.iter().any(|m| {
+        m["url"]
+            .as_str()
+            .is_some_and(|url| url.contains(&format!("/calls/{id}/mcp")))
+    }));
+    end(&f, id).await;
+}
+#[tokio::test]
+async fn unrelated_mcp_with_companion_title_still_waits_for_human_permission() {
+    let f = fixture("delegate");
+    configure_call_permission_fixture(&f, "other", false);
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let mut pending = None;
+    for _ in 0..100 {
+        if let Some(p) = f.s.permissions.list(room, "owner").first() {
+            pending = Some(p.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let pending = pending.expect("unrelated MCP must remain a human decision");
+    let path = format!(
+        "/api/v1/conversations/{room}/permissions/{}",
+        pending["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        request(&f, "POST", &path, Some(json!({"option_id":"reject_once"})))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    until(&f, id, "card").await;
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    let outcome: Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|v| v["id"] == "companion-permission-other" && v.get("result").is_some())
+        .unwrap();
+    assert_eq!(outcome["result"]["outcome"]["optionId"], "reject_once");
+    end(&f, id).await;
+}
+#[tokio::test]
+async fn static_companion_name_collision_is_rejected_before_session_setup() {
+    let f = fixture("delegate");
+    configure_call_permission_fixture(&f, "known", true);
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let mut interrupted = false;
+    for _ in 0..100 {
+        interrupted=f.s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE role='assistant' AND status='interrupted')",[],|r|r.get(0)).unwrap();
+        if interrupted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(interrupted);
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    assert!(!log.contains("session/new"));
+    assert!(!log.contains("session/prompt"));
     end(&f, id).await;
 }
