@@ -593,6 +593,12 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
             "This call's shared-space tools require advertised HTTP MCP support"
         );
         params["mcpServers"].as_array_mut().unwrap().push(tool);
+        crate::companion_surface::record_capabilities(
+            &state,
+            &conversation,
+            &agent_id,
+            &init["agentCapabilities"],
+        )?;
         companion_injected = true;
     }
     if crate::companion::context_registered(&state, &conversation)? {

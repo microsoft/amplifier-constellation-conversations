@@ -53,6 +53,7 @@
         </div>
         <div class="shared-panel" aria-label="Shared conversation space">
           <div class="shared-tabs" role="tablist" aria-label="Conversation detail"><button id="space-tab" role="tab" aria-selected="true" aria-controls="space-panel">Shared space <span id="card-count" class="count" hidden>0</span></button><button id="transcript-tab" role="tab" aria-selected="false" aria-controls="transcript-panel" tabindex="-1">Transcript</button></div>
+          <p id="connection-status" class="small connection-status" hidden></p>
           <div id="work-status" class="work-status" role="status" hidden></div>
           <section id="space-panel" role="tabpanel" aria-labelledby="space-tab" tabindex="0">
             <div class="share-toolbar"><p>Drop or paste text, images, or PDFs here.</p><button id="choose-files" class="secondary" type="button" disabled>Share files</button><input id="share-files" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,.md,.txt,.csv,.json" hidden></div>
@@ -61,6 +62,7 @@
               <div class="camera-heading"><h2>Your camera</h2><span class="preview-badge">LOCAL PREVIEW</span></div>
               <video id="camera-preview" autoplay playsinline muted aria-label="Local camera preview"></video>
               <p id="camera-note" class="small">The preview stays on your device. Capture &amp; share saves one photo and lets your agent know it is available. The live camera feed is never shared.</p>
+              <label class="camera-consent"><input id="voice-photos" type="checkbox"> Allow photos when I ask by voice during this call</label><p class="small">One photo per request. Turning off the camera also turns this off.</p>
               <button id="capture-photo" class="secondary">Capture &amp; share</button>
             </section>
             <div id="space-empty" class="space-empty"><div class="space-illustration" aria-hidden="true"><span></span><span></span><span></span></div><h2>A little space to see things.</h2><p>Share something while you talk. Useful answers and results will appear here too.</p></div><div id="cards" class="cards" aria-live="polite" aria-relevant="additions text"></div>

@@ -326,3 +326,120 @@ Official provider references: [Live](https://developers.openai.com/api/docs/guid
 [delegation](https://developers.openai.com/api/docs/guides/live-delegation),
 [WebRTC](https://developers.openai.com/api/docs/guides/voice-webrtc), and
 [server controls](https://developers.openai.com/api/docs/guides/voice-server-controls).
+
+## Hands-free controls and connection awareness
+
+An enabled call MCP server now also exposes `companion_view`,
+`companion_capture`, and `companion_surface_status`. A view operation can scroll
+one pane, change tabs, or focus an actual shared-card ID. It cannot choose DOM
+selectors, run JavaScript, navigate arbitrary pages, or open another call.
+
+The human must enable the camera in the browser and select **Allow photos when
+I ask by voice during this call**. Only then can a source-bound delegation request
+one photo. It cannot enable a camera or microphone. Turning the camera off,
+leaving the call, or losing the browser's live presence closes that permission.
+A capture receipt progresses through queued, accepted, executed (one frame), and
+uploaded (saved bytes). The browser executes only after its first confirmed
+atomic acceptance; uncertain acknowledgments never recapture or resend a photo.
+The status tool can return the actual owned JPEG/PNG as MCP image content for a
+vision-capable reasoning engine. Uploaded does not mean inspected. Camera images
+from this path are capped at 512 KiB. A local-only engine remains local-only; the
+connector does not add a cloud vision fallback.
+
+Browser routes use the owner's authenticated session and CSRF protection:
+
+| Route suffix under `/api/v1/companion/calls/{id}` | Purpose |
+| --- | --- |
+| `POST /surface/presence` | Exact browser UUID, explicit camera/voice-photo consent, nullable measured audio-activity hints. |
+| `GET /surface/commands?browser_id=...` | Pending commands for that browser only. |
+| `POST /surface/commands/{operation}/ack` | Atomic acceptance or actual executed/uploaded/failed receipt. |
+
+The immutable operation UUID, exact delegation, call, browser and 30-second TTL
+bind each command. Replay after timeout or uncertain execution is refused. A new
+UUID cannot create a second photo under the same delegation. Media energy is an
+activity hint; it is not speaker identity, transcription, or a finished turn.
+
+### Read-only observers
+
+Connection actions retain their original submission receipts. Optional observers
+add subsequent observations alongside them in `companion_action_status`. A
+Minecraft task is joined to the exact operator input/source ID, including bounded
+retained task history. An agent's `review` status is **reported complete**, with
+`verified: false`; it does not become independently verified completion. A new,
+unrelated task cannot establish the earlier task's outcome. Slack observations
+can prove **message delivery** within the bounded channel history, never acceptance
+or completion of subsequent work from message prose. A history gap remains a gap.
+
+Install fixed observer commands and add `companion-awareness.json` to this
+Conversations installation. No observer runs unless this separate policy is
+enabled. Each source requires exact authorized call owners and exact audience
+objects. The following is an example, not a fleet-default policy:
+
+```json
+{
+  "enabled": true,
+  "decision_command": ["/opt/companion/bin/node", "/opt/companion/bridge/awareness-decision.mjs"],
+  "guidance": "Prefer substantive requested outcomes or blockers over routine chatter.",
+  "agents": {
+    "default": [{
+      "id": "minecraft-workshop",
+      "label": "Workshop",
+      "owners": ["local-user"],
+      "command": ["/usr/bin/python3", "/opt/companion/bridge/minecraft-observe.py", "--config", "/etc/companion/game-observer.json"],
+      "audiences": [{"kind":"public","experience":"minecraft","connection_id":"minecraft-workshop"}]
+    }]
+  }
+}
+```
+
+An observer's connection ID must match the corresponding fixed action connection.
+Minecraft observer configuration is `{minecraft_home, connection_id,
+expected_username}`; Slack configuration is `{slack_home, connection_id,
+channel_id, expected_bot_user_id}`. Paths are absolute and installation-owned.
+Commands cannot be supplied by speech, a model, or event text. Platform tokens
+stay in their existing connector homes. The helpers use only fixed read routes;
+the Slack helper uses the official Slack SDK. Each poll has a bounded deadline,
+no retries, and at most 32 events and four known action receipts. Source text is
+not silently clipped; oversized facts are omitted with coverage information.
+
+Observations are collected only during an active, authorized private call.
+Unsolicited events must match the installed audience policy and be newer than
+this call. Private action status is visible only for that call's own exact
+request. Disabling or changing the policy withdraws pending presentation work;
+revoked credentials, changed room membership, or a changed agent endpoint close
+the path. Ending the call stops observations; it does not cancel accepted work.
+Durable prior receipts remain available in the installation's call history.
+
+### Decision models and presentation
+
+The official OpenAI SDK's Decisions endpoint with `gpt-6-luna` advises ignore,
+quiet, later, or notify from the intact event, bounded recent transcript fragments,
+and owner guidance. Decisions receive no credentials and grant no action
+permission. The host records intent before the single provider request, deduplicates
+immutable revisions, disables retries, and keeps uncertain outcomes uncertain.
+Provider failure/refusal/invalid output retains a quiet card. At most two new
+facts are evaluated per worker cycle, with a 240-fact bound per call.
+
+Full relevant facts are retained as shared cards. Short facts may enter voice
+context; long facts use a pointer to the exact call's saved shared space rather
+than a clipped summary. Pass the pointer's exact `awareness_id` (64 lowercase
+hexadecimal characters) to `companion_shared` to retrieve that card even after it
+leaves the recent-card list. This optional lookup stays within the current call;
+an unknown ID returns missing rather than substituting another card.
+Automatic context appends wait for fresh browser quiet
+hints, no recent transcript, and no pending reasoning delegation. This is a
+conservative opportunity to speak, not proof that a human turn ended. An unavailable
+observer does not block the others. Model scores are pilot thresholds, not
+calibrated accuracy or a delivery guarantee.
+
+Thinking appends are quiet-context intent, not a promise that their contents can
+never be spoken. Both thinking and commentary appends cancel pending provider
+automatic delegation acknowledgments, so this implementation defers background
+appends while a delegation is active. Matching provider acknowledgments record
+**context accepted**, not audio playback or completed work. Uncertain appends are
+never replayed automatically. These are Companion/MCP application policies, not
+new ACP fields or a replacement agent runtime.
+
+References: [OpenAI Decisions](https://developers.openai.com/api/docs/guides/decisions),
+[Live conversations](https://developers.openai.com/api/docs/guides/live-conversations),
+[Live delegation](https://developers.openai.com/api/docs/guides/live-delegation).

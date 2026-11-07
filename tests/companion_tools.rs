@@ -651,6 +651,122 @@ async fn status_reconciles_abandoned_submission_to_unknown_without_replaying() {
 fn native_permission(tool: &str, arguments: Value) -> Value {
     json!({"sessionId":"native-session","toolCall":{"toolCallId":"native-call","title":format!("companion / {tool}"),"kind":"other","status":"pending","rawInput":{"server":"companion","tool":tool,"arguments":arguments}},"options":[{"optionId":"persistent","name":"Always","kind":"allow_always"},{"optionId":"single","name":"Once","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]})
 }
+
+#[tokio::test]
+async fn exact_awareness_lookup_finds_older_card_and_cannot_cross_calls_or_redirect() {
+    let f = fixture();
+    let a = call(&f);
+    let b = call(&f);
+    let awareness_id = "a1".repeat(32);
+    let fact =
+        "The roof was reported complete; the final inspection failed. Do not claim verification.";
+    let data = json!({"awareness_id":awareness_id,"text":fact,"observed_only":true,"conversation_id":a.room});
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'card',?3,?4)",params![a.id,format!("awareness-card:{awareness_id}"),data.to_string(),now_ms()]).unwrap();
+        for i in 0..20 {
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'card',?3,?4)",params![a.id,format!("new-card-{i}"),json!({"text":format!("Newer card {i}"),"conversation_id":a.room}).to_string(),now_ms()]).unwrap();
+        }
+    }
+    let (status, recent) = request(&f, &a, "GET", "shared", None, &a.token, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recent["shown"].as_array().unwrap().len(), 16);
+    assert!(!recent.to_string().contains(fact));
+    let query = format!("shared?awareness_id={awareness_id}");
+    let (status, exact) = request(&f, &a, "GET", &query, None, &a.token, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(exact["items"], json!([]));
+    assert_eq!(exact["shown"].as_array().unwrap().len(), 1);
+    assert_eq!(exact["shown"][0]["awareness_id"], awareness_id);
+    assert_eq!(exact["shown"][0]["text"], fact);
+    assert!(
+        exact["shown"][0]["card_id"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        request(&f, &b, "GET", &query, None, &b.token, false)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&f, &a, "GET", &query, None, &b.token, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &f,
+            &a,
+            "GET",
+            &format!("shared?awareness_id={}", "b".repeat(64)),
+            None,
+            &a.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    for bad in ["short".to_owned(), "g".repeat(64), "a".repeat(65)] {
+        assert_eq!(
+            request(
+                &f,
+                &a,
+                "GET",
+                &format!("shared?awareness_id={bad}"),
+                None,
+                &a.token,
+                false
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/companion/calls/{}/tools/{query}&call_id={}",
+                    a.id, b.id
+                ))
+                .header("authorization", format!("Bearer {}", a.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Corrupted/mismatched stored identities must not return another card as
+    // the requested source, even when its event key happens to match.
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_events SET data=?3 WHERE call_id=?1 AND event_key=?2",
+            params![
+                a.id,
+                format!("awareness-card:{awareness_id}"),
+                json!({"awareness_id":"c".repeat(64),"text":"Wrong stored identity"}).to_string()
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        request(&f, &a, "GET", &query, None, &a.token, false)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(effects(&f).is_empty());
+}
 #[tokio::test]
 async fn scoped_native_permission_policy_requires_exact_source_and_never_title_only_or_persistent_approval()
  {
@@ -663,6 +779,7 @@ async fn scoped_native_permission_policy_requires_exact_source_and_never_title_o
     for (tool, args) in [
         ("companion_connections", json!({})),
         ("companion_shared", json!({})),
+        ("companion_shared", json!({"awareness_id":"a1".repeat(32)})),
         (
             "companion_action_status",
             json!({"request_id":uuid::Uuid::new_v4().to_string()}),
@@ -725,6 +842,13 @@ async fn scoped_native_permission_policy_requires_exact_source_and_never_title_o
         native_permission(
             "companion_show",
             json!({"url":"javascript:alert(1)","title":"unsafe"}),
+        ),
+        native_permission("companion_shared", json!({"awareness_id":null})),
+        native_permission("companion_shared", json!({"awareness_id":"../other"})),
+        native_permission("companion_shared", json!({"awareness_id":"g".repeat(64)})),
+        native_permission(
+            "companion_shared",
+            json!({"awareness_id":"a".repeat(64),"call_id":"another-call"}),
         ),
     ] {
         assert!(allow(&permission, true).is_none());

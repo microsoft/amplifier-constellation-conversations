@@ -1371,3 +1371,53 @@ async fn static_companion_name_collision_is_rejected_before_session_setup() {
     assert!(!log.contains("session/prompt"));
     end(&f, id).await;
 }
+
+#[tokio::test]
+async fn capture_image_delivery_uses_actual_initialized_acp_capability_not_static_profile() {
+    for image in [false, true] {
+        let f = fixture("delegate");
+        configure_call_permission_fixture(&f, "none", false);
+        let mut agent = f.s.agent("default").unwrap().unwrap();
+        if image {
+            agent.env.insert("FIXTURE_IMAGES".into(), "1".into());
+        }
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+                [serde_json::to_string(&agent).unwrap()],
+            )
+            .unwrap();
+        let path = f.home.path().join("companion.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["profiles"]["default"]["image_input"] = json!(!image);
+        std::fs::write(path, config.to_string()).unwrap();
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        until(&f, id, "card").await;
+        let (actual,at):(bool,i64)=f.s.db.lock().unwrap().query_row("SELECT image_input,observed_at FROM companion_surface_capabilities WHERE call_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(actual, image);
+        assert!(at > 0);
+        let events = std::fs::read_to_string(f.home.path().join("acp.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|v| v["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|v| v["method"] == "session/prompt")
+                .count(),
+            1
+        );
+        end(&f, id).await;
+    }
+}

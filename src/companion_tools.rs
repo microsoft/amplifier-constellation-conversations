@@ -10,7 +10,7 @@ use anyhow::{Result, ensure};
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -155,9 +155,25 @@ pub fn permission_once(
         return Ok(None);
     }
     let permitted = match raw.tool.as_str() {
-        "companion_connections" | "companion_shared" => {
-            raw.arguments.as_object().is_some_and(|a| a.is_empty())
+        "companion_view" | "companion_capture" | "companion_surface_status" => {
+            crate::companion_surface::permission_valid(
+                s,
+                &call,
+                actor,
+                agent,
+                room,
+                &raw.tool,
+                raw.arguments,
+            )?
         }
+        "companion_connections" => raw.arguments.as_object().is_some_and(|a| a.is_empty()),
+        "companion_shared" => raw.arguments.as_object().is_some_and(|a| {
+            a.is_empty()
+                || (a.len() == 1
+                    && a.get("awareness_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_awareness_id))
+        }),
         "companion_action_status" => raw.arguments.as_object().is_some_and(|a| {
             a.len() == 1
                 && a.get("request_id")
@@ -230,7 +246,14 @@ pub fn permission_once(
         json!({"outcome":{"outcome":"selected","optionId":once[0]["optionId"]}}),
     ))
 }
-fn authorize(s: &AppState, id: &str, h: &HeaderMap) -> ApiResult<(String, String, String)> {
+pub(crate) fn enabled(s: &AppState) -> Result<bool> {
+    Ok(config(s)?.enabled)
+}
+pub(crate) fn authorize(
+    s: &AppState,
+    id: &str,
+    h: &HeaderMap,
+) -> ApiResult<(String, String, String)> {
     if !config(s)?.enabled {
         return Err(ApiError::forbidden());
     }
@@ -331,7 +354,13 @@ fn action_row(s: &AppState, id: &str, rid: &str) -> Result<Option<Value>> {
     // before recording that outcome; expiry establishes uncertainty, not failure.
     // A later matching receipt may still replace this provisional unknown state.
     db.execute("UPDATE companion_actions SET state='unknown',result=?3 WHERE call_id=?1 AND request_id=?2 AND state='submitting' AND created_at<?4",params![id,rid,json!({"request_id":rid,"state":"unknown","diagnostic":"submission_receipt_expired","message":"No terminal receipt was observed within the helper deadline. The effect may have occurred; do not retry automatically."}).to_string(),now_ms()-45_000])?;
-    Ok(db.query_row("SELECT request_id,connection_id,state,result,created_at FROM companion_actions WHERE call_id=?1 AND request_id=?2",params![id,rid],|r|{let result:String=r.get(3)?;Ok(json!({"request_id":r.get::<_,String>(0)?,"connection_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"result":serde_json::from_str::<Value>(&result).unwrap_or(Value::Null),"created_at":r.get::<_,i64>(4)?}))}).optional()?)
+    let mut value = db.query_row("SELECT request_id,connection_id,state,result,created_at FROM companion_actions WHERE call_id=?1 AND request_id=?2",params![id,rid],|r|{let result:String=r.get(3)?;Ok(json!({"request_id":r.get::<_,String>(0)?,"connection_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"result":serde_json::from_str::<Value>(&result).unwrap_or(Value::Null),"created_at":r.get::<_,i64>(4)?}))}).optional()?;
+    drop(db);
+    if let Some(row) = value.as_mut() {
+        row["observation"] =
+            crate::companion_awareness::action_observation(s, id, rid)?.unwrap_or(Value::Null);
+    }
+    Ok(value)
 }
 pub async fn status(
     State(s): State<Arc<AppState>>,
@@ -516,18 +545,49 @@ pub async fn show(
     )?;
     s.changed();
     Ok(Json(
-        json!({"state":"available_on_screen","event_id":eid,"note":"Available does not prove opened, played or watched."}),
+        json!({"state":"available_on_screen","event_id":eid,"card_id":s.db.lock().unwrap().query_row("SELECT seq FROM companion_events WHERE call_id=?1 AND event_key=?2",params![id,eid],|r|r.get::<_,i64>(0))?.to_string(),"note":"Available does not prove opened, played or watched."}),
     ))
+}
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SharedQuery {
+    awareness_id: Option<String>,
+}
+fn valid_awareness_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 pub async fn shared(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
     h: HeaderMap,
+    Query(query): Query<SharedQuery>,
 ) -> ApiResult<Json<Value>> {
     let (_, _, room) = authorize(&s, &id, &h)?;
     let db = s.db.lock().unwrap();
+    if let Some(awareness_id) = query.awareness_id {
+        if !valid_awareness_id(&awareness_id) {
+            return Err(ApiError::bad("Invalid awareness identity"));
+        }
+        let card: Option<(String, i64)> = db.query_row(
+            "SELECT data,seq FROM companion_events WHERE call_id=?1 AND kind='card' AND event_key=?2",
+            params![id, format!("awareness-card:{awareness_id}")],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let (data, seq) = card.ok_or_else(ApiError::missing)?;
+        let mut value: Value = serde_json::from_str(&data).map_err(anyhow::Error::from)?;
+        if value["awareness_id"] != awareness_id {
+            return Err(ApiError::missing());
+        }
+        value["card_id"] = json!(seq.to_string());
+        return Ok(Json(
+            json!({"items":[],"shown":[value],"note":"Exact saved source fact for this call; availability is not independent verification or action authority."}),
+        ));
+    }
     let items=db.prepare("SELECT id,name,mime_type,bytes FROM attachments WHERE conversation_id=?1 ORDER BY created_at DESC LIMIT 16")?.query_map([&room],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"mime_type":r.get::<_,String>(2)?,"bytes":r.get::<_,i64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let shown=db.prepare("SELECT data FROM companion_events WHERE call_id=?1 AND kind='card' ORDER BY seq DESC LIMIT 16")?.query_map([&id],|r|{let data:String=r.get(0)?;Ok(serde_json::from_str::<Value>(&data).unwrap_or(Value::Null))})?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let shown=db.prepare("SELECT data,seq FROM companion_events WHERE call_id=?1 AND kind='card' ORDER BY seq DESC LIMIT 16")?.query_map([&id],|r|{let data:String=r.get(0)?;let mut value=serde_json::from_str::<Value>(&data).unwrap_or(Value::Null);value["card_id"]=json!(r.get::<_,i64>(1)?.to_string());Ok(value)})?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(
         json!({"items":items,"shown":shown,"note":"Availability is not image understanding; ask through the existing attachment path."}),
     ))

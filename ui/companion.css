@@ -1312,3 +1312,5 @@ video.shared-media,audio.shared-media {width:100%}
 .shared-panel>.work-status {flex:0 0 auto;max-height:76px;overflow:auto;margin:10px 0 0;padding:10px 12px;font-size:11px}
 .output-card .result-status {font-size:12px;color:var(--muted);margin-top:12px}
 .full-result-button {display:block;margin-top:4px}
+
+.camera-consent{display:flex;align-items:center;gap:.65rem;font-size:.9rem;line-height:1.5;margin:.75rem 0}.camera-consent input{width:1.1rem;height:1.1rem;flex:none;accent-color:var(--accent,#32685d)}.output-card.surface-focused{outline:2px solid #32685d;outline-offset:3px}.connection-status{padding:0 1rem;margin:.5rem 0}
