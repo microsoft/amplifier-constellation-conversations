@@ -42,11 +42,15 @@ if voice not in ('early','connecting'):emit({'type':'event','event':{'type':'ses
 if voice not in ('quiet','connecting'):
  if voice!='missing':
   event={'type':'session.input_transcript.delta','event_id':'human-1','delta':'Please inspect the supplied test context and report it.','start_ms':10,'end_ms':90}
+  if voice in ('anchor','anchors'):event.update({'delta':'Please inspect the existing work, without changing anything','start_ms':12000,'end_ms':12990})
   emit({'type':'event','event':event});emit({'type':'event','event':event})
+ if voice in ('anchor','anchors'):emit({'type':'event','event':{'type':'session.input_transcript.delta','event_id':'human-tail','delta':' elsewhere','start_ms':13000,'end_ms':13200}})
  if voice=='overlap_ack':emit({'type':'event','event':{'type':'session.output_transcript.delta','event_id':'assistant-ack','delta':'Let me check.','start_ms':90,'end_ms':110}})
- if voice in ('delegate','missing','overlap_ack'):
+ if voice in ('delegate','missing','overlap_ack','anchor','anchors'):
   event={'type':'session.delegation.created','event_id':'delegation-1','offset_ms':100,'delegation':{'id':'delegate-1','target':'client'}}
+  if voice in ('anchor','anchors'):event['offset_ms']=13000
   emit({'type':'event','event':event});emit({'type':'event','event':event})
+second_sent=False
 for line in sys.stdin:
  c=json.loads(line)
  with (root/'bridge-commands').open('a') as f:f.write(json.dumps(c)+'\n')
@@ -54,6 +58,10 @@ for line in sys.stdin:
  if c['op']=='append':
   if not c['content'].strip():emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
   emit({'type':'event','event':{'type':'session.'+c['channel']+'.appended','event_id':'ack-'+c['event_id'],'client_event_id':c['event_id'],'start_ms':100,'end_ms':110}})
+  if voice=='anchors' and not second_sent:
+   second_sent=True
+   emit({'type':'event','event':{'type':'session.input_transcript.delta','event_id':'human-second','delta':'Now give me a separate summary.','start_ms':15000,'end_ms':15200}})
+   emit({'type':'event','event':{'type':'session.delegation.created','event_id':'delegation-2','offset_ms':15100,'delegation':{'id':'delegate-2','target':'client'}}})
 "#).unwrap();
     let c = Config {
         id: uuid::Uuid::new_v4().to_string(),
@@ -769,6 +777,76 @@ async fn assistant_ack_overlap_does_not_hold_a_settled_human_request() {
             )
             .count(),
         1
+    );
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn delegation_anchor_includes_observed_straddling_word_with_original_timing() {
+    let f = fixture("anchor");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let v = until(&f, id, "card").await;
+    assert_eq!(v["state"], "connected");
+    let source:String=f.s.db.lock().unwrap().query_row("SELECT m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='delegate-1'",[id],|r|r.get(0)).unwrap();
+    let fragments: Vec<Value> =
+        serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
+    let tail = fragments
+        .iter()
+        .find(|v| v["event_id"] == "human-tail")
+        .unwrap();
+    assert_eq!(tail["text"], " elsewhere");
+    assert_eq!(tail["start_ms"], 13000);
+    assert_eq!(tail["end_ms"], 13200);
+    assert_eq!(tail["crosses_delegation_anchor"], true);
+    assert!(
+        !v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "delegation" && e["data"]["state"] == "held")
+    );
+    end(&f, id).await;
+}
+#[tokio::test]
+async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fragment() {
+    let f = fixture("anchors");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let mut complete = false;
+    for _ in 0..150 {
+        let (_, v) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+        if v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "card")
+            .count()
+            == 2
+        {
+            complete = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(complete, "Both independent delegations should settle");
+    let source:String=f.s.db.lock().unwrap().query_row("SELECT m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='delegate-2'",[id],|r|r.get(0)).unwrap();
+    let fragments: Vec<Value> =
+        serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0]["event_id"], "human-second");
+    assert_eq!(fragments[0]["crosses_delegation_anchor"], true);
+    assert!(!source.contains("elsewhere"));
+    assert!(!source.contains("human-tail"));
+    let lines = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    assert_eq!(
+        lines
+            .lines()
+            .filter(
+                |line| serde_json::from_str::<Value>(line).unwrap()["method"] == "session/prompt"
+            )
+            .count(),
+        2
     );
     end(&f, id).await;
 }
