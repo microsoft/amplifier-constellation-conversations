@@ -12,7 +12,7 @@ let holdNextSurfaceAck = false, heldSurfaceAck = null;
 let failNextResult = false;
 const fullResultText = "Complete saved answer. " + "Source fact. ".repeat(6000) + " FINAL QUALIFIER: broader testing remains incomplete. <script>window.fullResultInjected=true</script> [Source](https://example.com/source)";
 let rejectNextUpload = false, holdNextUpload = false, heldUpload = null;
-let loggedIn = false, pollFails = false, heartbeatFails = false, controlFails = false, catalogAvailable = true, nextCall = 1;
+let loggedIn = false, pollFails = false, heartbeatFails = false, controlFails = false, catalogAvailable = true, catalogFails = false, nextCall = 1;
 let authOwner = 'fixture-user', holdNextClose = false, heldClose = null;
 const csrf = 'fixture-csrf';
 const server = createServer(async (request,response) => {
@@ -33,6 +33,7 @@ const server = createServer(async (request,response) => {
   if (request.method !== 'GET' && request.headers['x-csrf-token'] !== csrf) { send(403,{error:'missing csrf'}); return; }
   if (url.pathname === '/auth/logout') { loggedIn=false; send(200,{}); return; }
   if (url.pathname === '/api/v1/companion') {
+    if (catalogFails) { send(503,{error:'Fixture contacts temporarily unavailable.'}); return; }
     const active=[...calls.values()].find(call=>call.owner===authOwner&&['starting','connecting','connected','closing'].includes(call.state));
     send(200,{available:catalogAvailable,active_call:active?{id:active.id,conversation_id:active.conversation_id,state:active.state}:null,contacts:[{id:'coach',label:'Coach',voice:voices.get('coach') || 'marin',description:'A thoughtful native teammate.'},{id:'rook',label:'Rook',voice:'cedar',description:'<img src=x onerror="window.injection=true"> Codex teammate.'},{id:'jarvis',label:'Jarvis',voice:'ash',description:'Local reasoning, cloud voice.',image_input:false}]}); return;
   }
@@ -83,8 +84,8 @@ const server = createServer(async (request,response) => {
     if (controlFails) { send(503,{error:'fixture control outage'}); return; }
     if (callPath[2] === 'close') {
       if (call.state !== 'closed') { call.state='closing'; call.closeChecks=2; }
-      if (holdNextClose) { holdNextClose=false; heldClose=(status=503)=>send(status,status===200?{state:call.state}:{error:'fixture delayed close failure'}); return; }
-      send(200,{state:call.state}); return;
+      if (holdNextClose) { holdNextClose=false; heldClose=(status=503)=>send(status,status===200?{id:call.id,state:call.state}:{error:'fixture delayed close failure'}); return; }
+      send(200,{id:call.id,state:call.state}); return;
     }
     if (callPath[2] === 'heartbeat') { send(heartbeatFails?503:200,heartbeatFails?{error:'fixture heartbeat outage'}:{}); return; }
     if (pollFails) { send(503,{error:'fixture network outage'}); return; }
@@ -557,7 +558,7 @@ try {
   heldClose(200);heldClose=null;
   heldSurfaceAck();heldSurfaceAck=null;await page.waitForTimeout(100);
   assert.ok(!requests.some(r=>r.path.endsWith(`/${lateView.operation_id}/ack`)&&r.body.state==='executed'));
-  assert.match(await page.locator('#ended-detail').innerText(),/Closing/);
+  assert.match(await page.locator('#recovery-detail').innerText(),/Closing/);
   await wait(async()=>calls.get('call-1').state==='closed','close not reported');
   await wait(async()=>page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)&&fixture.channels.every(channel=>channel.closed)&&fixture.wakeLocks.every(lock=>lock.released)&&fixture.audioContexts.every(context=>context.closed)),'terminal close did not release retained transports');
   assert(!requests.some(request=>/cancel|stop/.test(request.path)));
@@ -572,12 +573,21 @@ try {
   });
   await page.getByRole('button',{name:'Call Rook',exact:true}).click();await page.locator('#recover-call:not([hidden])').waitFor();
   const lostRequest=requests.filter(request=>request.path==='/api/v1/companion/calls').at(-1).body;
+  const mutationsBeforeUnknown=requests.filter(r=>r.method!=='GET').length,mediaBeforeUnknown=await page.evaluate(()=>fixture.media.length);
+  await page.locator('#back-to-contacts').click();
+  assert(await page.locator('#phonebook').isVisible(),'Contacts must open even when the creation response was lost');
+  await wait(async()=>await page.locator('.contact-card').count()===3,'contacts were not rendered during unknown call recovery');
+  await page.evaluate(()=>{window.dispatchEvent(new Event('focus'));window.dispatchEvent(new Event('online'));});
+  assert(await page.locator('#call-recovery').isVisible());assert(await page.locator('#check-call-status').isHidden());
+  assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isDisabled());
+  assert.equal(await page.locator('#recover-call').innerText(),'Resolve unconfirmed call');
+  assert.equal(requests.filter(r=>r.method!=='GET').length,mutationsBeforeUnknown);
+  assert.equal(await page.evaluate(()=>fixture.media.length),mediaBeforeUnknown);
   await page.locator('#recover-call').click();await wait(async()=>await page.locator('#recover-call').isHidden(),'lost response recovery did not finish');
   const retriedRequest=requests.filter(request=>request.path==='/api/v1/companion/calls').at(-1).body;
   assert.deepEqual(lostRequest,retriedRequest);assert.equal(calls.size,2);assert.equal(calls.get('call-2').state,'closed');
-  checks.push('lost creation response is resolved using the exact same UUID and SDP, with no duplicate call');
+  checks.push('Contacts stays accessible after a lost creation response; navigation and focus preserve the unknown request without writes or media, and explicit recovery uses the same UUID and SDP');
 
-  await page.locator('#back-to-contacts').click();
   await page.getByRole('button',{name:'Call Jarvis',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','Jarvis fixture did not connect');
   await wait(async()=>/cannot inspect/.test(await page.locator('#share-capability').innerText()),'effective capability missing before capture');
@@ -601,11 +611,38 @@ try {
   await wait(async()=>page.evaluate(()=>fixture.peers.every(peer=>peer.closed)),'failed close did not release retained transports');
   assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)));
   assert.equal(calls.size,4);await wait(async()=>await page.locator('#recover-call').isEnabled(),'outage close uncertainty was not retained');
-  assert.match(await page.locator('#ended-detail').innerText(),/not yet confirmed/);
-  controlFails=false;await page.locator('#recover-call').click();await wait(async()=>await page.locator('#recover-call').isHidden(),'same-call outage recovery did not close');
-  assert.equal(calls.size,4);checks.push('sustained control outage stops otherwise-live WebRTC and all devices, retaining same-call closure recovery without redial');
+  assert.match(await page.locator('#recovery-detail').innerText(),/not yet confirmed/);
+  const outageMutations=requests.filter(r=>r.method!=='GET').length,outageMedia=await page.evaluate(()=>fixture.media.length);
+  catalogFails=true;await page.locator('#back-to-contacts').click();
+  assert(await page.locator('#phonebook').isVisible(),'Contacts navigation was blocked by an unresolved call');
+  assert(await page.locator('#call-ended').isHidden());assert(await page.locator('#call-recovery').isVisible());
+  await wait(async()=>/contacts temporarily unavailable/.test(await page.locator('#notice-text').innerText()),'catalog failure not shown');
+  await page.locator('#dismiss-notice').click();
+  assert(await page.locator('#phonebook').isVisible());assert(await page.locator('#call-recovery').isVisible());
+  assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isDisabled());
+  await page.locator('#check-call-status').click();
+  await wait(async()=>/could not be checked/.test(await page.locator('#recovery-detail').innerText()),'read failure did not retain recovery');
+  assert.equal(requests.filter(r=>r.method!=='GET').length,outageMutations);
+  assert.equal(await page.evaluate(()=>fixture.media.length),outageMedia);
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  if(process.env.COMPANION_SCREENSHOT)await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-contacts-recovery.png'),fullPage:true});
+  checks.push('an unresolved call and failed catalog never block Contacts; dismissing an error leaves recovery usable and Call disabled without writes or media');
 
-  await page.locator('#back-to-contacts').click();await page.evaluate(()=>{fixture.delayMic=true;});
+  catalogFails=false;controlFails=false;
+  await page.route('**/api/v1/companion/calls/call-4?after=0',route=>route.fulfill({status:200,json:{id:'other-call',state:'closed'}}));
+  await page.locator('#check-call-status').click();
+  await wait(async()=>/could not be checked/.test(await page.locator('#recovery-detail').innerText()),'wrong call identity was accepted');
+  assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isDisabled());
+  await page.unroute('**/api/v1/companion/calls/call-4?after=0');
+  calls.get('call-4').state='closed';
+  await page.evaluate(()=>window.dispatchEvent(new Event('online')));
+  await wait(async()=>await page.locator('#call-recovery').isHidden(),'terminal same-call status did not clear stale recovery');
+  assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isEnabled(),'existing contact Call button stayed disabled after terminal reconciliation');
+  assert.equal(requests.filter(r=>r.method!=='GET').length,outageMutations);
+  assert.equal(await page.evaluate(()=>fixture.media.length),outageMedia);
+  assert.equal(calls.size,4);checks.push('only a terminal status with the exact call ID clears recovery and re-enables already-rendered Call buttons; online reconciliation never redials or closes again');
+
+  await page.evaluate(()=>{fixture.delayMic=true;});
   await page.getByRole('button',{name:'Call Jarvis',exact:true}).click();await page.locator('#call-screen:not([hidden])').waitFor();
   await page.locator('#hangup').click();await page.evaluate(()=>fixture.resolveMic());await page.waitForTimeout(150);
   assert.equal(calls.size,4);assert(await page.evaluate(()=>fixture.tracks.at(-1).stopped));
@@ -616,13 +653,14 @@ try {
   await page.reload();await page.getByRole('button',{name:'End earlier call',exact:true}).waitFor();
   assert.equal(await page.evaluate(()=>fixture.media.length),0);assert.equal(await page.evaluate(()=>fixture.peers.length),0);
   assert.equal(requests.filter(request=>request.path==='/api/v1/companion/calls').length,beforeReload);
-  assert.match(await page.locator('#ended-detail').innerText(),/already accepted can continue/);
-  assert.equal(await page.locator('#ended-work-link').getAttribute('href'),'/?conversation=earlier-room');
+  assert(await page.locator('#phonebook').isVisible());assert(await page.locator('#call-recovery').isVisible());
+  assert.match(await page.locator('#recovery-detail').innerText(),/already accepted can continue/);
+  assert.equal(await page.locator('#recovery-work-link').getAttribute('href'),'/?conversation=earlier-room');
   await page.getByRole('button',{name:'End earlier call',exact:true}).click();
   await wait(async()=>await page.locator('#recover-call').isHidden(),'previous call did not close');
   assert.equal(calls.get('reloaded-call').state,'closed');assert.equal(await page.evaluate(()=>fixture.media.length),0);
   catalogAvailable=true;
-  await page.locator('#back-to-contacts').click();await page.getByRole('button',{name:'Call Rook',exact:true}).click();
+  await page.reload();await page.getByRole('button',{name:'Call Rook',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','fresh call blocked after explicit prior closure');
   assert.equal(requests.filter(request=>request.path==='/api/v1/companion/calls').length,beforeReload+1);
   await page.locator('#hangup').click();await wait(async()=>await page.locator('#recover-call').isHidden(),'last fixture call did not close');
@@ -637,19 +675,28 @@ try {
   holdNextUpload=true;await page.locator('#share-files').setInputFiles({name:'late-private.txt',mimeType:'text/plain',buffer:Buffer.from('Private pending upload.')});
   await wait(async()=>heldUpload!==null,'late upload fixture did not reach storage');
   const availableBeforeLogout = requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available').length;
-  holdNextClose=true;await page.locator('#sign-out').click();
+  let deliverOldStatus;
+  await page.route('**/api/v1/companion/calls/call-6?after=0',async route=>{
+    const response=await route.fetch();deliverOldStatus=()=>route.fulfill({response});
+  });
+  holdNextClose=true;await page.locator('#hangup').click();
+  await wait(async()=>heldClose!==null,'close was not pending before sign-out');
+  await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+  await wait(async()=>deliverOldStatus!==undefined,'old recovery status was not pending');
+  await page.locator('#sign-out').click();
   await page.locator('#login:not([hidden])').waitFor();await wait(async()=>heldClose!==null,'close was not pending at sign-out');
   assert.equal(await page.locator('.transcript-entry').count(),0);assert.equal(await page.locator('.output-card').count(),0);
   assert.equal(await page.locator('#continue-work').getAttribute('href'),'/');assert.equal(await page.locator('#ended-work-link').getAttribute('href'),'/');
   assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)));
   await page.locator('#username').fill('next-fixture-user');await page.locator('#password').fill('fixture-only');await page.locator('#sign-in').click();
-  await page.locator('#app:not([hidden])').waitFor();heldClose();heldClose=null;heldUpload();heldUpload=null;await page.waitForTimeout(200);
+  await page.locator('#app:not([hidden])').waitFor();heldClose();heldClose=null;heldUpload();heldUpload=null;await deliverOldStatus();await page.waitForTimeout(200);
   assert.equal(requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available').length,availableBeforeLogout);
   assert.equal(await page.locator('#recover-call').isHidden(),true);assert.equal(await page.locator('#call-ended').isHidden(),true);
+  assert(await page.locator('#call-recovery').isHidden());assert.equal(await page.locator('#recovery-detail').textContent(),'');assert.equal(await page.locator('#recovery-work-link').getAttribute('href'),'/');
   assert.equal(await page.getByRole('button',{name:'Call Coach',exact:true}).isEnabled(),true);
   assert.doesNotMatch(await page.locator('body').textContent(),/Private prior caller/);
   assert.equal(await page.evaluate(()=>Object.keys(localStorage).length+Object.keys(sessionStorage).length),0);
-  checks.push('sign-out clears private presentation and devices; delayed old upload receipts and close failures cannot contaminate the next owner’s login');
+  checks.push('sign-out clears private presentation and devices; delayed old status reads, upload receipts and close failures cannot contaminate the next owner’s login');
 
   await page.getByRole('button',{name:'Call Coach',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','provider interruption fixture did not connect');
@@ -685,6 +732,84 @@ try {
   await deliverExitTerminal();
   await wait(async()=>page.evaluate(()=>fixture.tracks.every(t=>t.stopped)&&fixture.peers.every(p=>p.closed)),'page exit terminal receipt did not release browser transport');
   checks.push('page exit still stops sensors immediately and records an explicit exit reason plus pre-release bounded transport diagnostics');
+  await page.locator('#back-to-contacts').click();await page.getByRole('button',{name:'Call Coach',exact:true}).click();
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','late close fixture did not connect');
+  const lateCloseCall=[...calls.values()].at(-1);holdNextClose=true;
+  await page.locator('#hangup').click();await wait(async()=>heldClose!==null,'late close was not held');
+  let deliverOldCatalog;
+  await page.route('**/api/v1/companion',async route=>{
+    const response=await route.fetch();deliverOldCatalog=()=>route.fulfill({response});
+  });
+  await page.locator('#back-to-contacts').click();
+  await wait(async()=>deliverOldCatalog!==undefined,'old catalog was not held');
+  await wait(async()=>await page.locator('#check-call-status').isEnabled(),'first nonterminal check did not settle');
+  assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isDisabled());
+  const writesBeforeTerminal=requests.filter(r=>r.method!=='GET').length;
+  lateCloseCall.state='closed';await page.locator('#check-call-status').click();
+  await wait(async()=>await page.locator('#call-recovery').isHidden(),'known terminal call remained blocked behind pending close');
+  assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isEnabled());
+  assert.equal(requests.filter(r=>r.method!=='GET').length,writesBeforeTerminal);
+  assert(await page.evaluate(()=>fixture.peers.every(peer=>peer.closed)),'terminal observation must release any retained old transport');
+  await page.getByRole('button',{name:'Call Coach',exact:true}).click();
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','new explicit call did not connect');
+  const latestCall=[...calls.values()].at(-1),writesBeforeLate=requests.filter(r=>r.method!=='GET').length;
+  heldClose();heldClose=null;await deliverOldCatalog();await page.waitForTimeout(200);
+  await page.unroute('**/api/v1/companion');
+  assert(await page.locator('#call-recovery').isHidden());assert(await page.locator('#call-screen').isVisible());
+  assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
+  assert.equal(requests.filter(r=>r.method!=='GET').length,writesBeforeLate);
+  assert.equal(await page.evaluate(()=>fixture.peers.at(-1).closed||fixture.tracks.at(-1).stopped),false);
+  assert.equal([...calls.values()].at(-1).id,latestCall.id);
+  await page.locator('#hangup').click();await wait(async()=>await page.locator('#call-recovery').isHidden(),'last call did not settle');
+  checks.push('a terminal read settles a pending close; late close failure and stale catalog cannot restore old recovery or alter a later explicit call');
+  for (const {lateOutcome,deliveryStage} of ['success','failure'].flatMap(lateOutcome=>['during recovery','before next call','after next call'].map(deliveryStage=>({lateOutcome,deliveryStage})))) {
+    await page.locator('#back-to-contacts').click();
+    let deliverOriginal,deliverRetry;
+    await page.route('**/api/v1/companion/calls',async route=>{
+      if(!deliverOriginal && route.request().method()==='POST') {
+        const response=await route.fetch();deliverOriginal=()=>lateOutcome==='success'?route.fulfill({response}):route.abort('failed');return;
+      }
+      if(deliveryStage==='during recovery' && !deliverRetry && route.request().method()==='POST') {
+        const response=await route.fetch();deliverRetry=()=>route.fulfill({response});return;
+      }
+      await route.continue();
+    });
+    await page.getByRole('button',{name:'Call Coach',exact:true}).click();
+    await wait(async()=>deliverOriginal!==undefined,'original creation response was not held');
+    const original=[...calls.values()].at(-1),createsBeforeResolution=requests.filter(r=>r.path==='/api/v1/companion/calls').length;
+    await page.locator('#hangup').click();await page.locator('#back-to-contacts').click();
+    assert(await page.locator('#phonebook').isVisible());assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isDisabled());
+    assert(await page.locator('#check-call-status').isHidden());
+    const closesBeforeResolution=requests.filter(r=>r.path.endsWith('/close')).length;
+    await page.locator('#recover-call').click();
+    if(deliveryStage==='during recovery') {
+      await wait(async()=>deliverRetry!==undefined,'explicit resolution response was not held');
+      await deliverOriginal();await page.waitForTimeout(100);
+      assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeResolution,'original response must leave close ownership with the explicit resolver');
+      await deliverRetry();
+    }
+    await wait(async()=>await page.locator('#call-recovery').isHidden(),'explicit pending creation recovery did not settle');
+    assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeResolution+1);
+    if(deliveryStage==='before next call') {
+      await deliverOriginal();await page.waitForTimeout(100);
+      assert(await page.locator('#call-recovery').isHidden());assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isEnabled());
+      assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeResolution+1);
+    }
+    assert.equal(original.state,'closed');
+    const creationRequests=requests.filter(r=>r.path==='/api/v1/companion/calls');
+    assert.equal(creationRequests.length,createsBeforeResolution+1);assert.deepEqual(creationRequests.at(-1).body,original.request);
+    await page.getByRole('button',{name:'Call Coach',exact:true}).click();
+    await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','new call after pending creation did not connect');
+    const closesBeforeOriginal=requests.filter(r=>r.path.endsWith('/close')).length;
+    if(deliveryStage==='after next call') { await deliverOriginal();await page.waitForTimeout(200); }
+    assert(await page.locator('#call-recovery').isHidden());assert(await page.locator('#call-screen').isVisible());
+    assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
+    assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeOriginal,'late original creation must not close again');
+    assert.equal(await page.evaluate(()=>fixture.peers.at(-1).closed||fixture.tracks.at(-1).stopped),false);
+    await page.unroute('**/api/v1/companion/calls');
+    await page.locator('#hangup').click();await wait(async()=>await page.locator('#call-recovery').isHidden(),'pending creation successor did not settle');
+    checks.push(`late original creation ${lateOutcome} ${deliveryStage} preserves explicit recovery ownership and never restores a settled call`);
+  }
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:checks.length,checks,scope:'real Chromium UI; fake API, media, and provider; no paid calls'},null,2));
 } finally { await browser.close(); await new Promise(resolve=>server.close(resolve)); }

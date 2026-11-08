@@ -552,6 +552,14 @@ outage still releases devices. Mobile operating systems may suspend WebRTC while
 backgrounded: foreground Chromium tests are not evidence of background phone
 support.
 
+Contacts and Conversations remain reachable while an earlier call's closure is
+unconfirmed. Dismissing an error changes presentation only. The recovery panel
+stays available from Contacts, and new calls remain disabled until the earlier
+call is reconciled. A read-only check clears a known call only after a matching
+terminal response; an empty catalog is not proof of settlement. Unknown creation
+requests keep their original identity and require explicit recovery. Late checks
+or close failures cannot reintroduce an old call after recovery or sign-out.
+
 Heartbeat and close requests may include strictly projected `diagnostics`: fixed
 lifecycle/transport state enums and bounded timing counters only. The installation
 retains the latest snapshot and at most 120 transitions per call. No SDP, addresses,
