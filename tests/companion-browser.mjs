@@ -12,7 +12,7 @@ let holdNextSurfaceAck = false, heldSurfaceAck = null;
 let failNextResult = false;
 const fullResultText = "Complete saved answer. " + "Source fact. ".repeat(6000) + " FINAL QUALIFIER: broader testing remains incomplete. <script>window.fullResultInjected=true</script> [Source](https://example.com/source)";
 let rejectNextUpload = false, holdNextUpload = false, heldUpload = null;
-let loggedIn = false, pollFails = false, controlFails = false, catalogAvailable = true, nextCall = 1;
+let loggedIn = false, pollFails = false, heartbeatFails = false, controlFails = false, catalogAvailable = true, nextCall = 1;
 let authOwner = 'fixture-user', holdNextClose = false, heldClose = null;
 const csrf = 'fixture-csrf';
 const server = createServer(async (request,response) => {
@@ -86,7 +86,7 @@ const server = createServer(async (request,response) => {
       if (holdNextClose) { holdNextClose=false; heldClose=(status=503)=>send(status,status===200?{state:call.state}:{error:'fixture delayed close failure'}); return; }
       send(200,{state:call.state}); return;
     }
-    if (callPath[2] === 'heartbeat') { send(200,{}); return; }
+    if (callPath[2] === 'heartbeat') { send(heartbeatFails?503:200,heartbeatFails?{error:'fixture heartbeat outage'}:{}); return; }
     if (pollFails) { send(503,{error:'fixture network outage'}); return; }
     if (call.state === 'closing' && --call.closeChecks <= 0) call.state=call.request.agent_id==='jarvis'?'interrupted':'closed';
     const after = Number(url.searchParams.get('after') || 0);
@@ -118,28 +118,32 @@ const browser = await chromium.launch({headless:true,executablePath:process.env.
 const context = await browser.newContext({viewport:{width:1280,height:900}});
 const page = await context.newPage(), errors=[]; page.on('pageerror', error => errors.push(error.message));
 await page.addInitScript(() => {
-  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,draws:0,shutters:0};
+  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,delayCamera:false,draws:0,shutters:0,enumerations:0,cameras:[{kind:'videoinput',deviceId:'rear-camera',label:'Back camera'},{kind:'videoinput',deviceId:'front-camera',label:'Front camera'}]};
   const actualNow=Date.now;fixture.clockOffset=0;Date.now=()=>actualNow()+fixture.clockOffset;
-  const makeStream = kind => {
+  const actualInterval=window.setInterval;window.setInterval=(fn,ms,...args)=>{if(ms===500)fixture.controlTick=fn;return actualInterval(fn,ms,...args);};
+  const makeStream = (kind,deviceId) => {
     const track = new EventTarget(); track.kind=kind; track.enabled=true; track.stopped=false; track.readyState='live';track.stop=()=>{track.stopped=true;track.readyState='ended';}; fixture.tracks.push(track);
+    track.getSettings=()=>({deviceId:deviceId||'rear-camera'});
     const stream = new MediaStream(); Object.defineProperties(stream,{getTracks:{value:()=>[track]},getAudioTracks:{value:()=>kind==='audio'?[track]:[]},getVideoTracks:{value:()=>kind==='video'?[track]:[]}}); return stream;
   };
-  Object.defineProperty(navigator,'mediaDevices',{configurable:true,value:{getUserMedia:async constraints=>{
+  const mediaDevices=Object.assign(new EventTarget(),{getUserMedia:async constraints=>{
     fixture.media.push(constraints);
     if (constraints.video && fixture.denyCamera) throw new DOMException('denied','NotAllowedError');
+    if (constraints.video && fixture.delayCamera) return new Promise(resolve=>{fixture.resolveCamera=()=>resolve(makeStream('video',constraints.video.deviceId?.exact));});
     if (constraints.audio && fixture.delayMic) return new Promise(resolve=>{fixture.resolveMic=()=>resolve(makeStream('audio'));});
-    return makeStream(constraints.video?'video':'audio');
-  }}});
+    return makeStream(constraints.video?'video':'audio',constraints.video?.deviceId?.exact);
+  },enumerateDevices:async()=>{fixture.enumerations++;return fixture.cameras;}});
+  Object.defineProperty(navigator,'mediaDevices',{configurable:true,value:mediaDevices});
   Object.defineProperty(navigator,'wakeLock',{configurable:true,value:{request:async()=>{
     const lock=new EventTarget(); lock.released=false; lock.release=async()=>{lock.released=true;lock.dispatchEvent(new Event('release'));}; fixture.wakeLocks.push(lock); return lock;
   }}});
   class FakePeer extends EventTarget {
-    constructor(){super();this.connectionState='new';this.iceGatheringState='complete';this.order=[];this.closed=false;fixture.peers.push(this);}
+    constructor(){super();this.connectionState='new';this.iceConnectionState='new';this.iceGatheringState='complete';this.order=[];this.closed=false;fixture.peers.push(this);}
     addTrack(){this.order.push('track');}
-    createDataChannel(label){this.order.push('channel'); const channel=new EventTarget();channel.label=label;channel.sent=[];channel.send=value=>channel.sent.push(value);channel.close=()=>{channel.closed=true;};fixture.channels.push(channel);return channel;}
+    createDataChannel(label){this.order.push('channel'); const channel=new EventTarget();channel.label=label;channel.readyState='open';channel.sent=[];channel.send=value=>channel.sent.push(value);channel.close=()=>{channel.closed=true;channel.readyState='closed';};fixture.channels.push(channel);return channel;}
     async createOffer(){this.order.push('offer');return {type:'offer',sdp:'fixture-offer-' + fixture.peers.length};}
     async setLocalDescription(offer){this.localDescription=offer;}
-    async setRemoteDescription(answer){this.remoteDescription=answer;this.connectionState='connected';this.dispatchEvent(new Event('connectionstatechange'));const event=new Event('track');event.streams=[new MediaStream()];this.dispatchEvent(event);}
+    async setRemoteDescription(answer){this.remoteDescription=answer;this.connectionState='connected';this.iceConnectionState='connected';this.dispatchEvent(new Event('connectionstatechange'));const event=new Event('track');event.streams=[new MediaStream()];this.dispatchEvent(event);}
     close(){this.closed=true;this.connectionState='closed';}
   }
   window.RTCPeerConnection=FakePeer;
@@ -176,7 +180,7 @@ try {
   await page.locator('#app:not([hidden])').waitFor(); assert.equal(await page.locator('.contact-card').count(),3);
   assert.equal(await page.locator('.contact-card img').count(),0); assert.equal(await page.evaluate(()=>window.injection),undefined);
   assert.match(await page.locator('.call-note').innerText(),/local reasoning uses cloud audio/);
-  assert.equal(await page.evaluate(()=>fixture.media.length),0); checks.push('login and contact rendering never acquire media; untrusted text stays text');
+  assert.equal(await page.evaluate(()=>fixture.media.length),0); assert.equal(await page.evaluate(()=>fixture.enumerations),0); checks.push('login and contact rendering never acquire media or enumerate cameras; untrusted text stays text');
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-contacts.png'),fullPage:true});
 
   await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
@@ -283,6 +287,34 @@ try {
   await page.locator('#mute').click();assert.equal(await page.evaluate(()=>fixture.tracks[0].enabled),false);assert.equal(await page.locator('#mute').getAttribute('aria-pressed'),'true');
   await page.locator('#mute').click();assert.equal(await page.evaluate(()=>fixture.tracks[0].enabled),true);
   await page.locator('#camera-toggle').click();await page.locator('#camera-panel:not([hidden])').waitFor();
+  await wait(async()=>await page.locator('#camera-choice option').count()===2,'granted cameras were not listed');
+  assert.equal(await page.locator('#camera-choice').inputValue(),'rear-camera');
+  assert.deepEqual(await page.locator('#camera-choice option').allTextContents(),['Back camera','Front camera']);
+  await page.locator('#voice-photos').check();
+  const oldCamera=await page.evaluate(()=>fixture.tracks.findIndex(t=>t.kind==='video'&&!t.stopped));
+  await page.locator('#camera-choice').selectOption('front-camera');
+  await wait(async()=>page.evaluate(()=>fixture.tracks.at(-1).getSettings().deviceId==='front-camera'&&!fixture.tracks.at(-1).stopped),'selected camera did not open');
+  assert(await page.evaluate(index=>fixture.tracks[index].stopped,oldCamera));
+  assert.equal(await page.evaluate(()=>fixture.media.at(-1).audio),false);
+  assert.deepEqual(await page.evaluate(()=>fixture.media.at(-1).video.deviceId),{exact:'front-camera'});
+  assert.equal(await page.evaluate(()=>fixture.tracks[0].stopped||fixture.peers[0].closed),false);
+  const cameraRequests=await page.evaluate(()=>fixture.media.length);
+  await page.evaluate(()=>{fixture.cameras=fixture.cameras.slice(1);navigator.mediaDevices.dispatchEvent(new Event('devicechange'));});
+  await page.locator('#camera-picker').waitFor({state:'hidden'});
+  assert.equal(await page.evaluate(()=>fixture.media.length),cameraRequests);
+  await page.evaluate(()=>{fixture.cameras.unshift({kind:'videoinput',deviceId:'rear-camera',label:'Back camera'});navigator.mediaDevices.dispatchEvent(new Event('devicechange'));});
+  await page.locator('#camera-picker').waitFor({state:'visible'});
+  checks.push('camera choice lists only browser-granted video devices, switches exact cameras without touching microphone or voice, and device changes never acquire media');
+  await page.evaluate(()=>{fixture.delayCamera=true;});
+  await page.locator('#camera-choice').selectOption('rear-camera');
+  await wait(async()=>page.evaluate(()=>Boolean(fixture.resolveCamera)),'camera switch was not pending');
+  await page.locator('#camera-toggle').click();
+  assert.equal(await page.locator('#voice-photos').isChecked(),false);
+  await page.evaluate(()=>{fixture.delayCamera=false;fixture.resolveCamera();});await page.waitForTimeout(100);
+  assert(await page.evaluate(()=>fixture.tracks.at(-1).stopped));assert(await page.locator('#camera-panel').isHidden());
+  assert.equal(await page.evaluate(()=>fixture.tracks[0].stopped||fixture.peers[0].closed),false);
+  await page.locator('#camera-toggle').click();await page.locator('#camera-panel:not([hidden])').waitFor();
+  checks.push('Camera off revokes voice-photo consent and releases a late camera-switch result without interrupting voice');
   assert.equal(requests.filter(request=>/\/attachments$/.test(request.path)).length,0);
   let lostNotification=false;
   await page.route('**/api/v1/companion/calls/*/uploads',async route=>{
@@ -454,6 +486,44 @@ try {
   checks.push('a lost permission decision response remains uncertain across later snapshots and never retries or re-enables its choices');
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-desktop-shared.png'),fullPage:true});
 
+  heartbeatFails=true;await page.evaluate(()=>window.dispatchEvent(new Event('blur')));
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connection interrupted','heartbeat failure not visible');
+  await page.waitForTimeout(1100);
+  assert.equal(await page.locator('#call-status-text').innerText(),'Connection interrupted','a successful poll must not hide a failed heartbeat');
+  heartbeatFails=false;await page.evaluate(()=>window.dispatchEvent(new Event('online')));
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','heartbeat did not recover');
+  checks.push('heartbeat and poll failures remain distinct; a successful event poll cannot hide a failed heartbeat');
+
+  let heldHeartbeat=null,heartbeatAttempts=0;
+  await page.route('**/api/v1/companion/calls/call-1/heartbeat',async route=>{heartbeatAttempts++;if(!heldHeartbeat){heldHeartbeat=route;return;}await route.continue();});
+  await page.evaluate(()=>window.dispatchEvent(new Event('blur')));
+  await wait(async()=>heldHeartbeat!==null,'stale heartbeat fixture did not start');
+  const callsBeforeResume=calls.size;
+  // Resume the overdue watchdog before fetch callbacks. This also covers a wall
+  // clock jump: neither may close healthy media before one bounded fresh check.
+  assert.equal(await page.evaluate(()=>{fixture.clockOffset+=16000;fixture.controlTick();return fixture.peers[0].closed||fixture.tracks[0].stopped;}),false);
+  await wait(async()=>heartbeatAttempts>=2,'stale in-flight heartbeat blocked recovery');
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','suspended timer recovery did not reconcile');
+  await heldHeartbeat.abort().catch(()=>{});await page.unroute('**/api/v1/companion/calls/call-1/heartbeat');
+  assert.equal(calls.size,callsBeforeResume);assert.equal(await page.evaluate(()=>fixture.peers[0].closed||fixture.tracks[0].stopped),false);
+  assert(requests.some(r=>r.path.endsWith('/heartbeat')&&r.body?.diagnostics?.trigger==='timer_resume'));
+  checks.push('an overdue watchdog reconciles the same call after a timer pause, replaces a stale heartbeat, and never redials or stops healthy media first');
+
+  const mediaBeforePicker=await page.evaluate(()=>fixture.media.length);
+  const chooserPromise=page.waitForEvent('filechooser');await page.locator('#choose-files').click();const chooser=await chooserPromise;
+  await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,value:true});document.dispatchEvent(new Event('visibilitychange'));});
+  assert(await page.locator('#call-screen').isVisible());
+  await chooser.setFiles([]);
+  await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,value:false});document.dispatchEvent(new Event('visibilitychange'));document.getElementById('share-files').dispatchEvent(new Event('cancel'));window.dispatchEvent(new Event('focus'));});
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','file picker return did not reconcile');
+  assert.equal(calls.size,callsBeforeResume);assert.equal(await page.evaluate(()=>fixture.media.length),mediaBeforePicker);
+  assert.equal(await page.evaluate(()=>fixture.tracks[0].stopped||fixture.peers[0].closed),false);
+  for(const r of requests.filter(r=>r.body?.diagnostics)){
+    assert.deepEqual(Object.keys(r.body.diagnostics).sort(),['trigger','visibility','peer_state','ice_state','channel_state','audio_state','wake_lock','control_age_ms','heartbeat_age_ms','timer_gap_ms'].sort());
+    for(const key of ['control_age_ms','heartbeat_age_ms','timer_gap_ms'])assert(Number.isInteger(r.body.diagnostics[key])&&r.body.diagnostics[key]>=0&&r.body.diagnostics[key]<=3600000);
+  }
+  checks.push('file-picker and visibility transitions preserve voice and refresh the existing call; diagnostics contain only bounded lifecycle states and timings');
+
   pollFails=true;
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connection interrupted','network interruption not visible');
   assert.equal(requests.filter(request=>request.path==='/api/v1/companion/calls').length,1);
@@ -580,6 +650,29 @@ try {
   assert.doesNotMatch(await page.locator('body').textContent(),/Private prior caller/);
   assert.equal(await page.evaluate(()=>Object.keys(localStorage).length+Object.keys(sessionStorage).length),0);
   checks.push('sign-out clears private presentation and devices; delayed old upload receipts and close failures cannot contaminate the next owner’s login');
+
+  await page.getByRole('button',{name:'Call Coach',exact:true}).click();
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','provider interruption fixture did not connect');
+  const interruptedCall=[...calls.values()].at(-1),closesBeforeProvider=requests.filter(r=>r.path.endsWith('/close')).length;
+  interruptedCall.state='interrupted';interruptedCall.closure={confirmed:true,provider_reason:'connection_lost',reason:'The voice provider lost the audio connection. Your saved work remains in the conversation.'};
+  await page.locator('#call-ended:not([hidden])').waitFor();
+  assert.equal(await page.locator('#ended-title').innerText(),'Call interrupted');
+  assert.equal(await page.locator('#ended-detail').innerText(),interruptedCall.closure.reason);
+  assert.doesNotMatch(await page.locator('#ended-detail').innerText(),/not confirmed/);
+  assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeProvider);
+  assert(await page.evaluate(()=>fixture.tracks.every(t=>t.stopped)&&fixture.peers.every(p=>p.closed)));
+  checks.push('confirmed provider connection loss is shown as an interruption with its saved reason, releases devices, and does not issue a duplicate close');
+
+  await page.locator('#back-to-contacts').click();await page.getByRole('button',{name:'Call Coach',exact:true}).click();
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','page exit fixture did not connect');
+  const exitingCall=[...calls.values()].at(-1);
+  await page.evaluate(()=>window.dispatchEvent(new Event('pagehide')));
+  await wait(async()=>exitingCall.state==='closed','explicit page exit did not close');
+  const exitRequest=requests.find(r=>r.path===`/api/v1/companion/calls/${exitingCall.id}/close`);
+  assert.equal(exitRequest.body.reason,'page_exit');assert.equal(exitRequest.body.diagnostics.trigger,'page_exit');
+  assert.equal(exitRequest.body.diagnostics.peer_state,'connected','closure must retain the pre-release transport state');
+  assert(await page.evaluate(()=>fixture.tracks.every(t=>t.stopped)&&fixture.peers.every(p=>p.closed)));
+  checks.push('page exit still stops sensors immediately and records an explicit exit reason plus pre-release bounded transport diagnostics');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:checks.length,checks,scope:'real Chromium UI; fake API, media, and provider; no paid calls'},null,2));
 } finally { await browser.close(); await new Promise(resolve=>server.close(resolve)); }

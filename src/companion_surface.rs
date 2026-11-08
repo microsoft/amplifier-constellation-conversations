@@ -191,6 +191,27 @@ fn card_exists(s: &AppState, id: &str, card: &str) -> Result<bool> {
         |r| r.get(0),
     )?)
 }
+pub(crate) fn permission_shape_valid(tool: &str, args: &Value) -> bool {
+    match tool {
+        "companion_surface_status" => args.as_object().is_some_and(|a| {
+            a.len() == 1
+                && a.get("operation_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|x| uuid::Uuid::parse_str(x).is_ok())
+        }),
+        "companion_view" => {
+            serde_json::from_value::<View>(args.clone()).is_ok_and(|v| valid_view(&v))
+        }
+        "companion_capture" => serde_json::from_value::<Capture>(args.clone())
+            .is_ok_and(|v| valid_identity(&v.operation_id, &v.delegation_id)),
+        "companion_hangup" => serde_json::from_value::<Hangup>(args.clone())
+            .is_ok_and(|v| valid_identity(&v.operation_id, &v.delegation_id)),
+        "companion_feedback" => {
+            serde_json::from_value::<Feedback>(args.clone()).is_ok_and(|v| valid_feedback(&v))
+        }
+        _ => false,
+    }
+}
 pub fn permission_valid(
     s: &AppState,
     id: &str,
@@ -251,8 +272,14 @@ pub fn permission_valid(
         }
         _ => return Ok(false),
     };
-    Ok(surface(s, id, capture)?.is_some()
-        && source_authorized(s, id, owner, agent, room, &delegation)?)
+    // This grants only access to the fixed endpoint. The endpoint and browser
+    // retain the actual camera/consent gate, and can explain a missing setting
+    // without a generic native approval that cannot change browser consent.
+    Ok((if capture {
+        active(s, id)?
+    } else {
+        surface(s, id, false)?.is_some()
+    }) && source_authorized(s, id, owner, agent, room, &delegation)?)
 }
 
 fn reconcile(db: &Connection, id: &str) -> Result<()> {
@@ -325,14 +352,7 @@ fn enqueue(
 ) -> ApiResult<Value> {
     let (owner, agent, room) = authority;
     let capture = kind == "capture";
-    let browser = surface(s, id, capture)?.ok_or_else(|| {
-        ApiError::bad(if capture {
-            "No fresh browser with explicit camera capture consent"
-        } else {
-            "No fresh active browser surface"
-        })
-    })?;
-    if !source_authorized(s, id, owner, agent, room, delegation)? {
+    if !active(s, id)? || !source_authorized(s, id, owner, agent, room, delegation)? {
         return Err(ApiError::forbidden());
     }
     let mut db = s.db.lock().unwrap();
@@ -359,11 +379,38 @@ fn enqueue(
             return Ok(receipt);
         }
     }
+    // Resolve earlier receipts before checking current consent. Turning a
+    // camera off must never hide an uncertain capture and invite a replay.
+    let presence: Option<(String, String, bool, bool)> = tx.query_row(
+        "SELECT browser_id,session_hash,camera_enabled,capture_consent FROM companion_surfaces p JOIN companion_calls c ON c.id=p.call_id WHERE p.call_id=?1 AND p.updated_at>=?2 AND c.state IN ('connecting','connected') AND c.heartbeat_at>=?2",
+        params![id, now_ms()-FRESH_MS], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional()?;
+    let blocked = match &presence {
+        None => Some((
+            "browser_unavailable",
+            "Return to the active call in the browser before requesting a photo.",
+        )),
+        Some((_, _, false, _)) => Some((
+            "camera_disabled",
+            "Turn on the camera in the call, then enable the browser setting allowing a photo when asked by voice.",
+        )),
+        Some((_, _, _, false)) => Some((
+            "capture_consent_required",
+            "Enable the browser setting allowing a photo when asked by voice. A native tool Allow choice cannot enable this setting.",
+        )),
+        _ => None,
+    };
+    if capture && let Some((reason, guidance)) = blocked {
+        return Ok(
+            json!({"operation_id":operation,"delegation_id":delegation,"kind":"capture","state":"blocked","reason":reason,"effect_attempted":false,"artifact_ids":[],"inspection":false,"guidance":guidance}),
+        );
+    }
+    let (browser, session, _, _) =
+        presence.ok_or_else(|| ApiError::bad("No fresh active browser surface"))?;
     let (total,recent,pending):(i64,i64,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(created_at>=?2),0),COALESCE(SUM(state IN ('queued','accepted')),0) FROM companion_surface_commands WHERE call_id=?1",params![id,now_ms()-60_000],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     if total >= 256 || recent >= 16 || pending >= 8 {
         return Err(ApiError::bad("Surface command limit reached"));
     }
-    let session:String = tx.query_row("SELECT session_hash FROM companion_surfaces WHERE call_id=?1 AND browser_id=?2 AND updated_at>=?3 AND (?4=0 OR (camera_enabled=1 AND capture_consent=1))",params![id,browser,now_ms()-FRESH_MS,capture],|r|r.get(0)).optional()?.ok_or_else(ApiError::forbidden)?;
     let at = now_ms();
     tx.execute("INSERT INTO companion_surface_commands(call_id,operation_id,delegation_id,browser_id,session_hash,kind,command,state,created_at,expires_at) VALUES(?1,?2,?3,?4,?9,?5,?6,'queued',?7,?8)",params![id,operation,delegation,browser,kind,command.to_string(),at,at+TTL_MS,session])?;
     let receipt = row(&tx, id, operation)?.unwrap();

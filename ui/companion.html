@@ -62,9 +62,10 @@
             <p id="share-capability" class="small">Images and PDFs can be saved; inspection depends on this agent’s capabilities.</p>
             <section id="camera-panel" class="camera-panel" aria-label="Optional camera" hidden>
               <div class="camera-heading"><h2>Your camera</h2><span class="preview-badge">LOCAL PREVIEW</span></div>
+              <label id="camera-picker" class="camera-picker" hidden>Camera<select id="camera-choice" aria-label="Choose camera"></select></label>
               <video id="camera-preview" autoplay playsinline muted aria-label="Local camera preview"></video>
               <p id="camera-note" class="small">The preview stays on your device. Capture &amp; share saves one photo and lets your agent know it is available. The live camera feed is never shared.</p>
-              <label class="camera-consent"><input id="voice-photos" type="checkbox"> Allow photos when I ask by voice during this call</label><p class="small">One photo per request. Turning off the camera also turns this off.</p>
+              <label class="camera-consent"><input id="voice-photos" type="checkbox"> Allow one photo when I ask by voice</label><p class="small">This setting lets a spoken request capture one photo during this call. A tool’s Allow button does not turn it on. Turning off the camera turns it off.</p>
               <button id="capture-photo" class="secondary">Capture &amp; share</button>
             </section>
             <div id="space-empty" class="space-empty"><div class="space-illustration" aria-hidden="true"><span></span><span></span><span></span></div><h2>A little space to see things.</h2><p>Share something while you talk. Useful answers and results will appear here too.</p></div><div id="cards" class="cards" aria-live="polite" aria-relevant="additions text"></div>

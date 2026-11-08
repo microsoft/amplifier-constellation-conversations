@@ -6,6 +6,8 @@ pub mod auth;
 pub mod client_callbacks;
 pub mod companion;
 pub mod companion_awareness;
+mod companion_diagnostics;
+mod companion_history;
 mod companion_prompt;
 pub mod companion_surface;
 pub mod companion_tools;

@@ -10,6 +10,11 @@ const REQUEST_LIMIT = 64 * 1024;
 const RESPONSE_LIMIT = 256 * 1024;
 const SURFACE_RESPONSE_LIMIT = 900 * 1024;
 const DELEGATION = z.string().min(1).max(160);
+const CAPTURE_PREREQUISITES = {
+  browser_unavailable:'Return to the active call in the browser before requesting a photo.',
+  camera_disabled:'Turn on the camera in the call, then enable the browser setting allowing a photo when asked by voice.',
+  capture_consent_required:'Enable the browser setting allowing a photo when asked by voice. A native tool Allow choice cannot enable this setting.',
+};
 /** @typedef {{apiBase:string,callId:string,token:string,port?:number,timeoutMs?:number}} CompanionMcpOptions */
 /** @param {Record<string,unknown>} value @returns {import('@modelcontextprotocol/sdk/types.js').CallToolResult} */
 const textResult = value => ({content:[{type:'text',text:JSON.stringify(value)}],structuredContent:value});
@@ -57,6 +62,13 @@ function buildServer(config,stopSignal) {
       if(!response.body)throw new Error('empty_companion_response');
       const value=await boundedJson(/** @type {AsyncIterable<Uint8Array>} */ (/** @type {unknown} */ (response.body)),path.startsWith('surface/')?SURFACE_RESPONSE_LIMIT:RESPONSE_LIMIT);
       if(!value || typeof value!=='object' || Array.isArray(value))throw new Error('invalid_companion_response');
+      if(path==='capture' && value.state==='blocked') {
+        if(value.kind!=='capture' || value.operation_id!==body?.operation_id || value.delegation_id!==body?.delegation_id ||
+          value.effect_attempted!==false || value.inspection!==false || !Array.isArray(value.artifact_ids) || value.artifact_ids.length!==0 ||
+          !Object.hasOwn(CAPTURE_PREREQUISITES,value.reason))throw new Error('invalid_capture_prerequisite');
+        return textResult({operation_id:value.operation_id,delegation_id:value.delegation_id,kind:'capture',state:'blocked',reason:value.reason,
+          effect_attempted:false,artifact_ids:[],inspection:false,guidance:CAPTURE_PREREQUISITES[/** @type {keyof typeof CAPTURE_PREREQUISITES} */(value.reason)]});
+      }
       if(path.startsWith('surface/') && value.image) {
         const {image,...receipt}=value;
         if(receipt.state!=='uploaded' || receipt.kind!=='capture' || receipt.inspection!==false || receipt.image_input!==true || !Array.isArray(receipt.artifact_ids) || receipt.artifact_ids.length!==1 ||
@@ -80,6 +92,11 @@ function buildServer(config,stopSignal) {
     description:'Read a bounded selection of saved connection reports for this caller and agent, with actor, audience, source and timestamps. Use this first for what is happening elsewhere or what is on screen. No new platform call or effect; this is not complete source history even if omitted is zero. Do not infer inactivity or that nothing newer was recorded. Preserve plans, requests, work in progress and reported completion as distinct. Other agents’ statements are their reports, not your own work.',
     inputSchema:z.object({}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
   },()=>call('observations'));
+  server.registerTool('companion_connection_status',{
+    description:'Make one fresh bounded read of an installation-configured observation source for this caller. Choose its connection_id from companion_connections observation_sources or companion_observations sources. Prefer this for fresh status over requesting a general external tool. Runs only the fixed read-only observer; no action, model, or source mutation. Query time and original report times are separate; missing reports never prove inactivity, and agent reports are not independent completion verification.',
+    inputSchema:z.object({connection_id:z.string().min(1).refine(v=>Buffer.byteLength(v)<=120&&!/[\u0000-\u001f\u007f-\u009f]/.test(v))}).strict(),
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
+  },({connection_id})=>call(`connection-status?connection_id=${encodeURIComponent(connection_id)}`));
   server.registerTool('companion_hangup',{
     description:'End only the caller’s current Companion call when explicitly requested. Use its exact delegation_id and one operation UUID. Browser acknowledgement means local media stopped; provider terminal independently confirms closure. This does not cancel accepted agent work. Never claim the call ended from a queued receipt.',
     inputSchema:z.object({operation_id:UUID,delegation_id:DELEGATION}).strict(),
@@ -116,7 +133,7 @@ function buildServer(config,stopSignal) {
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },args=>call('view','POST',args));
   server.registerTool('companion_capture',{
-    description:'Request exactly ONE photo for the caller’s explicit current instruction. Requires a camera already enabled by the human and explicit browser consent to voice captures. Cannot enable a camera or microphone. One capture per delegation; use the original operation UUID to inspect uncertainty, never a new capture. Queued/accepted/executed do not mean saved or inspected. Poll companion_surface_status for the saved image evidence.',
+    description:'Request exactly ONE photo for the caller’s explicit current instruction. Requires a camera already enabled by the human and explicit browser consent to voice captures. A blocked receipt explains the missing browser setting; native tool Allow cannot enable it, so do not ask for repeated native approval. Cannot enable a camera or microphone. One capture per delegation; use the original operation UUID to inspect uncertainty, never a new capture. Queued/accepted/executed do not mean saved or inspected. Poll companion_surface_status for the saved image evidence.',
     inputSchema:z.object({operation_id:UUID,delegation_id:DELEGATION}).strict(),
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },args=>call('capture','POST',args));

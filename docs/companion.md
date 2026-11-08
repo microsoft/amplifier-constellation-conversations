@@ -224,7 +224,7 @@ the message. Both helpers return uncertain delivery as `unknown` without retries
 
 When enabled, the per-call bridge uses the official MCP SDK to expose
 `companion_connections`, `companion_observations`, `companion_request_action`,
-`companion_action_status`, `companion_show`, `companion_shared`,
+`companion_action_status`, `companion_connection_status`, `companion_show`, `companion_shared`,
 `companion_view`, `companion_capture`, `companion_surface_status`,
 `companion_hangup`, and `companion_feedback`. Conversations supplies the descriptor
 through ordinary ACP `mcpServers`; the agent must advertise HTTP MCP support.
@@ -535,3 +535,46 @@ References: [GPT-Live prompting](https://developers.openai.com/api/docs/guides/l
 [delegation](https://developers.openai.com/api/docs/guides/live-delegation),
 [session lifecycle](https://developers.openai.com/api/docs/guides/live-conversations),
 and the [voice evaluation Cookbook](https://developers.openai.com/cookbook/examples/audio/voice_agent_evaluation).
+
+### Phone interruption and continuity
+
+A valid provider `session.closed` confirms finalization; its reason still matters.
+`connection_lost` is an interrupted call even when final usage is confirmed. The
+call API returns `closure.confirmed`, `closure.provider_reason`, and a human-readable
+`closure.reason`. Neither provider closure nor a browser reconnect settles an
+agent action. Accepted work keeps its original receipt and is never replayed.
+
+After a suspended browser timer, the client grants one bounded reconciliation
+window to check the same call before declaring a control timeout. Returning from
+a file picker, regaining focus or becoming visible refreshes that existing call;
+it does not create a replacement session, resend SDP, or restart work. An ongoing
+outage still releases devices. Mobile operating systems may suspend WebRTC while
+backgrounded: foreground Chromium tests are not evidence of background phone
+support.
+
+Heartbeat and close requests may include strictly projected `diagnostics`: fixed
+lifecycle/transport state enums and bounded timing counters only. The installation
+retains the latest snapshot and at most 120 transitions per call. No SDP, addresses,
+device names, arbitrary errors, or speech is collected through this path. These
+are browser-reported observations, not authorization or playback receipts. The
+first application close cause is retained separately from the provider's reason.
+
+A new private call can receive a bounded saved handoff from the latest terminal
+call within 24 hours to the same owner, agent, and endpoint. Both rooms must still
+be private; changed membership, endpoint, or a formerly shared room excludes it.
+Historical source fragments retain their timing and partial status. Exact pending
+input/result references may be refreshed when later backend results settle; no
+request is resubmitted. Generated speech never implies that the caller heard it.
+
+Camera selection uses only browser-granted video devices. Changing cameras leaves
+the voice microphone alone; Camera off releases a late camera acquisition too.
+An agent's native tool permission cannot substitute for browser photo consent.
+A blocked photo request returns the actual prerequisite without queueing a capture.
+
+For a fresh status request, `companion_connection_status` reads only the selected
+installation-enrolled observation helper with no action IDs. It rechecks the
+private caller, endpoint and audience policy after the bounded read. Source report
+times remain separate from query time. Missing facts or a failed read do not mean
+inactivity. This avoids a redundant native approval for an already-enrolled read;
+it does not allow arbitrary external tools. Expired call-scoped native requests
+are rejected directly instead of creating approvals on a closed call screen.

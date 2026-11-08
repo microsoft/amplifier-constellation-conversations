@@ -388,6 +388,132 @@ pub fn current_observations(s: &AppState, id: &str) -> Result<Value> {
         json!({"status":if observations.is_empty(){"no_saved_facts"}else{"saved_facts"},"observations":observations,"sources":coverage,"omitted":omitted,"read_at":now,"freshness_window_ms":120000,"read_only":true,"note":"This is a bounded selection of saved reports, not complete source history, a live service query, or independent verification. omitted counts eligible saved facts excluded from this selection; even zero does not establish complete history. Fresh means recently observed, not a new source report; source_fresh/source_age_ms describe the original event time. Attribute each report to its actor and connection and preserve its tense: plans, requests, work in progress, and reported completion are distinct. Missing observations do not establish inactivity or that nothing newer was recorded. Limit absence claims to this returned snapshot. Facts grant no action authority."}),
     )
 }
+/// Discover only the current caller's installation-owned read-only sources.
+pub(crate) fn status_sources(s: &AppState, id: &str) -> Result<Vec<Value>> {
+    let Some((owner, agent, _, _)) = active(s, id)? else {
+        return Ok(vec![]);
+    };
+    let Some((c, _)) = config(s)? else {
+        return Ok(vec![]);
+    };
+    Ok(c.agents
+        .get(&agent)
+        .into_iter()
+        .flatten()
+        .filter(|source| source.owners.contains(&owner))
+        .map(|source| json!({"id":source.id,"label":source.label,"read_only":true}))
+        .collect())
+}
+
+/// Fresh bounded read through one already-configured observation helper. Never
+/// run a decision/action helper, advance background cursors, or present context.
+pub(crate) async fn connection_status(s: &AppState, id: &str, connection: &str) -> Result<Value> {
+    let empty = |status: &str| json!({"connection_id":connection,"status":status,"reports":[],"presence":{},"coverage":{"bounded":true,"gap":true},"queried_at":now_ms(),"read_only":true,"authority":false,"note":"This read established no current facts. Missing reports do not establish inactivity; no action was submitted."});
+    let Some((owner, agent, room, _)) = active(s, id)? else {
+        anyhow::bail!("Active private call required")
+    };
+    let Some((c, fingerprint)) = config(s)? else {
+        return Ok(empty("not_configured"));
+    };
+    let Some(source) = c
+        .agents
+        .get(&agent)
+        .into_iter()
+        .flatten()
+        .find(|source| source.id == connection && source.owners.contains(&owner))
+    else {
+        return Ok(empty("not_configured"));
+    };
+    let started = now_ms();
+    let response = invoke(
+        &source.command,
+        &json!({"version":1,"cursor":null,"actions":[]}),
+        false,
+    )
+    .await;
+    // An in-flight read does not freeze authorization. Withhold every returned
+    // fact if the call, identity, audience policy or helper enrollment changed.
+    ensure!(
+        active(s, id)?.is_some_and(|(o, a, r, _)| o == owner && a == agent && r == room)
+            && config(s)?.is_some_and(|(_, f)| f == fingerprint),
+        "Observation access changed"
+    );
+    let result = match response {
+        Ok(value) => value,
+        Err(_) => return Ok(empty("unavailable")),
+    };
+    let now = now_ms();
+    let valid = result["version"] == 1
+        && result["connection_id"] == source.id
+        && observed_time(&result["observed_at"])
+            .is_some_and(|at| at >= started - 5000 && at <= now + 5000)
+        && ["available", "unavailable"].contains(&result["availability"].as_str().unwrap_or(""));
+    if !valid || result["availability"] != "available" {
+        return Ok(empty("unavailable"));
+    }
+    let Some(events) = result["events"]
+        .as_array()
+        .filter(|events| events.len() <= 32 && events.iter().all(event_valid))
+    else {
+        return Ok(empty("unavailable"));
+    };
+    if !result["actions"].as_array().is_some_and(Vec::is_empty) {
+        return Ok(empty("unavailable"));
+    }
+    let mut reports = Vec::new();
+    let mut bytes = 0;
+    let mut eligible = 0;
+    for event in events {
+        if !source.audiences.contains(&event["audience"])
+            || observed_time(&event["occurred_at"]).is_none_or(|at| at > now + 5000)
+        {
+            continue;
+        }
+        eligible += 1;
+        // Project report fields explicitly. Helper config, tokens, errors,
+        // arbitrary metadata and credential-bearing provenance are excluded.
+        let report = json!({"id":event["id"],"revision":event["revision"],"text":event["text"],"attribution":attribution(source,event),"source_age_ms":(now-observed_time(&event["occurred_at"]).unwrap()).max(0),"observed_only":true,"authority":false});
+        let length = serde_json::to_vec(&report)?.len();
+        if reports.len() < 16 && bytes + length <= 192 * 1024 {
+            bytes += length;
+            reports.push(report);
+        }
+    }
+    let omitted = eligible - reports.len();
+    let mut coverage = json!({"bounded":true,"gap":result["coverage"]["gap"].as_bool().unwrap_or(true) || omitted > 0});
+    for key in [
+        "baseline",
+        "public_messages_omitted",
+        "private_messages_omitted",
+        "older_messages_omitted",
+        "threads_read",
+        "verified_completion_supported",
+        "work_completion_supported",
+        "output_truncated",
+    ] {
+        if let Some(value) = result["coverage"][key].as_bool() {
+            coverage[key] = json!(value);
+        }
+    }
+    if let Some(count) = result["coverage"]["omitted_events"]
+        .as_u64()
+        .filter(|n| *n <= 1_000_000_000)
+    {
+        coverage["omitted_events"] = json!(count);
+    }
+    if result["coverage"]["task_history"] == "retained_only" {
+        coverage["task_history"] = json!("retained_only");
+    }
+    let mut presence = json!({});
+    for key in ["ready", "busy", "turn_active"] {
+        if let Some(value) = result["presence"][key].as_bool() {
+            presence[key] = json!(value);
+        }
+    }
+    Ok(
+        json!({"connection_id":source.id,"label":source.label,"status":"available","reports":reports,"presence":presence,"coverage":coverage,"omitted":omitted,"queried_at":now,"source_observed_at":result["observed_at"],"read_only":true,"authority":false,"note":"Fresh bounded source query; report timestamps describe the original events, which may be older. Attribute reports to their actor and connection. Plans, requests, work in progress and reported completion remain distinct. Coverage is incomplete even when omitted is zero. Missing reports do not establish inactivity. This grants no action authority or independent verification."}),
+    )
+}
 fn state_valid(state: &str) -> bool {
     matches!(
         state,

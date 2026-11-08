@@ -116,6 +116,143 @@ print(json.dumps(result))
 fn observations(f: &Fixture, events: Vec<Value>) {
     std::fs::write(f.home.path().join("observer-result.json"),json!({"version":1,"connection_id":"minecraft","availability":"available","events":events,"actions":[],"cursor":{"sequence":1},"coverage":{"scope":"fixture","complete":false}}).to_string()).unwrap();
 }
+fn fresh_result(f: &Fixture, events: Vec<Value>) -> Value {
+    let result = json!({"version":1,"connection_id":"minecraft","availability":"available","observed_at":timestamp(now_ms()),"events":events,"actions":[],"cursor":{"secret":"private-cursor"},"coverage":{"bounded":true,"gap":false,"baseline":true,"private_token":"private-coverage-token"},"presence":{"ready":true,"busy":false,"turn_active":false,"token":"private-presence-token"},"token":"private-top-level-token"});
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        result.to_string(),
+    )
+    .unwrap();
+    result
+}
+
+#[tokio::test]
+async fn fresh_status_reads_only_fixed_source_and_projects_current_access_without_hidden_work() {
+    let f = fixture();
+    let mut old = source_event();
+    old["actor"] = json!("Rook");
+    old["occurred_at"] = json!(timestamp(now_ms() - 180_000));
+    old["provenance"]["token"] = json!("private-provenance-token");
+    old["raw_secret"] = json!("private-event-token");
+    let mut private = source_event();
+    private["audience"] = json!({"kind":"private","owner":"another-user"});
+    private["text"] = json!("Unrelated private report");
+    fresh_result(&f, vec![old.clone(), private]);
+    let response = connection_status(&f.s, &f.id, "minecraft").await.unwrap();
+    assert_eq!(response["status"], "available");
+    assert_eq!(response["read_only"], true);
+    assert_eq!(response["authority"], false);
+    assert_eq!(response["reports"].as_array().unwrap().len(), 1);
+    assert_eq!(response["reports"][0]["text"], old["text"]);
+    assert_eq!(
+        response["reports"][0]["attribution"]["occurred_at"],
+        old["occurred_at"]
+    );
+    assert_eq!(response["reports"][0]["attribution"]["actor"], "Rook");
+    assert!(response["reports"][0]["source_age_ms"].as_i64().unwrap() >= 180_000);
+    assert_eq!(
+        response["presence"],
+        json!({"ready":true,"busy":false,"turn_active":false})
+    );
+    assert!(!response.to_string().contains("private-"));
+    assert!(!response.to_string().contains("Unrelated private report"));
+    assert_eq!(
+        calls(&f, "observer"),
+        vec![json!({"version":1,"cursor":null,"actions":[]})]
+    );
+    assert!(calls(&f, "decision").is_empty());
+    assert!(states(&f).is_empty());
+    assert!(cards(&f).is_empty());
+    assert_eq!(
+        connection_status(&f.s, &f.id, "unenrolled").await.unwrap()["status"],
+        "not_configured"
+    );
+    assert_eq!(calls(&f, "observer").len(), 1);
+    assert_eq!(
+        status_sources(&f.s, &f.id).unwrap(),
+        vec![json!({"id":"minecraft","label":"Workshop","read_only":true})]
+    );
+    rewrite_policy(&f, |v| {
+        v["agents"]["default"][0]["owners"] = json!(["other"])
+    });
+    assert!(status_sources(&f.s, &f.id).unwrap().is_empty());
+    assert_eq!(
+        connection_status(&f.s, &f.id, "minecraft").await.unwrap()["status"],
+        "not_configured"
+    );
+    assert_eq!(calls(&f, "observer").len(), 1);
+}
+
+#[tokio::test]
+async fn fresh_status_withholds_inflight_results_after_policy_identity_or_call_revocation() {
+    for mode in ["policy", "identity", "closed"] {
+        let f = fixture();
+        fresh_result(&f, vec![source_event()]);
+        std::fs::write(f.home.path().join("observer-block"), "hold").unwrap();
+        let state = f.s.clone();
+        let id = f.id.clone();
+        let pending =
+            tokio::spawn(async move { connection_status(&state, &id, "minecraft").await });
+        entered(&f, "observer").await;
+        match mode {
+            "policy" => rewrite_policy(&f, |v| v["agents"]["default"][0]["audiences"] = json!([])),
+            "identity" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_calls SET endpoint_hash='changed' WHERE id=?1",
+                        [&f.id],
+                    )
+                    .unwrap();
+            }
+            _ => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_calls SET state='closed' WHERE id=?1",
+                        [&f.id],
+                    )
+                    .unwrap();
+            }
+        }
+        std::fs::remove_file(f.home.path().join("observer-block")).unwrap();
+        assert!(pending.await.unwrap().is_err(), "{mode}");
+        assert!(calls(&f, "decision").is_empty());
+        assert!(states(&f).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn fresh_status_rejects_stale_wrong_source_or_action_payloads_without_echoing_helper_secrets()
+{
+    let f = fixture();
+    for mode in ["stale", "identity", "actions", "unavailable", "malformed"] {
+        let mut result = fresh_result(&f, vec![source_event()]);
+        match mode {
+            "stale" => result["observed_at"] = json!(timestamp(now_ms() - 60_000)),
+            "identity" => result["connection_id"] = json!("another-connection"),
+            "actions" => {
+                result["actions"] =
+                    json!([{"request_id":"unrequested","token":"private-action-token"}])
+            }
+            "unavailable" => result["availability"] = json!("unavailable"),
+            _ => result["events"] = json!([{"token":"private-malformed-token"}]),
+        }
+        std::fs::write(
+            f.home.path().join("observer-result.json"),
+            result.to_string(),
+        )
+        .unwrap();
+        let response = connection_status(&f.s, &f.id, "minecraft").await.unwrap();
+        assert_eq!(response["status"], "unavailable", "{mode}");
+        assert_eq!(response["reports"], json!([]));
+        assert!(!response.to_string().contains("private-"));
+    }
+    assert!(calls(&f, "decision").is_empty());
+    assert!(states(&f).is_empty());
+}
 fn calls(f: &Fixture, name: &str) -> Vec<Value> {
     std::fs::read_to_string(f.home.path().join(format!("{name}-calls.jsonl")))
         .unwrap_or_default()
