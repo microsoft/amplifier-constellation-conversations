@@ -43,19 +43,17 @@ function current(call) { return Boolean(call && state.call === call && call.gene
 function conversationLink(id) { return '/?conversation=' + encodeURIComponent(id); }
 
 async function openContacts() {
-  const authGeneration = state.authGeneration;
+  const authGeneration = state.authGeneration, generation = state.generation, recovery = state.recovery;
   const config = await api('/api/v1/companion');
   if (authGeneration !== state.authGeneration) return;
   state.contacts = Array.isArray(config.contacts) ? config.contacts : [];
   state.available = config.available === true;
   const prior = config.active_call;
-  if (!state.call && prior && typeof prior.id === 'string' && !['closed','interrupted'].includes(prior.state)) {
-    state.recovery = {callId:prior.id,request:null,discovered:true};
-    $('phonebook').hidden = true; $('call-screen').hidden = true; $('call-ended').hidden = false;
-    $('ended-title').textContent = 'An earlier call is still open.';
-    $('ended-work-link').hidden = typeof prior.conversation_id !== 'string';
-    if (typeof prior.conversation_id === 'string') $('ended-work-link').href = conversationLink(prior.conversation_id);
-    showRecovery();
+  // Catalog absence is not proof of closure. Preserve an unresolved creation
+  // request, and never restore recovery from a read begun before it was cleared.
+  if (!state.call && generation === state.generation && state.recovery === recovery && !recovery
+      && prior && typeof prior.id === 'string' && !['closed','interrupted'].includes(prior.state)) {
+    state.recovery = {callId:prior.id,conversationId:prior.conversation_id,request:null,discovered:true};
   }
   $('loading').hidden = true; $('login').hidden = true; $('app').hidden = false; $('sign-out').hidden = false;
   $('availability').hidden = state.available;
@@ -67,11 +65,13 @@ async function openContacts() {
     card.append(avatar, element('h2', null, contact.label || 'Agent'), element('p', null, contact.description || 'Your agent, with room to talk.'));
     const voice = element('button', 'contact-voice text-button', `Voice · ${contact.voice || 'Settings'}`); voice.type = 'button'; voice.setAttribute('aria-label', `Voice settings for ${contact.label || 'agent'}`); voice.onclick = () => openVoiceSettings(contact); card.append(voice);
     const button = element('button', 'primary', 'Call'); button.type = 'button'; button.setAttribute('aria-label', `Call ${contact.label || 'agent'}`);
-    button.disabled = !state.available || Boolean(state.recovery);
+    button.disabled = !state.available || Boolean(state.recovery) || Boolean(state.call);
     button.append(element('span', null, '↗')); button.lastChild.setAttribute('aria-hidden', 'true');
     button.onclick = () => startCall(contact);
     card.append(button); return card;
   }));
+  showRecovery();
+  checkRecovery();
 }
 function showLogin() {
   if (state.call) endCall('Your sign-in expired. Your microphone and camera are off.',true,true,'auth_expired');
@@ -83,8 +83,8 @@ function showLogin() {
   $('call-permissions').replaceChildren(); $('permission-alert').hidden = true;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = ''; notice('');
   $('ended-detail').textContent = '';
-  $('call-ended').hidden = true; $('call-screen').hidden = true; $('phonebook').hidden = false; $('recover-call').hidden = true;
-  for (const id of ['continue-work','ended-work-link']) { $(id).hidden = true; $(id).href = '/'; }
+  $('call-ended').hidden = true; $('call-screen').hidden = true; $('phonebook').hidden = false; showRecovery();
+  for (const id of ['continue-work','ended-work-link','recovery-work-link']) { $(id).hidden = true; $(id).href = '/'; }
   $('loading').hidden = true; $('app').hidden = true; $('login').hidden = false; $('sign-out').hidden = true;
   $('username').value = state.session?.owner || ''; $('password').value = '';
 }
@@ -207,8 +207,8 @@ async function startCall(contact) {
     call.controlTimer = setInterval(() => checkControl(call), 500);
     await requestWakeLock(call); heartbeat(call); poll(call);
   } catch (error) {
-    if (call.authGeneration === state.authGeneration && call.requestPending && (!error.status || error.uncertain)) {
-      state.recovery = {request:call.request,callId:call.id};
+    if (call.authGeneration === state.authGeneration && (current(call) || state.recovery?.call === call) && !call.recoverySettled && call.requestPending && (!error.status || error.uncertain)) {
+      if (state.recovery?.call !== call) state.recovery = {request:call.request,callId:call.id,call};
     }
     call.requestPending = false;
     if (current(call)) endCall(error.name === 'NotAllowedError' ? 'Microphone access was not granted. No voice connection was opened.' : error.message,true,true,'setup_failed');
@@ -805,10 +805,13 @@ function releaseMedia(call, retainTransport = false) {
   else releaseTransport(call);
   call.wakeLock?.release().catch(() => {}); call.wakeLock = null; $('presence').classList.remove('speaking');
 }
-async function confirmClose(id, result) {
+async function confirmClose(id, result, ownsRecovery) {
   for (let attempt = 0; attempt < 12; attempt++) {
+    if (!ownsRecovery()) throw new Error('The earlier call check is no longer current.');
+    if (result.id !== id) throw new Error('The service could not confirm the earlier call’s identity.');
     if (['closed','interrupted'].includes(result.state)) return result;
     await new Promise(resolve => setTimeout(resolve, 500));
+    if (!ownsRecovery()) throw new Error('The earlier call check is no longer current.');
     result = await api(`/api/v1/companion/calls/${encodeURIComponent(id)}?after=0`);
   }
   throw new Error('Your devices are off. The service is still closing the voice connection; check the same call again shortly.');
@@ -823,36 +826,70 @@ function showTerminal(result) {
   $('ended-detail').textContent = terminalMessage(result);
   if (result.state === 'interrupted' || result.closure?.provider_reason === 'connection_lost') $('ended-title').textContent = 'Call interrupted';
 }
+function finishRecovery(recovery, result) {
+  if (state.recovery !== recovery || state.call || result.id !== recovery.callId || !['closed','interrupted'].includes(result.state)) return;
+  if (recovery.call) recovery.call.recoverySettled = true;
+  state.recovery = null;
+  for (const call of state.finalizingCalls) if (call.id === result.id && call.authGeneration === state.authGeneration) releaseTransport(call);
+  showRecovery(); showTerminal(result);
+  if (!$('phonebook').hidden) notice(terminalMessage(result));
+}
+async function checkRecovery() {
+  const recovery = state.recovery, authGeneration = state.authGeneration;
+  if (!recovery?.callId || recovery.refreshing || state.call) return;
+  recovery.refreshing = true; recovery.statusError = false; showRecovery();
+  try {
+    const result = await api(`/api/v1/companion/calls/${encodeURIComponent(recovery.callId)}?after=0`);
+    if (authGeneration !== state.authGeneration || state.recovery !== recovery || state.call) return;
+    if (result.id !== recovery.callId) throw new Error('Call identity did not match.');
+    finishRecovery(recovery, result);
+  } catch {
+    if (authGeneration === state.authGeneration && state.recovery === recovery) recovery.statusError = true;
+  } finally {
+    if (authGeneration === state.authGeneration && state.recovery === recovery) { recovery.refreshing = false; showRecovery(); }
+  }
+}
 async function closeKnownCall(call) {
   if (!call.id || call.authGeneration !== state.authGeneration) { releaseTransport(call); return; }
-  const recovery = state.recovery || {callId:call.id,request:null};
-  recovery.callId = call.id; state.recovery = recovery; recovery.checking = true; showRecovery();
+  const pending = state.recovery;
+  const matches = pending && (pending.callId === call.id || (call.request && pending.request?.request_id === call.request.request_id));
+  // The original create response can arrive after explicit same-request recovery
+  // has already settled it. It must not revive that call or close it again.
+  if (call.recoverySettled || state.call || state.generation !== call.generation + 1 || (pending && (!matches || pending.checking))) { releaseTransport(call); return; }
+  const recovery = pending || {callId:call.id,request:null,call};
+  recovery.callId = call.id; recovery.conversationId = call.conversationId; state.recovery = recovery; recovery.checking = true; showRecovery();
   try {
     const result = await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/close`, 'POST', {reason:call.clientCloseReason || 'setup_failed',diagnostics:call.closeDiagnostics || diagnostics(call,'call_close')}, {keepalive:true});
-    if (call.authGeneration !== state.authGeneration) return;
-    const terminal = await confirmClose(call.id, result);
-    if (call.authGeneration !== state.authGeneration) return;
-    if (state.recovery?.callId === call.id || (call.request && state.recovery?.request?.request_id === call.request.request_id)) {
-      state.recovery = null; showRecovery();
-      showTerminal(terminal);
-    }
+    if (call.authGeneration !== state.authGeneration || state.recovery !== recovery) return;
+    const terminal = await confirmClose(call.id, result, () => call.authGeneration === state.authGeneration && state.recovery === recovery);
+    if (call.authGeneration === state.authGeneration) finishRecovery(recovery, terminal);
+  } catch {
+    // A later observation may already have settled this call. An old close
+    // failure must not restore recovery over another call or owner's session.
+  } finally {
+    if (call.authGeneration === state.authGeneration && state.recovery === recovery) { recovery.checking = false; showRecovery(); }
+    releaseTransport(call);
   }
-  catch {
-    // No reconnect or replay: retain the same known call for an explicit close
-    // retry. The server's heartbeat lease also bounds orphaned voice sessions.
-    if (call.authGeneration === state.authGeneration) { state.recovery = {callId:call.id,request:null}; showRecovery(); }
-  }
-  finally { releaseTransport(call); }
 }
 function showRecovery() {
-  $('recover-call').hidden = !state.recovery;
-  $('recover-call').disabled = Boolean(state.recovery?.checking);
-  $('recover-call').textContent = state.recovery?.discovered ? 'End earlier call' : 'Resolve unconfirmed call';
-  if (state.recovery) $('ended-detail').textContent = state.recovery.checking
-    ? 'Your microphone and camera are off. Closing the voice connection…'
-    : state.recovery.discovered
-      ? 'This page has not connected your microphone or camera. End the earlier voice call before starting another. Work your agent already accepted can continue in its conversation.'
-      : 'Your microphone and camera are off. The service has not yet confirmed that this voice call closed. Resolve it before opening another call.';
+  const recovery = state.recovery;
+  $('call-recovery').hidden = !recovery;
+  $('recover-call').hidden = !recovery;
+  $('recover-call').disabled = Boolean(recovery?.checking || recovery?.refreshing);
+  $('recover-call').textContent = recovery?.callId ? 'End earlier call' : 'Resolve unconfirmed call';
+  $('check-call-status').hidden = !recovery?.callId;
+  $('check-call-status').disabled = Boolean(recovery?.refreshing);
+  $('check-call-status').textContent = recovery?.refreshing ? 'Checking call status…' : 'Check call status';
+  $('recovery-work-link').hidden = typeof recovery?.conversationId !== 'string';
+  $('recovery-work-link').href = typeof recovery?.conversationId === 'string' ? conversationLink(recovery.conversationId) : '/';
+  $('recovery-detail').textContent = !recovery ? '' : recovery.checking
+    ? 'Your microphone and camera are off. Closing the voice connection… You can browse Contacts while this finishes.'
+    : (recovery.discovered
+      ? 'This page has not connected your microphone or camera. An earlier voice call is still open. Work your agent already accepted can continue in its conversation.'
+      : 'Your microphone and camera are off. The service has not yet confirmed that the earlier voice call ended.')
+      + ' You can browse Contacts; starting another call is paused until this is resolved.'
+      + (recovery.statusError ? ' Call status could not be checked. Try again shortly.' : '');
+  for (const button of $('contacts').querySelectorAll('.primary')) button.disabled = !state.available || Boolean(recovery) || Boolean(state.call);
 }
 function endCall(message = 'Your microphone and camera are off. Accepted work can continue.', sendClose = true, retainTransport = sendClose, reason = 'user_hangup') {
   const call = state.call; if (!call) return;
@@ -863,37 +900,41 @@ function endCall(message = 'Your microphone and camera are off. Accepted work ca
   $('ended-detail').textContent = message;
   $('ended-work-link').hidden = !call.conversationId;
   if (call.conversationId) $('ended-work-link').href = conversationLink(call.conversationId);
-  if (call.requestPending) state.recovery = {request:call.request,callId:null};
+  if (call.requestPending) state.recovery = {request:call.request,callId:null,call};
   showRecovery();
   if (sendClose && call.id) closeKnownCall(call);
   $('back-to-contacts').focus();
 }
 $('recover-call').onclick = async () => {
-  const recovery = state.recovery; if (!recovery) return;
+  const recovery = state.recovery; if (!recovery || recovery.checking || recovery.refreshing) return;
   const authGeneration = state.authGeneration;
   recovery.checking = true; showRecovery();
   try {
     let id = recovery.callId;
-    if (!id && recovery.request) { const saved = await api('/api/v1/companion/calls','POST',recovery.request); id = saved.id; }
-    if (authGeneration !== state.authGeneration) return;
+    if (!id && recovery.request) {
+      const saved = await api('/api/v1/companion/calls','POST',recovery.request); id = saved.id;
+      if (authGeneration !== state.authGeneration || state.recovery !== recovery) return;
+      recovery.callId = id; recovery.conversationId = saved.conversation_id;
+    }
+    if (authGeneration !== state.authGeneration || state.recovery !== recovery) return;
     if (!id) throw new Error('The service could not identify the earlier call.');
     const result = await api(`/api/v1/companion/calls/${encodeURIComponent(id)}/close`,'POST',{reason:'user_hangup'});
-    const terminal = await confirmClose(id, result);
-    if (authGeneration !== state.authGeneration) return;
-    if (state.recovery === recovery) state.recovery = null;
-    showTerminal(terminal);
-    showRecovery();
-  } catch (error) { if (authGeneration === state.authGeneration) notice(error.message); }
-  finally { if (authGeneration === state.authGeneration) { recovery.checking = false; showRecovery(); } }
+    if (authGeneration !== state.authGeneration || state.recovery !== recovery) return;
+    const terminal = await confirmClose(id, result, () => authGeneration === state.authGeneration && state.recovery === recovery);
+    if (authGeneration === state.authGeneration) finishRecovery(recovery, terminal);
+  } catch (error) { if (authGeneration === state.authGeneration && state.recovery === recovery) notice(error.message); }
+  finally { if (authGeneration === state.authGeneration && state.recovery === recovery) { recovery.checking = false; showRecovery(); } }
 };
+$('check-call-status').onclick = checkRecovery;
 $('mute').onclick = () => { const call = state.call; if (!current(call) || !call.stream) return; call.muted = !call.muted; call.stream.getAudioTracks().forEach(track => { track.enabled = !call.muted; }); refreshStatus(call); };
 $('hangup').onclick = () => endCall();
 $('camera-toggle').onclick = toggleCamera;
 $('capture-photo').onclick = capturePhoto;
 $('back-to-contacts').onclick = async () => {
-  if (state.recovery) { showRecovery(); notice('Resolve the previous call before starting another. Your devices are already off.'); return; }
-  $('call-ended').hidden = true; $('phonebook').hidden = false;
-  try { await openContacts(); } catch (error) { notice(error.message); }
+  $('call-ended').hidden = true; $('phonebook').hidden = false; showRecovery();
+  checkRecovery();
+  const authGeneration = state.authGeneration;
+  try { await openContacts(); } catch (error) { if (authGeneration === state.authGeneration) notice(error.message); }
 };
 $('dismiss-notice').onclick = () => notice('');
 $('login-form').onsubmit = async event => {
@@ -908,13 +949,13 @@ $('sign-out').onclick = async () => {
   catch (error) { notice(error.message); }
 };
 document.addEventListener('visibilitychange', () => {
-  const call = state.call; if (!current(call)) return;
+  const call = state.call; if (!current(call)) { if (!document.hidden) checkRecovery(); return; }
   if (document.hidden) {
     $('foreground-note').textContent = 'This page is out of view. Your browser may pause audio; return here to continue.';
     heartbeat(call,'visibility_hidden');
   } else { $('foreground-note').textContent = 'Keep this page in the foreground. A screen lock or app switch may interrupt audio.'; resumeCall(call,'visibility_visible'); }
 });
-for (const event of ['focus','pageshow','online']) window.addEventListener(event, () => resumeCall(state.call,event));
+for (const event of ['focus','pageshow','online']) window.addEventListener(event, () => { if (state.call) resumeCall(state.call,event); else checkRecovery(); });
 for (const event of ['blur','offline']) window.addEventListener(event, () => heartbeat(state.call,event));
 document.addEventListener('resume', () => resumeCall(state.call,'resume'));
 window.addEventListener('pagehide', () => { if (state.call) endCall(undefined,true,true,'page_exit'); });

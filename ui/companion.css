@@ -822,8 +822,20 @@ input,textarea {
   margin-top:28px;
   flex-wrap:wrap
 }
-#recover-call {
-  margin-top:20px
+.recovery-card {
+  margin:0 0 30px;
+  padding:24px;
+  background:var(--paper);
+  border:1px solid var(--line);
+  border-radius:var(--radius)
+}
+.recovery-card h2 { margin-bottom:10px }
+.recovery-card p { color:var(--muted) }
+.recovery-actions {
+  display:flex;
+  gap:12px;
+  align-items:center;
+  flex-wrap:wrap
 }
 @media(min-width:1500px) {
   .call-layout {

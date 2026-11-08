@@ -24,6 +24,10 @@
     </section>
     <div id="app" hidden>
       <div id="notice" class="notice" role="alert" hidden><p id="notice-text"></p><button id="dismiss-notice" class="text-button" aria-label="Dismiss notice">Dismiss</button></div>
+      <section id="call-recovery" class="recovery-card" aria-labelledby="recovery-title" hidden>
+        <h2 id="recovery-title">An earlier call needs attention.</h2><p id="recovery-detail" role="status"></p>
+        <div class="recovery-actions"><button id="check-call-status" class="secondary" type="button" hidden>Check call status</button><button id="recover-call" class="secondary" type="button" hidden>Resolve unconfirmed call</button><a id="recovery-work-link" class="text-button" href="/" target="constellation-work" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a></div>
+      </section>
       <section id="phonebook" aria-labelledby="phonebook-title">
         <div class="phonebook-heading"><div><p class="eyebrow">YOUR AGENTS, A CALL AWAY</p><h1 id="phonebook-title">Who’s on your mind?</h1><p class="lede">A conversation for the desk, the workbench, or wherever the day takes you.</p></div><span class="private-badge"><span aria-hidden="true">◌</span> One person. One agent.</span></div>
         <div id="availability" class="availability" role="status" hidden></div>
@@ -73,7 +77,7 @@
           <section id="transcript-panel" role="tabpanel" aria-labelledby="transcript-tab" tabindex="0" hidden><p class="transcript-note">Live transcript fragments may contain mistakes. Generated text does not confirm what you heard.</p><div id="transcript" class="transcript" role="log" aria-label="Call transcript" aria-live="off"></div><p id="transcript-empty" class="empty-state">The conversation will appear here.</p></section>
         </div>
       </section>
-      <section id="call-ended" class="ended-card" hidden><p class="eyebrow">BACK WHEN YOU NEED THEM</p><h1 id="ended-title">Call ended.</h1><p id="ended-detail">Your microphone and camera are off.</p><div class="ended-actions"><button id="back-to-contacts" class="primary">Back to contacts</button><a id="ended-work-link" class="secondary" href="/" target="constellation-work" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a></div><button id="recover-call" class="secondary" hidden>Resolve unconfirmed call</button></section>
+      <section id="call-ended" class="ended-card" hidden><p class="eyebrow">BACK WHEN YOU NEED THEM</p><h1 id="ended-title">Call ended.</h1><p id="ended-detail">Your microphone and camera are off.</p><div class="ended-actions"><button id="back-to-contacts" class="primary">Back to contacts</button><a id="ended-work-link" class="secondary" href="/" target="constellation-work" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a></div></section>
     </div>
   </main>
   <dialog id="voice-settings" class="voice-settings" aria-labelledby="voice-settings-title"><form id="voice-settings-form"><h2 id="voice-settings-title">Voice settings</h2><p id="voice-settings-note">Your selection applies to the next call.</p><label for="voice-choice">Voice</label><select id="voice-choice" disabled></select><p id="voice-settings-status" role="status"></p><div class="photo-actions"><button id="save-voice" class="primary" type="submit" disabled>Save voice</button><button id="close-voice-settings" class="text-button" type="button">Close</button></div></form></dialog>
