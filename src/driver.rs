@@ -7,6 +7,57 @@ use sha2::{Digest, Sha256};
 use std::{process::Stdio, sync::Arc, time::Duration};
 use tokio::process::{Child, Command};
 
+/// Positive diagnostic projection. Provider messages, data and subprocess
+/// output remain outside public audit records, even when attached as causes.
+#[derive(Debug)]
+struct TurnFailure {
+    kind: &'static str,
+    phase: &'static str,
+    rpc_code: Option<i64>,
+    stop_reason: Option<&'static str>,
+}
+impl TurnFailure {
+    fn new(kind: &'static str, phase: &'static str) -> Self {
+        Self {
+            kind,
+            phase,
+            rpc_code: None,
+            stop_reason: None,
+        }
+    }
+}
+impl std::fmt::Display for TurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Agent {} during {}", self.kind, self.phase)
+    }
+}
+impl std::error::Error for TurnFailure {}
+fn rejected(error: &Value, method: &str) -> anyhow::Error {
+    let phase = match method {
+        "initialize" => "initialize",
+        "session/new" => "session/new",
+        "session/load" => "session/load",
+        "session/prompt" => "session/prompt",
+        "authenticate" => "authenticate",
+        _ => "request",
+    };
+    crate::acp_auth::rejected(error, method).context(TurnFailure {
+        kind: "acp_rejected",
+        phase,
+        rpc_code: error["code"].as_i64(),
+        stop_reason: None,
+    })
+}
+fn interruption(error: &anyhow::Error) -> Value {
+    if let Some(cause) = error.downcast_ref::<TurnFailure>() {
+        json!({"kind":cause.kind,"phase":cause.phase,"rpc_code":cause.rpc_code,"stop_reason":cause.stop_reason})
+    } else if crate::acp_auth::authentication_required(error) {
+        json!({"kind":"authentication_required"})
+    } else {
+        json!({"kind":"client_error","detail_available":false})
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SetupInteraction<'a> {
     state: &'a Arc<AppState>,
@@ -85,8 +136,9 @@ impl Peer {
     async fn read(&mut self) -> Result<Value> {
         self.connection
             .recv()
-            .await?
-            .context("The agent disconnected")
+            .await
+            .context(TurnFailure::new("transport_error", "read"))?
+            .context(TurnFailure::new("disconnected", "read"))
     }
     fn send_request(&self, method: &str, params: Value) -> Result<Value> {
         self.connection.sender.request(method, params)
@@ -150,12 +202,12 @@ impl Peer {
                     continue;
                 },
                 value=self.read()=>value?,
-                _=cancel_signal(cancel)=>{ctx.callbacks.stop();bail!("Turn cancelled");},
-                _=tokio::time::sleep_until(ctx.deadline)=>{ctx.callbacks.stop();bail!("Turn timed out");},
+                _=cancel_signal(cancel)=>{ctx.callbacks.stop();return Err(TurnFailure::new("cancelled", "turn").into());},
+                _=tokio::time::sleep_until(ctx.deadline)=>{ctx.callbacks.stop();return Err(TurnFailure::new("timeout", "turn").into());},
             };
             if v.get("method").is_none() && v["id"] == id {
                 if let Some(error) = v.get("error") {
-                    return Err(crate::acp_auth::rejected(error, method));
+                    return Err(rejected(error, method));
                 }
                 ensure!(
                     pending.is_empty(),
@@ -266,7 +318,7 @@ impl Peer {
             let v = self.read().await?;
             if v.get("method").is_none() && v["id"] == id {
                 if let Some(error) = v.get("error") {
-                    return Err(crate::acp_auth::rejected(error, method));
+                    return Err(rejected(error, method));
                 }
                 return Ok(v["result"].clone());
             }
@@ -415,20 +467,21 @@ pub async fn deliver(state: Arc<AppState>, input: crate::delivery::Input) -> Res
         source_seq: input.seq,
         reconcile_only: false,
     };
+    let turn_source = turn.user_message.clone();
     let result = tokio::time::timeout(
         Duration::from_secs(timeout + 5),
         turn_agent(state.clone(), turn),
     )
     .await
-    .context("The agent turn timed out")
+    .context(TurnFailure::new("timeout", "turn"))
     .and_then(|v| v);
     crate::delivery::finish(&state, &assistant_id, result.is_ok())?;
-    if result.is_err() {
+    if let Err(error) = &result {
         state.db.lock().unwrap().execute(
-            "UPDATE messages SET status='interrupted' WHERE id=?1",
-            [&assistant_id],
+            "UPDATE messages SET status='interrupted',updated_at=?2 WHERE id=?1",
+            params![assistant_id, crate::state::now_ms()],
         )?;
-        state.audit("turn.interrupted",Some(&input.room),json!({"agent_id":input.agent,"reason":"The agent could not complete. Session binding and delivery receipts were retained; work was not replayed."}))?;
+        state.audit("turn.interrupted",Some(&input.room),json!({"agent_id":input.agent,"message_id":assistant_id,"source_message_id":turn_source,"cause":interruption(error),"reason":"The agent could not complete. Session binding and delivery receipts were retained; work was not replayed."}))?;
     }
     result
 }
@@ -618,6 +671,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         }
     }
     let mut loaded = false;
+    let setup;
     let sid = if let Some(old) = prior {
         params["sessionId"] = json!(old);
         let restore = c
@@ -640,11 +694,12 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
             .await;
         // A failed load is not evidence that the previous work never happened.
         // Keep its binding instead of silently rebuilding and replaying context.
-        restore?;
+        setup = restore?;
         loaded = true;
         old
     } else {
-        c.peer
+        setup = c
+            .peer
             .session_request(
                 "session/new",
                 params,
@@ -660,7 +715,8 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 },
                 &mut cancel_rx,
             )
-            .await?["sessionId"]
+            .await?;
+        setup["sessionId"]
             .as_str()
             .context("The agent did not return a session")?
             .to_owned()
@@ -670,10 +726,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     let mut pending_callbacks = tokio::task::JoinSet::new();
     let mut forms = crate::elicitation::Callbacks::default();
     let _callback_lifetime = CallbackLifetime(callbacks.clone());
-    state.db.lock().unwrap().execute(
-        "UPDATE conversations SET agent_info=?2 WHERE id=?1",
-        params![conversation, init["agentInfo"].to_string()],
-    )?;
+    crate::companion_identity::record(&state, &conversation, &init, &setup)?;
     // Explicit reconciliation never resubmits the source input. Native engines
     // also need their saved uncertain receipt acknowledged before another prompt.
     for crate::delivery::Acknowledgment {
@@ -893,8 +946,8 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                     c.peer.write(reply).await?;continue;
                 },
                 v=c.peer.read()=>v?,
-                _=cancel_signal(&mut cancel_rx)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; bail!("Turn cancelled");},
-                _=tokio::time::sleep_until(deadline)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; bail!("Turn timed out");},
+                _=cancel_signal(&mut cancel_rx)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; return Err(TurnFailure::new("cancelled", "turn").into());},
+                _=tokio::time::sleep_until(deadline)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; return Err(TurnFailure::new("timeout", "turn").into());},
             }
         };
         if v.get("method").is_none() && pending_input.as_ref().is_some_and(|p| v["id"] == p.id) {
@@ -997,10 +1050,24 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 "The agent completed with unresolved callbacks"
             );
             if let Some(error) = v.get("error") {
-                return Err(crate::acp_auth::rejected(error, "session/prompt"));
+                return Err(rejected(error, "session/prompt"));
             }
             if v["result"]["stopReason"] != "end_turn" {
-                bail!("The agent stopped before completing this turn");
+                let reason = match v["result"]["stopReason"].as_str() {
+                    Some("max_tokens") => "max_tokens",
+                    Some("max_turn_requests") => "max_turn_requests",
+                    Some("refusal") => "refusal",
+                    Some("cancelled") => "cancelled",
+                    Some(_) => "other",
+                    None => "missing",
+                };
+                return Err(TurnFailure {
+                    kind: "incomplete_turn",
+                    phase: "session/prompt",
+                    rpc_code: None,
+                    stop_reason: Some(reason),
+                }
+                .into());
             }
             let has_media: bool = state.db.lock().unwrap().query_row(
                 "SELECT EXISTS(SELECT 1 FROM attachments WHERE message_id=?1)",
@@ -1184,5 +1251,39 @@ async fn cancel_signal(receiver: &mut Option<tokio::sync::watch::Receiver<bool>>
         }
     } else {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_diagnostic_keeps_code_and_phase_without_provider_payload_or_losing_auth_type() {
+        let error = rejected(
+            &json!({"code":-32603,"message":"secret-api-key","data":{"token":"private","url":"https://secret.invalid"}}),
+            "session/prompt",
+        );
+        assert_eq!(
+            interruption(&error),
+            json!({"kind":"acp_rejected","phase":"session/prompt","rpc_code":-32603,"stop_reason":null})
+        );
+        assert!(!interruption(&error).to_string().contains("secret"));
+        let auth = rejected(&json!({"code":-32000,"message":"private"}), "session/new");
+        assert!(crate::acp_auth::authentication_required(&auth));
+    }
+
+    #[test]
+    fn transport_timeout_and_unclassified_failures_have_distinct_safe_evidence() {
+        let transport = anyhow::anyhow!("https://secret.invalid/token")
+            .context(TurnFailure::new("transport_error", "read"));
+        let timeout =
+            anyhow::anyhow!("private prompt").context(TurnFailure::new("timeout", "turn"));
+        assert_eq!(interruption(&transport)["kind"], "transport_error");
+        assert_eq!(interruption(&timeout)["kind"], "timeout");
+        assert_eq!(
+            interruption(&anyhow::anyhow!("private prompt")),
+            json!({"kind":"client_error","detail_available":false})
+        );
     }
 }

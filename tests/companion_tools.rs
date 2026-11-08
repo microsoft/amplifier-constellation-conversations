@@ -456,7 +456,8 @@ async fn shared_urls_are_inert_validated_and_readable_after_display() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(shown["state"], "available_on_screen");
+    assert_eq!(shown["state"], "saved");
+    assert_eq!(shown["presentation"], "requested_current");
     let (status, shared) = request(&f, &c, "GET", "shared", None, &c.token, false).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -1023,6 +1024,86 @@ async fn fresh_connection_status_stays_on_the_authenticated_private_call_without
     assert_eq!(
         request(&f, &c, "GET", path, None, &c.token, false).await.0,
         StatusCode::NOT_FOUND
+    );
+    assert!(effects(&f).is_empty());
+}
+
+#[tokio::test]
+async fn short_plain_note_cards_share_the_existing_board_and_permission_boundary() {
+    let f = fixture();
+    let c = call(&f);
+    companion_tools::record_mcp_port(&f.s, &c.id, 34567).unwrap();
+    let text = "Compare the two paths:\n- Keep the entrance clear.\n- Check the roof next.\n<script>not executable</script>";
+    let args = json!({"title":"Next steps","text":text,"kind":"note"});
+    let (status, saved) = request(
+        &f,
+        &c,
+        "POST",
+        "shared",
+        Some(args.clone()),
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["state"], "saved");
+    let (_, shared) = request(&f, &c, "GET", "shared", None, &c.token, false).await;
+    assert_eq!(shared["shown"][0]["text"], text);
+    assert_eq!(shared["shown"][0]["kind"], "note");
+    assert!(shared["shown"][0]["url"].is_null());
+    assert_eq!(shared["shown"][0]["presentation"], "current");
+    let permission = |arguments: Value| json!({"toolCall":{"toolCallId":"note","title":"companion / companion_show","kind":"other","status":"pending","rawInput":{"server":"companion","tool":"companion_show","arguments":arguments}},"options":[{"optionId":"once","name":"Once","kind":"allow_once"}]});
+    assert_eq!(
+        companion_tools::permission_once(
+            &f.s,
+            &c.room,
+            "owner",
+            "default",
+            true,
+            &permission(args)
+        )
+        .unwrap()
+        .unwrap()["outcome"]["optionId"],
+        "once"
+    );
+    for bad in [
+        json!({"title":"Missing content"}),
+        json!({"title":"Both","url":"https://example.test","text":"Note"}),
+        json!({"title":"Too long","text":"漢".repeat(401)}),
+        json!({"title":"Blank","text":"  "}),
+        json!({"title":"Wrong kind","text":"Note","kind":"image"}),
+        json!({"title":"Wrong kind","url":"https://example.test","kind":"note"}),
+    ] {
+        assert_ne!(
+            request(&f, &c, "POST", "shared", Some(bad.clone()), &c.token, false)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert!(
+            companion_tools::permission_once(
+                &f.s,
+                &c.room,
+                "owner",
+                "default",
+                true,
+                &permission(bad)
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    assert!(
+        companion_tools::permission_once(
+            &f.s,
+            &c.room,
+            "owner",
+            "default",
+            true,
+            &permission(json!({"title":"Note","text":"Safe","html":"<script>"}))
+        )
+        .unwrap()
+        .is_none()
     );
     assert!(effects(&f).is_empty());
 }

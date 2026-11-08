@@ -8,6 +8,7 @@ pub mod companion;
 pub mod companion_awareness;
 mod companion_diagnostics;
 mod companion_history;
+mod companion_identity;
 mod companion_prompt;
 pub mod companion_surface;
 pub mod companion_tools;

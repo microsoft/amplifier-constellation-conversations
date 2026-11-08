@@ -79,7 +79,7 @@ function showLogin() {
   // A later login must not inherit private presentation or recovery state. Old
   // asynchronous callbacks may close their media, but cannot repopulate it.
   state.authGeneration++; state.recovery = null; state.contacts = [];
-  $('voice-settings').close(); state.voiceContact = null; $('voice-choice').replaceChildren(); $('voice-settings-status').textContent = ''; $('cards').replaceChildren(); $('transcript').replaceChildren(); $('contacts').replaceChildren();
+  $('voice-settings').close(); state.voiceContact = null; $('voice-choice').replaceChildren(); $('voice-settings-status').textContent = ''; $('voice-model-facts').replaceChildren(); $('voice-advanced-facts').replaceChildren(); $('cards').replaceChildren(); $('board-items').replaceChildren(); $('board-history').open = false; $('paste-input').value = ''; $('paste-composer').hidden = true; $('share-receipt').hidden = true; $('transcript').replaceChildren(); $('contacts').replaceChildren();
   $('call-permissions').replaceChildren(); $('permission-alert').hidden = true;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = ''; notice('');
   $('ended-detail').textContent = '';
@@ -114,6 +114,7 @@ function refreshStatus(call) {
   $('mute').disabled = !call.stream;
   $('camera-toggle').disabled = !call.id || !call.connected;
   $('choose-files').disabled = !call.id || !call.connected;
+  $('show-paste').disabled = $('paste-input').disabled = $('share-text').disabled = !call.id || !call.connected;
   $('mute').setAttribute('aria-pressed', String(Boolean(call.muted)));
   $('mute-label').textContent = call.muted ? 'Unmute mic' : 'Mute mic';
 }
@@ -145,16 +146,17 @@ function updateDuration(call) {
 async function startCall(contact) {
   if (state.call || state.recovery || !state.available) return;
   const call = {generation:++state.generation, authGeneration:state.authGeneration, contact, id:null, request:null, ended:false, connected:false,
-    browserId:crypto.randomUUID(), surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
+    browserId:crypto.randomUUID(), surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), cards:new Map(), board:[], muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
   state.call = call;
   document.body.classList.add('call-active');
   notice(''); $('phonebook').hidden = true; $('call-ended').hidden = true; $('call-screen').hidden = false;
   $('call-avatar').textContent = initials(contact.label); $('call-name').textContent = contact.label || 'Your agent';
   $('call-description').textContent = contact.description || 'The same agent. Another place to talk.';
-  $('call-duration').textContent = '00:00'; $('cards').replaceChildren(); $('transcript').replaceChildren();
+  $('call-duration').textContent = '00:00'; $('cards').replaceChildren(); $('board-items').replaceChildren(); $('board-history').open = false; $('paste-input').value = ''; $('paste-composer').hidden = true; $('share-receipt').hidden = true; $('transcript').replaceChildren();
   $('call-permissions').replaceChildren(); $('permission-alert').hidden = true;
   $('transcript-empty').hidden = false; $('space-empty').hidden = false; $('work-status').hidden = true;
   $('connection-status').hidden = true; $('connection-status').textContent = '';
+  updateBoard(call); resetFollowing();
   $('card-count').hidden = true; $('card-count').textContent = '0'; $('continue-work').hidden = true;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = 'Take your time. There’s room for a pause.';
   $('speaker-state').textContent = 'Speaker waiting'; $('enable-audio').hidden = true;
@@ -196,7 +198,7 @@ async function startCall(contact) {
     if (typeof result.id === 'string') call.id = result.id;
     if (!result.id || !result.sdp || !result.conversation_id) throw Object.assign(new Error('The service returned an incomplete call connection.'), {uncertain:true});
     call.requestPending = false;
-    call.id = result.id; call.conversationId = result.conversation_id; call.providerConnected = result.state === 'connected';
+    call.id = result.id; call.conversationId = result.conversation_id; call.voice = result.voice; call.providerConnected = result.state === 'connected';
     if (!current(call)) { await closeKnownCall(call); return; }
     $('continue-work').href = conversationLink(call.conversationId); $('continue-work').hidden = false;
     await peer.setRemoteDescription({type:'answer',sdp:result.sdp});
@@ -382,6 +384,7 @@ function renderEvent(call, event) {
   if (call.seen.size > 500) call.seen.delete(call.seen.values().next().value);
   const data = event.data || {};
   if (event.kind === 'transcript' && ['user','assistant'].includes(data.role) && typeof data.text === 'string') {
+    const followTranscript = followsEnd($('transcript-panel')), followCaption = followsEnd($('latest-caption'));
     const speaker = data.role === 'user' ? 'You' : call.contact.label;
     const previous = call.transcriptRow;
     // GPT-Live publishes transcript fragments, not complete user messages.
@@ -399,12 +402,12 @@ function renderEvent(call, event) {
     $('caption-speaker').textContent = speaker;
     $('caption-text').textContent = call.transcriptRow.text.slice(-360);
     $('transcript-empty').hidden = true;
-    if (!$('transcript-panel').hidden) $('transcript-panel').scrollTop = $('transcript-panel').scrollHeight;
+    followChange($('transcript-panel'),followTranscript); followChange($('latest-caption'),followCaption);
   } else if (event.kind === 'delegation') {
     const waiting = ['waiting_transcript','dispatched'].includes(data.state);
     if (waiting) call.working.set(data.id, data.state); else { call.working.delete(data.id); call.progress.delete(data.id); }
     refreshWorkStatus(call);
-    if (['failed','unknown','held'].includes(data.state) && data.message) addCard(call, 'Work update', data.message, call.conversationId);
+    if (['failed','unknown','held'].includes(data.state) && data.message) addCard(call, 'Work update', data.message, call.conversationId, {card_id:`update:${event.seq}`});
     refreshStatus(call);
   } else if (event.kind === 'progress' && call.working.has(data.delegation_id)) {
     call.progress.set(data.delegation_id, data); refreshWorkStatus(call);
@@ -438,7 +441,7 @@ function refreshWorkStatus(call) {
   const update = [...call.progress.values()].at(-1);
   const elapsed = Number.isSafeInteger(update?.elapsed_seconds) && update.elapsed_seconds >= 0 ? ` after ${update.elapsed_seconds} seconds` : '';
   $('work-status').textContent = update
-    ? (update.state === 'awaiting_permission' ? 'A request is waiting for your decision. Open work controls to review it.' : `Last update: a request was still pending${elapsed}. No completed result has arrived.`) + (call.working.size > 1 ? ` ${call.working.size} requests pending.` : '')
+    ? (update.state === 'blocked' ? 'An earlier request needs review before more work can start. Open the conversation to review it.' : update.state === 'awaiting_permission' ? 'A request is waiting for your decision. Open work controls to review it.' : `Last update: a request was still pending${elapsed}. No completed result has arrived.`) + (call.working.size > 1 ? ` ${call.working.size} requests pending.` : '')
     : `${call.contact.label} has ${call.working.size === 1 ? 'a pending request' : call.working.size + ' pending requests'}. You can keep talking.`;
 }
 // All answer content is built from DOM text and validated links. No HTML,
@@ -496,16 +499,90 @@ function appendRichText(card, text, conversationId, includeMedia = true) {
   body.append(document.createTextNode(String(text).slice(at))); card.append(body);
   if (includeMedia) for (const item of [...media.values()].slice(0,8)) appendMedia(card, item, conversationId);
 }
-function appendCard(call, card) {
+const BOARD_LIMIT = 3;
+const followers = new Map();
+function followsEnd(panel) { return panel.scrollHeight - panel.clientHeight - panel.scrollTop < 48; }
+function followChange(panel, follow = followsEnd(panel)) {
+  const tracker = followers.get(panel); if (!tracker) return;
+  tracker.follow = follow; tracker.unread = !follow;
+  if (follow && !panel.hidden) panel.scrollTop = panel.scrollHeight;
+  if (tracker.button) tracker.button.hidden = !tracker.unread || panel.hidden;
+}
+function resetFollowing() { for (const [panel,tracker] of followers) { tracker.follow = true; tracker.unread = false; panel.scrollTop = 0; if(tracker.button)tracker.button.hidden = true; } }
+for (const [panelId,contentId,buttonId] of [['space-panel','board-items','space-new'],['transcript-panel','transcript','transcript-new'],['latest-caption','caption-text',null]]) {
+  const panel = $(panelId), button = buttonId && $(buttonId), tracker = {follow:true,unread:false,button}; followers.set(panel,tracker);
+  panel.addEventListener('scroll', () => { tracker.follow = followsEnd(panel); if (tracker.follow) tracker.unread = false; if(button)button.hidden = !tracker.unread || panel.hidden; }, {passive:true});
+  if (button) button.onclick = () => { panel.scrollTop = panel.scrollHeight; followChange(panel,true); };
+  new ResizeObserver(() => { if (current(state.call) && !panel.hidden) followChange(panel,tracker.follow); }).observe($(contentId));
+}
+function readingProtected(call, entry) {
+  return entry.card.contains(document.activeElement) || (call.readingCard === entry.id && !followsEnd($('space-panel')));
+}
+function boardProtected(call, entry) { return entry.pinned || readingProtected(call,entry); }
+function updateBoard(call) {
   if (!current(call)) return;
-  $('cards').append(card);
-  while ($('cards').children.length > 40) {
-    const first = [...$('cards').children].find(node => !call.shares.get(node.dataset.uploadId)?.sending); if (!first) break;
-    const oldShare = call.shares.get(first.dataset.uploadId);
-    if (oldShare?.previewUrl) URL.revokeObjectURL(oldShare.previewUrl);
-    call.shares.delete(first.dataset.uploadId); first.remove();
+  for (const entry of call.cards.values()) {
+    const shown = call.board.includes(entry.id); entry.card.dataset.presented = String(shown);
+    entry.show.hidden = shown; entry.pin.hidden = !shown; entry.remove.hidden = !shown;
+    entry.pin.textContent = entry.pinned ? 'Unpin' : 'Pin'; entry.pin.setAttribute('aria-pressed',String(Boolean(entry.pinned)));
   }
-  $('space-empty').hidden = true; $('card-count').hidden = false; $('card-count').textContent = String($('cards').children.length);
+  $('space-empty').hidden = call.board.length !== 0;
+  $('board-count').textContent = `${call.board.length} of ${BOARD_LIMIT}`;
+  $('history-count').textContent = String(call.cards.size - call.board.length);
+  $('card-count').hidden = call.cards.size === 0; $('card-count').textContent = String(call.board.length);
+}
+function changeBoard(call, ids, user = false) {
+  if (!current(call) || ids.length > BOARD_LIMIT || new Set(ids).size !== ids.length) throw Object.assign(new Error('The whiteboard has room for three items.'),{reason:'board_full'});
+  if (ids.some(id=>!call.cards.has(id))) throw new Error('That item is no longer on this page. Open the conversation to find it.');
+  if (!user && (call.board.some(id=>!ids.includes(id) && boardProtected(call,call.cards.get(id))) || (JSON.stringify(ids) !== JSON.stringify(call.board) && call.board.some(id=>readingProtected(call,call.cards.get(id)))))) throw Object.assign(new Error('An item is pinned or being read. The whiteboard was left as it is.'),{reason:'item_protected'});
+  const following = followsEnd($('space-panel'));
+  for (const id of call.board) if (!ids.includes(id)) { const entry = call.cards.get(id); entry.pinned = false; $('cards').prepend(entry.card); }
+  call.board = ids;
+  for (const [index,id] of ids.entries()) { const card = call.cards.get(id).card, before = $('board-items').children[index]; if (before !== card) $('board-items').insertBefore(card,before || null); }
+  updateBoard(call); followChange($('space-panel'),following); surfacePresence(call);
+}
+function presentCard(call, id, user = false, reveal = false) {
+  if (!call.board.includes(id)) {
+    let ids = [...call.board];
+    if (ids.length === BOARD_LIMIT && user) {
+      const replace = ids.find(old=>!boardProtected(call,call.cards.get(old)));
+      if (replace) ids = ids.filter(old=>old !== replace);
+    }
+    changeBoard(call,[...ids,id],user);
+  }
+  if (reveal) {
+    const card = call.cards.get(id).card; setTab('space');
+    $('space-panel').scrollTop += card.getBoundingClientRect().top - $('space-panel').getBoundingClientRect().top - 12;
+    if (user) call.readingCard = id;
+  }
+}
+function revealEntry(call, entry) {
+  try { presentCard(call,entry.id,true,true); }
+  catch { setTab('space'); $('board-history').open = true; $('space-panel').scrollTop += entry.card.getBoundingClientRect().top - $('space-panel').getBoundingClientRect().top - 12; }
+}
+function appendCard(call, card, intent = false) {
+  if (!current(call)) return;
+  const id = card.dataset.cardId || `local:${crypto.randomUUID()}`, following = followsEnd($('space-panel'));
+  card.dataset.boardId = id; card.tabIndex = -1;
+  const actions = element('div','board-item-actions');
+  const show = element('button','text-button','Show on whiteboard'), pin = element('button','text-button','Pin'), remove = element('button','text-button','Put away');
+  for (const button of [show,pin,remove]) { button.type = 'button'; actions.append(button); }
+  const entry = {id,card,show,pin,remove,pinned:false}; call.cards.set(id,entry); card.append(actions); $('cards').prepend(card);
+  show.onclick = () => revealEntry(call,entry);
+  pin.onclick = () => { entry.pinned = !entry.pinned; updateBoard(call); surfacePresence(call); };
+  remove.onclick = () => changeBoard(call,call.board.filter(value=>value !== id),true);
+  card.addEventListener('pointerdown', () => { call.readingCard = id; });
+  card.addEventListener('focusin', () => { call.readingCard = id; });
+  // Automatic answers and observations stay in history. Only an intentional
+  // presentation or a user-shared item asks for room on the whiteboard.
+  if (intent) { try { presentCard(call,id,intent === 'user'); } catch { /* Saved in history; never evict something being read. */ } }
+  while (call.cards.size > 40) {
+    const oldest = [...call.cards.values()].find(item=>!call.board.includes(item.id) && !item.card.contains(document.activeElement) && !call.shares.get(item.card.dataset.uploadId)?.sending);
+    if (!oldest) break;
+    const share = call.shares.get(oldest.card.dataset.uploadId); if (share?.previewUrl) URL.revokeObjectURL(share.previewUrl);
+    call.shares.delete(oldest.card.dataset.uploadId); call.cards.delete(oldest.id); oldest.card.remove();
+  }
+  updateBoard(call); followChange($('space-panel'),following);
 }
 function addCard(call, title, text, conversationId, data = {}) {
   if (!current(call)) return;
@@ -514,18 +591,18 @@ function addCard(call, title, text, conversationId, data = {}) {
   const heading = element('h2', null, title); heading.append(element('small', null, new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})));
   card.append(heading);
   if (data.late) card.append(element('p', 'card-context', 'Answer to your earlier request'));
-  const answer = element('div', 'card-answer'), explicitMedia = safeLink(data.url, conversationId);
-  appendRichText(answer, text, conversationId, !explicitMedia); card.append(answer);
+  const answer = element('div', 'card-answer'), note = data.kind === 'note', explicitMedia = !note && safeLink(data.url, conversationId);
+  if (note) answer.append(element('p',null,text)); else appendRichText(answer, text, conversationId, !explicitMedia); card.append(answer);
   if (explicitMedia) appendMedia(card, {url:explicitMedia,name:typeof data.title === 'string' ? data.title : 'Shared media',kind:data.kind}, conversationId);
   if (data.truncated) addFullResultControl(call,card,answer,data,conversationId);
-  for (const item of (Array.isArray(data.attachments) ? data.attachments : []).slice(0,8)) {
+  for (const item of (!note && Array.isArray(data.attachments) ? data.attachments : []).slice(0,8)) {
     if (typeof item?.id === 'string') appendMedia(card, {...item,url:`/api/v1/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(item.id)}`}, conversationId);
   }
-  for (const item of (Array.isArray(data.media) ? data.media : []).slice(0,8)) appendMedia(card, item, conversationId);
+  for (const item of (!note && Array.isArray(data.media) ? data.media : []).slice(0,8)) appendMedia(card, item, conversationId);
   // This named target is always our own work surface. noopener on a named
   // anchor would force a new browsing context on every click.
   if (conversationId) { const link = element('a', 'conversation-link', 'Open conversation ↗'); link.href = conversationLink(conversationId); link.target = 'constellation-work'; card.append(link); }
-  appendCard(call, card);
+  appendCard(call, card, data.presentation === 'current');
 }
 function addFullResultControl(call, card, answer, data, conversationId) {
   const status = element('p','result-status','This is a shortened result. The complete answer is saved in the conversation.'); card.append(status);
@@ -542,7 +619,7 @@ function addFullResultControl(call, card, answer, data, conversationId) {
       const result = await api(path,'GET',undefined,{redirect:'error'});
       if (!current(call) || !card.isConnected) return;
       if (result.message_id !== data.message_id || typeof result.text !== 'string') throw new Error('The service did not return this saved result.');
-      answer.replaceChildren(); appendRichText(answer,result.text,conversationId);
+      const following = followsEnd($('space-panel')); answer.replaceChildren(); appendRichText(answer,result.text,conversationId); followChange($('space-panel'),following);
       status.textContent = 'Full saved result shown.'; button.remove();
     } catch (error) { if (current(call) && card.isConnected) { status.textContent = error.message + ' You can open the conversation or try again.'; button.disabled = false; } }
   };
@@ -552,6 +629,7 @@ function setTab(name) {
     const selected = name === candidate, button = $(candidate + '-tab');
     button.setAttribute('aria-selected', String(selected)); button.tabIndex = selected ? 0 : -1;
     $(candidate + '-panel').hidden = !selected;
+    $(candidate + '-new').hidden = !selected || !followers.get($(candidate + '-panel'))?.unread;
   }
 }
 for (const name of ['space','transcript']) {
@@ -572,8 +650,8 @@ function updateShareCapability(call) {
   $('share-capability').textContent = call.contact.image_input === false
     ? `${call.contact.label} can save images here, but its current connection cannot inspect them. Text is supported; PDF inspection depends on document support.`
     : call.contact.image_input === true
-      ? 'Photos can be inspected when you ask. Sharing makes items available; it does not mean they have been read. PDFs depend on document support.'
-      : 'Image inspection has not been verified for this connection. You can still save images, PDFs, and text here; the agent will state any reading limits.';
+      ? 'Images can be inspected when you ask.'
+      : 'Image inspection is not verified. Files can still be saved.';
 }
 async function refreshCapabilities(call) {
   try {
@@ -660,7 +738,10 @@ function fileMime(file) {
   return ({md:'text/markdown',txt:'text/plain',csv:'text/csv',json:'application/json',pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp'})[file.name.split('.').at(-1).toLowerCase()] || file.type;
 }
 function shareStatus(share, status, message) {
+  const following = followsEnd($('space-panel'));
   share.card.dataset.state = status; share.status.textContent = message; share.retry.hidden = true;
+  if (state.call?.lastSharedId === share.id) { $('share-receipt').hidden = false; $('share-receipt-text').textContent = `${share.name} · ${({captured:'Preparing to share…',uploading:'Uploading…',available:'Saved. Inspection not confirmed.',failed:'Not shared.',unconfirmed:'Upload receipt unknown.'})[status] || message}`; }
+  followChange($('space-panel'),following);
 }
 function availableText(call, share) {
   return share.mime?.startsWith('image/') && call.contact.image_input === false
@@ -668,11 +749,12 @@ function availableText(call, share) {
     : 'Saved and available in this conversation. Sharing does not mean the agent has read it.';
 }
 function shareCard(call, id, name) {
-  const card = element('article', 'output-card upload-card'); card.dataset.uploadId = id;
+  const card = element('article', 'output-card upload-card'); card.dataset.uploadId = id; card.dataset.cardId = `upload:${id}`;
   card.append(element('h2', null, name));
   const status = element('p', 'upload-status'), retry = element('button', 'text-button', 'Check voice notification'); retry.type = 'button'; retry.hidden = true;
-  card.append(status, retry); appendCard(call, card);
-  const share = {id,name,card,status,retry,attachmentIds:[],sending:false}; call.shares.set(id,share); return share;
+  card.append(status, retry);
+  const share = {id,name,card,status,retry,attachmentIds:[],sending:true}; call.shares.set(id,share);
+  appendCard(call, card, 'user'); call.lastSharedId = id; return share;
 }
 async function notifyShare(call, share, status) {
   if (!current(call)) return null;
@@ -685,7 +767,7 @@ async function announceAvailable(call, share) {
     if (!current(call) || !result) return;
     const confirmed = result.voice_awareness === 'queued';
     shareStatus(share, 'available', availableText(call, share) + (confirmed ? ' Voice notification queued.' : ' Voice notification has not been confirmed.'));
-    share.retry.hidden = confirmed;
+    share.retry.hidden = confirmed; share.availableRecorded = true; surfacePresence(call);
   } catch (error) {
     if (current(call)) { shareStatus(share, 'available', availableText(call, share) + ' Voice notification is unconfirmed.'); share.retry.hidden = false; }
   }
@@ -696,6 +778,7 @@ async function shareFile(call, file, source, uploadId = null) {
   const name = (file.name || 'shared-file').replace(/[\\/"\u0000-\u001f\u007f]/g,'_').slice(0,150);
   const share = shareCard(call, uploadId || crypto.randomUUID(), name); Object.assign(share,{source,mime,sending:true,local:true});
   share.retry.onclick = () => announceAvailable(call, share);
+  if (call.board.includes(share.card.dataset.boardId)) revealEntry(call,call.cards.get(share.card.dataset.boardId));
   shareStatus(share,'captured',source === 'camera' ? 'Captured. Preparing to share…' : 'Selected. Preparing to share…');
   if (!allowed.includes(mime) || !file.size || file.size > (mime.startsWith('text/') || mime === 'application/json' ? 200000 : 2*1024*1024)) {
     share.sending = false; shareStatus(share,'failed','Not shared. Use an image or PDF up to 2 MB, or UTF-8 text, Markdown, CSV, or JSON up to 200 KB.');
@@ -733,6 +816,7 @@ function renderShareEvent(call, data) {
   let share = call.shares.get(data.upload_id);
   if (share?.local) return; // The local upload tracks its richer receipt/uncertainty state.
   share ||= shareCard(call,data.upload_id,typeof data.name === 'string' ? data.name : 'Shared item');
+  share.availableRecorded = data.state === 'available'; share.sending = ['captured','uploading'].includes(data.state);
   shareStatus(share,data.state,({captured:'Captured on this device; not yet uploaded.',uploading:'Uploading to this conversation…',available:'Saved and available in this conversation. Sharing does not mean the agent has read it.',failed:'The item could not be made available. Check before sharing it again.'})[data.state] || 'Sharing status unavailable.');
 }
 async function shareFiles(files, source) {
@@ -752,20 +836,47 @@ $('space-panel').addEventListener('drop', event => {
   const files = [...event.dataTransfer.files], text = event.dataTransfer.getData('text/plain');
   if (files.length) shareFiles(files,'drop'); else if (text.trim()) shareFiles([new File([text],'shared-text.txt',{type:'text/plain'})],'drop');
 });
-$('space-panel').addEventListener('paste', event => {
-  if (event.target.closest('input,textarea,[contenteditable="true"]')) return;
+function pasteToShare(event) {
+  if (event.target.closest('input,textarea,[contenteditable="true"]') && !(event.target === $('paste-input') && event.clipboardData?.files.length)) return;
   const files = [...(event.clipboardData?.files || [])], text = event.clipboardData?.getData('text/plain') || '';
   if (!files.length && !text.trim()) return;
-  event.preventDefault(); shareFiles(files.length ? files : [new File([text],'pasted-text.txt',{type:'text/plain'})],'paste');
-});
+  event.preventDefault(); if (event.target === $('paste-input') && !$('paste-input').value) $('paste-composer').hidden = true; shareFiles(files.length ? files : [new File([text],'pasted-text.txt',{type:'text/plain'})],'paste');
+}
+$('space-panel').addEventListener('paste',pasteToShare);
+$('paste-input').addEventListener('paste',pasteToShare);
+$('show-paste').onclick = () => { $('paste-composer').hidden = false; $('paste-input').focus(); };
+$('paste-composer').onsubmit = event => {
+  event.preventDefault(); const text = $('paste-input').value;
+  if (!text.trim()) { $('paste-input').focus(); return; }
+  if (!current(state.call) || !state.call.connected) return;
+  $('paste-input').value = ''; $('paste-composer').hidden = true; shareFiles([new File([text],'shared-note.txt',{type:'text/plain'})],'paste');
+};
+$('reveal-share').onclick = () => {
+  const call = state.call, share = call?.shares.get(call.lastSharedId); if (!current(call) || !share) return;
+  const entry = call.cards.get(share.card.dataset.boardId); if(entry)revealEntry(call,entry);
+};
+function showModelFacts(contact, result) {
+  const facts = $('voice-model-facts'); facts.replaceChildren(); $('voice-advanced-facts').replaceChildren();
+  const fact = (list,name,value) => { list.append(element('dt',null,name),element('dd',null,String(value))); };
+  fact(facts,'Voice model',[result.voice_provider,result.voice_model].filter(value=>typeof value === 'string' && value).join(' · ') || 'Not reported');
+  if (current(state.call) && state.call.contact.id === contact.id) fact(facts,'Voice in this call',state.call.voice || 'Not reported');
+  const backend = result.backend;
+  fact(facts,'Reasoning runtime (last reported)',backend?.agent?.title || backend?.agent?.name || 'Not yet reported by this agent');
+  fact(facts,'Reasoning model (last reported)',backend?.model?.name || backend?.model?.id || 'Not yet reported by this agent');
+  if (Number.isFinite(backend?.observed_at)) fact(facts,'Last reported',new Date(backend.observed_at).toLocaleString());
+  const options = Array.isArray(backend?.options) ? backend.options.filter(option=>['model','thought_level'].includes(option.category) && option.editable === false) : [];
+  $('voice-advanced').hidden = options.length === 0;
+  for (const option of options) fact($('voice-advanced-facts'),option.name || option.id,option.label || option.value || 'Not reported');
+}
 async function openVoiceSettings(contact) {
   state.voiceContact = contact; const generation = state.authGeneration;
-  $('voice-settings-title').textContent = `Voice for ${contact.label || 'agent'}`; $('voice-choice').replaceChildren();
+  $('voice-settings-title').textContent = `Voice for ${contact.label || 'agent'}`; $('voice-choice').replaceChildren(); $('voice-model-facts').replaceChildren(); $('voice-advanced-facts').replaceChildren(); $('voice-advanced').hidden = true; $('voice-advanced').open = false;
   $('voice-settings-status').textContent = 'Loading available voices…'; $('save-voice').disabled = true; $('voice-choice').disabled = true;
   if (!$('voice-settings').open) $('voice-settings').showModal();
   try {
     const result = await api(`/api/v1/companion/agents/${encodeURIComponent(contact.id)}/voice-settings`);
     if (state.voiceContact !== contact || generation !== state.authGeneration) return;
+    showModelFacts(contact,result);
     const voices = Array.isArray(result.available_voices) ? result.available_voices.filter(voice => typeof voice === 'string') : [];
     $('voice-choice').replaceChildren(...voices.map(voice => { const option = element('option',null,voice); option.value = voice; return option; }));
     $('voice-choice').value = result.voice; $('voice-choice').disabled = !voices.length; $('save-voice').disabled = !voices.length;
@@ -778,7 +889,7 @@ $('voice-settings-form').onsubmit = async event => {
   try {
     const result = await api(`/api/v1/companion/agents/${encodeURIComponent(contact.id)}/voice-settings`,'PUT',{voice:$('voice-choice').value});
     if (state.voiceContact !== contact || generation !== state.authGeneration) return;
-    contact.voice = result.voice; $('voice-settings-status').textContent = `Saved. ${result.voice} will be used for your next call with ${contact.label}.`;
+    showModelFacts(contact,result); contact.voice = result.voice; $('voice-settings-status').textContent = `Saved. ${result.voice} will be used for your next call with ${contact.label}.`;
     const card = [...$('contacts').children].find(card => card.dataset.agentId === contact.id); if (card) card.querySelector('.contact-voice').textContent = `Voice · ${result.voice}`;
   } catch (error) { if (state.voiceContact === contact && generation === state.authGeneration) $('voice-settings-status').textContent = error.message; }
   finally { if (state.voiceContact === contact && generation === state.authGeneration) $('save-voice').disabled = false; }
@@ -982,10 +1093,12 @@ function startMicrophoneMeter(call) {
 async function surfacePresence(call) {
   if (!current(call) || !call.id || call.surfaceUpdating) return;
   call.surfaceUpdating = true;
+  const board = call.board.filter(id=>/^\d+$/.test(id) || (id.startsWith('upload:') && call.shares.get(id.slice(7))?.availableRecorded));
   try {
     await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/presence`, 'POST', {
       browser_id:call.browserId,camera_enabled:Boolean(call.cameraStream?.getVideoTracks().some(t=>t.readyState === 'live')),
       capture_consent:Boolean(call.cameraStream && $('voice-photos').checked),
+      board_card_ids:board,pinned_card_ids:board.filter(id=>call.cards.get(id)?.pinned),focused_card_id:board.find(id=>readingProtected(call,call.cards.get(id))) || null,
       user_speaking:document.hidden ? null : call.userSpeaking,
       agent_speaking:document.hidden ? null : call.agentSpeaking,
     });
@@ -1018,7 +1131,9 @@ async function executeSurface(call, receipt) {
         || accepted.kind !== receipt.kind || accepted.state !== 'accepted' || !Number.isSafeInteger(accepted.expires_at)
         || accepted.expires_at !== receipt.expires_at || accepted.expires_at <= Date.now()) return;
     if (receipt.kind === 'view') {
-      applyView(call,receipt.command); await ack('executed');
+      try { applyView(call,receipt.command); }
+      catch (error) { await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/commands/${encodeURIComponent(op)}/ack`,'POST',{browser_id:call.browserId,state:'failed',...(['board_full','item_protected'].includes(error.reason) ? {reason:error.reason} : {})}); return; }
+      await ack('executed');
     } else if (receipt.kind === 'hangup') {
       // Release this call's media before acknowledging the effect. Closing a
       // voice session never cancels separately authorized background work.
@@ -1054,23 +1169,25 @@ async function executeSurface(call, receipt) {
 }
 function applyView(call, command) {
   if (!current(call) || !command) throw new Error('The call is no longer active.');
+  if (command.action === 'replace_board') { changeBoard(call,command.card_ids); return; }
+  if (command.action === 'add_card') { presentCard(call,command.card_id); return; }
+  if (command.action === 'remove_card') { changeBoard(call,call.board.filter(id=>id !== command.card_id)); return; }
+  if (command.action === 'clear_board') { changeBoard(call,[]); return; }
   if (command.action === 'show_shared') { setTab('space'); return; }
   if (command.action === 'show_transcript') { setTab('transcript'); return; }
   const panel = $('space-panel').hidden ? $('transcript-panel') : $('space-panel');
   if (['scroll_up','scroll_down'].includes(command.action)) {
     panel.scrollBy({top:Math.max(160,panel.clientHeight*.75)*(command.action === 'scroll_up' ? -1 : 1),behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'}); return;
   }
-  const cards = [...$('cards').querySelectorAll('[data-card-id]')];
-  let target;
-  if (command.action === 'focus_card') target = cards.find(card=>card.dataset.cardId === command.card_id);
-  else if (['next_card','previous_card'].includes(command.action)) {
-    const index = cards.findIndex(card=>card.dataset.cardId === call.focusedCard);
-    const next = index<0 ? (command.action === 'previous_card' ? cards.length-1 : 0) : Math.max(0,Math.min(cards.length-1,index+(command.action === 'previous_card' ? -1 : 1)));
-    target = cards[next];
+  let id = command.card_id;
+  if (['next_card','previous_card'].includes(command.action)) {
+    const index = call.board.indexOf(call.focusedCard), next = index<0 ? (command.action === 'previous_card' ? call.board.length-1 : 0) : Math.max(0,Math.min(call.board.length-1,index+(command.action === 'previous_card' ? -1 : 1)));
+    id = call.board[next];
   }
-  if (!target) throw new Error('That shared card is not currently on this screen.');
-  setTab('space'); call.focusedCard = target.dataset.cardId;
-  // Scroll only the contained shared pane, never the whole call surface.
-  $('space-panel').scrollTop += target.getBoundingClientRect().top - $('space-panel').getBoundingClientRect().top - 12;
-  target.classList.add('surface-focused'); setTimeout(()=>target.classList.remove('surface-focused'),1800);
+  if (!call.cards.has(id)) throw new Error('That saved item is not on this page.');
+  const reading = call.cards.get(call.readingCard);
+  if (reading && reading.id !== id && readingProtected(call,reading)) throw Object.assign(new Error('The current item is being read.'),{reason:'item_protected'});
+  presentCard(call,id,false,true); call.focusedCard = id;
+  const target = call.cards.get(id).card; target.classList.add('surface-focused'); setTimeout(()=>target.classList.remove('surface-focused'),1800);
+  surfacePresence(call);
 }

@@ -1016,6 +1016,15 @@ async fn exact_native_capture_permission_explains_browser_consent_without_author
         )
         .is_some()
     );
+    assert!(check("companion_surface_status", json!({})).is_some());
+    assert!(check("companion_surface_status", json!({"artifact_id":operation})).is_some());
+    assert!(
+        check(
+            "companion_surface_status",
+            json!({"artifact_id":operation,"operation_id":operation})
+        )
+        .is_none()
+    );
     std::fs::write(
         f.home.path().join("companion-actions.json"),
         json!({"enabled":false}).to_string(),
@@ -1175,4 +1184,235 @@ async fn a_new_login_cannot_claim_an_old_browsers_command_by_reusing_its_identif
         StatusCode::FORBIDDEN
     );
     assert_eq!(surface_status(&f, &c, &operation).await["state"], "queued");
+}
+
+#[tokio::test]
+async fn whiteboard_commands_retain_history_and_record_protected_item_refusal() {
+    let f = fixture();
+    let c = call(&f);
+    let other = call(&f);
+    delegation(&f, &c, "user");
+    let browser = uuid::Uuid::new_v4().to_string();
+    presence(&f, &c, &browser, false, false).await;
+    let mut cards = Vec::new();
+    for title in ["Current question", "Useful comparison", "Replacement"] {
+        let (_, shown) = request(
+            &f,
+            &c,
+            "POST",
+            "shared",
+            Some(json!({"url":"https://example.test/demo","title":title})),
+            &c.token,
+            false,
+        )
+        .await;
+        cards.push(shown["card_id"].as_str().unwrap().to_owned());
+    }
+    let (_, foreign) = request(
+        &f,
+        &other,
+        "POST",
+        "shared",
+        Some(json!({"url":"https://example.test/private","title":"Private"})),
+        &other.token,
+        false,
+    )
+    .await;
+    let presence_path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
+    let state = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"board_card_ids":[cards[0]],"pinned_card_ids":[cards[0]],"focused_card_id":cards[0]});
+    assert_eq!(
+        browser_request(
+            &f,
+            "POST",
+            &presence_path,
+            Some(state.clone()),
+            "browser",
+            true
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let current = surface_status(&f, &c, "current").await;
+    assert_eq!(current["board_card_ids"], json!([cards[0]]));
+    assert_eq!(current["pinned_card_ids"], json!([cards[0]]));
+    assert_eq!(current["focused_card_id"], cards[0]);
+    let operation = uuid::Uuid::new_v4().to_string();
+    let change = json!({"operation_id":operation,"delegation_id":"fixture-delegation","action":"replace_board","card_ids":[cards[2]]});
+    let (_, queued) = request(
+        &f,
+        &c,
+        "POST",
+        "view",
+        Some(change.clone()),
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(queued["state"], "queued");
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "accepted", vec![])
+            .await
+            .1["execute"],
+        true
+    );
+    let failed = json!({"browser_id":browser,"state":"failed","reason":"item_protected","attachment_ids":[]});
+    let (_, receipt) = browser_request(
+        &f,
+        "POST",
+        &format!(
+            "/api/v1/companion/calls/{}/surface/commands/{operation}/ack",
+            c.id
+        ),
+        Some(failed),
+        "browser",
+        true,
+    )
+    .await;
+    assert_eq!(receipt["state"], "failed");
+    assert_eq!(receipt["reason"], "item_protected");
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(change), &c.token, false)
+            .await
+            .1["reason"],
+        "item_protected"
+    );
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "accepted", vec![])
+            .await
+            .1["execute"],
+        false
+    );
+    for extra in [
+        json!({"action":"replace_board","card_ids":[cards[0],cards[0]]}),
+        json!({"action":"replace_board","card_ids":[]}),
+        json!({"action":"replace_board","card_ids":[cards[0],cards[1],cards[2],foreign["card_id"]]}),
+        json!({"action":"replace_board","card_ids":[foreign["card_id"]]}),
+        json!({"action":"clear_board","card_ids":[cards[0]]}),
+    ] {
+        let mut body = json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert_ne!(
+            request(&f, &c, "POST", "view", Some(body), &c.token, false)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
+                [&c.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        surface_status(&f, &c, "current").await["board_card_ids"],
+        json!([cards[0]])
+    );
+    let mut invalid = state;
+    invalid["board_card_ids"] = json!([foreign["card_id"]]);
+    invalid["pinned_card_ids"] = json!([]);
+    invalid["focused_card_id"] = Value::Null;
+    assert_eq!(
+        browser_request(&f, "POST", &presence_path, Some(invalid), "browser", true)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn existing_shared_image_is_readable_without_recapture_and_stays_call_scoped() {
+    let f = fixture();
+    let c = call(&f);
+    let other = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    presence(&f, &c, &browser, false, false).await;
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3XcAAAAASUVORK5CYII=";
+    let (_, image) = browser_request(
+        &f,
+        "POST",
+        &format!("/api/v1/conversations/{}/attachments", c.room),
+        Some(json!({"name":"Already-shared.png","mime_type":"image/png","data":png})),
+        "browser",
+        true,
+    )
+    .await;
+    let aid = image["id"].as_str().unwrap();
+    let upload = uuid::Uuid::new_v4().to_string();
+    for (state, ids) in [("captured", vec![]), ("available", vec![aid])] {
+        let (status,result)=browser_request(&f,"POST",&format!("/api/v1/companion/calls/{}/uploads",c.id),Some(json!({"upload_id":upload,"state":state,"source":"paste","name":"Already-shared.png","attachment_ids":ids})),"browser",true).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+    }
+    let current = surface_status(&f, &c, "current").await;
+    assert_eq!(current["camera_enabled"], false);
+    assert_eq!(current["capture_consent"], false);
+    assert_eq!(current["artifacts"][0]["id"], aid);
+    let receipt = surface_status(&f, &c, &format!("attachment:{aid}")).await;
+    assert_eq!(receipt["state"], "available");
+    assert_eq!(receipt["kind"], "attachment");
+    assert_eq!(receipt["inspection"], false);
+    assert_eq!(receipt["image"]["data"], png);
+    assert_eq!(
+        request(
+            &f,
+            &other,
+            "GET",
+            &format!("surface/attachment:{aid}"),
+            None,
+            &other.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let upload_card = format!("upload:{upload}");
+    let (status,result)=browser_request(&f,"POST",&format!("/api/v1/companion/calls/{}/surface/presence",c.id),Some(json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"board_card_ids":[upload_card],"pinned_card_ids":[upload_card]})),"browser",true).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        surface_status(&f, &c, "current").await["board_card_ids"],
+        json!([upload_card])
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_surface_capabilities SET image_input=0 WHERE call_id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    let unsupported = surface_status(&f, &c, &format!("attachment:{aid}")).await;
+    assert_eq!(unsupported["image_delivery"], "unsupported");
+    assert!(unsupported.get("image").is_none());
+    assert_eq!(unsupported["artifact_ids"], json!([aid]));
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_surfaces SET updated_at=?1 WHERE call_id=?2",
+            params![now_ms() - 60_000, c.id],
+        )
+        .unwrap();
+    let stale = surface_status(&f, &c, "current").await;
+    assert_eq!(stale["state"], "unconfirmed");
+    assert!(stale["camera_enabled"].is_null());
+    assert_eq!(stale["artifacts"][0]["id"], aid);
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_surface_commands", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }

@@ -171,3 +171,93 @@ test('uncorrelated provider errors do not imply closure but transport failures d
  assert.equal(JSON.stringify(events).includes('private diagnostic'),false);
  assert.equal(JSON.stringify(events).includes('secret socket failure'),false);
 });
+
+const inputEvent=(id,text='Please end this call.',start=100,end=200)=>({type:'session.input_transcript.delta',event_id:id,delta:text,start_ms:start,end_ms:end});
+const endDecision=(source,probability=.999,patch={})=>({type:'decision.event',event_id:`decision-${source}`,delegation_id:null,trigger_id:`trigger-${source}`,source_event_type:'session.input_transcript.delta',source_event_id:source,event:{type:'decision.completed',decision:{answers:[{name:'end_current_call',type:'predicate',probability}],model:'native-fixture',usage:{}}},...patch});
+const waitControl=()=>new Promise(resolve=>setTimeout(resolve,30));
+
+test('native call control is input-only and independent of client reasoning delegation',()=>{
+ const options=sessionOptions({...create,native_call_control:true});
+ assert.equal(options.session.delegation.type,'client');
+ assert.equal(options.session.triggers.length,1);
+ const trigger=options.session.triggers[0];
+ assert.equal(trigger.event_type,'session.input_transcript.delta');assert.equal(trigger.type,'decisions');
+ assert.equal(trigger.decisions.questions.length,1);assert.equal(trigger.decisions.questions[0].name,'end_current_call');
+ const instructions=trigger.decisions.questions[0].instructions;
+ for(const term of ['COMPLETE','Quoted','hypothetical','negative','revokes','Stop working on Minecraft = false','Please end = false','assistant speech'])assert.ok(instructions.includes(term));
+ assert.equal(options.session.client.data_channel.allowed_server_events.some(v=>v.type==='decision.event'),false);
+});
+
+test('a matching current native end-call signal closes exactly once even without backend work',async()=>{
+ const {bridge,sideband,events}=fixture({callControlGraceMs:10});await bridge.command({...create,native_call_control:true});
+ sideband.emit('event',inputEvent('end-now'));sideband.emit('event',endDecision('end-now'));
+ await waitControl();
+ assert.equal(sideband.sent.filter(v=>v.type==='session.close').length,1);
+ const control=events.find(v=>v.type==='call_control');assert.equal(control.action,'end_call');assert.equal(control.decision,'requested');assert.equal(control.session_id,'live_one');
+ assert.equal(control.source_event_id,'end-now');assert.equal(control.source_end_ms,200);
+ sideband.emit('event',endDecision('end-now'));await waitControl();
+ assert.equal(sideband.sent.filter(v=>v.type==='session.close').length,1);
+ assert.equal(events.filter(v=>v.type==='call_control').length,1);
+ assert.equal(events.at(-1).confirmed,false); // Socket/timeout is still not provider closure.
+});
+
+test('a spoken hangup promise, negative decision, refusal and malformed output never close the call',async()=>{
+ const {bridge,sideband,events}=fixture({callControlGraceMs:10});await bridge.command({...create,native_call_control:true});
+ sideband.emit('event',{type:'session.output_transcript.delta',event_id:'promise',delta:'Hanging up now.',start_ms:10,end_ms:20});
+ const cases=[
+  ['negative',endDecision('negative',.001)],
+  ['uncertain',endDecision('uncertain',.97)],
+  ['refusal',endDecision('refusal',.999,{event:{type:'decision.completed',decision:{answers:[{type:'refusal',name:'end_current_call'}]}}})],
+  ['wrong-question',endDecision('wrong-question',.999,{event:{type:'decision.completed',decision:{answers:[{type:'predicate',name:'other',probability:1}]}}})],
+  ['delegated',endDecision('delegated',1,{delegation_id:'backend-delegation'})],
+  ['output',endDecision('output',1,{source_event_type:'session.output_transcript.delta'})],
+  ['bad-probability',endDecision('bad-probability',NaN)],
+ ];
+ let time=100;
+ for(const [id,decision] of cases){sideband.emit('event',inputEvent(id,'This fixture provides a semantic model answer.',time,time+10));sideband.emit('event',decision);time+=20;}
+ await waitControl();assert.equal(events.some(v=>v.type==='call_control'),false);assert.equal(sideband.sent.length,0);
+ await bridge.close();
+});
+
+test('new human speech revokes a pending signal and older decisions cannot end a continued conversation',async()=>{
+ const {bridge,sideband,events}=fixture({callControlGraceMs:10});await bridge.command({...create,native_call_control:true});
+ sideband.emit('event',inputEvent('old'));sideband.emit('event',endDecision('old'));
+ sideband.emit('event',inputEvent('correction','Actually, stay on the call.',250,300));
+ sideband.emit('event',endDecision('correction',.001));
+ sideband.emit('event',endDecision('old',1,{event_id:'old-later',trigger_id:'old-later'}));
+ await waitControl();assert.equal(events.some(v=>v.type==='call_control'),false);assert.equal(sideband.sent.length,0);
+ await bridge.close();
+});
+
+test('out-of-order delivery binds the trigger to its exact source while stale and foreign sessions are ignored',async()=>{
+ const {bridge,sideband,events}=fixture({callControlGraceMs:10});await bridge.command({...create,native_call_control:true});
+ sideband.emit('event',{...inputEvent('foreign'),session_id:'live_other'});
+ sideband.emit('event',{...endDecision('foreign'),session_id:'live_other'});
+ sideband.emit('event',endDecision('now'));
+ sideband.emit('event',inputEvent('now','Please hang up.',500,600));
+ sideband.emit('event',inputEvent('earlier','Old fragment.',200,300));
+ await waitControl();assert.equal(events.filter(v=>v.type==='call_control').length,1);
+ assert.equal(events.find(v=>v.type==='call_control').source_event_id,'now');
+ assert.equal(sideband.sent.filter(v=>v.type==='session.close').length,1);
+});
+
+test('old trigger results and changed duplicate source identity never authorize call control',async()=>{
+ const first=fixture({callControlGraceMs:10,callControlFreshMs:10});await first.bridge.command({...create,native_call_control:true});
+ first.sideband.emit('event',inputEvent('expired'));await waitControl();first.sideband.emit('event',endDecision('expired'));await waitControl();
+ assert.equal(first.events.some(v=>v.type==='call_control'),false);await first.bridge.close();
+ const second=fixture({callControlGraceMs:10});await second.bridge.command({...create,native_call_control:true});
+ second.sideband.emit('event',inputEvent('changed'));second.sideband.emit('event',endDecision('changed'));
+ second.sideband.emit('event',inputEvent('changed','Do not hang up.'));
+ await waitControl();assert.equal(second.events.some(v=>v.type==='call_control'),false);await second.bridge.close();
+});
+
+
+test('native Decisions call control is an explicit optional capability, off by default',async()=>{
+ assert.equal(sessionOptions(create).session.triggers,undefined);
+ assert.equal(sessionOptions({...create,native_call_control:false}).session.triggers,undefined);
+ for(const bad of [null,1,'true',{},[]])assert.throws(()=>sessionOptions({...create,native_call_control:bad}),/invalid_native_call_control/);
+ const {bridge,sideband,events}=fixture({callControlGraceMs:10});await bridge.command(create);
+ sideband.emit('event',inputEvent('disabled'));sideband.emit('event',endDecision('disabled'));await waitControl();
+ assert.equal(events.some(e=>e.type==='call_control'),false);assert.equal(sideband.sent.length,0);
+ await bridge.close();
+});

@@ -57,6 +57,14 @@ pub fn next(db: &Connection, room: &str, agent: Option<&str>) -> Result<Option<I
     let id:Option<String>=db.query_row("SELECT d.id FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.conversation_id=?1 AND (?2 IS NULL OR d.agent_id=?2) AND d.state IN ('received','promptRequired') AND EXISTS(SELECT 1 FROM room_members WHERE conversation_id=d.conversation_id AND username=m.actor) AND EXISTS(SELECT 1 FROM room_agents WHERE conversation_id=d.conversation_id AND agent_id=d.agent_id) AND NOT EXISTS(SELECT 1 FROM input_deliveries x WHERE x.conversation_id=d.conversation_id AND x.agent_id=d.agent_id AND x.state IN ('unknown','notAccepted')) ORDER BY d.sequence LIMIT 1",params![room,agent],|r|r.get(0)).optional()?;
     id.map(|id| input(db, &id)).transpose()
 }
+/// Explain the existing no-replay fence without changing or acknowledging it.
+/// A locally received input behind this fence has not reached a model turn.
+pub(crate) fn blockers(state: &AppState, room: &str, agent: &str) -> Result<Vec<Value>> {
+    let db = state.db.lock().unwrap();
+    Ok(db.prepare("SELECT id,message_id,state,target_turn FROM input_deliveries WHERE conversation_id=?1 AND agent_id=?2 AND state IN ('unknown','notAccepted') ORDER BY sequence")?
+        .query_map(params![room,agent],|r|Ok(json!({"input_id":r.get::<_,String>(0)?,"message_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"target_turn":r.get::<_,Option<String>>(3)?})))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
 pub fn set(state: &AppState, id: &str, status: &str) -> Result<()> {
     state.db.lock().unwrap().execute(
         "UPDATE input_deliveries SET state=?2,updated_at=?3 WHERE id=?1",

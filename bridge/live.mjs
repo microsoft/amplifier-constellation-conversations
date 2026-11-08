@@ -16,6 +16,12 @@ export const BROWSER_EVENTS = Object.freeze(/** @satisfies {Array<ServerEvent['t
   'session.started', 'session.input_transcript.delta', 'session.output_transcript.delta',
   'session.usage.updated', 'session.closed', 'error',
 ]));
+// This provider-native predicate is independent of the reasoning-agent queue.
+// It has no game/work authority; its only effect is closing this call.
+export const END_CALL_QUESTION = Object.freeze({
+  type:'predicate',name:'end_current_call',
+  instructions:'Is there a COMPLETE unambiguous instruction in the CURRENT human utterance to hang up this voice call now? Use the cumulative words of this current utterance through the triggering fragment, not a fragment in isolation. True requires either the complete idiom hang up/disconnect, or an instruction explicitly naming the call or voice connection as the thing to end. IMPORTANT: bare incomplete phrases such as please end, please stop, can you, or I want you to end are FALSE even if earlier conversation discussed ending calls; never fill in their missing object. Examples: Please hang up = true. End this call now = true. Please end = false. Do not hang up = false. If I asked you to end the call later = false. The phrase I am quoting is please hang up = false. Stop working on Minecraft = false. After an explicit complete request, trailing words this call and now retain its meaning; an assistant acknowledgment does not revoke it. A human correction such as actually do not hang up or keep talking revokes it. Quoted/reported/example/hypothetical/future requests, negative/revoked requests, questions about hangup, and assistant speech alone are false. Do not carry an old request into a different human utterance.',
+});
 const PUBLIC_EVENTS = new Set([...BROWSER_EVENTS, 'session.delegation.created',
   'session.thinking.appended', 'session.commentary.appended']);
 // Parameter names are protocol identifiers, never provider-supplied values.
@@ -35,11 +41,13 @@ export function sessionOptions(command) {
   if (typeof command.voice !== 'string' || !VOICES.has(command.voice)) throw new Error('invalid_voice');
   if (typeof command.instructions !== 'string' || command.instructions.length > 24000) throw new Error('invalid_instructions');
   if (command.history !== undefined && (typeof command.history !== 'string' || Buffer.byteLength(command.history) > 12000)) throw new Error('invalid_history');
+  if (command.native_call_control !== undefined && typeof command.native_call_control !== 'boolean') throw new Error('invalid_native_call_control');
   return {
     session: {
       model: 'gpt-live-1', store: false,
       instructions: command.instructions,
       delegation: {type: 'client', acknowledgement_delay_ms: 600},
+      ...(command.native_call_control === true ? {triggers:[{type:'decisions',event_type:'session.input_transcript.delta',decisions:{questions:[END_CALL_QUESTION]}}]} : {}),
       audio: {output: {voice: command.voice}},
       client: {data_channel: {allowed_client_events: [], allowed_server_events: BROWSER_EVENTS.map(type=>({type}))}},
       // Retained conversation is context, not privileged application instructions.
@@ -117,6 +125,65 @@ export function publicEvent(event,knownCommands=new Set()) {
   return null;
 }
 
+/** A native transcript-trigger result can arrive before its source or out of
+ * order. Keep only recent exact input identities; never infer intent from text.
+ * Probability is a model signal, not proof: this is intentionally limited to the
+ * reversible current call control, with a short interval for a correction.
+ */
+export class CallControl {
+  /** @param {{request:(event:Record<string,unknown>)=>void,graceMs?:number,freshMs?:number}} options */
+  constructor({request,graceMs=800,freshMs=5000}) {
+    this.request=request;this.graceMs=graceMs;this.freshMs=freshMs;
+    this.inputs=new Map();this.pending=new Map();this.seen=new Map();this.latest=null;
+    this.timer=undefined;this.closed=false;
+  }
+  cancelPending(){clearTimeout(this.timer);this.timer=undefined;}
+  close(){this.closed=true;this.cancelPending();this.inputs.clear();this.pending.clear();this.seen.clear();}
+  /** @param {ServerEvent} event */
+  observe(event) {
+    if(this.closed)return;
+    const now=Date.now();
+    for(const [id,value] of this.pending)if(now-value.at>this.freshMs)this.pending.delete(id);
+    if(event.type==='session.input_transcript.delta') {
+      const id=commandId(event.event_id);
+      if(!id || typeof event.delta!=='string' || !event.delta.trim() || event.delta.length>16384 || !Number.isFinite(event.start_ms) || !Number.isFinite(event.end_ms) || event.start_ms<0 || event.end_ms<event.start_ms)return;
+      const exact=JSON.stringify([event.delta,event.start_ms,event.end_ms]),old=this.inputs.get(id);
+      if(old){if(old.exact!==exact){this.cancelPending();this.closed=true;}return;}
+      const input={id,start:event.start_ms,end:event.end_ms,at:now,exact};
+      this.inputs.set(id,input);if(this.inputs.size>128)this.inputs.delete(this.inputs.keys().next().value);
+      if(!this.latest || input.end>this.latest.end || (input.end===this.latest.end && input.start>=this.latest.start)) {
+        this.latest=input;this.cancelPending();
+      }
+      const early=this.pending.get(id);this.pending.delete(id);if(early)this.apply(early.event,input);
+      return;
+    }
+    if(event.type!=='decision.event' || event.delegation_id!==null || event.source_event_type!=='session.input_transcript.delta' || event.event?.type!=='decision.completed')return;
+    const source=commandId(event.source_event_id),trigger=commandId(event.trigger_id),eventId=commandId(event.event_id);
+    if(!source||!trigger||!eventId)return;
+    const exact=JSON.stringify([source,eventId,event.event.decision?.answers]);
+    if(this.seen.has(trigger)) {if(this.seen.get(trigger)!==exact){this.cancelPending();this.closed=true;}return;}
+    this.seen.set(trigger,exact);if(this.seen.size>256)this.seen.delete(this.seen.keys().next().value);
+    const input=this.inputs.get(source);
+    if(!input) {this.pending.set(source,{event,at:now});if(this.pending.size>32)this.pending.delete(this.pending.keys().next().value);return;}
+    this.apply(event,input);
+  }
+  /** @param {import('openai/resources/live/live').DecisionEvent} event @param {{id:string,start:number,end:number,at:number,exact:string}} input */
+  apply(event,input) {
+    if(this.closed || input.id!==this.latest?.id || Date.now()-input.at>this.freshMs)return;
+    const answers=event.event.decision?.answers;
+    if(!Array.isArray(answers)||answers.length!==1)return;
+    const answer=answers[0];
+    this.cancelPending();
+    if(answer.type!=='predicate' || answer.name!=='end_current_call' || !Number.isFinite(answer.probability) || answer.probability<0.98 || answer.probability>1)return;
+    this.timer=setTimeout(()=>{
+      if(this.closed || this.latest?.id!==input.id || Date.now()-input.at>this.freshMs)return;
+      this.closed=true;
+      this.request({type:'call_control',action:'end_call',decision:'requested',source_event_id:input.id,
+        trigger_id:event.trigger_id,decision_event_id:event.event_id,source_start_ms:input.start,source_end_ms:input.end,probability:answer.probability});
+    },this.graceMs);
+  }
+}
+
 export class LiveBridge {
   /** @type {Awaited<ReturnType<typeof startCompanionMcp>> | undefined} */ mcp;
   /** @type {SidebandWS | undefined} */ sideband;
@@ -126,11 +193,12 @@ export class LiveBridge {
   /** @type {() => void} */ resolveDone=()=>{};
   createPending=false;
   closeSent=false;
-  /** @param {{emit: Emit, client: OpenAI, connect: (...args: ConstructorParameters<typeof SidebandWS>) => SidebandWS, setupMs?: number, finalizationMs?: number, maxCallMs?: number}} options */
-  constructor({emit, client, connect, setupMs=20000, finalizationMs=10000, maxCallMs=1800000}) {
+  /** @param {{emit: Emit, client: OpenAI, connect: (...args: ConstructorParameters<typeof SidebandWS>) => SidebandWS, setupMs?: number, finalizationMs?: number, maxCallMs?: number,callControlGraceMs?:number,callControlFreshMs?:number}} options */
+  constructor({emit, client, connect, setupMs=20000, finalizationMs=10000, maxCallMs=1800000,callControlGraceMs=800,callControlFreshMs=5000}) {
     this.emit=emit; this.client=client; this.connect=connect;
     this.setupMs=setupMs; this.finalizationMs=finalizationMs; this.maxCallMs=maxCallMs;
     this.state='new'; this.seenCommands=new Map(); this.finished=false;
+    this.callControl=new CallControl({graceMs:callControlGraceMs,freshMs:callControlFreshMs,request:event=>{if(this.state!=='active'||this.finished)return;this.emit({...event,session_id:this.sessionId});void this.close();}});
     this.done=new Promise(resolve=>{this.resolveDone=()=>resolve(undefined);});
   }
   /** @param {unknown} input */
@@ -173,6 +241,8 @@ export class LiveBridge {
       this.sideband.on('event',event=>{
         if (this.finished || !event || typeof event!=='object') return;
         if ((event.type==='session.started' || event.type==='session.closed') && event.session?.id!==this.sessionId) return;
+        if('session_id' in event && event.session_id!==this.sessionId)return;
+        if (command.native_call_control === true) this.callControl.observe(event);
         // Never mirror private reasoning, raw audio, or session configuration.
         const safe=publicEvent(event,this.seenCommands);
         if (safe) this.emit({type:'event',event:safe});
@@ -223,7 +293,7 @@ export class LiveBridge {
   }
   startClosing() {
     if(this.finished || this.closeSent || !this.sideband)return;
-    this.closeSent=true;
+    this.closeSent=true;this.callControl.close();
     // Listeners were installed before any command. Closure is only confirmed by
     // the matching terminal event, not socket closure or send acceptance.
     this.finalizer=setTimeout(()=>this.finish(false),this.finalizationMs);
@@ -232,7 +302,7 @@ export class LiveBridge {
   /** @param {boolean} confirmed */
   finish(confirmed) {
     if(this.finished)return;
-    this.finished=true;this.state='closed';clearTimeout(this.expiry);clearTimeout(this.finalizer);
+    this.finished=true;this.state='closed';this.callControl.close();clearTimeout(this.expiry);clearTimeout(this.finalizer);
     this.emit({type:'closed',confirmed,session_id:this.sessionId??null});
     this.mcp?.close();
     this.sideband?.close(); this.resolveDone();
