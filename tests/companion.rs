@@ -64,7 +64,7 @@ for line in sys.stdin:
  if c['op']=='close':emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});break
  if c['op']=='append':
   if not c['content'].strip():emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
-  if voice=='append_error':
+  if voice=='append_error' and not c['content'].startswith('Your request is saved and awaiting'):
    if second_sent:continue
    second_sent=True
    for suffix,client,outer in [('unrelated','never-queued',None),('conflict',c['event_id'],'another-command'),('matched',c['event_id'],None)]:
@@ -73,6 +73,11 @@ for line in sys.stdin:
     emit({'type':'event','event':event})
    emit({'type':'error','code':'voice_transport_failed','message':'Generic close'});continue
   emit({'type':'event','event':{'type':'session.'+c['channel']+'.appended','event_id':'ack-'+c['event_id'],'client_event_id':c['event_id'],'start_ms':100,'end_ms':110}})
+  if voice=='control_on_hold' and 'full request is saved' in c['content']:
+   emit({'type':'event','event':{'type':'session.input_transcript.delta','event_id':'human-close','delta':'Please end this call.','start_ms':700000,'end_ms':701000}})
+   emit({'type':'event','event':{'type':'session.input_transcript.delta','event_id':'late-older-input','delta':'An older fragment.','start_ms':699000,'end_ms':699100}})
+   emit({'type':'call_control','action':'end_call','decision':'requested','session_id':'live-fixture','source_event_id':'human-close','trigger_id':'trigger:close.1','decision_event_id':'decision:close.1','source_start_ms':700000,'source_end_ms':701000,'probability':.99})
+   emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});break
   if voice=='upload_delegate' and 'is available.' in c['content'] and not second_sent:
    second_sent=True
    emit({'type':'event','event':{'type':'session.delegation.created','event_id':'upload-delegation','offset_ms':100,'delegation':{'id':'delegate-upload','target':'client'}}})
@@ -156,14 +161,23 @@ async fn start(f: &Fixture) -> (Value, Value) {
     (input, value)
 }
 async fn until(f: &Fixture, id: &str, kind: &str) -> Value {
+    let mut after = 0;
+    let mut seen = Vec::new();
     for _ in 0..100 {
-        let (_, v) = request(f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
-        if v["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["kind"] == kind)
-        {
+        let (_, mut v) = request(
+            f,
+            "GET",
+            &format!("/api/v1/companion/calls/{id}?after={after}"),
+            None,
+        )
+        .await;
+        let page = v["events"].as_array().unwrap();
+        if let Some(last) = page.last() {
+            after = last["seq"].as_i64().unwrap();
+        }
+        seen.extend(page.iter().cloned());
+        if seen.iter().any(|e| e["kind"] == kind) {
+            v["events"] = json!(seen);
             return v;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -187,16 +201,20 @@ async fn provider_append_rejection_is_correlated_without_replaying_settled_deleg
     let id = call["id"].as_str().unwrap();
     let result = until(&f, id, "closed").await;
     let events = result["events"].as_array().unwrap();
-    let queued = events
-        .iter()
-        .find(|e| e["kind"] == "context_delivery" && e["data"]["state"] == "queued")
-        .unwrap();
     let receipts = events
         .iter()
-        .filter(|e| e["kind"] == "context_delivery" && e["data"]["state"] != "queued")
+        .filter(|e| e["kind"] == "context_delivery" && e["data"]["state"] == "rejected")
         .collect::<Vec<_>>();
     assert_eq!(receipts.len(), 1);
     let rejection = &receipts[0]["data"];
+    let queued = events
+        .iter()
+        .find(|e| {
+            e["kind"] == "context_delivery"
+                && e["data"]["state"] == "queued"
+                && e["data"]["event_id"] == rejection["event_id"]
+        })
+        .unwrap();
     assert_eq!(rejection["state"], "rejected");
     assert_eq!(rejection["event_id"], queued["data"]["event_id"]);
     assert_eq!(rejection["delegation_id"], "delegate-1");
@@ -560,7 +578,24 @@ for line in sys.stdin:
             .any(|e| e["kind"] == "card" && e["data"]["text"] == "Settled after hangup")
     );
     let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
-    assert_eq!(commands.lines().filter(|l| l.contains("append")).count(), 0);
+    let commands = commands
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect::<Vec<_>>();
+    let close = commands.iter().position(|v| v["op"] == "close").unwrap();
+    assert!(commands[close + 1..].iter().all(|v| v["op"] != "append"));
+    let appends = commands
+        .iter()
+        .filter(|v| v["op"] == "append")
+        .collect::<Vec<_>>();
+    assert_eq!(appends.len(), 1);
+    assert_eq!(appends[0]["channel"], "thinking");
+    assert!(
+        appends[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Your request is saved and awaiting")
+    );
     assert_eq!(
         std::fs::read_to_string(f.home.path().join("bridge-starts")).unwrap(),
         "start\n"
@@ -871,16 +906,33 @@ async fn delegation_anchor_includes_observed_straddling_word_with_original_timin
     let v = until(&f, id, "card").await;
     assert_eq!(v["state"], "connected");
     let source:String=f.s.db.lock().unwrap().query_row("SELECT m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='delegate-1'",[id],|r|r.get(0)).unwrap();
-    let fragments: Vec<Value> =
-        serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
-    let tail = fragments
+    let persisted: String =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source FROM companion_delegations WHERE call_id=?1 AND id='delegate-1'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let persisted: Value = serde_json::from_str(&persisted).unwrap();
+    let tail = persisted["fragments"]
+        .as_array()
+        .unwrap()
         .iter()
         .find(|v| v["event_id"] == "human-tail")
         .unwrap();
     assert_eq!(tail["text"], " elsewhere");
     assert_eq!(tail["start_ms"], 13000);
     assert_eq!(tail["end_ms"], 13200);
-    assert_eq!(tail["crosses_delegation_anchor"], true);
+    let segments: Vec<Value> = serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0]["text"],
+        "Please inspect the existing work, without changing anything elsewhere"
+    );
+    assert_eq!(segments[0]["crosses_delegation_anchor"], true);
     assert!(
         !v["events"]
             .as_array()
@@ -895,28 +947,30 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
     let f = fixture("anchors");
     let (_, call) = start(&f).await;
     let id = call["id"].as_str().unwrap();
-    let mut complete = false;
-    for _ in 0..150 {
-        let (_, v) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
-        if v["events"]
-            .as_array()
+    for _ in 0..200 {
+        let completed: i64 = f
+            .s
+            .db
+            .lock()
             .unwrap()
-            .iter()
-            .filter(|e| e["kind"] == "card")
-            .count()
-            == 2
-        {
-            complete = true;
+            .query_row(
+                "SELECT COUNT(*) FROM companion_delegations WHERE call_id=?1 AND state='completed'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if completed == 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(complete, "Both independent delegations should settle");
+    wait_delegation(&f, &call, "delegate-1", "completed").await;
+    wait_delegation(&f, &call, "delegate-2", "completed").await;
     let source:String=f.s.db.lock().unwrap().query_row("SELECT m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='delegate-2'",[id],|r|r.get(0)).unwrap();
     let fragments: Vec<Value> =
         serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0]["event_id"], "human-second");
+    assert_eq!(fragments[0]["text"], "Now give me a separate summary.");
     assert_eq!(fragments[0]["crosses_delegation_anchor"], true);
     assert!(
         !serde_json::to_string(&fragments)
@@ -935,9 +989,15 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
         .split_once("\n\nThe CURRENT NEW REQUEST")
         .unwrap()
         .0;
-    let context: Vec<Value> = serde_json::from_str(context).unwrap();
-    assert!(context.iter().any(|v| v["event_id"] == "human-tail"));
-    assert!(context.iter().all(|v| v["action_authority"] == false));
+    let context: Value = serde_json::from_str(context).unwrap();
+    assert!(
+        context["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["text"].as_str().unwrap().contains("elsewhere"))
+    );
+    assert_eq!(context["action_authority"], false);
     assert!(source.contains("Never repeat an earlier instruction or effect from this block"));
     let lines = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
     assert_eq!(
@@ -949,6 +1009,37 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
             .count(),
         2
     );
+    // The second source arrives on the first append, before result delivery.
+    // Each accepted source gets exactly one quiet receipt, even after polling.
+    for _ in 0..3 {
+        request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+    }
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    let intake = commands
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| {
+            v["content"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("Your request is saved and awaiting")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(intake.len(), 2);
+    for delegation in ["delegate-1", "delegate-2"] {
+        let receipt = intake
+            .iter()
+            .filter(|v| v["delegation_id"] == delegation)
+            .collect::<Vec<_>>();
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(receipt[0]["channel"], "thinking");
+        assert!(
+            receipt[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("not completion or proof that work has started")
+        );
+    }
     end(&f, id).await;
 }
 
@@ -970,9 +1061,9 @@ async fn grounded_bootstrap_and_voice_preferences_do_not_create_backend_model_wo
         "Coach",
         "Minecraft",
         "2026-11-07T19:00:00Z",
-        "Missing observations do not mean nothing is happening",
+        "missing reports do not mean a place is quiet",
         "<|SpawnThinking|>",
-        "not current activity",
+        "dated snapshots retain their original age",
     ] {
         assert!(instructions.contains(expected), "{expected}");
     }
@@ -981,6 +1072,11 @@ async fn grounded_bootstrap_and_voice_preferences_do_not_create_backend_model_wo
     let (status, setting) = request(&f, "PUT", settings, Some(json!({"voice":"marin"}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(setting["applies_to"], "next_call");
+    assert_eq!(setting["voice_model"], "gpt-live-1");
+    assert_eq!(setting["voice_provider"], "OpenAI");
+    assert_eq!(setting["available_voice_models"], json!(["gpt-live-1"]));
+    assert_eq!(setting["backend_settings_editable"], false);
+    assert!(setting["backend"].is_null());
     assert_eq!(
         request(&f, "PUT", settings, Some(json!({"voice":"invented"})))
             .await
@@ -2141,4 +2237,462 @@ async fn persisted_provider_terminal_survives_bridge_eof_before_wrapper() {
     assert_eq!(result["state"], "closed");
     assert_eq!(result["closure"]["confirmed"], true);
     assert_eq!(result["closure"]["provider_reason"], "expired");
+}
+
+fn speech_fixture(f: &Fixture, call: &Value, key: &str, role: &str, start: i64, text: &str) {
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'transcript',?3,?4)",rusqlite::params![call["id"].as_str().unwrap(),key,json!({"event_id":key,"role":role,"start_ms":start,"end_ms":start+200,"text":text}).to_string(),now_ms()]).unwrap();
+}
+fn pending_voice_fixture(f: &Fixture, call: &Value, delegation: &str, offset: i64) {
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,?2,?3,'waiting_transcript',?4,?5)",rusqlite::params![call["id"].as_str().unwrap(),delegation,offset,uuid::Uuid::new_v4().to_string(),now_ms()-3000]).unwrap();
+}
+
+#[tokio::test]
+async fn long_spoken_request_and_followup_preserve_exact_source_and_human_card_label() {
+    let f = fixture("quiet");
+    agent_fixture_env(&f, "FIXTURE_IMAGES", "1");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let mut exact = String::new();
+    for i in 0..700 {
+        let text = if i == 0 {
+            "Inspect the shop carefully"
+        } else if i == 350 {
+            " without changing any structure"
+        } else {
+            " and report what you see"
+        };
+        exact.push_str(text);
+        speech_fixture(&f, &call, &format!("long-{i}"), "user", 200 * i, text);
+    }
+    pending_voice_fixture(&f, &call, "long-request", 140_000);
+    wait_delegation(&f, &call, "long-request", "completed").await;
+    let (source,prompt):(String,String)=f.s.db.lock().unwrap().query_row("SELECT d.source,m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='long-request'",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let saved: Value = serde_json::from_str(&source).unwrap();
+    assert!(source.len() > 48 * 1024);
+    assert_eq!(saved["fragments"].as_array().unwrap().len(), 700);
+    assert_eq!(
+        saved["fragments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["text"].as_str().unwrap())
+            .collect::<String>(),
+        exact
+    );
+    assert!(prompt.len() < 48 * 1024);
+    let segments: Vec<Value> = serde_json::from_str(prompt.rsplit_once("\n\n").unwrap().1).unwrap();
+    assert_eq!(segments[0]["text"], exact);
+    let record = until(&f, id, "card").await;
+    let card = record["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "card")
+        .unwrap();
+    assert!(
+        card["data"]["request_text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Inspect the shop")
+    );
+    assert!(
+        !card["data"]["request_text"]
+            .as_str()
+            .unwrap()
+            .contains("companion_request_action")
+    );
+    speech_fixture(
+        &f,
+        &call,
+        "followup-ask",
+        "assistant",
+        141_000,
+        "Shall I save that feedback?",
+    );
+    speech_fixture(
+        &f,
+        &call,
+        "followup-human",
+        "user",
+        142_000,
+        "Yes, but keep it private.",
+    );
+    pending_voice_fixture(&f, &call, "followup-request", 142_100);
+    wait_delegation(&f, &call, "followup-request", "completed").await;
+    let saved: String = f
+        .s
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT source FROM companion_delegations WHERE call_id=?1 AND id='followup-request'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let saved: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["fragments"].as_array().unwrap().len(), 2);
+    assert_eq!(saved["fragments"][1]["text"], "Yes, but keep it private.");
+    let room = call["conversation_id"].as_str().unwrap();
+    let (_, photo) = request(&f, "POST", &format!("/api/v1/conversations/{room}/attachments"),
+        Some(json!({"name":"camera.png","mime_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="}))).await;
+    let upload = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        request(
+            &f,
+            "POST",
+            &format!("/api/v1/companion/calls/{id}/uploads"),
+            Some(
+                json!({"upload_id":upload,"state":"captured","source":"camera","name":"camera.png"})
+            )
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, _) = request(&f, "POST", &format!("/api/v1/companion/calls/{id}/uploads"),
+        Some(json!({"upload_id":upload,"state":"available","source":"camera","name":"camera.png","attachment_ids":[photo["id"]]}))).await;
+    assert_eq!(status, StatusCode::OK);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_uploads SET updated_at=?2 WHERE call_id=?1",
+            rusqlite::params![id, now_ms() - 4000],
+        )
+        .unwrap();
+    speech_fixture(
+        &f,
+        &call,
+        "photo-human",
+        "user",
+        143_000,
+        "Now inspect this photo. Do not send or publish it.",
+    );
+    pending_voice_fixture(&f, &call, "photo-request", 143_100);
+    wait_delegation(&f, &call, "photo-request", "completed").await;
+    let prompts = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    let logs = prompts
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect::<Vec<_>>();
+    let prompts = logs
+        .iter()
+        .filter(|v| v["method"] == "session/prompt")
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 3);
+    assert!(
+        prompts[1]["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Shall I save that feedback?")
+    );
+    assert!(
+        prompts[1]["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Yes, but keep it private.")
+    );
+    assert!(
+        prompts[2]["params"]["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["type"] == "image" && v["mimeType"] == "image/png")
+    );
+    assert!(
+        prompts[2]["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Do not send or publish it.")
+    );
+    assert_eq!(
+        logs.iter().filter(|v| v["method"] == "session/new").count(),
+        1
+    );
+    assert_eq!(
+        logs.iter()
+            .filter(|v| v["method"] == "session/load")
+            .count(),
+        2
+    );
+    let owner: String = f.s.db.lock().unwrap().query_row("SELECT d.id FROM attachments a JOIN companion_delegations d ON d.message_id=a.message_id WHERE a.id=?1", [photo["id"].as_str().unwrap()], |r|r.get(0)).unwrap();
+    assert_eq!(owner, "photo-request");
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn late_human_source_repairs_an_empty_held_request_without_replaying_it() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    pending_voice_fixture(&f, &call, "late-source", 1000);
+    wait_delegation(&f, &call, "late-source", "held").await;
+    speech_fixture(
+        &f,
+        &call,
+        "late-human",
+        "user",
+        900,
+        "Inspect the saved photo without changing anything.",
+    );
+    wait_delegation(&f, &call, "late-source", "completed").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let prompts = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    assert_eq!(
+        prompts
+            .lines()
+            .filter(|l| serde_json::from_str::<Value>(l).unwrap()["method"] == "session/prompt")
+            .count(),
+        1
+    );
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn blocked_received_inputs_report_not_started_once_and_preserve_unknown_receipts() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    terminal_fixture(&f, &call, "interrupted-target", "interrupted");
+    settlement_source(
+        &f,
+        &call,
+        "uncertain-source",
+        "unknown",
+        "interrupted-target",
+    );
+    for name in ["pending-one", "pending-two"] {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user','Please check the latest status','complete',?3,?3,'owner')",rusqlite::params![name,room,now_ms()]).unwrap();
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES(?1,?1,?2,'default','direct','received',?3)",rusqlite::params![name,room,now_ms()]).unwrap();
+        db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,?2,2000,'dispatched',?2,?3)",rusqlite::params![id,name,now_ms()]).unwrap();
+    }
+    let record = until(&f, id, "backend_status").await;
+    assert!(
+        record["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "progress"
+                && e["data"]["state"] == "blocked"
+                && e["data"]["delivery_state"] == "received")
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    assert_eq!(
+        commands
+            .lines()
+            .filter(|l| l.contains("has not reached the agent"))
+            .count(),
+        1
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    {
+        let db = f.s.db.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT state FROM input_deliveries WHERE id='uncertain-source'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "unknown"
+        );
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM input_deliveries WHERE id IN ('pending-one','pending-two') AND state='received' AND target_turn IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+    }
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn genuine_source_capacity_preserves_text_and_independent_hangup_does_not_release_work() {
+    let f = fixture("control_on_hold");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    f.s.running.lock().unwrap().insert(room.into(), tx);
+    for i in 1..=6 {
+        speech_fixture(
+            &f,
+            &call,
+            &format!("large-{i}"),
+            "user",
+            i * 1000,
+            &"word ".repeat(2000),
+        );
+    }
+    pending_voice_fixture(&f, &call, "capacity-request", 6500);
+    let record = until(&f, id, "closed").await;
+    assert_eq!(record["state"], "closed");
+    let source: String = f
+        .s
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT source FROM companion_delegations WHERE call_id=?1 AND id='capacity-request'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(source.len() > 60_000);
+    assert!(
+        record["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "call_control" && e["data"]["decision"] == "requested")
+    );
+    assert!(record["events"].as_array().unwrap().iter().any(|e| {
+        e["kind"] == "delegation"
+            && e["data"]["state"] == "held"
+            && e["data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("full request is saved")
+    }));
+    assert!(!*rx.borrow());
+    assert!(f.s.running.lock().unwrap().contains_key(room));
+    assert!(!f.home.path().join("acp.jsonl").exists());
+}
+
+fn agent_fixture_env(f: &Fixture, name: &str, value: &str) {
+    let db = f.s.db.lock().unwrap();
+    let mut config: Value = serde_json::from_str(
+        &db.query_row(
+            "SELECT config FROM agent_endpoints WHERE id='default'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    config["env"][name] = json!(value);
+    db.execute(
+        "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+        [config.to_string()],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn advertised_backend_settings_are_observed_only_after_real_fixture_setup() {
+    let f = fixture("quiet");
+    agent_fixture_env(&f, "FIXTURE_MODEL_SETTINGS", "1");
+    let settings = "/api/v1/companion/agents/default/voice-settings";
+    assert!(request(&f, "GET", settings, None).await.1["backend"].is_null());
+    let (_, call) = start(&f).await;
+    assert!(request(&f, "GET", settings, None).await.1["backend"].is_null());
+    speech_fixture(
+        &f,
+        &call,
+        "settings-human",
+        "user",
+        10,
+        "Check the fixture status.",
+    );
+    pending_voice_fixture(&f, &call, "settings-request", 100);
+    wait_delegation(&f, &call, "settings-request", "completed").await;
+    let (_, setting) = request(&f, "GET", settings, None).await;
+    assert_eq!(setting["backend"]["model"]["id"], "fixture-local-model");
+    assert_eq!(setting["backend"]["model"]["name"], "Fixture local model");
+    assert_eq!(setting["backend"]["options"][0]["value"], "low");
+    assert_eq!(setting["backend"]["options"][0]["editable"], false);
+    assert_eq!(setting["backend"]["source"], "acp_session_setup");
+    assert!(setting["backend"]["observed_at"].as_i64().unwrap() > 0);
+    assert_eq!(setting["backend_settings_editable"], false);
+    end(&f, call["id"].as_str().unwrap()).await;
+}
+
+#[tokio::test]
+async fn interrupted_driver_preserves_bounded_actual_causes_and_never_replays_input() {
+    for (terminal, kind) in [
+        ("rpc_error", "acp_rejected"),
+        ("refusal", "incomplete_turn"),
+        ("disconnect", "transport_error"),
+    ] {
+        let f = fixture("quiet");
+        agent_fixture_env(&f, "FIXTURE_TERMINAL", terminal);
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        let room = call["conversation_id"].as_str().unwrap();
+        speech_fixture(
+            &f,
+            &call,
+            "error-human",
+            "user",
+            10,
+            "Please inspect the fixture status.",
+        );
+        pending_voice_fixture(&f, &call, "error-request", 100);
+        wait_delegation(&f, &call, "error-request", "unknown").await;
+        let raw: String = f.s.db.lock().unwrap().query_row("SELECT data FROM audit WHERE kind='turn.interrupted' AND conversation_id=?1 ORDER BY seq DESC LIMIT 1", [room], |r| r.get(0)).unwrap();
+        let audit: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(audit["cause"]["kind"], kind, "{terminal}: {audit}");
+        if terminal == "rpc_error" {
+            assert_eq!(audit["cause"]["rpc_code"], -32088);
+            assert_eq!(audit["cause"]["phase"], "session/prompt");
+        } else if terminal == "refusal" {
+            assert_eq!(audit["cause"]["stop_reason"], "refusal");
+        }
+        assert!(!raw.contains("private fixture secret"));
+        assert!(!raw.contains("token"));
+        let (delivery,status): (String,String) = f.s.db.lock().unwrap().query_row("SELECT d.state,m.status FROM input_deliveries d JOIN messages m ON m.id=d.target_turn WHERE d.conversation_id=?1", [room], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(delivery, "unknown");
+        assert_eq!(status, "interrupted");
+        for _ in 0..3 {
+            request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+        }
+        let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|l| serde_json::from_str::<Value>(l).unwrap()["method"] == "session/prompt")
+                .count(),
+            1
+        );
+        end(&f, id).await;
+    }
+}
+
+#[tokio::test]
+async fn oversized_source_and_short_followup_remain_retained_without_false_same_call_recovery() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let exact = "Keep this whole instruction. ".repeat(2200);
+    speech_fixture(&f, &call, "oversized-human", "user", 100, &exact);
+    pending_voice_fixture(&f, &call, "oversized-request", 1000);
+    wait_delegation(&f, &call, "oversized-request", "held").await;
+    speech_fixture(
+        &f,
+        &call,
+        "smaller-human",
+        "user",
+        1100,
+        "Just do the first part.",
+    );
+    pending_voice_fixture(&f, &call, "smaller-request", 1200);
+    wait_delegation(&f, &call, "smaller-request", "held").await;
+    {
+        let db = f.s.db.lock().unwrap();
+        let original: String = db.query_row("SELECT source FROM companion_delegations WHERE call_id=?1 AND id='oversized-request'", [id], |r|r.get(0)).unwrap();
+        let followup: String = db.query_row("SELECT source FROM companion_delegations WHERE call_id=?1 AND id='smaller-request'", [id], |r|r.get(0)).unwrap();
+        let original: Value = serde_json::from_str(&original).unwrap();
+        let followup: Value = serde_json::from_str(&followup).unwrap();
+        assert_eq!(original["fragments"][0]["text"], exact);
+        assert_eq!(followup["fragments"][0]["text"], exact);
+        assert_eq!(followup["fragments"][1]["text"], "Just do the first part.");
+        let notices = db.prepare("SELECT data FROM companion_events WHERE call_id=?1 AND kind='delegation' AND json_extract(data,'$.state')='held'").unwrap().query_map([id], |r|r.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(notices.len(), 2);
+        for notice in notices {
+            assert!(notice.contains("too large for this call to send"));
+            assert!(notice.contains("start a new call with a smaller request"));
+            assert!(notice.contains("retained and unexecuted"));
+            assert!(!notice.contains("please narrow"));
+        }
+    }
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    end(&f, id).await;
 }

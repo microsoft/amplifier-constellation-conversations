@@ -25,6 +25,20 @@ to 200 KB each. Share up to four files at a time. These inputs use the same save
 attachment path as camera captures. The ongoing conversation determines whether
 the agent inspects an item or asks a useful follow-up question.
 
+Treat the current shared space as a small whiteboard. Prefer one useful item;
+use up to three when a comparison needs them. The agent can add, replace, remove,
+or clear current items through the existing view tool. Results and observations
+stay in collapsed history unless deliberately presented. Clearing the board does
+not delete saved material, cancel work, or imply that anyone saw it. Pinned items
+and an item the caller is reading are protected; an incompatible change fails
+without partially rearranging the board. The caller can unpin or move an item to
+history. A saved presentation request is not confirmation that it is on screen.
+
+An explicit **Paste** control opens a text composer; pasted images use the saved
+upload path. A receipt says when material is available. New content follows the
+bottom only while the caller is already near the bottom; reading older content
+preserves their place. The same rule applies to captions and the transcript.
+
 The shared pane and transcript scroll independently of the call controls, on
 desktop and mobile. Conversation and work-control links reuse a separate work tab
 so the call can remain open. Answer links are clickable. Supported saved media
@@ -36,6 +50,13 @@ Choose **Voice** on a contact, or **Voice settings · next call** during a call.
 Preferences are saved for the signed-in person and selected agent. A change takes
 effect on their next call; it does not change the current voice, ACP identity,
 model, or working session.
+
+The settings panel also identifies the configured cloud voice model and the
+reasoning model/settings last reported by the selected ACP backend. Unknown
+settings remain unknown. Only advertised model and thinking selections are
+projected, with an observation time; launcher commands, credentials, and private
+configuration are not exposed. Backend values are read-only here. They are not a
+claim that a setting from an earlier call is still current.
 
 Hanging up releases microphone, camera, audio, and the call's optional tools. It
 closes the voice connection but does not cancel already submitted connector work
@@ -280,7 +301,7 @@ require the session's `X-CSRF-Token`. All paths below start with `/api/v1`.
 | Method and path | Purpose |
 | --- | --- |
 | `GET /companion` | Contacts, effective voice preference, availability, and an existing open call. |
-| `GET /companion/agents/{id}/voice-settings` | `voice`, `available_voices`, and `applies_to: "next_call"`. |
+| `GET /companion/agents/{id}/voice-settings` | Voice choices, configured `voice_provider`/`voice_model`, nullable last-reported `backend`, and `applies_to: "next_call"`. |
 | `PUT /companion/agents/{id}/voice-settings` | Save `{ "voice": "marin" }` for this person and agent. |
 | `GET /companion/agents/{id}/capabilities` | Fresh initialization probe: `image_input`, `capabilities_available`, `checked_at`, `source`. No model prompt. |
 | `POST /companion/calls` | Create with `request_id` UUID, `agent_id`, and SDP `sdp`; retain the same request for uncertain-create reconciliation. |
@@ -304,9 +325,10 @@ Optional MCP uses `POST /companion/calls/{id}/mcp`. Its host callbacks under
 not browser session authorization, and reject browser Origin requests. The MCP
 SDK owns protocol framing; these are Companion application routes, not ACP
 extensions. `companion_request_action` takes `connection_id`, `instruction`, the
-original `delegation_id` (a provider ID of 1–160 characters), and a UUID `request_id`; `companion_show` takes an HTTP(S) `url`, `title`, and optional
-`kind` (`auto`, `link`, `image`, or `video`). Showing a link is neither platform
-publication nor evidence that the media loaded.
+original `delegation_id` (a provider ID of 1–160 characters), and a UUID `request_id`.
+`companion_show` takes a `title` and either an HTTP(S) `url` or bounded plain `text`.
+Optional `kind` is `auto`, `link`, `image`, or `video` for a URL, and `note` for text.
+Saving a card is neither platform publication nor evidence that it was displayed.
 
 ## Validation and remaining boundaries
 
@@ -586,3 +608,64 @@ times remain separate from query time. Missing facts or a failed read do not mea
 inactivity. This avoids a redundant native approval for an already-enrolled read;
 it does not allow arbitrary external tools. Expired call-scoped native requests
 are rejected directly instead of creating approvals on a closed call screen.
+
+### Coherent speech and bounded presentation
+
+Provider transcript deltas are fragments, not conversational turns. The host
+groups adjacent fragments from the same speaker without changing their text,
+while retaining every original event ID, timing, and fragment in the existing
+delegation record. Limits apply to the compact presentation instead of repeated
+per-word metadata. Recent coherent speech helps interpret a short “yes” or a
+correction. Held input is retained and can be carried forward by a later request;
+it is never labelled completed or silently dropped. An actually oversized request
+remains saved with an explicit capacity explanation.
+
+If an interrupted earlier response blocks delivery, the call receives one clear
+explanation for that blocking set. Later requests remain saved. Status reads and
+hang-up never release the block or retry an uncertain action. Structured driver
+diagnostics retain only bounded error categories/codes, not raw provider errors.
+Results refer to the human request rather than the generated backend prompt;
+late results remain available without taking over the current topic.
+
+`companion_surface_status` with no arguments reads current browser presence,
+camera/consent facts and saved-artifact metadata. With `artifact_id`, it retrieves
+an already shared attachment from this private call, subject to the backend's
+actual image capability. It does not recapture, re-upload or claim inspection.
+An `operation_id` still reads the exact operation receipt; these selectors are
+mutually exclusive.
+
+Whiteboard operations reuse `companion_view` and saved identities:
+`replace_board` takes up to three `card_ids`; `add_card` and `remove_card` take
+`card_id`; `clear_board` takes neither. Cards are saved event sequence IDs or
+`upload:<uuid>` for an available upload belonging to this call. Browser presence
+reports current/pinned/focused IDs. `board_full` and `item_protected` are explicit
+failures. `companion_show` returns `saved`/`requested_current`; consult browser
+presence for display, never infer playback or human attention.
+To write a short note, `companion_show` accepts `text` (at most 1,200 UTF-8 bytes)
+instead of `url`, with a title and optional `kind: "note"`. The caller sees plain
+text; HTML and media references in a note are not executed or automatically loaded.
+Existing URL/media calls retain their shape.
+
+### Independent voice hang-up
+
+An installation may set `native_call_control: true` on a Companion profile after
+qualifying that project's native Decisions access and spoken behavior. It is off
+by default; existing projects do not gain a new provider prerequisite silently.
+No failed creation is retried with a different configuration.
+
+The official GPT-Live input-transcript Decisions trigger evaluates only whether
+the human explicitly requests ending the current call. It runs independently of
+the reasoning queue. Its sole effect is existing call closure; it cannot cancel
+agent work, resolve unknown delivery or affect another call. Quoted, hypothetical,
+incomplete, negated and revoked requests, and requests to stop other work, are
+excluded. The host requires the exact current session and source event/times,
+a matching completed predicate result, probability at least 0.98 and a short
+interval without newer input. Old, conflicting and failed decisions do nothing.
+A matching provider terminal event still confirms closure separately.
+
+This native decision may incur provider usage and requires the project's
+Decisions access. Automated signal/ordering tests do not establish semantic
+accuracy for real speech. Qualify with explicit, quoted, corrected and negative
+utterances before treating it as dependable hands-free control; the on-screen
+End call button remains available independently. See OpenAI's
+[voice Decisions guidance](https://developers.openai.com/api/docs/guides/decisions-voice).

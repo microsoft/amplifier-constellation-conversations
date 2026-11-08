@@ -41,7 +41,7 @@ const server = createServer(async (request,response) => {
   if (agentPath) {
     if (agentPath[2] === 'capabilities') { send(200,{image_input:agentPath[1] !== 'jarvis',capabilities_available:true}); return; }
     if (request.method === 'PUT') voices.set(agentPath[1],body.voice);
-    send(200,{voice:voices.get(agentPath[1]) || 'marin',available_voices:['marin','cedar','ash'],applies_to:'next_call'}); return;
+    send(200,{voice:voices.get(agentPath[1]) || 'marin',available_voices:['marin','cedar','ash'],applies_to:'next_call',voice_provider:'OpenAI',voice_model:'fixture-live',available_voice_models:['fixture-live'],backend_settings_editable:false,backend:agentPath[1]==='jarvis'?null:{agent:{name:'fixture-runtime',title:'Fixture reasoning runtime'},model:{id:'fixture-model',name:'Fixture reasoning model'},observed_at:1794157902184,options:[{id:'reasoning',name:'Thinking',category:'thought_level',value:'medium',label:'Medium',editable:false}]}}); return;
   }
   const uploadPath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)\/uploads$/);
   if (uploadPath) {
@@ -54,7 +54,7 @@ const server = createServer(async (request,response) => {
   if (url.pathname === '/api/v1/companion/calls' && request.method === 'POST') {
     let call = [...calls.values()].find(value => value.request.request_id === body.request_id);
     if (call && JSON.stringify(call.request) !== JSON.stringify(body)) { send(409,{error:'changed request'}); return; }
-    if (!call) { call = {id:'call-' + nextCall++,owner:authOwner,request:body,conversation_id:'room-' + body.agent_id,session_id:'fixture-live',sdp:'fixture-answer',state:'connecting'}; calls.set(call.id,call); }
+    if (!call) { call = {id:'call-' + nextCall++,owner:authOwner,request:body,conversation_id:'room-' + body.agent_id,session_id:'fixture-live',sdp:'fixture-answer',voice:voices.get(body.agent_id)||'marin',state:'connecting'}; calls.set(call.id,call); }
     send(200,call); return;
   }
   const resultPath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)\/results\/([^/]+)$/);
@@ -76,7 +76,7 @@ const server = createServer(async (request,response) => {
     }
     if(body.state==='failed'&&command.state==='queued'){send(400,{error:'not accepted'});return;}
     if(body.state==='uploaded'&&(!uploads.has(command.operation_id+':available')||!body.attachment_ids?.every(id=>attachments.has(id)))){send(400,{error:'image not saved'});return;}
-    command.state=body.state;command.artifact_ids=body.attachment_ids||[];send(200,{...command,execute:false});return;
+    command.state=body.state;command.reason=body.reason;command.artifact_ids=body.attachment_ids||[];send(200,{...command,execute:false});return;
   }
   const callPath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)(?:\/(heartbeat|close))?$/);
   if (callPath) {
@@ -185,7 +185,10 @@ try {
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-contacts.png'),fullPage:true});
 
   await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
-  await page.locator('#voice-choice:not([disabled])').waitFor(); await page.locator('#voice-choice').selectOption('ash'); await page.locator('#save-voice').click();
+  await page.locator('#voice-choice:not([disabled])').waitFor();
+  assert.match(await page.locator('#voice-model-facts').innerText(),/OpenAI · fixture-live/);assert.match(await page.locator('#voice-model-facts').innerText(),/Fixture reasoning runtime/);assert.match(await page.locator('#voice-model-facts').innerText(),/Fixture reasoning model/);
+  await page.locator('#voice-advanced summary').click();assert.match(await page.locator('#voice-advanced-facts').innerText(),/Thinking.*Medium/s);assert.equal(await page.locator('#voice-advanced input,#voice-advanced select').count(),0);
+  await page.locator('#voice-choice').selectOption('ash'); await page.locator('#save-voice').click();
   await wait(async()=>/next call/.test(await page.locator('#voice-settings-status').innerText()),'voice save missing');
   assert.equal(voices.get('coach'),'ash'); assert.equal(requests.find(request=>request.method==='PUT').csrf,csrf);
   assert.equal(await page.evaluate(()=>fixture.media.length),0); await page.locator('#close-voice-settings').click();
@@ -196,6 +199,13 @@ try {
   assert.deepEqual(await page.evaluate(()=>fixture.peers[0].order),['track','channel','offer']);
   assert.equal(await page.evaluate(()=>fixture.channels[0].label),'oai-events');
   assert.equal(await page.evaluate(()=>fixture.channels[0].sent.length),0);
+  await page.locator('#call-voice-settings').click();await page.locator('#voice-choice:not([disabled])').waitFor();
+  assert.match(await page.locator('#voice-model-facts').innerText(),/Voice in this call.*ash/s);
+  await page.locator('#voice-choice').selectOption('cedar');await page.locator('#save-voice').click();
+  await wait(async()=>/cedar will be used/.test(await page.locator('#voice-settings-status').innerText()),'next-call voice setting not saved');
+  assert.match(await page.locator('#voice-model-facts').innerText(),/Voice in this call.*ash/s);await page.locator('#close-voice-settings').click();
+  assert.equal(await page.evaluate(()=>fixture.media.length),1);assert.equal(calls.size,1);
+  checks.push('voice settings show reported provider/runtime/model facts and real read-only advanced values; saving the next voice preserves the current call and its voice snapshot');
   const firstRequest=requests.find(request=>request.path==='/api/v1/companion/calls');assert.equal(firstRequest.csrf,csrf);assert.equal(firstRequest.body.agent_id,'coach');
   assert.match(firstRequest.body.request_id,/^[\da-f-]{36}$/); checks.push('explicit Call creates one CSRF-protected SDP session; data channel is receive-only');
 
@@ -221,6 +231,8 @@ try {
   emit('delegation',{id:'d1',state:'completed'});
   await wait(async()=>await page.locator('.output-card').count()===1,'result card missing');
   assert.equal(await page.locator('.output-card script').count(),0); assert.equal(await page.evaluate(()=>window.injected),undefined);
+  assert(await page.locator('#board-history').evaluate(node=>!node.open));assert.equal(await page.locator('#board-items .output-card').count(),0);
+  await page.locator('#board-history summary').click();
   assert.match(await page.locator('.output-card p').innerText(),/<script>/);
   await page.waitForTimeout(1100); assert.equal(await page.locator('.output-card').count(),1);assert.equal(await page.locator('#work-status').isHidden(),true);
   checks.push('durable transcript/result events deduplicate; only actual audio energy animates speaking');
@@ -258,7 +270,7 @@ try {
 
   emit('card',{title:'Complete answer',text:'A shortened saved answer.',truncated:true,message_id:'full-result-1',result_url:'/api/v1/companion/calls/call-1/results/full-result-1',conversation_id:'room-coach',late:true,request_text:'The live voice conversation delegated help at 00:42.\nDelegation ID: private-delegation-1\nCaller request: Earlier research question'});
   await page.getByRole('button',{name:'Show full result',exact:true}).waitFor();
-  const fullCard=page.locator('.output-card').nth(1);
+  const fullCard=page.locator('.output-card').filter({has:page.getByRole('heading',{name:/Complete answer/})});
   assert.equal(await fullCard.locator('.card-context').innerText(),'Answer to your earlier request');
   assert.doesNotMatch(await page.locator('body').innerText(),/The live voice conversation delegated help at|private-delegation-1|Earlier research question/);
   failNextResult=true;await fullCard.getByRole('button',{name:'Show full result'}).click();
@@ -274,14 +286,14 @@ try {
   emit('card',{title:'Video demonstration',text:'https://media.example/watch?id=demo',url:'https://media.example/watch?id=demo',kind:'video',conversation_id:'room-coach'});
   emit('card',{title:'Reference only',text:'https://media.example/clip.mp4',url:'https://media.example/clip.mp4',kind:'link',conversation_id:'room-coach'});
   await wait(async()=>await page.locator('.output-card').count()===5,'explicit media cards missing');
-  assert.equal(await page.locator('.output-card').nth(2).locator('.full-result-button').count(),0);
-  const explicitVideo=page.locator('.output-card').nth(3);
+  assert.equal(await page.locator('.output-card').filter({has:page.getByRole('heading',{name:/Invalid result URL/})}).locator('.full-result-button').count(),0);
+  const explicitVideo=page.locator('.output-card').filter({has:page.getByRole('heading',{name:/Video demonstration/})});
   assert.match(await explicitVideo.locator('h2').innerText(),/Video demonstration/);
   assert.equal(await explicitVideo.locator('video').count(),0);
   await explicitVideo.getByRole('button',{name:'Load video preview',exact:true}).click();
   assert.equal(await explicitVideo.locator('video').getAttribute('src'),'https://media.example/watch?id=demo');
   assert.equal(await explicitVideo.locator('video').getAttribute('autoplay'),null);
-  assert.equal(await page.locator('.output-card').nth(4).locator('.media-preview-button,video,iframe').count(),0);
+  assert.equal(await page.locator('.output-card').filter({has:page.getByRole('heading',{name:/Reference only/})}).locator('.media-preview-button,video,iframe').count(),0);
   checks.push('full saved results load only from this call’s authenticated route and remain safe text; explicit extensionless video previews need a click and link-only cards stay links');
 
 
@@ -342,10 +354,12 @@ try {
   checks.push('Capture immediately uploads without a question; same-ID voice notice recovers a lost acknowledgment without duplicate storage or forced summary');
   await page.locator('#camera-toggle').click();
 
-  await page.evaluate(()=>{
-    const clipboardData=new DataTransfer(); clipboardData.setData('text/plain','Notes pasted while talking.');
-    document.getElementById('space-panel').dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData}));
-  });
+  await context.grantPermissions(['clipboard-read','clipboard-write']);
+  await page.evaluate(()=>navigator.clipboard.writeText('Notes pasted while talking.'));
+  await page.getByRole('button',{name:'Paste text or an image',exact:true}).click();await page.keyboard.press('Control+V');
+  await wait(async()=>await page.locator('#paste-input').inputValue()==='Notes pasted while talking.','actual focused paste did not reach the composer');
+  assert.equal(attachments.size,1,'a text draft is shared only by its explicit Share button');
+  await page.locator('#share-text').click();
   await wait(async()=>attachments.size===2,'pasted text was not shared');
   await page.evaluate(()=>{
     const dataTransfer=new DataTransfer(); dataTransfer.items.add(new File(['%PDF-1.7\nfixture'],'notes.pdf',{type:'application/pdf'}));
@@ -357,6 +371,7 @@ try {
     document.getElementById('space-panel').dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData}));
   });
   await wait(async()=>attachments.size===4,'pasted image was not shared');
+  assert(await page.locator('#share-receipt').isVisible());assert.match(await page.locator('#share-receipt-text').innerText(),/pasted.png/);
   assert.equal(attachments.get('fixture-attachment-2').mime_type,'text/plain');
   assert.equal(Buffer.from(attachments.get('fixture-attachment-2').data,'base64').toString(),'Notes pasted while talking.');
   assert.equal(attachments.get('fixture-attachment-3').mime_type,'application/pdf');
@@ -373,7 +388,7 @@ try {
   await page.locator('#share-files').setInputFiles({name:'uncertain.txt',mimeType:'text/plain',buffer:Buffer.from('Uncertain receipt.')});
   await wait(async()=>await page.locator('.upload-card[data-state="unconfirmed"]').count()===1,'uncertain upload state missing');
   assert.equal(attachments.size,5); await page.waitForTimeout(250); assert.equal(attachments.size,5);
-  assert.equal(await page.locator('.upload-card[data-state="unconfirmed"] button:not([hidden])').count(),0);
+  assert(await page.locator('.upload-card[data-state="unconfirmed"]').getByRole('button',{name:'Check voice notification',exact:true}).isHidden());
   checks.push('paste/drop share UTF-8 text, images, and PDFs; unsupported and rejected files are distinct; unknown upload outcomes are never replayed');
 
   await wait(async()=>surfaces.get('call-1')?.camera_enabled===false,'browser surface presence missing');
@@ -453,6 +468,83 @@ try {
   assert.equal(await page.evaluate(()=>scrollY),0);const afterView=await page.locator('#hangup').boundingBox();assert(Math.abs(desktopAfter.y-afterView.y)<1);
   assert.equal(await page.evaluate(()=>fixture.media.length),beforeViewSensors);assert.equal(await page.evaluate(()=>fixture.draws),beforeViewFrames);
   checks.push('agent view controls focus owned cards and switch or scroll only the contained pane without moving hangup or opening media');
+  const savedIds=await page.locator('#cards .output-card[data-card-id]').evaluateAll(nodes=>nodes.map(node=>node.dataset.cardId).filter(id=>/^\d+$/.test(id)).slice(0,6));
+  await page.locator('#board-history summary').click();
+  const replaceBoard=surfaceCommand('view',{action:'replace_board',card_ids:savedIds.slice(0,3)});
+  await wait(async()=>replaceBoard.state==='executed','replace_board did not select saved results');
+  assert.equal(await page.locator('#board-items>.output-card').count(),3);
+  assert.deepEqual(await page.locator('#board-items>.output-card').evaluateAll(nodes=>nodes.map(node=>node.dataset.cardId)),savedIds.slice(0,3));
+  const fullBoard=surfaceCommand('view',{action:'add_card',card_id:savedIds[3]});
+  await wait(async()=>fullBoard.state==='failed','full board command did not return a failed receipt');assert.equal(fullBoard.reason,'board_full');
+  const pinned=page.locator(`#board-items>[data-card-id="${savedIds[0]}"]`);await pinned.getByRole('button',{name:'Pin',exact:true}).click();
+  const protectedBoard=surfaceCommand('view',{action:'clear_board'});
+  await wait(async()=>protectedBoard.state==='failed','clear removed a pinned item');assert.equal(protectedBoard.reason,'item_protected');
+  assert.equal(await page.locator('#board-items>.output-card').count(),3);
+  await wait(async()=>surfaces.get('call-1')?.pinned_card_ids?.includes(savedIds[0]),'pin was not reported to the agent surface');
+  await pinned.getByRole('button',{name:'Unpin',exact:true}).click();await page.locator('#space-tab').click();
+  await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  await wait(async()=>surfaces.get('call-1')?.focused_card_id===null,'reported reading focus stayed stale after the user returned to the end');
+  const removeBoard=surfaceCommand('view',{action:'remove_card',card_id:savedIds[1]});await wait(async()=>removeBoard.state==='executed','remove did not put away a saved item');
+  assert.equal(await page.locator('#cards>[data-card-id="'+savedIds[1]+'"]').count(),1,'removed presentation must remain in history');
+  const addBoard=surfaceCommand('view',{action:'add_card',card_id:savedIds[3]});await wait(async()=>addBoard.state==='executed','add did not use freed board capacity');
+  const beforeFlood=await page.locator('#board-items>.output-card').evaluateAll(nodes=>nodes.map(node=>node.dataset.cardId));
+  for(let i=0;i<8;i++)emit('card',{title:'Background update '+i,text:'Saved update only.',presentation:'later',observed_only:true});
+  await wait(async()=>await page.locator('#cards .output-card').filter({hasText:'Background update 7'}).count()===1,'background updates were not saved');
+  assert.deepEqual(await page.locator('#board-items>.output-card').evaluateAll(nodes=>nodes.map(node=>node.dataset.cardId)),beforeFlood);
+  assert(await page.locator('#board-history').evaluate(node=>!node.open));
+  checks.push('whiteboard presents at most three intentional items; full/protected commands fail atomically, pins are observable, removal keeps history, and automatic observations never flood current content');
+
+  const readingCard=page.locator(`#board-items>[data-card-id="${savedIds[0]}"]`);
+  await readingCard.locator('.card-answer').click();await page.locator('#space-panel').evaluate(node=>{node.scrollTop=100;});
+  const readingTop=await page.locator('#space-panel').evaluate(node=>node.scrollTop);
+  const protectedReading=surfaceCommand('view',{action:'replace_board',card_ids:[savedIds[4]]});
+  await wait(async()=>protectedReading.state==='failed','agent replaced an item being read');assert.equal(protectedReading.reason,'item_protected');
+  emit('card',{title:'While reading',text:'Saved quietly.',presentation:'later'});
+  await wait(async()=>await page.locator('#cards .output-card').filter({hasText:'While reading'}).count()===1,'reading fixture update missing');
+  assert(Math.abs(await page.locator('#space-panel').evaluate(node=>node.scrollTop)-readingTop)<2,'a background update moved the reading position');
+  await page.locator('#space-tab').click();await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  const clearBoard=surfaceCommand('view',{action:'clear_board'});await wait(async()=>clearBoard.state==='executed','unprotected board did not clear');
+  assert.equal(await page.locator('#board-items>.output-card').count(),0);assert(await page.locator('#space-empty').isVisible());
+  emit('card',{title:'Deliberate presentation',text:'One useful thing. '+ 'Detail for the current discussion. '.repeat(50),presentation:'current'});
+  await wait(async()=>await page.locator('#board-items>.output-card').count()===1,'explicit show did not present');
+  await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  emit('card',{title:'Second deliberate item',text:'Another useful thing. '+ 'Supporting detail. '.repeat(50),presentation:'current'});
+  await wait(async()=>await page.locator('#board-items>.output-card').count()===2,'second intentional item missing');
+  await wait(async()=>page.locator('#space-panel').evaluate(node=>node.scrollHeight-node.clientHeight-node.scrollTop<48),'whiteboard did not follow from the bottom');
+  await page.locator('#space-panel').evaluate(node=>{node.scrollTop=0;});
+  emit('card',{title:'Third deliberate item',text:'More saved material.',presentation:'current'});
+  await wait(async()=>await page.locator('#board-items>.output-card').count()===3,'third intentional item missing');
+  assert.equal(await page.locator('#space-panel').evaluate(node=>node.scrollTop),0,'whiteboard dragged a scrolled-up reader to the bottom');
+  await page.locator('#space-new').click();assert(await page.locator('#space-panel').evaluate(node=>node.scrollHeight-node.clientHeight-node.scrollTop<48));
+  await page.locator('#transcript-tab').click();
+  for(let i=0;i<20;i++)emit('transcript',{role:i%2?'user':'assistant',text:'Transcript scrolling fixture. '.repeat(12),fragment:true,start_ms:5000+i*2000,end_ms:5100+i*2000});
+  await wait(async()=>await page.locator('.transcript-entry').count()>=20,'long transcript did not arrive');
+  await page.locator('#transcript-panel').evaluate(node=>{node.scrollTop=0;});
+  emit('transcript',{role:'user',text:'New words while reading older text.',fragment:true,start_ms:50000,end_ms:50200});
+  await wait(async()=>/New words while reading/.test(await page.locator('#transcript').textContent()),'new transcript fragment missing');
+  assert.equal(await page.locator('#transcript-panel').evaluate(node=>node.scrollTop),0);await page.locator('#transcript-new').click();
+  emit('transcript',{role:'assistant',text:'Following from the bottom. '.repeat(12),fragment:true,start_ms:52000,end_ms:52200});
+  await wait(async()=>/Following from the bottom/.test(await page.locator('#transcript').textContent()),'bottom transcript missing');
+  await wait(async()=>page.locator('#transcript-panel').evaluate(node=>node.scrollHeight-node.clientHeight-node.scrollTop<48),'transcript did not follow from the bottom');
+  await page.locator('#space-tab').click();
+  checks.push('agent presentation preserves an item being read; whiteboard and transcript follow only from the bottom and offer an explicit jump for new content');
+  {
+    if(await page.locator('#notice').isVisible())await page.locator('#dismiss-notice').click();
+    await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+    const visualClear=surfaceCommand('view',{action:'clear_board'});await wait(async()=>visualClear.state==='executed','visual board did not clear');
+    emit('card',{title:'A reading nook',kind:'note',text:'A comfortable chair by the window, a small table for a book, and warm light for the evening. Start with the chair; we can refine the rest together.',presentation:'current'});
+    await wait(async()=>await page.locator('#board-items>.output-card').count()===1,'visual presentation missing');
+    await page.locator('#space-panel').evaluate(node=>{node.scrollTop=0;});
+    if(process.env.COMPANION_SCREENSHOT)await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-whiteboard-desktop.png'),fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    const boardMobileHangup=await page.locator('#hangup').boundingBox();assert(boardMobileHangup.y>=0&&boardMobileHangup.y+boardMobileHangup.height<=844);
+    assert(await page.evaluate(()=>document.documentElement.scrollHeight<=innerHeight&&document.documentElement.scrollWidth<=innerWidth));
+    const noteHeading=await page.locator('#board-items h2').boundingBox();assert(noteHeading.y<844&&noteHeading.y+noteHeading.height>0,'intentional note was not visible on the phone');
+    assert(await page.getByRole('button',{name:'Paste text or an image',exact:true}).isVisible());assert(await page.locator('#choose-files').isVisible());
+    if(process.env.COMPANION_SCREENSHOT)await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-whiteboard-mobile.png'),fullPage:true});
+    await page.setViewportSize({width:1280,height:900});
+    checks.push('an intentional plain-text note stays visible on the phone beside reachable paste, file-sharing and call controls');
+  }
   const permission={id:randomUUID(),conversation_id:'room-coach',agent:'Coach',expires_at:Date.now()+60000,tool_call:{title:'Check Minecraft status',rawInput:{command:'<img src=x onerror="window.permissionInjected=true">'}},options:[{optionId:'always',name:'Always',kind:'allow_always'},{optionId:'once',name:'Read basic status',kind:'allow_once'},{optionId:'detail',name:'Read detailed status',kind:'allow_once'},{optionId:'no',name:'Reject once',kind:'reject_once'}]};
   permissions.set(permission.id,permission);
   await page.locator('#transcript-tab').click();
@@ -591,6 +683,7 @@ try {
   await page.getByRole('button',{name:'Call Jarvis',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','Jarvis fixture did not connect');
   await wait(async()=>/cannot inspect/.test(await page.locator('#share-capability').innerText()),'effective capability missing before capture');
+  await page.locator('#call-voice-settings').click();await page.locator('#voice-choice:not([disabled])').waitFor();assert.match(await page.locator('#voice-model-facts').innerText(),/Reasoning model.*Not yet reported/s);assert(await page.locator('#voice-advanced').isHidden());await page.locator('#close-voice-settings').click();
   await page.locator('#camera-toggle').click();
   const shuttersBeforeSuspended=await page.evaluate(async()=>{await fixture.audioContexts.at(-1).suspend();return fixture.shutters;});
   await page.locator('#capture-photo').click();

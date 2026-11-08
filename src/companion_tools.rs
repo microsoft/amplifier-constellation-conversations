@@ -591,23 +591,37 @@ async fn invoke(command: &[String], input: &Value) -> Result<Value> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Show {
-    url: String,
+    url: Option<String>,
+    text: Option<String>,
     title: String,
     #[serde(default)]
     kind: Option<String>,
 }
 fn valid_show(v: &Show) -> bool {
-    reqwest::Url::parse(&v.url).is_ok_and(|url| {
-        matches!(url.scheme(), "http" | "https")
-            && url.username().is_empty()
-            && url.password().is_none()
-    }) && v.url.len() <= 4000
+    !v.title.trim().is_empty()
         && v.title.len() <= 300
         && !v.title.contains(['\n', '\r'])
-        && v.kind
-            .as_deref()
-            .is_none_or(|kind| matches!(kind, "link" | "image" | "video" | "auto"))
+        && match (&v.url, &v.text) {
+            (Some(value), None) => {
+                value.len() <= 4000
+                    && reqwest::Url::parse(value).is_ok_and(|url| {
+                        matches!(url.scheme(), "http" | "https")
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                    })
+                    && v.kind
+                        .as_deref()
+                        .is_none_or(|kind| matches!(kind, "link" | "image" | "video" | "auto"))
+            }
+            (None, Some(text)) => {
+                !text.trim().is_empty()
+                    && text.len() <= 1200
+                    && v.kind.as_deref().is_none_or(|kind| kind == "note")
+            }
+            _ => false,
+        }
 }
+
 pub async fn show(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -619,7 +633,8 @@ pub async fn show(
         return Err(ApiError::bad("Unsupported shared artifact"));
     }
     let eid = uuid::Uuid::new_v4().to_string();
-    let data = json!({"title":v.title,"text":v.url,"url":v.url,"kind":v.kind.unwrap_or("auto".into()),"conversation_id":room});
+    let note = v.text.is_some();
+    let data = json!({"title":v.title,"text":v.text.or_else(||v.url.clone()),"url":v.url,"kind":v.kind.unwrap_or_else(||if note {"note".into()} else {"auto".into()}),"conversation_id":room,"presentation":"current"});
     let count: i64 = s.db.lock().unwrap().query_row(
         "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
         [&id],
@@ -634,7 +649,7 @@ pub async fn show(
     )?;
     s.changed();
     Ok(Json(
-        json!({"state":"available_on_screen","event_id":eid,"card_id":s.db.lock().unwrap().query_row("SELECT seq FROM companion_events WHERE call_id=?1 AND event_key=?2",params![id,eid],|r|r.get::<_,i64>(0))?.to_string(),"note":"Available does not prove opened, played or watched."}),
+        json!({"state":"saved","presentation":"requested_current","event_id":eid,"card_id":s.db.lock().unwrap().query_row("SELECT seq FROM companion_events WHERE call_id=?1 AND event_key=?2",params![id,eid],|r|r.get::<_,i64>(0))?.to_string(),"note":"Saved in this call and offered to the limited whiteboard. Pinned or currently read items can keep it in history; companion_surface_status reports current board IDs. Saved does not prove displayed, opened, played or watched."}),
     ))
 }
 #[derive(Deserialize, Default)]

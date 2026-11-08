@@ -221,3 +221,44 @@ test('observations hangup and feedback use fixed own-call routes without arbitra
  ])assert.equal((await client.callTool({name,arguments:args})).isError,true);
  assert.equal(requests.length,count);
 });
+
+test('surface state and existing shared-image lookup reuse one scoped read tool',async t=>{
+ const {client,requests}=await fixture(t);const artifact=randomUUID();
+ assert.notEqual((await client.callTool({name:'companion_surface_status',arguments:{}})).isError,true);
+ assert.notEqual((await client.callTool({name:'companion_surface_status',arguments:{artifact_id:artifact}})).isError,true);
+ assert.equal(requests[0].path,`/api/v1/companion/calls/${callId}/tools/surface/current`);
+ assert.equal(requests[1].path,`/api/v1/companion/calls/${callId}/tools/surface/attachment:${artifact}`);
+ for(const args of [{artifact_id:'../private'},{artifact_id:artifact,operation_id:randomUUID()},{artifact_id:artifact,call_id:randomUUID()}]) {
+  assert.equal((await client.callTool({name:'companion_surface_status',arguments:args})).isError,true);
+ }
+ assert.equal(requests.length,2);assert.ok(requests.every(r=>r.method==='GET'));
+});
+
+test('whiteboard operations are limited to three exact saved IDs and cannot change other surfaces',async t=>{
+ const {client,requests}=await fixture(t);const upload=`upload:${randomUUID()}`;
+ for(const extra of [{action:'replace_board',card_ids:['1',upload]},{action:'add_card',card_id:'2'},{action:'remove_card',card_id:upload},{action:'clear_board'}]) {
+  assert.notEqual((await client.callTool({name:'companion_view',arguments:{operation_id:randomUUID(),delegation_id:'delegate-1',...extra}})).isError,true);
+ }
+ for(const extra of [{action:'replace_board',card_ids:[]},{action:'replace_board',card_ids:['1','1']},{action:'replace_board',card_ids:['1','2','3','4']},{action:'replace_board',card_ids:['#selector']},{action:'add_card',card_ids:['1']},{action:'clear_board',card_id:'1'},{action:'remove_card',card_id:'upload:../../secret'}]) {
+  assert.equal((await client.callTool({name:'companion_view',arguments:{operation_id:randomUUID(),delegation_id:'delegate-1',...extra}})).isError,true);
+ }
+ assert.equal(requests.length,4);assert.ok(requests.every(r=>r.path===`/api/v1/companion/calls/${callId}/tools/view`));
+});
+
+test('saved manually shared images are actual MCP image content without a camera operation',async t=>{
+ const png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3XcAAAAASUVORK5CYII=';
+ const artifact=randomUUID();
+ const {client,requests}=await fixture(t,(_req,res)=>res.end(JSON.stringify({kind:'attachment',state:'available',artifact_ids:[artifact],inspection:false,image_input:true,image:{mimeType:'image/png',data:png}})));
+ const result=await client.callTool({name:'companion_surface_status',arguments:{artifact_id:artifact}});
+ assert.notEqual(result.isError,true);assert.equal(result.content[1].type,'image');assert.equal(result.content[1].data,png);
+ assert.equal(result.structuredContent.image,undefined);assert.equal(result.structuredContent.inspection,false);
+ assert.equal(requests.length,1);assert.equal(requests[0].method,'GET');
+});
+
+test('one existing show tool can author a short plain note without URL or HTML authority',async t=>{
+ const {client,requests}=await fixture(t);const text='One useful comparison.\n<script>literal text only</script>';
+ assert.notEqual((await client.callTool({name:'companion_show',arguments:{title:'Compare',text}})).isError,true);
+ assert.equal(requests[0].body.kind,'note');assert.equal(requests[0].body.text,text);assert.equal(requests[0].body.url,undefined);
+ for(const args of [{title:'None'},{title:'Both',text:'note',url:'https://example.test'},{title:'Long',text:'漢'.repeat(401)},{title:'Blank',text:' '},{title:'Wrong kind',text:'Note',kind:'image'},{title:'Wrong kind',url:'https://example.test',kind:'note'},{title:'HTML',text:'plain',html:'<script/>'}])assert.equal((await client.callTool({name:'companion_show',arguments:args})).isError,true);
+ assert.equal(requests.length,1);
+});

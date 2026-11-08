@@ -64,7 +64,11 @@ for line in sys.stdin:
         sid=params.get("sessionId",str(uuid.uuid4()))
         if os.environ.get("FIXTURE_COMPANION_PERMISSIONS")=="known":
             companion_permission(sid,"setup","companion_connections")
-        write({"id": value["id"], "result": {"sessionId":sid}})
+        setup = {"sessionId":sid}
+        if os.environ.get("FIXTURE_MODEL_SETTINGS"):
+            setup.update({"models":{"currentModelId":"fixture-local-model","availableModels":[{"modelId":"fixture-local-model","name":"Fixture local model"}]},
+                "configOptions":[{"id":"effort","name":"Thinking","category":"thought_level","type":"select","currentValue":"low","options":[{"value":"low","name":"Low"}]}]})
+        write({"id": value["id"], "result": setup})
     elif method == "session/prompt":
         sid = params["sessionId"]
         text = params["prompt"][0]["text"]
@@ -98,6 +102,10 @@ for line in sys.stdin:
             write({"method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"image","mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="}}}})
         for chunk in (["[[PASS]]"] if os.environ.get("FIXTURE_AMBIENT_PASS") and "This is a group conversation" in text.split("Room participants:")[0] else ["Fixture response: ", text]):
             write({"method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "messageId": "final", "content": {"type": "text", "text": chunk}}}})
-        write({"id": value["id"], "result": {"stopReason": "end_turn"}})
+        terminal = os.environ.get("FIXTURE_TERMINAL", "end_turn")
+        if terminal == "disconnect": sys.exit(0)
+        elif terminal == "rpc_error":
+            write({"id":value["id"],"error":{"code":-32088,"message":"private fixture secret: do not expose","data":{"token":"private"}}})
+        else: write({"id": value["id"], "result": {"stopReason": terminal}})
     elif method:
         write({"id": value["id"], "error": {"code": -32601, "message": "Unsupported fixture request"}})
