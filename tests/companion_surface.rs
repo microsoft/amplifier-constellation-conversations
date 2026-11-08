@@ -575,22 +575,47 @@ async fn camera_requires_actual_browser_consent_fresh_presence_and_active_exact_
     let c = call(&f);
     let browser = uuid::Uuid::new_v4().to_string();
     let operation = uuid::Uuid::new_v4().to_string();
-    assert_eq!(capture(&f, &c, &operation).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(capture(&f, &c, &operation).await.0, StatusCode::FORBIDDEN);
+    let (_, source, _) = delegation(&f, &c, "user");
+    let (status, unavailable) = capture(&f, &c, &operation).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(unavailable["state"], "blocked");
+    assert_eq!(unavailable["reason"], "browser_unavailable");
     assert_eq!(
         presence(&f, &c, &browser, false, true).await.0,
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
+        presence(&f, &c, &browser, false, false).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        capture(&f, &c, &operation).await.1["reason"],
+        "camera_disabled"
+    );
+    assert_eq!(
         presence(&f, &c, &browser, true, false).await.0,
         StatusCode::OK
     );
-    assert_eq!(capture(&f, &c, &operation).await.0, StatusCode::BAD_REQUEST);
+    let (status, blocked) = capture(&f, &c, &operation).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(blocked["reason"], "capture_consent_required");
+    assert_eq!(blocked["effect_attempted"], false);
+    assert_eq!(blocked["artifact_ids"], json!([]));
+    assert_eq!(blocked["inspection"], false);
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_surface_commands", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
     assert_eq!(
         presence(&f, &c, &browser, true, true).await.0,
         StatusCode::OK
     );
-    assert_eq!(capture(&f, &c, &operation).await.0, StatusCode::FORBIDDEN);
-    let (_, source, _) = delegation(&f, &c, "user");
     let (status, receipt) = capture(&f, &c, &operation).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["state"], "queued");
@@ -641,6 +666,8 @@ async fn acceptance_is_once_and_uncertain_capture_is_never_replayed_even_with_a_
             .1["execute"],
         false
     );
+    // Losing consent after an uncertain effect must not hide that receipt.
+    presence(&f, &c, &browser, false, false).await;
     let (_, again) = capture(&f, &c, &uuid::Uuid::new_v4().to_string()).await;
     assert_eq!(again["operation_id"], operation);
     assert_eq!(again["state"], "unknown");
@@ -803,7 +830,10 @@ async fn owner_browser_session_csrf_heartbeat_and_hangup_bound_all_controls() {
             [now_ms() - 30_001],
         )
         .unwrap();
-    assert_eq!(capture(&f, &c, &operation).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        capture(&f, &c, &operation).await.1["reason"],
+        "browser_unavailable"
+    );
     presence(&f, &c, &browser, true, true).await;
     f.s.db
         .lock()
@@ -813,7 +843,7 @@ async fn owner_browser_session_csrf_heartbeat_and_hangup_bound_all_controls() {
             [now_ms() - 30_001],
         )
         .unwrap();
-    assert_eq!(capture(&f, &c, &operation).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(capture(&f, &c, &operation).await.0, StatusCode::FORBIDDEN);
     f.s.db
         .lock()
         .unwrap()
@@ -925,7 +955,7 @@ async fn view_commands_are_finite_owned_and_recoverable_without_reexecution() {
 }
 
 #[tokio::test]
-async fn exact_native_surface_permission_remains_once_only_and_requires_browser_consent() {
+async fn exact_native_capture_permission_explains_browser_consent_without_authorizing_a_photo() {
     let f = fixture();
     let c = call(&f);
     delegation(&f, &c, "user");
@@ -944,31 +974,39 @@ async fn exact_native_surface_permission_remains_once_only_and_requires_browser_
         .unwrap()
     };
     let capture = json!({"operation_id":operation,"delegation_id":"fixture-delegation"});
-    assert!(check("companion_capture", capture.clone()).is_none());
+    assert_eq!(
+        check("companion_capture", capture.clone()).unwrap()["outcome"]["optionId"],
+        "once"
+    );
     presence(&f, &c, &browser, false, false).await;
-    assert!(check("companion_capture", capture.clone()).is_none());
+    assert_eq!(
+        check("companion_capture", capture.clone()).unwrap()["outcome"]["optionId"],
+        "once"
+    );
     assert_eq!(
         check("companion_hangup", capture.clone()).unwrap()["outcome"]["optionId"],
         "once"
     );
     assert_eq!(check("companion_feedback",json!({"operation_id":operation,"delegation_id":"fixture-delegation","text":"Please add a shutter cue."})).unwrap()["outcome"]["optionId"],"once");
-    assert!(
+    assert_eq!(
         check(
             "companion_hangup",
             json!({"operation_id":operation,"delegation_id":"other"})
         )
-        .is_none()
+        .unwrap(),
+        agent_conversations::permissions::cancelled()
     );
     assert!(check("companion_feedback",json!({"operation_id":operation,"delegation_id":"fixture-delegation","text":"Feedback","external_channel":"Slack"})).is_none());
     assert_eq!(check("companion_view",json!({"operation_id":operation,"delegation_id":"fixture-delegation","action":"scroll_down"})).unwrap()["outcome"]["optionId"],"once");
     presence(&f, &c, &browser, true, true).await;
     assert!(check("companion_capture", capture.clone()).is_some());
-    assert!(
+    assert_eq!(
         check(
             "companion_capture",
             json!({"operation_id":operation,"delegation_id":"other"})
         )
-        .is_none()
+        .unwrap(),
+        agent_conversations::permissions::cancelled()
     );
     assert!(check("companion_capture",json!({"operation_id":operation,"delegation_id":"fixture-delegation","enable_camera":true})).is_none());
     assert!(
@@ -983,7 +1021,10 @@ async fn exact_native_surface_permission_remains_once_only_and_requires_browser_
         json!({"enabled":false}).to_string(),
     )
     .unwrap();
-    assert!(check("companion_capture", capture).is_none());
+    assert_eq!(
+        check("companion_capture", capture).unwrap(),
+        agent_conversations::permissions::cancelled()
+    );
 }
 
 #[tokio::test]

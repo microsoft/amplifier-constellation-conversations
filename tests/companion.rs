@@ -40,6 +40,12 @@ if voice=='closed_setup':
 if voice=='early':emit({'type':'event','event':{'type':'session.started','event_id':'started','session':{'id':'live-fixture'}}})
 emit({'type':'ready','session_id':'live-fixture','sdp':'v=0\r\nfixture-answer',**({'mcp_port':34567} if c.get('mcp') else {})})
 if voice not in ('early','connecting'):emit({'type':'event','event':{'type':'session.started','event_id':'started','session':{'id':'live-fixture'}}})
+if voice in ('connection_lost','expired','remote_hangup','terminal_eof'):
+ import time
+ time.sleep(.1)
+ emit({'type':'event','event':{'type':'session.closed','event_id':'provider-terminal','session':{'id':'live-fixture'},'reason':'expired' if voice=='terminal_eof' else voice,'usage':{'seconds':120}}})
+ if voice=='terminal_eof':sys.exit(0)
+ emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});sys.exit(0)
 if voice not in ('quiet','connecting','upload_delegate'):
  if voice!='missing':
   event={'type':'session.input_transcript.delta','event_id':'human-1','delta':'Please inspect the supplied test context and report it.','start_ms':10,'end_ms':90}
@@ -1133,6 +1139,39 @@ async fn delayed_result_preserves_qualifiers_full_lookup_and_delegation_without_
     let (status, full) = request(&f, "GET", card["result_url"].as_str().unwrap(), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(full["text"], text);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE input_deliveries SET state='incorporated' WHERE id='late-delivery'",
+            [],
+        )
+        .unwrap();
+    let (status, full) = request(&f, "GET", card["result_url"].as_str().unwrap(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(full["text"], text);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET agent_id='different-agent' WHERE id='late-result'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        request(&f, "GET", card["result_url"].as_str().unwrap(), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET agent_id='default' WHERE id='late-result'",
+            [],
+        )
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(650)).await;
     let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
     let appends: Vec<Value> = commands
@@ -1944,4 +1983,162 @@ async fn current_incorporated_followup_keeps_shared_result_relevant_without_rene
     }
     assert!(!f.home.path().join("acp.jsonl").exists());
     end(&f, id).await;
+}
+
+#[tokio::test]
+async fn provider_loss_is_confirmed_finalization_but_interrupted_call() {
+    for (reason, state) in [
+        ("connection_lost", "interrupted"),
+        ("expired", "closed"),
+        ("remote_hangup", "closed"),
+    ] {
+        let f = fixture(reason);
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        let result = until(&f, id, "closed").await;
+        assert_eq!(result["state"], state);
+        assert_eq!(result["closure"]["confirmed"], true);
+        assert_eq!(result["closure"]["provider_reason"], reason);
+        if reason == "connection_lost" {
+            assert!(
+                result["closure"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("lost unexpectedly")
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn browser_diagnostics_are_private_bounded_observations_not_authority() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let mut diag = json!({"trigger":"heartbeat","visibility":"visible","peer_state":"connected","ice_state":"completed","channel_state":"open","audio_state":"running","wake_lock":"held","control_age_ms":0,"heartbeat_age_ms":0,"timer_gap_ms":0});
+    for i in 0..3 {
+        diag["control_age_ms"] = json!(i);
+        let (status, _) = request(
+            &f,
+            "POST",
+            &format!("/api/v1/companion/calls/{id}/heartbeat"),
+            Some(json!({"diagnostics":diag})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let count: i64 = f
+        .s
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='browser_diagnostic'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    diag["visibility"] = json!("hidden");
+    let (status, _) = request(
+        &f,
+        "POST",
+        &format!("/api/v1/companion/calls/{id}/heartbeat"),
+        Some(json!({"diagnostics":diag})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for mutation in [
+        json!({"sdp":"private"}),
+        json!({"control_age_ms":3600001}),
+        json!({"trigger":"arbitrary secret"}),
+    ] {
+        let mut bad = diag.clone();
+        for (k, v) in mutation.as_object().unwrap() {
+            bad[k] = v.clone();
+        }
+        let (status, _) = request(
+            &f,
+            "POST",
+            &format!("/api/v1/companion/calls/{id}/heartbeat"),
+            Some(json!({"diagnostics":bad})),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+    }
+    let (status, _) = request(
+        &f,
+        "POST",
+        &format!("/api/v1/companion/calls/{id}/close"),
+        Some(json!({"reason":"page_exit","diagnostics":diag})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    until(&f, id, "closed").await;
+    let browser_close:String=f.s.db.lock().unwrap().query_row("SELECT data FROM companion_events WHERE call_id=?1 AND event_key='browser-close-request'",[id],|r|r.get(0)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&browser_close).unwrap()["reason"],
+        "page_exit"
+    );
+}
+
+#[tokio::test]
+async fn new_private_call_seeds_saved_context_without_repeating_backend_work() {
+    let f = fixture("quiet");
+    let (_, first) = start(&f).await;
+    let first_id = first["id"].as_str().unwrap();
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'prior-human','transcript',?2,?3)",rusqlite::params![first_id,json!({"role":"user","text":"What about the oak counter?","start_ms":100,"end_ms":900}).to_string(),now_ms()]).unwrap();
+    end(&f, first_id).await;
+    let (_, second) = start(&f).await;
+    let initial: Value =
+        serde_json::from_slice(&std::fs::read(f.home.path().join("bridge-initial.json")).unwrap())
+            .unwrap();
+    let history: Value = serde_json::from_str(initial["history"].as_str().unwrap()).unwrap();
+    assert_eq!(history["source_call_id"], first_id);
+    assert_eq!(history["automatic_resume_authorized"], false);
+    assert!(history.to_string().contains("oak counter"));
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_delegations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    end(&f, second["id"].as_str().unwrap()).await;
+}
+
+#[tokio::test]
+async fn confirmed_teardown_does_not_erase_browser_timeout_cause() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let (status, _) = request(
+        &f,
+        "POST",
+        &format!("/api/v1/companion/calls/{id}/close"),
+        Some(json!({"reason":"control_timeout"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result = until(&f, id, "closed").await;
+    assert_eq!(result["state"], "interrupted");
+    assert_eq!(result["closure"]["confirmed"], true);
+    assert_eq!(result["closure"]["local_cause"], "control_timeout");
+    assert!(
+        result["closure"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("device was lost")
+    );
+}
+
+#[tokio::test]
+async fn persisted_provider_terminal_survives_bridge_eof_before_wrapper() {
+    let f = fixture("terminal_eof");
+    let (_, call) = start(&f).await;
+    let result = until(&f, call["id"].as_str().unwrap(), "closed").await;
+    assert_eq!(result["state"], "closed");
+    assert_eq!(result["closure"]["confirmed"], true);
+    assert_eq!(result["closure"]["provider_reason"], "expired");
 }

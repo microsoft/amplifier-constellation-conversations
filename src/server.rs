@@ -120,6 +120,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(crate::companion_tools::observations),
         )
         .route(
+            "/api/v1/companion/calls/{id}/tools/connection-status",
+            get(crate::companion_tools::connection_status),
+        )
+        .route(
             "/api/v1/companion/calls/{id}/tools/hangup",
             post(crate::companion_surface::hangup),
         )

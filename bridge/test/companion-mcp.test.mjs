@@ -29,7 +29,7 @@ async function fixture(t,handler) {
 test('official MCP client discovers only bounded tools and callbacks stay in this call',async t=>{
   const {client,requests}=await fixture(t);
   const {tools}=await client.listTools();
-  assert.deepEqual(tools.map(v=>v.name).sort(),['companion_action_status','companion_capture','companion_connections','companion_feedback','companion_hangup','companion_observations','companion_request_action','companion_shared','companion_show','companion_surface_status','companion_view']);
+  assert.deepEqual(tools.map(v=>v.name).sort(),['companion_action_status','companion_capture','companion_connection_status','companion_connections','companion_feedback','companion_hangup','companion_observations','companion_request_action','companion_shared','companion_show','companion_surface_status','companion_view']);
   const id=randomUUID();
   for(const [name,args] of [
     ['companion_connections',{}],
@@ -157,6 +157,32 @@ test('capture transport uncertainty never repeats the request and directs same-o
   const {client,requests}=await fixture(t,(req,res)=>res.destroy());
   const result=await client.callTool({name:'companion_capture',arguments:{operation_id:randomUUID(),delegation_id:'delegate-1'}});
   assert.equal(result.isError,true);assert.equal(result.structuredContent.outcome,'unknown');assert.match(result.structuredContent.guidance,/companion_surface_status/);assert.equal(requests.length,1);
+});
+
+test('camera prerequisites are explicit no-effect results and native Allow is never presented as browser consent',async t=>{
+  const operation=randomUUID();let reason='capture_consent_required';
+  const {client,requests}=await fixture(t,(_req,res)=>res.end(JSON.stringify({operation_id:operation,delegation_id:'delegate-1',kind:'capture',state:'blocked',reason,effect_attempted:false,artifact_ids:[],inspection:false,private_detail:'hidden helper credentials',guidance:'arbitrary upstream instruction'})));
+  for(const expected of ['capture_consent_required','camera_disabled','browser_unavailable']) {
+    reason=expected;
+    const result=await client.callTool({name:'companion_capture',arguments:{operation_id:operation,delegation_id:'delegate-1'}});
+    assert.notEqual(result.isError,true);assert.equal(result.structuredContent.state,'blocked');
+    assert.equal(result.structuredContent.reason,expected);assert.equal(result.structuredContent.effect_attempted,false);
+    assert.deepEqual(result.structuredContent.artifact_ids,[]);assert.equal(result.structuredContent.inspection,false);
+    assert.ok(!JSON.stringify(result).includes('hidden helper credentials'));assert.ok(!JSON.stringify(result).includes('arbitrary upstream instruction'));
+    if(expected==='capture_consent_required')assert.match(result.structuredContent.guidance,/Allow choice cannot enable/);
+  }
+  assert.equal(requests.length,3);assert.ok(requests.every(r=>r.body.operation_id===operation));
+});
+
+test('fresh connection status has one encoded fixed read-only route and rejects target or command substitutions',async t=>{
+  const {client,requests}=await fixture(t);
+  const result=await client.callTool({name:'companion_connection_status',arguments:{connection_id:'workshop:coach / status'}});
+  assert.notEqual(result.isError,true);assert.equal(requests.length,1);assert.equal(requests[0].method,'GET');
+  assert.equal(requests[0].path,`/api/v1/companion/calls/${callId}/tools/connection-status?connection_id=workshop%3Acoach%20%2F%20status`);
+  for(const args of [{connection_id:'x',command:'host-command'},{connection_id:'x',url:'https://other.test'},{connection_id:''},{connection_id:'漢'.repeat(41)},{connection_id:'a\nb'}]) {
+    assert.equal((await client.callTool({name:'companion_connection_status',arguments:args})).isError,true);
+  }
+  assert.equal(requests.length,1);
 });
 
 test('unsaved or malformed capture media is never presented as image evidence',async t=>{

@@ -764,6 +764,8 @@ input,textarea {
   letter-spacing:0;
   margin:0
 }
+.camera-picker {display:flex;align-items:center;gap:.75rem;margin:.75rem 0}
+.camera-picker select {flex:1;min-width:0;max-width:100%;padding:.5rem;border:1px solid var(--line);border-radius:.5rem;background:var(--paper);color:inherit;font:inherit}
 .preview-badge {
   font-size:8px;
   letter-spacing:.1em;

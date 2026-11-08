@@ -14,10 +14,13 @@ const audio = $('remote-audio');
 async function api(path, method = 'GET', body, options = {}) {
   const headers = body === undefined ? {} : {'Content-Type':'application/json'};
   if (method !== 'GET' && state.session?.csrf) headers['X-CSRF-Token'] = state.session.csrf;
+  const {signal, ...fetchOptions} = options;
   const abort = new AbortController(), timer = setTimeout(() => abort.abort(), path === '/api/v1/companion/calls' ? 40000 : 10000);
+  const cancel = () => abort.abort();
+  if (signal?.aborted) abort.abort(); else signal?.addEventListener('abort', cancel, {once:true});
   try {
     const response = await fetch(path, {method, headers, credentials:'same-origin', cache:'no-store', signal:abort.signal,
-      body:body === undefined ? undefined : JSON.stringify(body), ...options});
+      body:body === undefined ? undefined : JSON.stringify(body), ...fetchOptions});
     let value;
     try { value = await response.json(); }
     catch { const error = new Error('The service returned an unreadable response.'); error.uncertain = method !== 'GET'; throw error; }
@@ -33,7 +36,7 @@ async function api(path, method = 'GET', body, options = {}) {
     // explicit rejection establishes that the operation failed definitively.
     if (method !== 'GET' && error.uncertain === undefined) error.uncertain = true;
     throw error;
-  } finally { clearTimeout(timer); }
+  } finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel); }
 }
 function notice(message) { $('notice').hidden = !message; $('notice-text').textContent = message || ''; }
 function current(call) { return Boolean(call && state.call === call && call.generation === state.generation && !call.ended); }
@@ -71,7 +74,7 @@ async function openContacts() {
   }));
 }
 function showLogin() {
-  if (state.call) endCall('Your sign-in expired. Your microphone and camera are off.');
+  if (state.call) endCall('Your sign-in expired. Your microphone and camera are off.',true,true,'auth_expired');
   for (const call of state.finalizingCalls) releaseTransport(call);
   // A later login must not inherit private presentation or recovery state. Old
   // asynchronous callbacks may close their media, but cannot repopulate it.
@@ -97,7 +100,7 @@ function refreshStatus(call) {
   if (!current(call)) return;
   call.connected = call.peer?.connectionState === 'connected' && call.providerConnected === true;
   let status = 'connecting', title = 'Connecting…', detail = 'Opening a voice conversation.';
-  if (call.networkError || call.peer?.connectionState === 'disconnected') {
+  if (call.pollError || call.heartbeatError || call.reconcilingUntil || call.peer?.connectionState === 'disconnected') {
     status = 'reconnecting'; title = 'Connection interrupted'; detail = 'Checking the existing call. No new call or work is being started.';
   } else if (call.peer?.connectionState === 'failed' || call.failed) {
     status = 'error'; title = 'Audio connection lost'; detail = 'End this call and call again. Work already accepted stays in its conversation.';
@@ -165,19 +168,22 @@ async function startCall(contact) {
     if (!current(call)) { stream.getTracks().forEach(track => track.stop()); return; }
     call.stream = stream;
     const peer = new RTCPeerConnection(); call.peer = peer;
-    for (const track of stream.getTracks()) { peer.addTrack(track, stream); track.addEventListener('ended', () => { if (current(call)) endCall('The microphone became unavailable. Your camera is off, and accepted work can continue.'); }); }
+    for (const track of stream.getTracks()) { peer.addTrack(track, stream); track.addEventListener('ended', () => { if (current(call)) endCall('The microphone became unavailable. Your camera is off, and accepted work can continue.',true,true,'microphone_ended'); }); }
     const channel = peer.createDataChannel('oai-events'); call.channel = channel;
     // Receive-only by design. The server sideband is the sole owner of provider
     // controls and delegation. Durable API events are also the sole transcript
     // source, so data-channel copies cannot duplicate captions or task results.
     channel.addEventListener('message', () => {});
+    for (const event of ['open','closing','close','error']) channel.addEventListener(event, () => heartbeat(call,'channel_state'));
     peer.addEventListener('track', event => attachRemoteAudio(call, event.streams?.[0] || new MediaStream([event.track])));
     peer.addEventListener('connectionstatechange', () => {
       if (!current(call)) return;
       if (peer.connectionState === 'connected') { call.startedAt = call.audioStartedAt || Date.now(); call.audioStartedAt = call.startedAt; call.peerLostAt = null; call.failed = false; }
       if (['failed','disconnected'].includes(peer.connectionState)) { call.peerLostAt ||= Date.now(); call.failed = peer.connectionState === 'failed'; }
+      heartbeat(call,'peer_state');
       refreshStatus(call);
     });
+    peer.addEventListener('iceconnectionstatechange', () => heartbeat(call,'ice_state'));
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (AudioContext) { try { call.audioContext = new AudioContext(); call.audioContext.resume().catch(() => {}); startMicrophoneMeter(call); } catch { /* Playback still works without the meter. */ } }
     refreshStatus(call);
@@ -194,25 +200,18 @@ async function startCall(contact) {
     if (!current(call)) { await closeKnownCall(call); return; }
     $('continue-work').href = conversationLink(call.conversationId); $('continue-work').hidden = false;
     await peer.setRemoteDescription({type:'answer',sdp:result.sdp});
-    call.lastControlAt = Date.now();
+    call.lastControlAt = Date.now(); call.lastWatchdogAt = Date.now();
     call.durationTimer = setInterval(() => updateDuration(call), 1000);
     call.surfaceTimer = setInterval(() => surfacePresence(call), 2000); surfacePresence(call);
     call.heartbeatTimer = setInterval(() => heartbeat(call), 5000);
-    call.controlTimer = setInterval(() => {
-      if (!current(call)) return;
-      if (Date.now() - call.lastControlAt > 15000) {
-        endCall('Contact with the Companion service was lost. Your microphone and camera are off. Existing work has not been retried.');
-      } else if (call.peerLostAt && Date.now() - call.peerLostAt > 15000) {
-        endCall('The audio connection could not recover. Your microphone and camera are off. Existing work stays in the conversation.');
-      }
-    }, 500);
+    call.controlTimer = setInterval(() => checkControl(call), 500);
     await requestWakeLock(call); heartbeat(call); poll(call);
   } catch (error) {
     if (call.authGeneration === state.authGeneration && call.requestPending && (!error.status || error.uncertain)) {
       state.recovery = {request:call.request,callId:call.id};
     }
     call.requestPending = false;
-    if (current(call)) endCall(error.name === 'NotAllowedError' ? 'Microphone access was not granted. No voice connection was opened.' : error.message);
+    if (current(call)) endCall(error.name === 'NotAllowedError' ? 'Microphone access was not granted. No voice connection was opened.' : error.message,true,true,'setup_failed');
     else if (call.id) closeKnownCall(call).catch(() => {});
   }
 }
@@ -250,32 +249,88 @@ $('enable-audio').onclick = async () => {
   catch { notice('Audio playback is still blocked. Check this browser’s sound permissions.'); }
 };
 
-async function heartbeat(call) {
-  if (!current(call) || !call.id || call.heartbeating) return;
-  call.heartbeating = true;
-  try { await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/heartbeat`, 'POST', {}); if (current(call)) call.lastControlAt = Date.now(); }
-  catch (error) { if (current(call)) { call.networkError = true; refreshStatus(call); if (error.status === 401) endCall('Your sign-in expired. Your microphone and camera are off.'); } }
-  finally { call.heartbeating = false; }
+function diagnostics(call, trigger) {
+  const age = at => Math.min(3600000,Math.max(0,Math.round(Date.now() - (at || call.startedAt))));
+  return {trigger,visibility:document.hidden?'hidden':'visible',peer_state:call.peer?.connectionState || 'unknown',
+    ice_state:call.peer?.iceConnectionState || 'unknown',channel_state:call.channel?.readyState || 'unknown',
+    audio_state:call.audioContext?.state || 'unknown',wake_lock:call.wakeLock&&!call.wakeLock.released?'held':navigator.wakeLock?'released':'unavailable',
+    control_age_ms:age(call.lastControlAt),heartbeat_age_ms:age(call.lastHeartbeatAt),timer_gap_ms:Math.min(3600000,Math.max(0,Math.round(call.timerGap || 0)))};
+}
+function controlReceived(call, heartbeatReceived = false) {
+  call.lastControlAt = Date.now();
+  if (heartbeatReceived) call.lastHeartbeatAt = Date.now();
+  if (!call.peerLostAt) call.reconcilingUntil = null;
+}
+function resumeCall(call, trigger) {
+  if (!current(call) || !call.id) return;
+  const now = Date.now(), stale = now - call.lastControlAt > 5000 || (call.peerLostAt && now - call.peerLostAt > 5000);
+  // One bounded opportunity to reconcile after suspension. Repeated focus or
+  // online events cannot extend it; only fresh control plus healthy media resets it.
+  if (stale && !call.reconcilingUntil) call.reconcilingUntil = now + 10000;
+  if (now - (call.lastResumeAt || 0) < 1000) { call.pendingHeartbeatTrigger = trigger; return; }
+  call.lastResumeAt = now;
+  for (const key of ['heartbeatRequest','pollRequest']) {
+    const pending = call[key];
+    if (pending && now - pending.startedAt > 2500) { call[key] = null; pending.abort.abort(); }
+  }
+  heartbeat(call,trigger); clearTimeout(call.pollTimer); poll(call);
+  requestWakeLock(call); call.audioContext?.resume().catch(() => {});
+  if (audio.srcObject && audio.paused) audio.play().catch(() => { if (current(call)) $('enable-audio').hidden = false; });
+  refreshStatus(call);
+}
+function checkControl(call) {
+  if (!current(call)) return;
+  const now = Date.now(); call.timerGap = Math.max(0,now - call.lastWatchdogAt); call.lastWatchdogAt = now;
+  if (call.timerGap > 5000) resumeCall(call,'timer_resume');
+  if (call.reconcilingUntil && now < call.reconcilingUntil) return;
+  if (now - call.lastControlAt > 15000) {
+    endCall('Contact with the Companion service was lost. Your microphone and camera are off. Existing work has not been retried.',true,true,'control_timeout');
+  } else if (call.peerLostAt && now - call.peerLostAt > 15000) {
+    endCall('The audio connection could not recover. Your microphone and camera are off. Existing work stays in the conversation.',true,true,'audio_timeout');
+  }
+}
+async function heartbeat(call, trigger = 'heartbeat') {
+  if (!current(call) || !call.id) return;
+  if (call.heartbeatRequest) { if (trigger !== 'heartbeat') call.pendingHeartbeatTrigger = trigger; return; }
+  const request = {abort:new AbortController(),startedAt:Date.now()}; call.heartbeatRequest = request;
+  trigger = call.pendingHeartbeatTrigger || trigger; call.pendingHeartbeatTrigger = null;
+  try {
+    await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/heartbeat`, 'POST', {diagnostics:diagnostics(call,trigger)}, {signal:request.abort.signal,keepalive:document.hidden});
+    if (current(call) && call.heartbeatRequest === request) { call.heartbeatError = false; controlReceived(call,true); refreshStatus(call); }
+  } catch (error) {
+    if (current(call) && call.heartbeatRequest === request) {
+      call.heartbeatError = true; refreshStatus(call);
+      if (error.status === 401) endCall('Your sign-in expired. Your microphone and camera are off.',true,true,'auth_expired');
+    }
+  } finally { if (call.heartbeatRequest === request) call.heartbeatRequest = null; }
 }
 async function poll(call) {
-  if (!current(call) || !call.id) return;
+  if (!current(call) || !call.id || call.pollRequest) return;
+  clearTimeout(call.pollTimer);
+  const request = {abort:new AbortController(),startedAt:Date.now()}; call.pollRequest = request;
   try {
-    const result = await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}?after=${call.cursor}`);
-    if (!current(call)) return;
-    call.networkError = false; call.lastControlAt = Date.now();
+    const result = await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}?after=${call.cursor}`, 'GET', undefined, {signal:request.abort.signal});
+    if (!current(call) || call.pollRequest !== request) return;
+    call.pollError = false; controlReceived(call);
     call.providerConnected = result.state === 'connected';
     for (const event of result.events || []) renderEvent(call, event);
     renderCallPermissions(call, result.permissions);
     pollSurface(call);
     if (Number.isSafeInteger(result.next_cursor) && result.next_cursor >= call.cursor) call.cursor = result.next_cursor;
-    if (['closed','interrupted'].includes(result.state)) { endCall(result.state === 'interrupted' ? 'The voice connection was interrupted. Accepted work stays in the conversation.' : 'Your microphone and camera are off. Accepted work can continue.', false); return; }
+    if (['closed','interrupted'].includes(result.state)) {
+      endCall(terminalMessage(result), false); showTerminal(result); return;
+    }
     refreshStatus(call);
   } catch (error) {
-    if (!current(call)) return;
-    call.networkError = true; refreshStatus(call);
-    if (error.status === 401) { endCall('Your sign-in expired. Your microphone and camera are off.'); return; }
+    if (!current(call) || call.pollRequest !== request) return;
+    call.pollError = true; refreshStatus(call);
+    if (error.status === 401) { endCall('Your sign-in expired. Your microphone and camera are off.',true,true,'auth_expired'); return; }
+  } finally {
+    if (call.pollRequest === request) {
+      call.pollRequest = null;
+      if (current(call)) call.pollTimer = setTimeout(() => poll(call), call.pollError ? 2500 : 900);
+    }
   }
-  if (current(call)) call.pollTimer = setTimeout(() => poll(call), call.networkError ? 2500 : 900);
 }
 function renderCallPermissions(call, permissions) {
   const pending = (Array.isArray(permissions) ? permissions : []).filter(p => p.conversation_id === call.conversationId
@@ -373,7 +428,7 @@ function renderEvent(call, event) {
   } else if (event.kind === 'error') {
     notice(typeof data.message === 'string' ? data.message : 'The voice service reported an error. Check the conversation before repeating a request.');
   } else if (event.kind === 'closed') {
-    call.closeReason = typeof data.reason === 'string' ? data.reason : '';
+    call.providerCloseReason = typeof data.reason === 'string' ? data.reason : '';
   }
 }
 function refreshWorkStatus(call) {
@@ -505,9 +560,11 @@ for (const name of ['space','transcript']) {
 }
 
 function stopCamera(call) {
+  if (call) { call.cameraRequest = null; call.cameraLoading = false; }
   call?.cameraStream?.getTracks().forEach(track => track.stop()); if (call) call.cameraStream = null;
   $('voice-photos').checked = false; if (current(call)) surfacePresence(call);
   $('camera-preview').srcObject = null; $('camera-toggle').setAttribute('aria-pressed', 'false'); $('camera-label').textContent = 'Camera';
+  $('camera-choice').replaceChildren(); $('camera-picker').hidden = true; $('camera-choice').disabled = false;
   $('camera-panel').hidden = true;
 }
 function updateShareCapability(call) {
@@ -526,18 +583,46 @@ async function refreshCapabilities(call) {
 }
 async function toggleCamera() {
   const call = state.call; if (!current(call) || !call.id) return;
-  if (call.cameraStream) { stopCamera(call); return; }
-  $('camera-toggle').disabled = true;
+  if (call.cameraStream || call.cameraLoading) { stopCamera(call); return; }
+  await openCamera(call);
+}
+async function listCameras(call) {
+  if (!current(call) || !call.cameraStream || !navigator.mediaDevices.enumerateDevices) return;
+  const stream = call.cameraStream;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});
-    if (!current(call)) { stream.getTracks().forEach(track => track.stop()); return; }
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter(device=>device.kind === 'videoinput' && device.deviceId);
+    if (!current(call) || call.cameraStream !== stream) return;
+    const selected = stream.getVideoTracks()[0]?.getSettings?.().deviceId;
+    $('camera-choice').replaceChildren(...devices.map((device,index)=>{
+      const option = element('option',null,device.label || `Camera ${index+1}`); option.value = device.deviceId; return option;
+    }));
+    if (selected && devices.some(device=>device.deviceId === selected)) $('camera-choice').value = selected;
+    $('camera-picker').hidden = devices.length < 2;
+  } catch { /* The granted default camera remains usable without enumeration. */ }
+}
+async function openCamera(call, deviceId) {
+  const request = {}; call.cameraRequest = request; call.cameraLoading = true;
+  // Mobile devices may not open a second camera while the first is in use.
+  // Release only the old video track; microphone and voice transport stay put.
+  call.cameraStream?.getTracks().forEach(track=>track.stop()); call.cameraStream = null;
+  $('camera-preview').srcObject = null; $('camera-choice').disabled = true;
+  $('camera-toggle').setAttribute('aria-pressed','true'); $('camera-label').textContent = 'Camera off';
+  surfacePresence(call);
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:{...(deviceId?{deviceId:{exact:deviceId}}:{facingMode:{ideal:'environment'}}),width:{ideal:1280},height:{ideal:720}},audio:false});
+    if (!current(call) || call.cameraRequest !== request) { stream.getTracks().forEach(track => track.stop()); return; }
     call.cameraStream = stream; $('camera-preview').srcObject = stream; $('camera-panel').hidden = false; setTab('space');
     $('camera-toggle').setAttribute('aria-pressed', 'true'); $('camera-label').textContent = 'Camera off';
-    await $('camera-preview').play(); $('space-panel').scrollTop = 0; surfacePresence(call);
+    await $('camera-preview').play();
+    if (!current(call) || call.cameraRequest !== request) return;
+    $('space-panel').scrollTop = 0; surfacePresence(call); listCameras(call);
     for (const track of stream.getTracks()) track.addEventListener('ended', () => { if (current(call) && call.cameraStream === stream) stopCamera(call); });
-  } catch (error) { notice(error.name === 'NotAllowedError' ? 'Camera permission was not granted. The voice call is unchanged.' : 'The camera could not be opened. Your voice call can continue.'); stopCamera(call); }
-  finally { if (current(call)) $('camera-toggle').disabled = false; }
+  } catch (error) {
+    if (current(call) && call.cameraRequest === request) { notice(error.name === 'NotAllowedError' ? 'Camera permission was not granted. The voice call is unchanged.' : 'The selected camera could not be opened. Your voice call can continue.'); stopCamera(call); }
+  } finally { if (current(call) && call.cameraRequest === request) { call.cameraLoading = false; $('camera-choice').disabled = false; } }
 }
+$('camera-choice').onchange = () => { if (current(state.call) && state.call.cameraStream) openCamera(state.call,$('camera-choice').value); };
+navigator.mediaDevices?.addEventListener?.('devicechange', () => listCameras(state.call));
 function captureCue(call) {
   // A short mechanical double click belongs to the actual captured frame, not
   // an agent's promise or an upload/inspection result. No microphone input.
@@ -657,8 +742,9 @@ async function shareFiles(files, source) {
   if (files.length > 4) { notice('Share up to four files at a time.'); return; }
   for (const file of files) { if (!current(call)) return; await shareFile(call,file,source); }
 }
-$('choose-files').onclick = () => $('share-files').click();
-$('share-files').onchange = event => { shareFiles([...event.target.files],'file'); event.target.value = ''; };
+$('choose-files').onclick = () => { heartbeat(state.call,'file_picker_open'); $('share-files').click(); };
+$('share-files').onchange = event => { resumeCall(state.call,'file_picker_return'); shareFiles([...event.target.files],'file'); event.target.value = ''; };
+$('share-files').addEventListener('cancel', () => resumeCall(state.call,'file_picker_return'));
 $('space-panel').addEventListener('dragover', event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; $('space-panel').classList.add('dragging'); });
 $('space-panel').addEventListener('dragleave', event => { if (!$('space-panel').contains(event.relatedTarget)) $('space-panel').classList.remove('dragging'); });
 $('space-panel').addEventListener('drop', event => {
@@ -709,6 +795,7 @@ function releaseTransport(call) {
 function releaseMedia(call, retainTransport = false) {
   clearInterval(call.surfaceTimer); clearInterval(call.micMeterTimer); call.micSource?.disconnect();
   clearTimeout(call.pollTimer); clearInterval(call.heartbeatTimer); clearInterval(call.durationTimer); clearInterval(call.meterTimer); clearInterval(call.controlTimer);
+  call.pollRequest?.abort.abort(); call.heartbeatRequest?.abort.abort();
   call.stream?.getTracks().forEach(track => track.stop()); call.remoteStream?.getTracks().forEach(track => track.stop());
   stopCamera(call); for (const share of call.shares.values()) { if (share.previewUrl) URL.revokeObjectURL(share.previewUrl); } $('share-files').value = '';
   audio.pause(); audio.srcObject = null; call.audioContext?.suspend().catch(() => {});
@@ -726,20 +813,28 @@ async function confirmClose(id, result) {
   }
   throw new Error('Your devices are off. The service is still closing the voice connection; check the same call again shortly.');
 }
+function terminalMessage(result) {
+  if (typeof result.closure?.reason === 'string' && result.closure.reason) return result.closure.reason;
+  return result.closure?.confirmed === true || result.state === 'closed'
+    ? 'Your microphone and camera are off. The voice call is closed; accepted work can continue.'
+    : 'Your microphone and camera are off. The local connection ended, but provider closure was not confirmed. Accepted work stays in the conversation.';
+}
+function showTerminal(result) {
+  $('ended-detail').textContent = terminalMessage(result);
+  if (result.state === 'interrupted' || result.closure?.provider_reason === 'connection_lost') $('ended-title').textContent = 'Call interrupted';
+}
 async function closeKnownCall(call) {
   if (!call.id || call.authGeneration !== state.authGeneration) { releaseTransport(call); return; }
   const recovery = state.recovery || {callId:call.id,request:null};
   recovery.callId = call.id; state.recovery = recovery; recovery.checking = true; showRecovery();
   try {
-    const result = await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/close`, 'POST', {}, {keepalive:true});
+    const result = await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/close`, 'POST', {reason:call.clientCloseReason || 'setup_failed',diagnostics:call.closeDiagnostics || diagnostics(call,'call_close')}, {keepalive:true});
     if (call.authGeneration !== state.authGeneration) return;
     const terminal = await confirmClose(call.id, result);
     if (call.authGeneration !== state.authGeneration) return;
     if (state.recovery?.callId === call.id || (call.request && state.recovery?.request?.request_id === call.request.request_id)) {
       state.recovery = null; showRecovery();
-      $('ended-detail').textContent = terminal.state === 'closed'
-        ? 'Your microphone and camera are off. The voice call is closed; accepted work can continue.'
-        : 'Your microphone and camera are off. The local connection ended, but provider closure was not confirmed. Accepted work stays in the conversation.';
+      showTerminal(terminal);
     }
   }
   catch {
@@ -759,8 +854,9 @@ function showRecovery() {
       ? 'This page has not connected your microphone or camera. End the earlier voice call before starting another. Work your agent already accepted can continue in its conversation.'
       : 'Your microphone and camera are off. The service has not yet confirmed that this voice call closed. Resolve it before opening another call.';
 }
-function endCall(message = 'Your microphone and camera are off. Accepted work can continue.', sendClose = true, retainTransport = sendClose) {
+function endCall(message = 'Your microphone and camera are off. Accepted work can continue.', sendClose = true, retainTransport = sendClose, reason = 'user_hangup') {
   const call = state.call; if (!call) return;
+  call.clientCloseReason = reason; call.closeDiagnostics = diagnostics(call,reason === 'page_exit'?'page_exit':'call_close');
   call.ended = true; state.call = null; state.generation++; releaseMedia(call, retainTransport && Boolean(call.id)); document.body.classList.remove('call-active');
   $('call-screen').hidden = true; $('phonebook').hidden = true; $('call-ended').hidden = false;
   $('ended-title').textContent = call.connected ? 'Until next time.' : 'Call ended.';
@@ -781,13 +877,11 @@ $('recover-call').onclick = async () => {
     if (!id && recovery.request) { const saved = await api('/api/v1/companion/calls','POST',recovery.request); id = saved.id; }
     if (authGeneration !== state.authGeneration) return;
     if (!id) throw new Error('The service could not identify the earlier call.');
-    const result = await api(`/api/v1/companion/calls/${encodeURIComponent(id)}/close`,'POST',{});
+    const result = await api(`/api/v1/companion/calls/${encodeURIComponent(id)}/close`,'POST',{reason:'user_hangup'});
     const terminal = await confirmClose(id, result);
     if (authGeneration !== state.authGeneration) return;
     if (state.recovery === recovery) state.recovery = null;
-    $('ended-detail').textContent = terminal.state === 'closed'
-      ? 'The voice call is closed. Your microphone and camera are off.'
-      : 'Your devices are off. The local connection ended without confirmed provider closure. Accepted work stays in the conversation.';
+    showTerminal(terminal);
     showRecovery();
   } catch (error) { if (authGeneration === state.authGeneration) notice(error.message); }
   finally { if (authGeneration === state.authGeneration) { recovery.checking = false; showRecovery(); } }
@@ -817,9 +911,13 @@ document.addEventListener('visibilitychange', () => {
   const call = state.call; if (!current(call)) return;
   if (document.hidden) {
     $('foreground-note').textContent = 'This page is out of view. Your browser may pause audio; return here to continue.';
-  } else { $('foreground-note').textContent = 'Keep this page in the foreground. A screen lock or app switch may interrupt audio.'; requestWakeLock(call); heartbeat(call); }
+    heartbeat(call,'visibility_hidden');
+  } else { $('foreground-note').textContent = 'Keep this page in the foreground. A screen lock or app switch may interrupt audio.'; resumeCall(call,'visibility_visible'); }
 });
-window.addEventListener('pagehide', () => { if (state.call) endCall(); });
+for (const event of ['focus','pageshow','online']) window.addEventListener(event, () => resumeCall(state.call,event));
+for (const event of ['blur','offline']) window.addEventListener(event, () => heartbeat(state.call,event));
+document.addEventListener('resume', () => resumeCall(state.call,'resume'));
+window.addEventListener('pagehide', () => { if (state.call) endCall(undefined,true,true,'page_exit'); });
 start();
 
 // Browser-owned surface controls. A host request can neither enable a sensor
@@ -883,7 +981,7 @@ async function executeSurface(call, receipt) {
     } else if (receipt.kind === 'hangup') {
       // Release this call's media before acknowledging the effect. Closing a
       // voice session never cancels separately authorized background work.
-      endCall('Your microphone and camera are off. Closing the voice call…', false, true);
+      endCall('Your microphone and camera are off. Closing the voice call…', false, true,'surface_hangup');
       try { await ack('executed'); } finally { closeKnownCall(call); }
     } else {
       if (!cameraReady() || call.capturing || document.hidden) { await ack('failed'); return; }

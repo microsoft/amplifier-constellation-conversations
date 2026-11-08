@@ -105,6 +105,40 @@ struct NativeMcpPermission {
     tool: String,
     arguments: Value,
 }
+fn own_tool_shape_valid(tool: &str, args: &Value) -> bool {
+    match tool {
+        "companion_view"
+        | "companion_capture"
+        | "companion_surface_status"
+        | "companion_hangup"
+        | "companion_feedback" => crate::companion_surface::permission_shape_valid(tool, args),
+        "companion_connections" | "companion_observations" => {
+            args.as_object().is_some_and(|a| a.is_empty())
+        }
+        "companion_connection_status" => serde_json::from_value::<ConnectionStatus>(args.clone())
+            .is_ok_and(|v| valid_connection_id(&v.connection_id)),
+        "companion_shared" => args.as_object().is_some_and(|a| {
+            a.is_empty()
+                || (a.len() == 1
+                    && a.get("awareness_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_awareness_id))
+        }),
+        "companion_action_status" => args.as_object().is_some_and(|a| {
+            a.len() == 1
+                && a.get("request_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        }),
+        "companion_show" => {
+            serde_json::from_value::<Show>(args.clone()).is_ok_and(|v| valid_show(&v))
+        }
+        "companion_request_action" => {
+            serde_json::from_value::<Action>(args.clone()).is_ok_and(|v| valid_action(&v))
+        }
+        _ => false,
+    }
+}
 /// A single native ACP permission may use the installation's existing call
 /// authorization. This is not a general MCP, command, or filesystem policy.
 /// The driver must have injected this call's own reserved `companion` server.
@@ -119,12 +153,11 @@ pub fn permission_once(
     if !descriptor_injected || request.to_string().len() > 65536 {
         return Ok(None);
     }
-    let cfg = match config(s) {
-        Ok(cfg) if cfg.enabled => cfg,
-        _ => return Ok(None),
+    let cfg = config(s).ok();
+    let call:Option<(String,String)>=s.db.lock().unwrap().query_row("SELECT c.id,c.state FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.owner=?2 AND c.agent_id=?3 AND g.port>0",params![room,actor,agent],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((call, state)) = call else {
+        return Ok(None);
     };
-    let call:Option<String>=s.db.lock().unwrap().query_row("SELECT c.id FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.owner=?2 AND c.agent_id=?3 AND c.state IN ('connecting','connected') AND g.port>0",params![room,actor,agent],|r|r.get(0)).optional()?;
-    let Some(call) = call else { return Ok(None) };
     if !crate::companion::room_identity_valid(s, room)?
         || s.agent(agent)?
             .is_none_or(|a| a.mcp_servers.iter().any(|m| m["name"] == "companion"))
@@ -154,60 +187,7 @@ pub fn permission_once(
     if tool_call["title"].as_str() != Some(expected_title.as_str()) {
         return Ok(None);
     }
-    let permitted = match raw.tool.as_str() {
-        "companion_view"
-        | "companion_capture"
-        | "companion_surface_status"
-        | "companion_hangup"
-        | "companion_feedback" => crate::companion_surface::permission_valid(
-            s,
-            &call,
-            actor,
-            agent,
-            room,
-            &raw.tool,
-            raw.arguments,
-        )?,
-        "companion_connections" | "companion_observations" => {
-            raw.arguments.as_object().is_some_and(|a| a.is_empty())
-        }
-        "companion_shared" => raw.arguments.as_object().is_some_and(|a| {
-            a.is_empty()
-                || (a.len() == 1
-                    && a.get("awareness_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(valid_awareness_id))
-        }),
-        "companion_action_status" => raw.arguments.as_object().is_some_and(|a| {
-            a.len() == 1
-                && a.get("request_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-        }),
-        "companion_show" => {
-            serde_json::from_value::<Show>(raw.arguments).is_ok_and(|v| valid_show(&v))
-        }
-        "companion_request_action" => {
-            let action = match serde_json::from_value::<Action>(raw.arguments) {
-                Ok(a) if valid_action(&a) => a,
-                _ => return Ok(None),
-            };
-            if !cfg
-                .agents
-                .get(agent)
-                .is_some_and(|routes| routes.iter().any(|route| route.id == action.connection_id))
-            {
-                return Ok(None);
-            }
-            let source:Option<String>=s.db.lock().unwrap().query_row("SELECT d.message_id FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id=?2 AND d.state='dispatched' AND m.role='user' AND m.actor=?3 AND m.conversation_id=?4 AND EXISTS(SELECT 1 FROM input_deliveries i WHERE i.message_id=m.id AND i.state IN ('submitted','received_remote','incorporated'))",params![call,action.delegation_id,actor,room],|r|r.get(0)).optional()?;
-            match source {
-                Some(source) => crate::delivery::authorized(s, &source, actor)?,
-                None => false,
-            }
-        }
-        _ => false,
-    };
-    if !permitted {
+    if !own_tool_shape_valid(&raw.tool, &raw.arguments) {
         return Ok(None);
     }
     let Some(options) = request["options"].as_array() else {
@@ -233,6 +213,74 @@ pub fn permission_once(
             != options.len()
     {
         return Ok(None);
+    }
+    let deny = |reason: &str| -> Result<Option<Value>> {
+        // The descriptor was injected for this exact private call, but the
+        // call's authority has ended. Do not leave a late native approval for
+        // a browser that is no longer present; never extend effect authority.
+        let rejects = options
+            .iter()
+            .filter(|o| o["kind"] == "reject_once")
+            .collect::<Vec<_>>();
+        let outcome = if rejects.len() == 1 {
+            json!({"outcome":{"outcome":"selected","optionId":rejects[0]["optionId"]}})
+        } else {
+            crate::permissions::cancelled()
+        };
+        s.audit("permission.companion.denied", Some(room), json!({"agent_id":agent,"actor":actor,"call_id":call,"tool":raw.tool,"reason":reason,"kind":if rejects.len() == 1 {"reject_once"} else {"cancelled"}}))?;
+        Ok(Some(outcome))
+    };
+    let inactive = !matches!(state.as_str(), "connecting" | "connected");
+    if inactive || cfg.as_ref().is_none_or(|cfg| !cfg.enabled) {
+        return deny(if inactive {
+            "call_inactive"
+        } else {
+            "tools_disabled"
+        });
+    }
+    let cfg = cfg.unwrap();
+    let permitted = match raw.tool.as_str() {
+        "companion_view"
+        | "companion_capture"
+        | "companion_surface_status"
+        | "companion_hangup"
+        | "companion_feedback" => crate::companion_surface::permission_valid(
+            s,
+            &call,
+            actor,
+            agent,
+            room,
+            &raw.tool,
+            raw.arguments,
+        )?,
+        "companion_connections"
+        | "companion_observations"
+        | "companion_connection_status"
+        | "companion_shared"
+        | "companion_action_status"
+        | "companion_show" => true,
+        "companion_request_action" => {
+            let action = match serde_json::from_value::<Action>(raw.arguments) {
+                Ok(a) if valid_action(&a) => a,
+                _ => return Ok(None),
+            };
+            if !cfg
+                .agents
+                .get(agent)
+                .is_some_and(|routes| routes.iter().any(|route| route.id == action.connection_id))
+            {
+                return deny("connection_not_configured");
+            }
+            let source:Option<String>=s.db.lock().unwrap().query_row("SELECT d.message_id FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id=?2 AND d.state='dispatched' AND m.role='user' AND m.actor=?3 AND m.conversation_id=?4 AND EXISTS(SELECT 1 FROM input_deliveries i WHERE i.message_id=m.id AND i.state IN ('submitted','received_remote','incorporated'))",params![call,action.delegation_id,actor,room],|r|r.get(0)).optional()?;
+            match source {
+                Some(source) => crate::delivery::authorized(s, &source, actor)?,
+                None => false,
+            }
+        }
+        _ => false,
+    };
+    if !permitted {
+        return deny("call_scope_not_authorized");
     }
     let once = options
         .iter()
@@ -334,7 +382,7 @@ pub async fn connections(
     let (_, agent, _) = authorize(&s, &id, &h)?;
     let c = config(&s)?;
     Ok(Json(
-        json!({"connections":c.agents.get(&agent).into_iter().flatten().map(|x|json!({"id":x.id,"label":x.label,"description":x.description})).collect::<Vec<_>>(),"policy":"Use only for the caller's explicit request. Submission is not completion. Unknown sends must not be retried."}),
+        json!({"connections":c.agents.get(&agent).into_iter().flatten().map(|x|json!({"id":x.id,"label":x.label,"description":x.description})).collect::<Vec<_>>(),"observation_sources":crate::companion_awareness::status_sources(&s,&id)?,"policy":"Configured observation sources support a fresh read with companion_connection_status. Configuration alone does not prove availability. Actions require the caller's explicit request. Submission is not completion. Unknown sends must not be retried."}),
     ))
 }
 /// Saved connection observations require no new platform action or native MCP
@@ -348,6 +396,30 @@ pub async fn observations(
     Ok(Json(crate::companion_awareness::current_observations(
         &s, &id,
     )?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionStatus {
+    connection_id: String,
+}
+fn valid_connection_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 120 && !id.chars().any(char::is_control)
+}
+pub async fn connection_status(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    Query(query): Query<ConnectionStatus>,
+) -> ApiResult<Json<Value>> {
+    authorize(&s, &id, &h)?;
+    if !valid_connection_id(&query.connection_id) {
+        return Err(ApiError::bad("Choose a configured observation source"));
+    }
+    let response =
+        crate::companion_awareness::connection_status(&s, &id, &query.connection_id).await?;
+    authorize(&s, &id, &h)?;
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
