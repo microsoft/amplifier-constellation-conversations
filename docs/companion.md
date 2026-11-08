@@ -93,7 +93,7 @@ use installed paths and actual saved agent IDs:
   "enabled": true,
   "node": "/opt/companion/bin/node",
   "bridge": "/opt/companion/bridge/live.mjs",
-  "max_call_seconds": 1800,
+  "max_call_seconds": null,
   "profiles": {
     "coach": {
       "voice": "marin",
@@ -133,7 +133,13 @@ the signed-in person authorizes the microphone channel without speaker identity
 being inferred from voice. Existing agent permissions and work controls still
 apply. Screen locking or switching apps may interrupt audio; background operation
 is not guaranteed. Silent or muted provider sessions may still incur charges.
-Maximum call duration and browser heartbeats bound unattended sessions.
+`max_call_seconds` is an optional positive integer. Omit it or set it to `null`
+for no local duration cutoff; an explicit value still closes the call when that
+many seconds have elapsed, without the former 30-minute ceiling. Browser heartbeat
+loss, revoked access, Stop/hangup, and actual provider closure still end calls.
+[GPT-Live manages long conversations](https://developers.openai.com/api/docs/guides/live-conversations)
+automatically; removing the local cutoff does not override provider limits or
+turn a provider `expired` event into a successful ongoing session.
 
 ## Sharing, capabilities, and receipts
 

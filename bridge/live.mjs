@@ -208,7 +208,7 @@ export class LiveBridge {
   diagnosticCount=0;
   /** @type {() => void} */ resolveDisposed=()=>{};
   /** @param {{emit: Emit, client: OpenAI, connect: (...args: ConstructorParameters<typeof SidebandWS>) => SidebandWS, setupMs?: number, finalizationMs?: number, maxCallMs?: number,callControlGraceMs?:number,callControlFreshMs?:number}} options */
-  constructor({emit, client, connect, setupMs=20000, finalizationMs=10000, maxCallMs=1800000,callControlGraceMs=800,callControlFreshMs=5000}) {
+  constructor({emit, client, connect, setupMs=20000, finalizationMs=10000, maxCallMs,callControlGraceMs=800,callControlFreshMs=5000}) {
     this.emit=emit; this.client=client; this.connect=connect;
     this.setupMs=setupMs; this.finalizationMs=finalizationMs; this.maxCallMs=maxCallMs;
     this.state='new'; this.seenCommands=new Map(); this.finished=false;
@@ -289,7 +289,9 @@ export class LiveBridge {
       if(this.finished) return;
       if(this.state==='closing') {this.startClosing();return;}
       this.state='active';
-      this.expiry=setTimeout(()=>this.close(),this.maxCallMs);
+      // The host owns an explicitly configured local duration bound. Production
+      // creates this bridge without a second timer; fixtures may opt into one.
+      if(this.maxCallMs!==undefined)this.expiry=setTimeout(()=>this.close(),this.maxCallMs);
       this.emit({type:'ready',session_id:this.sessionId,sdp:result.transport.sdp,...(this.mcp?{mcp_port:this.mcp.port}:{})});
       this.diagnostic(command.native_call_control===true?'configured_enabled':'configured_disabled');
     } catch(error) {

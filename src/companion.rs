@@ -50,11 +50,11 @@ struct Config {
     node: PathBuf,
     bridge: PathBuf,
     profiles: BTreeMap<String, Profile>,
-    #[serde(default = "max_duration")]
-    max_call_seconds: u64,
+    #[serde(default)]
+    max_call_seconds: Option<u64>,
 }
-fn max_duration() -> u64 {
-    1800
+fn duration_expired(limit: Option<u64>, elapsed: Duration) -> bool {
+    limit.is_some_and(|seconds| elapsed >= Duration::from_secs(seconds))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,7 +101,7 @@ fn config(s: &AppState) -> Result<Config> {
         "Install the voice bridge first"
     );
     ensure!(
-        (10..=1800).contains(&c.max_call_seconds) && c.profiles.len() <= 100,
+        c.max_call_seconds.is_none_or(|seconds| seconds > 0) && c.profiles.len() <= 100,
         "Invalid call configuration"
     );
     ensure!(
@@ -1043,7 +1043,8 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
                 _=timer.tick()=>{
                     let heartbeat:i64=s.db.lock().unwrap().query_row("SELECT heartbeat_at FROM companion_calls WHERE id=?1",[&id],|r|r.get(0))?;
                     if closing.is_some_and(|deadline|started.elapsed()>deadline) { child.start_kill()?; return Ok(false); }
-                    if closing.is_none() && (started.elapsed()>Duration::from_secs(c.max_call_seconds) || now_ms()-heartbeat>60_000 || !private_room(&s,&room,&owner)? || auth::check(&s,&h,"chat",false).is_err()) { Some(json!({"op":"close","source":if now_ms()-heartbeat>60_000 {"heartbeat_expired"} else if started.elapsed()>Duration::from_secs(c.max_call_seconds) {"duration_limit"} else {"access_revoked"}})) }
+                    let duration_expired=duration_expired(c.max_call_seconds,started.elapsed());
+                    if closing.is_none() && (duration_expired || now_ms()-heartbeat>60_000 || !private_room(&s,&room,&owner)? || auth::check(&s,&h,"chat",false).is_err()) { Some(json!({"op":"close","source":if now_ms()-heartbeat>60_000 {"heartbeat_expired"} else if duration_expired {"duration_limit"} else {"access_revoked"}})) }
                     else if closing.is_none() { advance(&s,&id,&room,&h).await?; None } else { None }
                 }
             };
@@ -2023,6 +2024,16 @@ fn settle(s: &AppState, id: &str, did: &str, state: &str, message: &str) -> Resu
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+    #[test]
+    fn optional_call_duration_has_no_default_cutoff_and_honors_explicit_bounds() {
+        assert!(!duration_expired(None, Duration::MAX));
+        assert!(!duration_expired(Some(1800), Duration::from_secs(1799)));
+        assert!(duration_expired(Some(1800), Duration::from_secs(1800)));
+        assert!(!duration_expired(Some(7200), Duration::from_secs(1801)));
+        assert!(duration_expired(Some(7200), Duration::from_secs(7200)));
+        assert!(!duration_expired(Some(1), Duration::from_millis(999)));
+        assert!(duration_expired(Some(1), Duration::from_secs(1)));
+    }
     #[test]
     fn early_hangup_keeps_create_and_provider_finalization_budget() {
         // Hangup at one second; create returns at 18, close may settle at 28.

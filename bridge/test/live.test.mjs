@@ -75,6 +75,27 @@ test('only matching terminal settlement confirms close',async()=>{
  sideband.emit('event',{type:'session.closed',session:{id:'live_one'},reason:'close_requested',usage:{seconds:1}});
  await closing;assert.equal(events.at(-1).confirmed,true);assert.equal(sideband.sent.at(-1).type,'session.close');
 });
+test('default bridge has no local duration cutoff and honors provider expiry',async t=>{
+ t.mock.timers.enable({apis:['setTimeout']});
+ const {bridge,sideband,events}=fixture();await bridge.command(create);
+ t.mock.timers.tick(3_600_000);
+ assert.equal(bridge.state,'active');assert.equal(bridge.expiry,undefined);
+ assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,0);
+ sideband.emit('event',{type:'session.closed',session:{id:'live_one'},reason:'expired',usage:{seconds:3600}});
+ await bridge.done;
+ assert.equal(bridge.state,'closed');assert.equal(events.at(-1).confirmed,true);
+ assert.equal(events.find(e=>e.event?.type==='session.closed').event.reason,'expired');
+});
+test('an explicit fixture duration still requests close and awaits terminal settlement',async t=>{
+ t.mock.timers.enable({apis:['setTimeout']});
+ const {bridge,sideband,events}=fixture({maxCallMs:100});await bridge.command(create);
+ t.mock.timers.tick(99);assert.equal(bridge.state,'active');
+ t.mock.timers.tick(1);assert.equal(bridge.state,'closing');assert.equal(bridge.finished,false);
+ assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,1);
+ assert.equal(events.some(e=>e.type==='closed'),false);
+ sideband.emit('event',{type:'session.closed',session:{id:'live_one'},reason:'close_requested',usage:{seconds:0.1}});
+ await bridge.done;assert.equal(events.at(-1).confirmed,true);
+});
 test('socket disappearance is unknown finalization, never fabricated completion',async()=>{
  const {bridge,sideband,events}=fixture();await bridge.command(create);sideband.emit('close');await bridge.done;
  assert.equal(events.at(-1).confirmed,false);

@@ -215,6 +215,63 @@ async fn end(f: &Fixture, id: &str) {
     until(f, id, "closed").await;
 }
 #[tokio::test]
+async fn local_call_duration_accepts_unset_null_and_positive_bounds_without_a_ceiling() {
+    let f = fixture("quiet");
+    let path = f.home.path().join("companion.json");
+    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for (bound, available) in [
+        (None, true),
+        (Some(Value::Null), true),
+        (Some(json!(1)), true),
+        (Some(json!(1800)), true),
+        (Some(json!(7200)), true),
+        (Some(json!(0)), false),
+        (Some(json!(-1)), false),
+        (Some(json!(1.5)), false),
+    ] {
+        let mut config = original.clone();
+        config.as_object_mut().unwrap().remove("max_call_seconds");
+        if let Some(bound) = bound {
+            config["max_call_seconds"] = bound;
+        }
+        std::fs::write(&path, config.to_string()).unwrap();
+        let (status, catalog) = request(&f, "GET", "/api/v1/companion", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalog["available"], available, "{config}");
+    }
+    assert!(!f.home.path().join("bridge-starts").exists());
+    assert!(!f.home.path().join("acp.jsonl").exists());
+}
+#[tokio::test]
+async fn explicit_local_call_duration_closes_through_existing_finalization_path() {
+    let f = fixture("quiet");
+    let path = f.home.path().join("companion.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["max_call_seconds"] = json!(1);
+    std::fs::write(path, config.to_string()).unwrap();
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let result = until(&f, id, "closed").await;
+    assert_eq!(result["state"], "closed");
+    assert!(
+        result["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["data"]["type"] == "host_close_requested"
+                && e["data"]["source"] == "duration_limit")
+    );
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    assert_eq!(
+        commands
+            .lines()
+            .filter(|line| serde_json::from_str::<Value>(line).unwrap()["op"] == "close")
+            .count(),
+        1
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+}
+#[tokio::test]
 async fn provider_append_rejection_is_correlated_without_replaying_settled_delegation() {
     let f = fixture("append_error");
     let (_, call) = start(&f).await;
