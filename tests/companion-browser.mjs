@@ -666,12 +666,24 @@ try {
   await page.locator('#back-to-contacts').click();await page.getByRole('button',{name:'Call Coach',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','page exit fixture did not connect');
   const exitingCall=[...calls.values()].at(-1);
+  let deliverExitTerminal;
+  await page.route(`**/api/v1/companion/calls/${exitingCall.id}?after=0`,async route=>{
+    const response=await route.fetch();
+    if((await response.json()).state==='closed'){deliverExitTerminal=()=>route.fulfill({response});return;}
+    await route.fulfill({response});
+  });
   await page.evaluate(()=>window.dispatchEvent(new Event('pagehide')));
-  await wait(async()=>exitingCall.state==='closed','explicit page exit did not close');
+  assert(await page.evaluate(()=>fixture.tracks.every(t=>t.stopped)),'page exit must stop sensors before any close receipt');
+  await wait(async()=>deliverExitTerminal!==undefined,'explicit page exit did not reach terminal close');
+  assert.equal(exitingCall.state,'closed');
+  // Server closure precedes delivery to confirmClose; the silent peer remains
+  // until the browser receives that terminal response and releases transport.
+  assert.equal(await page.evaluate(()=>fixture.peers.at(-1).closed),false);
   const exitRequest=requests.find(r=>r.path===`/api/v1/companion/calls/${exitingCall.id}/close`);
   assert.equal(exitRequest.body.reason,'page_exit');assert.equal(exitRequest.body.diagnostics.trigger,'page_exit');
   assert.equal(exitRequest.body.diagnostics.peer_state,'connected','closure must retain the pre-release transport state');
-  assert(await page.evaluate(()=>fixture.tracks.every(t=>t.stopped)&&fixture.peers.every(p=>p.closed)));
+  await deliverExitTerminal();
+  await wait(async()=>page.evaluate(()=>fixture.tracks.every(t=>t.stopped)&&fixture.peers.every(p=>p.closed)),'page exit terminal receipt did not release browser transport');
   checks.push('page exit still stops sensors immediately and records an explicit exit reason plus pre-release bounded transport diagnostics');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:checks.length,checks,scope:'real Chromium UI; fake API, media, and provider; no paid calls'},null,2));
