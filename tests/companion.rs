@@ -34,11 +34,25 @@ c=json.loads(sys.stdin.readline())
 with (root/'bridge-starts').open('a') as f:f.write('start\n')
 (root/'bridge-initial.json').write_text(json.dumps(c))
 voice=(root/'bridge-mode').read_text()
+receipt_port=34567
+if voice=='retained_receipt':
+ import os,threading,http.server,atexit
+ (root/'receipt-pid').write_text(str(os.getpid()))
+ atexit.register(lambda:(root/'receipt-exited').write_text('exited'))
+ class Receipt(http.server.BaseHTTPRequestHandler):
+  def do_POST(self):
+   request=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+   result={'jsonrpc':'2.0','id':request['id'],'result':{'content':[{'type':'text','text':'Matching saved finalization'}],'structuredContent':{'state':'closed','provider_finalization':'confirmed'}}}
+   raw=json.dumps(result).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+  def log_message(self,*args):pass
+ listener=http.server.ThreadingHTTPServer(('127.0.0.1',0),Receipt)
+ receipt_port=listener.server_port
+ threading.Thread(target=listener.serve_forever,daemon=True).start()
 if voice=='closed_setup':
  emit({'type':'event','event':{'type':'session.closed','event_id':'early-closed','session':{'id':'live-fixture'},'reason':'close_requested','usage':{'seconds':15}}})
  emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});sys.exit(0)
 if voice=='early':emit({'type':'event','event':{'type':'session.started','event_id':'started','session':{'id':'live-fixture'}}})
-emit({'type':'ready','session_id':'live-fixture','sdp':'v=0\r\nfixture-answer',**({'mcp_port':34567} if c.get('mcp') else {})})
+emit({'type':'ready','session_id':'live-fixture','sdp':'v=0\r\nfixture-answer',**({'mcp_port':receipt_port} if c.get('mcp') else {})})
 if voice not in ('early','connecting'):emit({'type':'event','event':{'type':'session.started','event_id':'started','session':{'id':'live-fixture'}}})
 if voice in ('connection_lost','expired','remote_hangup','terminal_eof'):
  import time
@@ -46,7 +60,7 @@ if voice in ('connection_lost','expired','remote_hangup','terminal_eof'):
  emit({'type':'event','event':{'type':'session.closed','event_id':'provider-terminal','session':{'id':'live-fixture'},'reason':'expired' if voice=='terminal_eof' else voice,'usage':{'seconds':120}}})
  if voice=='terminal_eof':sys.exit(0)
  emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});sys.exit(0)
-if voice not in ('quiet','connecting','upload_delegate'):
+if voice not in ('quiet','connecting','upload_delegate','retained_receipt'):
  if voice!='missing':
   event={'type':'session.input_transcript.delta','event_id':'human-1','delta':'Please inspect the supplied test context and report it.','start_ms':10,'end_ms':90}
   if voice in ('anchor','anchors'):event.update({'delta':'Please inspect the existing work, without changing anything','start_ms':12000,'end_ms':12990})
@@ -61,10 +75,16 @@ second_sent=False
 for line in sys.stdin:
  c=json.loads(line)
  with (root/'bridge-commands').open('a') as f:f.write(json.dumps(c)+'\n')
- if c['op']=='close':emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});break
+ if c['op']=='dispose':
+  (root/'receipt-disposed').write_text('disposed');break
+ if c['op']=='close':
+  if voice=='retained_receipt':
+   emit({'type':'event','event':{'type':'session.closed','event_id':'receipt-provider-terminal','session':{'id':'live-fixture'},'reason':'close_requested','usage':{'seconds':1}}})
+   emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});continue
+  emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});break
  if c['op']=='append':
-  if not c['content'].strip():emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
-  if voice=='append_error' and not c['content'].startswith('Your request is saved and awaiting'):
+  if not c['content'].strip() and c['channel']!='thinking':emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
+  if voice=='append_error' and c['content']:
    if second_sent:continue
    second_sent=True
    for suffix,client,outer in [('unrelated','never-queued',None),('conflict',c['event_id'],'another-command'),('matched',c['event_id'],None)]:
@@ -590,12 +610,7 @@ for line in sys.stdin:
         .collect::<Vec<_>>();
     assert_eq!(appends.len(), 1);
     assert_eq!(appends[0]["channel"], "thinking");
-    assert!(
-        appends[0]["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("Your request is saved and awaiting")
-    );
+    assert!(appends[0]["content"].as_str().unwrap().is_empty());
     assert_eq!(
         std::fs::read_to_string(f.home.path().join("bridge-starts")).unwrap(),
         "start\n"
@@ -1018,12 +1033,7 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
     let intake = commands
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
-        .filter(|v| {
-            v["content"]
-                .as_str()
-                .unwrap_or("")
-                .starts_with("Your request is saved and awaiting")
-        })
+        .filter(|v| v["content"].as_str().unwrap_or("").is_empty())
         .collect::<Vec<_>>();
     assert_eq!(intake.len(), 2);
     for delegation in ["delegate-1", "delegate-2"] {
@@ -1033,12 +1043,7 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
             .collect::<Vec<_>>();
         assert_eq!(receipt.len(), 1);
         assert_eq!(receipt[0]["channel"], "thinking");
-        assert!(
-            receipt[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("not completion or proof that work has started")
-        );
+        assert_eq!(receipt[0]["content"], "");
     }
     end(&f, id).await;
 }
@@ -2695,4 +2700,143 @@ async fn oversized_source_and_short_followup_remain_retained_without_false_same_
     }
     assert!(!f.home.path().join("acp.jsonl").exists());
     end(&f, id).await;
+}
+
+#[tokio::test]
+async fn media_close_retains_original_receipt_transport_only_until_accepted_work_finishes() {
+    let f = fixture("retained_receipt");
+    std::fs::write(
+        f.home.path().join("companion-actions.json"),
+        json!({"enabled":true,"agents":{}}).to_string(),
+    )
+    .unwrap();
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let initial: Value =
+        serde_json::from_slice(&std::fs::read(f.home.path().join("bridge-initial.json")).unwrap())
+            .unwrap();
+    assert_eq!(initial["retain_receipts"], true);
+    let grant = initial["mcp"]["token"].as_str().unwrap().to_owned();
+    let before_port: i64 =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT port FROM companion_tool_grants WHERE call_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('receipt-source',?1,'user','End this call','complete',?2,?2,'owner')",rusqlite::params![room,now_ms()]).unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES('receipt-turn',?1,'assistant','','streaming',?2,?2,'Coach','default')",rusqlite::params![room,now_ms()]).unwrap();
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES('receipt-delivery','receipt-source',?1,'default','direct','submitted','receipt-turn',?2)",rusqlite::params![room,now_ms()]).unwrap();
+        db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'receipt-delegation',100,'dispatched','receipt-source',?2)",rusqlite::params![id,now_ms()]).unwrap();
+    }
+    end(&f, id).await;
+    let pid = std::fs::read_to_string(f.home.path().join("receipt-pid")).unwrap();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!f.home.path().join("receipt-disposed").exists());
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT port FROM companion_tool_grants WHERE call_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        before_port
+    );
+    let tool_request = |name: &str, args: Value| json!({"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":name,"arguments":args}});
+    for (name, args, wanted) in [
+        ("companion_surface_status", json!({}), StatusCode::OK),
+        (
+            "companion_hangup",
+            json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"receipt-delegation"}),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let result = f
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/companion/calls/{id}/mcp"))
+                    .header("authorization", format!("Bearer {grant}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(tool_request(name, args).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status(), wanted);
+        if wanted == StatusCode::OK {
+            let body: Value =
+                serde_json::from_slice(&to_bytes(result.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                body["result"]["structuredContent"]["provider_finalization"],
+                "confirmed"
+            );
+        }
+    }
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute(
+            "UPDATE messages SET status='complete',text='The call ended.' WHERE id='receipt-turn'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE input_deliveries SET state='completed' WHERE id='receipt-delivery'",
+            [],
+        )
+        .unwrap();
+    }
+    for _ in 0..100 {
+        if f.home.path().join("receipt-exited").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(f.home.path().join("receipt-disposed").exists());
+    assert!(f.home.path().join("receipt-exited").exists());
+    assert!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT port FROM companion_tool_grants WHERE call_id=?1",
+                [id],
+                |r| r.get::<_, Option<i64>>(0)
+            )
+            .unwrap()
+            .is_none()
+    );
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(commands.iter().filter(|v| v["op"] == "close").count(), 1);
+    assert_eq!(commands.iter().filter(|v| v["op"] == "dispose").count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(f.home.path().join("bridge-starts")).unwrap(),
+        "start\n"
+    );
+    assert!(
+        !f.home.path().join("acp.jsonl").exists(),
+        "Receipt lifecycle must not create a model turn"
+    );
 }

@@ -222,16 +222,19 @@ pub fn permission_once(
             .iter()
             .filter(|o| o["kind"] == "reject_once")
             .collect::<Vec<_>>();
-        let outcome = if rejects.len() == 1 {
+        let automatic_end = reason == "call_inactive";
+        let outcome = if rejects.len() == 1 && !automatic_end {
             json!({"outcome":{"outcome":"selected","optionId":rejects[0]["optionId"]}})
         } else {
             crate::permissions::cancelled()
         };
-        s.audit("permission.companion.denied", Some(room), json!({"agent_id":agent,"actor":actor,"call_id":call,"tool":raw.tool,"reason":reason,"kind":if rejects.len() == 1 {"reject_once"} else {"cancelled"}}))?;
+        s.audit("permission.companion.denied", Some(room), json!({"agent_id":agent,"actor":actor,"call_id":call,"tool":raw.tool,"reason":reason,"kind":if rejects.len() == 1 && !automatic_end {"reject_once"} else {"cancelled"},"human_decision":false}))?;
         Ok(Some(outcome))
     };
     let inactive = !matches!(state.as_str(), "connecting" | "connected");
-    if inactive || cfg.as_ref().is_none_or(|cfg| !cfg.enabled) {
+    let saved_receipt = raw.tool == "companion_surface_status"
+        && crate::companion_surface::terminal_status_shape_valid(&raw.arguments);
+    if (inactive && !saved_receipt) || cfg.as_ref().is_none_or(|cfg| !cfg.enabled) {
         return deny(if inactive {
             "call_inactive"
         } else {
@@ -306,6 +309,23 @@ pub(crate) fn authorize(
     id: &str,
     h: &HeaderMap,
 ) -> ApiResult<(String, String, String)> {
+    authorize_scope(s, id, h, false)
+}
+/// Saved receipts retain their exact call credential and endpoint identity after
+/// media ends. This does not authorize live observations or new effects.
+pub(crate) fn authorize_receipt(
+    s: &AppState,
+    id: &str,
+    h: &HeaderMap,
+) -> ApiResult<(String, String, String)> {
+    authorize_scope(s, id, h, true)
+}
+fn authorize_scope(
+    s: &AppState,
+    id: &str,
+    h: &HeaderMap,
+    saved_receipt: bool,
+) -> ApiResult<(String, String, String)> {
     if !config(s)?.enabled {
         return Err(ApiError::forbidden());
     }
@@ -317,7 +337,7 @@ pub(crate) fn authorize(
         .and_then(|x| x.to_str().ok())
         .and_then(|x| x.strip_prefix("Bearer "))
         .ok_or_else(ApiError::unauthorized)?;
-    let row: Option<(String,String,String,String)> = s.db.lock().unwrap().query_row("SELECT c.owner,c.agent_id,c.conversation_id,g.token FROM companion_calls c JOIN companion_tool_grants g ON c.id=g.call_id WHERE c.id=?1 AND c.state IN ('connecting','connected')",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    let row: Option<(String,String,String,String)> = s.db.lock().unwrap().query_row("SELECT c.owner,c.agent_id,c.conversation_id,g.token FROM companion_calls c JOIN companion_tool_grants g ON c.id=g.call_id WHERE c.id=?1 AND (?2 OR c.state IN ('connecting','connected'))",params![id,saved_receipt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let (owner, agent, room, token) = row.ok_or_else(ApiError::missing)?;
     if auth::digest(supplied) != auth::digest(&token)
         || !crate::companion::room_identity_valid(s, &room)?
@@ -332,15 +352,41 @@ pub async fn mcp(
     h: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Response> {
-    authorize(&s, &id, &h)?;
+    authorize_receipt(&s, &id, &h)?;
     if body.len() > 256 * 1024 {
         return Err(ApiError::bad("Tool request too large"));
     }
-    let port: u16 = s.db.lock().unwrap().query_row(
+    let active: bool = s.db.lock().unwrap().query_row(
+        "SELECT state IN ('connecting','connected') FROM companion_calls WHERE id=?1",
+        [&id],
+        |r| r.get(0),
+    )?;
+    if !active {
+        let value: Value =
+            serde_json::from_slice(&body).map_err(|_| ApiError::bad("Invalid tool request"))?;
+        let allowed = match value["method"].as_str() {
+            Some("initialize" | "notifications/initialized" | "tools/list" | "ping") => true,
+            Some("tools/call") => {
+                value["params"]["name"] == "companion_surface_status"
+                    && crate::companion_surface::terminal_status_shape_valid(
+                        &value["params"]
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                    )
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(ApiError::forbidden());
+        }
+    }
+    let port: Option<u16> = s.db.lock().unwrap().query_row(
         "SELECT port FROM companion_tool_grants WHERE call_id=?1",
         [&id],
         |r| r.get(0),
     )?;
+    let port = port.ok_or_else(ApiError::missing)?;
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())

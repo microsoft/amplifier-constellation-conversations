@@ -419,7 +419,7 @@ objects. The following is an example, not a fleet-default policy:
 
 An observer's connection ID must match the corresponding fixed action connection.
 Minecraft observer configuration is `{minecraft_home, connection_id,
-expected_username}`; Slack configuration is `{slack_home, connection_id,
+expected_username, node_executable?}`; Slack configuration is `{slack_home, connection_id,
 channel_id, expected_bot_user_id}`. Paths are absolute and installation-owned.
 Commands cannot be supplied by speech, a model, or event text. Platform tokens
 stay in their existing connector homes. The helpers use only fixed read routes;
@@ -447,22 +447,20 @@ quiet, later, or notify from the intact event, bounded recent transcript fragmen
 and owner guidance. Decisions receive no credentials and grant no action
 permission. The host records intent before the single provider request, deduplicates
 immutable revisions, disables retries, and keeps uncertain outcomes uncertain.
-Provider failure/refusal/invalid output retains a quiet card. At most two new
-facts are evaluated per worker cycle, with a 240-presentation-fact bound per call
-and at most 512 saved facts including observation-only baseline records.
+Provider failure/refusal/invalid output retains a quiet card. At most two new facts are evaluated per worker cycle. Durable source history has
+no lifetime event quota that silently stops a long call receiving new facts;
+per-query and per-transport bounds remain. Known action receipts rotate through
+bounded polls so newer requests cannot permanently hide older unresolved ones.
 
-Full relevant facts are retained as shared cards. Short facts may enter voice
-context with their original actor, connection, scope, and time; an unknown actor
-is not attributed to the selected voice agent. Long facts use a pointer to the exact call's saved shared space rather
-than a clipped summary. Pass the pointer's exact `awareness_id` (64 lowercase
-hexadecimal characters) to `companion_shared` to retrieve that card even after it
-leaves the recent-card list. This optional lookup stays within the current call;
-an unknown ID returns missing rather than substituting another card.
-Automatic context appends wait for fresh browser quiet hints and six seconds
-without a transcript fragment or a newly created delegation. This protects the
-short automatic-acknowledgment scheduling window without blocking for the full
-lifetime of background work. It is a conservative presentation heuristic, not
-proof that an acknowledgment played or a human turn ended. An unavailable
+Full relevant facts are retained as shared cards and supplied with their actor,
+connection, scope and original time. Long facts use numbered source-data parts,
+not clipped summaries or opaque retrieval pointers. Each provider append stays
+below its transport bound; all matching receipts are needed to mark the whole
+observation accepted. A missing part means the source must not be summarized.
+Quiet context can arrive while the caller speaks or other work runs. Deliberately
+spoken notices wait for fresh browser quiet hints and six seconds without a
+transcript fragment or a newly created delegation; this is a presentation
+heuristic, not proof that speech played or a human turn ended. An unavailable
 observer does not block the others. Model scores are pilot thresholds, not
 calibrated accuracy or a delivery guarantee.
 
@@ -669,3 +667,36 @@ accuracy for real speech. Qualify with explicit, quoted, corrected and negative
 utterances before treating it as dependable hands-free control; the on-screen
 End call button remains available independently. See OpenAI's
 [voice Decisions guidance](https://developers.openai.com/api/docs/guides/decisions-voice).
+
+
+### Direct connection context and receipt history
+
+The Context tab shows retained source observations, exact context supplied to
+voice, and correlated delivery receipts. "Accepted by voice service" establishes
+context delivery only; it does not establish that a model used it or that speech
+was played. Historical content without a retained receipt remains unknown.
+`companion_view` can open this tab with `action: "show_context"`.
+
+At delegation receipt the host sends the documented empty thinking append to
+cancel a pending automatic acknowledgment. Dispatch remains visible without
+injecting waiting narration. It is not a guarantee of silence: already-generated
+speech and independent model speech remain separate.
+
+Useful attributed observations are supplied directly to voice. A long observation
+is delivered as numbered source-data parts, preserving its full qualifiers; it no
+longer requires a second reasoning turn merely to retrieve its text. All matching
+part acknowledgments are required before the recorded observation becomes
+`context_accepted`. Quiet context can arrive while another request is active;
+deliberately spoken notifications still wait for a conversational gap.
+
+See [Minecraft observations](companion-minecraft-observation.md) for the official
+MCP SDK presence client. It reads own and other players' public chat, current
+position and nearby players. Local conversation admission, a settled turn, a
+reply, task acceptance and fulfillment remain distinct. Unknown effects are never
+replayed to fill a missing receipt.
+
+After media closes, the original per-call MCP listener can stay available while
+already accepted backend work settles. Only authenticated saved receipt reads
+remain available; ending a call does not reopen actions or another call's context.
+Native hang-up diagnostics retain bounded decision status and source identities,
+not private reasoning or raw provider configuration.

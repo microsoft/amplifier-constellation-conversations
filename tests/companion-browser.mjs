@@ -168,7 +168,7 @@ const wait = async (condition,message) => {
   for (let i=0;i<150;i++) { if (await condition()) return; await page.waitForTimeout(50); }
   throw new Error(message);
 };
-const emit = (kind,data) => events.push({seq:(events.at(-1)?.seq || 0)+1,kind,data});
+const emit = (kind,data,at=Date.now()) => events.push({seq:(events.at(-1)?.seq || 0)+1,kind,data,at});
 const surfaceCommand = (kind,command,options={}) => {
   const callId=options.callId||'call-1';
   const receipt={callId,operation_id:randomUUID(),delegation_id:'fixture-current-delegation',browser_id:surfaces.get(callId)?.browser_id,kind,command,state:'queued',created_at:Date.now(),expires_at:Date.now()+30000,artifact_ids:[],inspection:false,...options};
@@ -214,6 +214,7 @@ try {
   emit('transcript',{role:'assistant',text:' A little more context.',fragment:true,playback:'unconfirmed',start_ms:500,end_ms:1000});
   emit('delegation',{id:'d1',state:'dispatched'});
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Working together','delegated work not visible');
+  assert.match(await page.locator('.context-entry').textContent(),/Saved for agent/);assert.match(await page.locator('.context-entry').textContent(),/does not confirm forwarding/);
   assert.equal(await page.locator('.transcript-entry').count(),1);assert.match(await page.locator('.transcript-entry').innerText(),/playback\. A little/);
   assert.equal(await page.locator('.presence.speaking').count(),0);
   await page.evaluate(()=>fixture.channels[0].dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'session.output_transcript.delta',delta:'DUPLICATE'})})));
@@ -252,6 +253,49 @@ try {
   assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
   await page.evaluate(()=>fixture.noticeObserver.disconnect());await page.locator('#dismiss-notice').click();
   checks.push('provider errors show one nonfatal safe notice; correlated receipts stay quiet, saved results remain, and later speech continues without retry or hangup');
+
+  const suppliedAt = Date.now()-60000, originalAt='2026-11-08T20:42:17.003Z';
+  emit('context_supplied',{id:'initial-public-context',title:'Call background',target:'voice',state:'supplied',source_label:'Your earlier call',content:'You asked about the shop. Earlier work is not a new instruction.',private_config:'HIDDEN INITIAL CONFIG'},suppliedAt);
+  emit('context_delivery',{event_id:'context-visible',state:'queued',channel:'thinking',source_label:'Coach · Minecraft',source_at:originalAt,content:'<script>window.contextInjected=true</script> The door inspection is blocked. This is not completed work.',credential:'HIDDEN TOKEN',raw:{text:'HIDDEN RAW CONTEXT'}},suppliedAt+1000);
+  await page.locator('#context-tab').click();
+  const contextUpdate=page.locator('.context-entry').filter({hasText:'Coach · Minecraft'});
+  await wait(async()=>await contextUpdate.count()===1,'supplied context did not appear');
+  await contextUpdate.locator('summary').click();
+  assert.match(await contextUpdate.innerText(),/Waiting for voice receipt/);assert.match(await contextUpdate.innerText(),/Acceptance has not been confirmed/);
+  assert.match(await contextUpdate.locator('.context-text').innerText(),/<script>window.contextInjected=true<\/script>/);
+  assert.equal(await page.locator('#context-items script').count(),0);assert.equal(await page.evaluate(()=>window.contextInjected),undefined);
+  const unchangedCaption=await page.locator('#caption-text').innerText(), beforeContextTranscript=await page.locator('.transcript-entry').count();
+  emit('context_delivery',{event_id:'context-visible',state:'accepted',channel:'thinking',error:{message:'HIDDEN PROVIDER ERROR'}},suppliedAt+2000);
+  await wait(async()=>/Accepted by voice service/.test(await contextUpdate.locator('summary').innerText()),'accepted context receipt did not update');
+  assert.equal(await contextUpdate.count(),1);assert.match(await contextUpdate.locator('.context-text').innerText(),/door inspection is blocked/);
+  assert.match(await contextUpdate.innerText(),/does not confirm it was used or spoken/);
+  assert.equal(await contextUpdate.locator('time').getAttribute('datetime'),new Date(suppliedAt+2000).toISOString());
+  assert.match(await contextUpdate.locator('.context-source').innerText(),/Source time:.*First recorded:.*Receipt updated:/);
+  assert.equal(await page.locator('#caption-text').innerText(),unchangedCaption);assert.equal(await page.locator('.transcript-entry').count(),beforeContextTranscript);
+  assert.doesNotMatch(await page.locator('#context-panel').textContent(),/HIDDEN TOKEN|HIDDEN RAW CONTEXT|HIDDEN PROVIDER ERROR|HIDDEN INITIAL CONFIG/);
+  assert.match(await page.locator('#context-panel').textContent(),/not a complete view of the model’s current memory/);
+  assert.match(await page.locator('.context-entry').filter({hasText:'Request to Coach'}).textContent(),/Agent response saved/);
+  emit('context_delivery',{event_id:'old-context',state:'accepted'},null);
+  await wait(async()=>await page.locator('.context-entry').filter({hasText:'Time not recorded'}).count()===1,'missing context time was fabricated');
+  const oldContext=page.locator('.context-entry').filter({hasText:'Time not recorded'});
+  assert.match(await oldContext.textContent(),/text was not retained/);
+  await page.locator('#context-tab').focus();await page.keyboard.press('ArrowRight');assert.equal(await page.locator('#space-tab').getAttribute('aria-selected'),'true');
+  await page.keyboard.press('End');assert.equal(await page.locator('#context-tab').getAttribute('aria-selected'),'true');
+  await page.keyboard.press('ArrowLeft');assert.equal(await page.locator('#transcript-tab').getAttribute('aria-selected'),'true');
+  await page.keyboard.press('Home');assert.equal(await page.locator('#space-tab').getAttribute('aria-selected'),'true');
+  checks.push('Context shows exact safely rendered supplied text, source time and correlated delivery receipts without exposing raw configuration or claiming speech, comprehension, or task completion; all three tabs support keyboard navigation');
+  for(const [state,expected] of [['admitted',/connector admitted.*forwarding to the agent is not confirmed/],['settled',/conversation turn ended; a reply and work outcome are not confirmed/],['interrupted',/handling was interrupted; the outcome is unconfirmed/]]) {
+    emit('action_observation',{label:'Minecraft',observation:{request_id:'game-request-1',scope:'conversation',state,verified:false,fulfillment:'not_established',conversation:{host_forwarding_verified:false,reply_verified:false,task_acceptance_verified:false},observed_at:originalAt}});
+    await wait(async()=>expected.test(await page.locator('#connection-status').innerText()),`conversation ${state} was overstated`);
+  }
+  assert.equal(await page.locator('.context-entry').filter({hasText:'Connection report'}).count(),1);
+  assert.doesNotMatch(await page.locator('#connection-status').innerText(),/message was delivered|accepted your request|working on your request/);
+  emit('action_observation',{label:'Slack',observation:{request_id:'slack-request-1',scope:'message_delivery',state:'completed',verified:false}});
+  await wait(async()=>/Message delivery is unconfirmed/.test(await page.locator('#connection-status').innerText()),'unverified delivery was presented as confirmed');
+  emit('action_observation',{label:'Slack',observation:{request_id:'slack-request-1',scope:'message_delivery',state:'completed',verified:true}});
+  await wait(async()=>/message was delivered.*Further work is not verified/.test(await page.locator('#connection-status').innerText()),'confirmed delivery scope was lost');
+  assert.equal(await page.locator('#caption-text').innerText(),unchangedCaption);assert.equal(await page.locator('.transcript-entry').count(),beforeContextTranscript);
+  checks.push('local conversation admission, turn settlement and interruption never imply model forwarding, a reply, resumed work or message delivery; verified message delivery remains separate and quiet');
 
   assert.equal(await page.locator('.output-card a[href="https://example.com/project"]').count(),1);
   assert.equal(await page.locator('.output-card a[href^="javascript:"]').count(),0);
@@ -463,6 +507,7 @@ try {
   const focus=surfaceCommand('view',{action:'focus_card',card_id:focusId});await wait(async()=>focus.state==='executed','focus-card command did not execute');
   assert.equal(await page.locator(`.output-card[data-card-id="${focusId}"].surface-focused`).count(),1);
   const transcript=surfaceCommand('view',{action:'show_transcript',card_id:null});await wait(async()=>transcript.state==='executed','transcript command missing');assert.equal(await page.locator('#transcript-tab').getAttribute('aria-selected'),'true');
+  const contextView=surfaceCommand('view',{action:'show_context',card_id:null});await wait(async()=>contextView.state==='executed','context command missing');assert.equal(await page.locator('#context-tab').getAttribute('aria-selected'),'true');
   const shared=surfaceCommand('view',{action:'show_shared',card_id:null});await wait(async()=>shared.state==='executed','shared pane command missing');
   const scroll=surfaceCommand('view',{action:'scroll_down',card_id:null});await wait(async()=>scroll.state==='executed','bounded scroll command missing');
   assert.equal(await page.evaluate(()=>scrollY),0);const afterView=await page.locator('#hangup').boundingBox();assert(Math.abs(desktopAfter.y-afterView.y)<1);
@@ -526,8 +571,29 @@ try {
   emit('transcript',{role:'assistant',text:'Following from the bottom. '.repeat(12),fragment:true,start_ms:52000,end_ms:52200});
   await wait(async()=>/Following from the bottom/.test(await page.locator('#transcript').textContent()),'bottom transcript missing');
   await wait(async()=>page.locator('#transcript-panel').evaluate(node=>node.scrollHeight-node.clientHeight-node.scrollTop<48),'transcript did not follow from the bottom');
+  const transcriptBeforeLongCall=await page.locator('.transcript-entry').count();
+  for(let i=0;i<161;i++)emit('transcript',{role:i%2?'user':'assistant',text:`Long-call turn ${i}.`,fragment:true,start_ms:60000+i*2000,end_ms:60100+i*2000});
+  await wait(async()=>await page.locator('.transcript-entry').count()===transcriptBeforeLongCall+161,'long call silently discarded earlier transcript rows');
+  assert.match(await page.locator('.transcript-entry').first().innerText(),/Generated speech is not playback/);
+  await page.locator('#context-tab').click();
+  emit('card',{title:'Coach · Minecraft',awareness_id:'own-public-reply',text:'I checked the passage; I have not tested the mechanism.',source:{actor:'Coach',occurred_at:'2026-11-08T20:46:27Z',private:'NOT FOR CONTEXT RENDERING'},observed_only:true});
+  const observed=page.locator('.context-entry').filter({hasText:'I checked the passage'});
+  await wait(async()=>await observed.count()===1,'source observation absent from context');
+  await observed.locator('summary').click();assert.match(await observed.innerText(),/Saved observation/);
+  assert.match(await observed.innerText(),/does not confirm it reached voice context/);assert.doesNotMatch(await observed.innerText(),/NOT FOR CONTEXT RENDERING/);
+  await page.locator('#context-panel').evaluate(node=>{node.scrollTop=0;});
+  for(let i=0;i<12;i++)emit('context_delivery',{event_id:`context-scroll-${i}`,state:'queued',channel:'thinking',content:`Context scroll entry ${i}.`});
+  await wait(async()=>await page.locator('.context-entry').filter({hasText:'Context scroll entry'}).count()===12,'context scroll receipts missing');
+  assert.equal(await page.locator('#context-panel').evaluate(node=>node.scrollTop),0);await page.locator('#context-new').click();
+  await wait(async()=>page.locator('#context-panel').evaluate(node=>node.scrollHeight-node.clientHeight-node.scrollTop<48),'context jump did not follow new content');
+  await page.setViewportSize({width:390,height:844});
+  assert(await page.locator('#context-tab').isVisible());assert(await page.locator('#hangup').isVisible());
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth&&document.documentElement.scrollHeight<=innerHeight));
+  if(process.env.COMPANION_SCREENSHOT)await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-context-mobile.png'),fullPage:true});
+  await page.setViewportSize({width:1280,height:900});
   await page.locator('#space-tab').click();
   checks.push('agent presentation preserves an item being read; whiteboard and transcript follow only from the bottom and offer an explicit jump for new content');
+  checks.push('long calls retain earlier transcript text; observed connection facts are distinct from voice receipts; Context preserves reading position, offers a new-context jump and fits on a phone');
   {
     if(await page.locator('#notice').isVisible())await page.locator('#dismiss-notice').click();
     await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
@@ -764,7 +830,9 @@ try {
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','logout fixture did not connect');
   emit('transcript',{role:'user',text:'Private prior caller text.',fragment:true,start_ms:0,end_ms:100});
   emit('card',{text:'Private prior caller result.',conversation_id:'room-coach'});
+  emit('context_delivery',{event_id:'private-context',state:'queued',content:'Private prior caller context.'});
   await wait(async()=>await page.locator('.output-card').count()===1,'logout fixture result missing');
+  await wait(async()=>await page.locator('.context-entry').count()===1,'logout fixture context missing');
   holdNextUpload=true;await page.locator('#share-files').setInputFiles({name:'late-private.txt',mimeType:'text/plain',buffer:Buffer.from('Private pending upload.')});
   await wait(async()=>heldUpload!==null,'late upload fixture did not reach storage');
   const availableBeforeLogout = requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available').length;
@@ -778,7 +846,7 @@ try {
   await wait(async()=>deliverOldStatus!==undefined,'old recovery status was not pending');
   await page.locator('#sign-out').click();
   await page.locator('#login:not([hidden])').waitFor();await wait(async()=>heldClose!==null,'close was not pending at sign-out');
-  assert.equal(await page.locator('.transcript-entry').count(),0);assert.equal(await page.locator('.output-card').count(),0);
+  assert.equal(await page.locator('.transcript-entry').count(),0);assert.equal(await page.locator('.output-card').count(),0);assert.equal(await page.locator('.context-entry').count(),0);
   assert.equal(await page.locator('#continue-work').getAttribute('href'),'/');assert.equal(await page.locator('#ended-work-link').getAttribute('href'),'/');
   assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)));
   await page.locator('#username').fill('next-fixture-user');await page.locator('#password').fill('fixture-only');await page.locator('#sign-in').click();

@@ -42,11 +42,12 @@ export function sessionOptions(command) {
   if (typeof command.instructions !== 'string' || command.instructions.length > 24000) throw new Error('invalid_instructions');
   if (command.history !== undefined && (typeof command.history !== 'string' || Buffer.byteLength(command.history) > 12000)) throw new Error('invalid_history');
   if (command.native_call_control !== undefined && typeof command.native_call_control !== 'boolean') throw new Error('invalid_native_call_control');
+  if (command.retain_receipts !== undefined && typeof command.retain_receipts !== 'boolean') throw new Error('invalid_receipt_lifetime');
   return {
     session: {
       model: 'gpt-live-1', store: false,
       instructions: command.instructions,
-      delegation: {type: 'client', acknowledgement_delay_ms: 600},
+      delegation: {type: 'client', acknowledgement_delay_ms: 800},
       ...(command.native_call_control === true ? {triggers:[{type:'decisions',event_type:'session.input_transcript.delta',decisions:{questions:[END_CALL_QUESTION]}}]} : {}),
       audio: {output: {voice: command.voice}},
       client: {data_channel: {allowed_client_events: [], allowed_server_events: BROWSER_EVENTS.map(type=>({type}))}},
@@ -131,24 +132,24 @@ export function publicEvent(event,knownCommands=new Set()) {
  * reversible current call control, with a short interval for a correction.
  */
 export class CallControl {
-  /** @param {{request:(event:Record<string,unknown>)=>void,graceMs?:number,freshMs?:number}} options */
-  constructor({request,graceMs=800,freshMs=5000}) {
-    this.request=request;this.graceMs=graceMs;this.freshMs=freshMs;
+  /** @param {{request:(event:Record<string,unknown>)=>void,diagnostic?:(reason:string,event?:{event_id?:unknown,source_event_id?:unknown,trigger_id?:unknown},probability?:number)=>void,graceMs?:number,freshMs?:number}} options */
+  constructor({request,diagnostic=()=>{},graceMs=800,freshMs=5000}) {
+    this.diagnostic=diagnostic;this.request=request;this.graceMs=graceMs;this.freshMs=freshMs;
     this.inputs=new Map();this.pending=new Map();this.seen=new Map();this.latest=null;
     this.timer=undefined;this.closed=false;
   }
-  cancelPending(){clearTimeout(this.timer);this.timer=undefined;}
+  cancelPending(){if(this.timer)this.diagnostic('pending_cancelled');clearTimeout(this.timer);this.timer=undefined;}
   close(){this.closed=true;this.cancelPending();this.inputs.clear();this.pending.clear();this.seen.clear();}
   /** @param {ServerEvent} event */
   observe(event) {
     if(this.closed)return;
     const now=Date.now();
-    for(const [id,value] of this.pending)if(now-value.at>this.freshMs)this.pending.delete(id);
+    for(const [id,value] of this.pending)if(now-value.at>this.freshMs){this.diagnostic('source_not_received',value.event);this.pending.delete(id);}
     if(event.type==='session.input_transcript.delta') {
       const id=commandId(event.event_id);
       if(!id || typeof event.delta!=='string' || !event.delta.trim() || event.delta.length>16384 || !Number.isFinite(event.start_ms) || !Number.isFinite(event.end_ms) || event.start_ms<0 || event.end_ms<event.start_ms)return;
       const exact=JSON.stringify([event.delta,event.start_ms,event.end_ms]),old=this.inputs.get(id);
-      if(old){if(old.exact!==exact){this.cancelPending();this.closed=true;}return;}
+      if(old){if(old.exact!==exact){this.diagnostic('changed_source');this.cancelPending();this.closed=true;}return;}
       const input={id,start:event.start_ms,end:event.end_ms,at:now,exact};
       this.inputs.set(id,input);if(this.inputs.size>128)this.inputs.delete(this.inputs.keys().next().value);
       if(!this.latest || input.end>this.latest.end || (input.end===this.latest.end && input.start>=this.latest.start)) {
@@ -157,26 +158,35 @@ export class CallControl {
       const early=this.pending.get(id);this.pending.delete(id);if(early)this.apply(early.event,input);
       return;
     }
-    if(event.type!=='decision.event' || event.delegation_id!==null || event.source_event_type!=='session.input_transcript.delta' || event.event?.type!=='decision.completed')return;
+    if(event.type!=='decision.event')return;
+    if(event.delegation_id!==null || event.source_event_type!=='session.input_transcript.delta')return;
+    if(event.event?.type!=='decision.completed'){this.diagnostic('decision_not_completed',event);return;}
     const source=commandId(event.source_event_id),trigger=commandId(event.trigger_id),eventId=commandId(event.event_id);
-    if(!source||!trigger||!eventId)return;
+    if(!source||!trigger||!eventId){this.diagnostic('invalid_identity');return;}
     const exact=JSON.stringify([source,eventId,event.event.decision?.answers]);
-    if(this.seen.has(trigger)) {if(this.seen.get(trigger)!==exact){this.cancelPending();this.closed=true;}return;}
+    if(this.seen.has(trigger)) {if(this.seen.get(trigger)!==exact){this.diagnostic('changed_decision',event);this.cancelPending();this.closed=true;}return;}
     this.seen.set(trigger,exact);if(this.seen.size>256)this.seen.delete(this.seen.keys().next().value);
     const input=this.inputs.get(source);
-    if(!input) {this.pending.set(source,{event,at:now});if(this.pending.size>32)this.pending.delete(this.pending.keys().next().value);return;}
+    if(!input) {this.diagnostic('awaiting_source',event);this.pending.set(source,{event,at:now});if(this.pending.size>32)this.pending.delete(this.pending.keys().next().value);return;}
     this.apply(event,input);
   }
   /** @param {import('openai/resources/live/live').DecisionEvent} event @param {{id:string,start:number,end:number,at:number,exact:string}} input */
   apply(event,input) {
-    if(this.closed || input.id!==this.latest?.id || Date.now()-input.at>this.freshMs)return;
+    if(this.closed)return;
+    if(input.id!==this.latest?.id){this.diagnostic('superseded_source',event);return;}
+    if(Date.now()-input.at>this.freshMs){this.diagnostic('stale_source',event);return;}
     const answers=event.event.decision?.answers;
-    if(!Array.isArray(answers)||answers.length!==1)return;
+    if(!Array.isArray(answers)||answers.length!==1){this.diagnostic('invalid_answer',event);return;}
     const answer=answers[0];
     this.cancelPending();
-    if(answer.type!=='predicate' || answer.name!=='end_current_call' || !Number.isFinite(answer.probability) || answer.probability<0.98 || answer.probability>1)return;
+    if(answer.type!=='predicate' || answer.name!=='end_current_call' || !Number.isFinite(answer.probability) || answer.probability<0 || answer.probability>1){this.diagnostic('invalid_answer',event);return;}
+    if(answer.probability<0.98){this.diagnostic('no_close_decision',event,answer.probability);return;}
+    this.diagnostic('awaiting_correction_interval',event,answer.probability);
     this.timer=setTimeout(()=>{
-      if(this.closed || this.latest?.id!==input.id || Date.now()-input.at>this.freshMs)return;
+      this.timer=undefined;
+      if(this.closed)return;
+      if(this.latest?.id!==input.id || Date.now()-input.at>this.freshMs){this.diagnostic('stale_or_superseded_after_interval',event);return;}
+      this.diagnostic('close_requested',event,answer.probability);
       this.closed=true;
       this.request({type:'call_control',action:'end_call',decision:'requested',source_event_id:input.id,
         trigger_id:event.trigger_id,decision_event_id:event.event_id,source_start_ms:input.start,source_end_ms:input.end,probability:answer.probability});
@@ -193,18 +203,24 @@ export class LiveBridge {
   /** @type {() => void} */ resolveDone=()=>{};
   createPending=false;
   closeSent=false;
+  retainReceipts=false;
+  disposed=false;
+  diagnosticCount=0;
+  /** @type {() => void} */ resolveDisposed=()=>{};
   /** @param {{emit: Emit, client: OpenAI, connect: (...args: ConstructorParameters<typeof SidebandWS>) => SidebandWS, setupMs?: number, finalizationMs?: number, maxCallMs?: number,callControlGraceMs?:number,callControlFreshMs?:number}} options */
   constructor({emit, client, connect, setupMs=20000, finalizationMs=10000, maxCallMs=1800000,callControlGraceMs=800,callControlFreshMs=5000}) {
     this.emit=emit; this.client=client; this.connect=connect;
     this.setupMs=setupMs; this.finalizationMs=finalizationMs; this.maxCallMs=maxCallMs;
     this.state='new'; this.seenCommands=new Map(); this.finished=false;
-    this.callControl=new CallControl({graceMs:callControlGraceMs,freshMs:callControlFreshMs,request:event=>{if(this.state!=='active'||this.finished)return;this.emit({...event,session_id:this.sessionId});void this.close();}});
+    this.callControl=new CallControl({graceMs:callControlGraceMs,freshMs:callControlFreshMs,diagnostic:(reason,event,probability)=>this.diagnostic(reason,event,probability),request:event=>{if(this.state!=='active'||this.finished)return;this.emit({...event,session_id:this.sessionId});void this.close();}});
     this.done=new Promise(resolve=>{this.resolveDone=()=>resolve(undefined);});
+    this.transportDone=new Promise(resolve=>{this.resolveDisposed=()=>resolve(undefined);});
   }
   /** @param {unknown} input */
   async command(input) {
     if (!input || typeof input!=='object' || Array.isArray(input)) throw new Error('invalid_command');
     const command=/** @type {Control} */ (input);
+    if (command.op==='dispose') return this.dispose();
     if (command.op==='create') return this.create(command);
     if (command.op==='close') return this.close();
     if (command.op!=='append' || this.state!=='active') throw new Error('call_not_active');
@@ -213,7 +229,7 @@ export class LiveBridge {
         !(command.delegation_id===null || (typeof command.delegation_id==='string' && command.delegation_id.length>0 && command.delegation_id.length<=160))) throw new Error('invalid_append');
     /** @type {ClientEvent} */
     const event={type:`session.${command.channel}.append`,event_id:command.event_id,
-      delegation_id:command.delegation_id,content:spokenExcerpt(command.content)};
+      delegation_id:command.delegation_id,content:command.channel==='thinking' && command.content==='' ? '' : spokenExcerpt(command.content)};
     const exact=JSON.stringify(event), previous=this.seenCommands.get(command.event_id);
     if (previous && previous!==exact) throw new Error('changed_command');
     if (previous) return; // Local duplicate is never resent across a transport boundary.
@@ -225,6 +241,7 @@ export class LiveBridge {
   async create(command) {
     if (this.state!=='new') throw new Error('already_created');
     const options=sessionOptions(command);
+    this.retainReceipts=command.retain_receipts===true;
     const setupDeadline=Date.now()+this.setupMs;
     this.state='creating';this.createPending=true;
     try {
@@ -274,6 +291,7 @@ export class LiveBridge {
       this.state='active';
       this.expiry=setTimeout(()=>this.close(),this.maxCallMs);
       this.emit({type:'ready',session_id:this.sessionId,sdp:result.transport.sdp,...(this.mcp?{mcp_port:this.mcp.port}:{})});
+      this.diagnostic(command.native_call_control===true?'configured_enabled':'configured_disabled');
     } catch(error) {
       if (!this.finished) this.emit(safeError(error));
       this.close();
@@ -281,6 +299,23 @@ export class LiveBridge {
       this.createPending=false;
       if (this.state==='closing' && !this.sideband) this.finish(false);
     }
+  }
+  /** Local diagnostics contain no transcript, reasoning, SDK errors or credentials.
+   * @param {string} reason @param {{event_id?:unknown,source_event_id?:unknown,trigger_id?:unknown}} [source] @param {number} [probability]
+   */
+  diagnostic(reason,source={},probability) {
+    if(this.diagnosticCount>1024)return;
+    const count=++this.diagnosticCount;
+    const ids=Object.fromEntries([['decision_event_id',source.event_id],['source_event_id',source.source_event_id],['trigger_id',source.trigger_id]].flatMap(([key,value])=>{const id=commandId(value);return id?[[key,id]]:[];}));
+    this.emit({type:'event',event:{type:'companion.native_call_control.diagnostic',event_id:`native-control-diagnostic:${count}`,
+      reason:count>1024?'diagnostic_limit':reason,...(count<=1024?ids:{}),...(count<=1024 && Number.isFinite(probability)?{probability}:{})}});
+  }
+  async dispose() {
+    if(this.disposed)return;
+    this.disposed=true;
+    if(!this.finished)await this.close();
+    await this.mcp?.close();
+    this.resolveDisposed();
   }
   close() {
     if(this.finished) return this.done;
@@ -304,8 +339,8 @@ export class LiveBridge {
     if(this.finished)return;
     this.finished=true;this.state='closed';this.callControl.close();clearTimeout(this.expiry);clearTimeout(this.finalizer);
     this.emit({type:'closed',confirmed,session_id:this.sessionId??null});
-    this.mcp?.close();
     this.sideband?.close(); this.resolveDone();
+    if(!this.retainReceipts || !this.mcp)void this.dispose();
   }
 }
 
@@ -334,11 +369,12 @@ async function main() {
       chain=chain.then(()=>bridge.command(JSON.parse(line))).catch(()=>{emit({type:'error',code:'invalid_control',message:'Call control could not be applied.'});bridge.close();});
     }
   });
-  process.stdin.on('end',()=>{chain.finally(()=>bridge.close());});
-  process.on('SIGTERM',()=>bridge.close());
-  process.on('SIGINT',()=>bridge.close());
+  process.stdin.on('end',()=>{chain.finally(()=>bridge.dispose());});
+  process.on('SIGTERM',()=>bridge.dispose());
+  process.on('SIGINT',()=>bridge.dispose());
   process.stdout.on('error',()=>{bridge.close();});
   await bridge.done;
+  await bridge.transportDone;
   process.stdin.destroy();
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) await main();

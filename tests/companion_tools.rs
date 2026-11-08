@@ -907,7 +907,10 @@ async fn scoped_native_permission_policy_requires_exact_source_and_never_title_o
             [&c.id],
         )
         .unwrap();
-    assert_eq!(allow(&valid, true).unwrap()["outcome"]["optionId"], "no");
+    assert_eq!(
+        allow(&valid, true).unwrap(),
+        agent_conversations::permissions::cancelled()
+    );
     assert!(effects(&f).is_empty());
 }
 
@@ -954,8 +957,8 @@ async fn late_exact_own_tools_are_denied_after_call_end_without_a_hidden_human_p
     ] {
         let permission = native_permission(tool, args);
         assert_eq!(
-            check(&permission, true).unwrap()["outcome"]["optionId"],
-            "no"
+            check(&permission, true).unwrap(),
+            agent_conversations::permissions::cancelled()
         );
         assert!(check(&permission, false).is_none());
         let mut no_reject = permission.clone();
