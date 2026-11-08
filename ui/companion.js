@@ -80,7 +80,7 @@ function showLogin() {
   // asynchronous callbacks may close their media, but cannot repopulate it.
   state.authGeneration++; state.recovery = null; state.contacts = [];
   $('voice-settings').close(); state.voiceContact = null; $('voice-choice').replaceChildren(); $('voice-settings-status').textContent = ''; $('voice-model-facts').replaceChildren(); $('voice-advanced-facts').replaceChildren(); $('cards').replaceChildren(); $('board-items').replaceChildren(); $('board-history').open = false; $('paste-input').value = ''; $('paste-composer').hidden = true; $('share-receipt').hidden = true; $('transcript').replaceChildren(); $('contacts').replaceChildren();
-  $('call-permissions').replaceChildren(); $('permission-alert').hidden = true;
+  $('call-permissions').replaceChildren(); $('permission-alert').hidden = true; $('context-items').replaceChildren(); $('context-empty').hidden = false;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = ''; notice('');
   $('ended-detail').textContent = '';
   $('call-ended').hidden = true; $('call-screen').hidden = true; $('phonebook').hidden = false; showRecovery();
@@ -146,14 +146,14 @@ function updateDuration(call) {
 async function startCall(contact) {
   if (state.call || state.recovery || !state.available) return;
   const call = {generation:++state.generation, authGeneration:state.authGeneration, contact, id:null, request:null, ended:false, connected:false,
-    browserId:crypto.randomUUID(), surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), cards:new Map(), board:[], muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
+    browserId:crypto.randomUUID(), surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), cards:new Map(), contextItems:new Map(), board:[], muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
   state.call = call;
   document.body.classList.add('call-active');
   notice(''); $('phonebook').hidden = true; $('call-ended').hidden = true; $('call-screen').hidden = false;
   $('call-avatar').textContent = initials(contact.label); $('call-name').textContent = contact.label || 'Your agent';
   $('call-description').textContent = contact.description || 'The same agent. Another place to talk.';
   $('call-duration').textContent = '00:00'; $('cards').replaceChildren(); $('board-items').replaceChildren(); $('board-history').open = false; $('paste-input').value = ''; $('paste-composer').hidden = true; $('share-receipt').hidden = true; $('transcript').replaceChildren();
-  $('call-permissions').replaceChildren(); $('permission-alert').hidden = true;
+  $('call-permissions').replaceChildren(); $('permission-alert').hidden = true; $('context-items').replaceChildren(); $('context-empty').hidden = false;
   $('transcript-empty').hidden = false; $('space-empty').hidden = false; $('work-status').hidden = true;
   $('connection-status').hidden = true; $('connection-status').textContent = '';
   updateBoard(call); resetFollowing();
@@ -383,6 +383,7 @@ function renderEvent(call, event) {
   // Sequence retention is bounded; cursor remains authoritative on polling.
   if (call.seen.size > 500) call.seen.delete(call.seen.values().next().value);
   const data = event.data || {};
+  renderContextEvent(call, event);
   if (event.kind === 'transcript' && ['user','assistant'].includes(data.role) && typeof data.text === 'string') {
     const followTranscript = followsEnd($('transcript-panel')), followCaption = followsEnd($('latest-caption'));
     const speaker = data.role === 'user' ? 'You' : call.contact.label;
@@ -397,7 +398,6 @@ function renderEvent(call, event) {
       const row = element('article', 'transcript-entry'); row.dataset.role = data.role;
       const body = element('p', null, data.text); row.append(element('strong', null, speaker), body); $('transcript').append(row);
       call.transcriptRow = {role:data.role,text:data.text,body,seq:event.seq,endMs:data.end_ms};
-      while ($('transcript').children.length > 160) $('transcript').firstChild.remove();
     }
     $('caption-speaker').textContent = speaker;
     $('caption-text').textContent = call.transcriptRow.text.slice(-360);
@@ -416,9 +416,7 @@ function renderEvent(call, event) {
   } else if (event.kind === 'surface_command') {
     executeSurface(call, data);
   } else if (event.kind === 'action_observation') {
-    const observation = data.observation || {}, state = observation.state;
-    const wording = ({accepted:'accepted your request',running:'is working on your request',waiting:'is waiting',blocked:'reported a blocker',reported_complete:'reports the work ready for your review',stopped:'stopped the work',budget_exhausted:'reached the work limit',needs_review:'needs your review',superseded:'has a newer task; the earlier receipt remains saved',unknown:'has no confirmed new status',delivered:'confirmed message delivery',completed:'confirmed message delivery'})[state] || 'has a new observed status';
-    $('connection-status').textContent = `${data.label || 'The connection'} ${wording}. ${observation.scope === 'task' ? 'Reported status; not independently verified.' : 'Delivery confirms the message only.'}`;
+    $('connection-status').textContent = connectionObservationText(data);
     $('connection-status').hidden = false;
   } else if (event.kind === 'upload' && typeof data.upload_id === 'string') {
     renderShareEvent(call, data);
@@ -432,6 +430,111 @@ function renderEvent(call, event) {
     notice(typeof data.message === 'string' ? data.message : 'The voice service reported an error. Check the conversation before repeating a request.');
   } else if (event.kind === 'closed') {
     call.providerCloseReason = typeof data.reason === 'string' ? data.reason : '';
+  }
+}
+function connectionObservationText(data) {
+  const observation = data.observation || {}, state = observation.state, label = typeof data.label === 'string' && data.label ? data.label : 'The connection';
+  if (observation.scope === 'conversation') {
+    const wording = ({admitted:'The game connector admitted your request; forwarding to the agent is not confirmed.',settled:'The conversation turn ended; a reply and work outcome are not confirmed.',interrupted:'Conversation handling was interrupted; the outcome is unconfirmed.'})[state]
+      || (state === 'replied' && observation.conversation?.reply_verified === true ? 'The agent replied. A reply does not confirm task acceptance or resumed work.' : 'Conversation handling remains unconfirmed.');
+    return `${label}: ${wording}`;
+  }
+  if (observation.scope === 'message_delivery') return `${label}: ${observation.verified === true && ['completed','delivered'].includes(state) ? 'The message was delivered.' : 'Message delivery is unconfirmed.'} Further work is not verified.`;
+  if (observation.scope === 'task') {
+    const wording = ({accepted:'accepted your request',running:'is working on your request',waiting:'is waiting',blocked:'reported a blocker',reported_complete:'reports the work ready for your review',stopped:'stopped the work',budget_exhausted:'reached the work limit',needs_review:'needs your review',superseded:'has a newer task; the earlier receipt remains saved'})[state] || 'has no confirmed task status';
+    return `${label} ${wording}. Reported status; not independently verified.`;
+  }
+  return `${label}: No recognized status is available. The work outcome is unconfirmed.`;
+}
+function contextTime(value) {
+  const date = typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? new Date(value)
+    : typeof value === 'string' && /^\d{4}-\d\d-\d\dT/.test(value) ? new Date(value) : null;
+  return date && Number.isFinite(date.getTime()) ? date : null;
+}
+function contextReceipt(call, key, facts, event) {
+  const follow = followsEnd($('context-panel'));
+  let entry = call.contextItems.get(key);
+  if (!entry) {
+    const node = element('details', 'context-entry'), summary = element('summary');
+    const title = element('strong'), status = element('span', 'context-state'), timing = element('span', 'context-time');
+    summary.append(title, status, timing);
+    const source = element('p', 'context-source'), body = element('p', 'context-text'), note = element('p', 'context-explanation');
+    node.append(summary, source, body, note); $('context-items').append(node);
+    entry = {node,title,status,timing,source,body,note,facts:{},firstAt:event.at}; call.contextItems.set(key, entry);
+  }
+  entry.facts = {...entry.facts,...facts};
+  const value = entry.facts, at = contextTime(event.at), first = contextTime(entry.firstAt), sourceAt = contextTime(value.sourceAt);
+  entry.title.textContent = value.title;
+  entry.status.textContent = value.status;
+  entry.timing.replaceChildren();
+  if (at) {
+    const time = element('time', null, at.toLocaleTimeString([], {hour:'numeric',minute:'2-digit',second:'2-digit'}));
+    time.dateTime = at.toISOString(); time.title = at.toLocaleString(); entry.timing.append(time);
+  } else entry.timing.textContent = 'Time not recorded';
+  const sourceParts = [value.source || 'Source not recorded'];
+  if (sourceAt) sourceParts.push(`Source time: ${sourceAt.toLocaleString()}`);
+  if (first) sourceParts.push(`First recorded: ${first.toLocaleString()}`);
+  if (at && (!first || first.getTime() !== at.getTime())) sourceParts.push(`Receipt updated: ${at.toLocaleString()}`);
+  entry.source.textContent = sourceParts.join(' · ');
+  entry.body.textContent = value.content || 'The text was not retained with this receipt.';
+  entry.note.textContent = value.note;
+  $('context-empty').hidden = true;
+  followChange($('context-panel'), follow);
+}
+function renderContextEvent(call, event) {
+  const data = event.data || {}, text = value => typeof value === 'string' && value.trim() ? value : undefined;
+  if (event.kind === 'context_delivery') {
+    const descriptions = {
+      queued:['Waiting for voice receipt','Sent to the voice connection. Acceptance has not been confirmed.'],
+      accepted:['Accepted by voice service','The voice service accepted this text. This does not confirm it was used or spoken.'],
+      not_queued:['Not sent to voice','This text was not queued for the voice connection.'],
+      rejected:['Rejected by voice service','The voice service rejected this update. Saved source information remains separate.'],
+      provider_error:['Voice receipt uncertain','A service error left delivery unconfirmed. This does not mean the text was spoken.']
+    };
+    const [status,note] = descriptions[data.state] || ['Voice receipt unknown','No recognized delivery state is available.'];
+    const key = `voice:${text(data.event_id) || `event-${event.seq}`}`;
+    const facts = {title:'Voice context',status,note};
+    if (text(data.content)) facts.content = data.content;
+    if (text(data.source_label)) facts.source = data.source_label;
+    else if (text(data.channel) && !call.contextItems.get(key)?.facts.source) facts.source = ({thinking:'Companion · background context',commentary:'Companion · conversational context'})[data.channel] || 'Companion · voice context';
+    if (data.source_at) facts.sourceAt = data.source_at;
+    contextReceipt(call, key, facts, event);
+  } else if (event.kind === 'context_supplied') {
+    const target = data.target === 'agent' ? call.contact.label : 'voice session';
+    contextReceipt(call, `supplied:${text(data.id) || event.seq}`, {
+      title:text(data.title) || 'Supplied context',status:`Supplied to ${target}`,
+      source:text(data.source_label) || 'Companion',sourceAt:data.source_at,content:text(data.content),
+      note:'Recorded when supplied. This is not confirmation that the model used it or that it was spoken.'
+    }, event);
+  } else if (event.kind === 'delegation' && text(data.id)) {
+    const descriptions = {
+      waiting_transcript:['Collecting your request','Waiting for the available speech before sending this request.'],
+      dispatched:['Saved for agent','Saved for agent handling. This does not confirm forwarding, task acceptance or completion.'],
+      completed:['Agent response saved','A response is saved in this call’s history. Check the result for what was answered or completed.'],
+      incorporated:['Included in an agent turn','Included with other input. This alone does not confirm each question was answered.'],
+      held:['Request held','The request has not been dispatched.'],
+      failed:['Request failed','The request could not be completed.'],
+      unknown:['Result unconfirmed','A result is not confirmed. Existing work has not been replayed.']
+    };
+    const [status,note] = descriptions[data.state] || ['Request status unknown','No recognized delivery state is available.'];
+    const facts = {title:`Request to ${call.contact.label}`,status,note,source:'Your call'};
+    if (data.state === 'completed' && data.delivery_state === 'incorporated') facts.note = 'A shared agent response is saved in history. This does not confirm that every included question was answered.';
+    if (text(data.request_text)) facts.content = data.request_text;
+    if (text(data.message)) facts.note = `${note} ${data.message}`;
+    contextReceipt(call, `request:${data.id}`, facts, event);
+  } else if (event.kind === 'card' && text(data.awareness_id)) {
+    contextReceipt(call, `observation:${data.awareness_id}`, {
+      title:text(data.title) || 'Connection observation',status:'Saved observation',
+      source:text(data.attribution) || text(data.source?.actor) || 'Connected service',sourceAt:data.source?.occurred_at,
+      content:text(data.text),note:'Reported by this source. Saving an observation does not confirm it reached voice context, was spoken, or changed any work.'
+    }, event);
+  } else if (event.kind === 'action_observation') {
+    const observation = data.observation || {};
+    contextReceipt(call, `action:${text(observation.request_id) || text(data.request_id) || event.seq}`, {
+      title:text(data.label) || 'Connection request',status:'Connection report',source:text(data.label) || 'Connected service',
+      sourceAt:observation.observed_at,content:connectionObservationText(data),
+      note:'This report is separate from voice delivery and from what was spoken.'
+    }, event);
   }
 }
 function refreshWorkStatus(call) {
@@ -509,7 +612,7 @@ function followChange(panel, follow = followsEnd(panel)) {
   if (tracker.button) tracker.button.hidden = !tracker.unread || panel.hidden;
 }
 function resetFollowing() { for (const [panel,tracker] of followers) { tracker.follow = true; tracker.unread = false; panel.scrollTop = 0; if(tracker.button)tracker.button.hidden = true; } }
-for (const [panelId,contentId,buttonId] of [['space-panel','board-items','space-new'],['transcript-panel','transcript','transcript-new'],['latest-caption','caption-text',null]]) {
+for (const [panelId,contentId,buttonId] of [['space-panel','board-items','space-new'],['transcript-panel','transcript','transcript-new'],['context-panel','context-items','context-new'],['latest-caption','caption-text',null]]) {
   const panel = $(panelId), button = buttonId && $(buttonId), tracker = {follow:true,unread:false,button}; followers.set(panel,tracker);
   panel.addEventListener('scroll', () => { tracker.follow = followsEnd(panel); if (tracker.follow) tracker.unread = false; if(button)button.hidden = !tracker.unread || panel.hidden; }, {passive:true});
   if (button) button.onclick = () => { panel.scrollTop = panel.scrollHeight; followChange(panel,true); };
@@ -624,17 +727,18 @@ function addFullResultControl(call, card, answer, data, conversationId) {
     } catch (error) { if (current(call) && card.isConnected) { status.textContent = error.message + ' You can open the conversation or try again.'; button.disabled = false; } }
   };
 }
+const detailTabs = ['space','transcript','context'];
 function setTab(name) {
-  for (const candidate of ['space','transcript']) {
+  for (const candidate of detailTabs) {
     const selected = name === candidate, button = $(candidate + '-tab');
     button.setAttribute('aria-selected', String(selected)); button.tabIndex = selected ? 0 : -1;
     $(candidate + '-panel').hidden = !selected;
     $(candidate + '-new').hidden = !selected || !followers.get($(candidate + '-panel'))?.unread;
   }
 }
-for (const name of ['space','transcript']) {
+for (const name of detailTabs) {
   $(name + '-tab').onclick = () => setTab(name);
-  $(name + '-tab').onkeydown = event => { if (['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) { event.preventDefault(); const next = event.key === 'Home' ? 'space' : event.key === 'End' ? 'transcript' : name === 'space' ? 'transcript' : 'space'; setTab(next); $(next + '-tab').focus(); } };
+  $(name + '-tab').onkeydown = event => { if (['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) { event.preventDefault(); const next = event.key === 'Home' ? detailTabs[0] : event.key === 'End' ? detailTabs.at(-1) : detailTabs[(detailTabs.indexOf(name)+(event.key === 'ArrowRight' ? 1 : detailTabs.length-1))%detailTabs.length]; setTab(next); $(next + '-tab').focus(); } };
 }
 
 function stopCamera(call) {
@@ -1175,7 +1279,8 @@ function applyView(call, command) {
   if (command.action === 'clear_board') { changeBoard(call,[]); return; }
   if (command.action === 'show_shared') { setTab('space'); return; }
   if (command.action === 'show_transcript') { setTab('transcript'); return; }
-  const panel = $('space-panel').hidden ? $('transcript-panel') : $('space-panel');
+  if (command.action === 'show_context') { setTab('context'); return; }
+  const panel = detailTabs.map(name=>$(name+'-panel')).find(panel=>!panel.hidden);
   if (['scroll_up','scroll_down'].includes(command.action)) {
     panel.scrollBy({top:Math.max(160,panel.clientHeight*.75)*(command.action === 'scroll_up' ? -1 : 1),behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'}); return;
   }

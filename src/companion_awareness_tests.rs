@@ -501,7 +501,7 @@ async fn crash_after_paid_intent_is_unknown_and_never_replayed() {
 }
 
 #[tokio::test]
-async fn full_source_card_and_pointer_append_preserve_qualifiers_without_unseen_summary() {
+async fn full_source_reaches_voice_without_backend_lookup_or_lost_qualifiers() {
     let f = fixture();
     let mut event = source_event();
     event["text"] = json!(format!(
@@ -512,23 +512,35 @@ async fn full_source_card_and_pointer_append_preserve_qualifiers_without_unseen_
     let mut rx = quiet_browser(&f);
     run(&f).await.unwrap();
     assert_eq!(cards(&f)[0]["text"], event["text"]);
-    let append = rx.try_recv().unwrap();
-    assert_eq!(append["op"], "append");
-    assert_eq!(append["channel"], "thinking");
-    assert!(
-        append["content"]
-            .as_str()
-            .unwrap()
-            .contains("Do not paraphrase unseen content")
-    );
-    assert!(
-        !append["content"]
-            .as_str()
-            .unwrap()
-            .contains("Detailed source")
-    );
-    assert_eq!(append["delegation_id"], Value::Null);
+    let mut commands = Vec::new();
+    while let Ok(command) = rx.try_recv() {
+        commands.push(command);
+    }
+    assert!(commands.len() > 2);
+    let mut body = String::new();
+    for command in &commands {
+        assert_eq!(command["channel"], "thinking");
+        let content = command["content"].as_str().unwrap();
+        assert!(content.len() <= 480);
+        if let Some((_, part)) = content.split_once(":\n") {
+            body.push_str(part);
+        }
+    }
+    assert!(body.ends_with(event["text"].as_str().unwrap()));
+    assert!(body.contains("The final check FAILED; do not claim completion."));
+    assert!(!body.contains("Retrieve with companion_shared"));
     assert_eq!(states(&f), vec!["context_queued"]);
+    for command in commands.iter().take(commands.len() - 1) {
+        provider_event(
+            &f.s,
+            &f.id,
+            &json!({"type":"session.thinking.appended","client_event_id":command["event_id"]}),
+        )
+        .unwrap();
+        assert_eq!(states(&f), vec!["context_queued"]);
+    }
+    provider_event(&f.s,&f.id,&json!({"type":"session.thinking.appended","client_event_id":commands.last().unwrap()["event_id"]})).unwrap();
+    assert_eq!(states(&f), vec!["context_accepted"]);
     run(&f).await.unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(calls(&f, "decision").len(), 1);
@@ -653,7 +665,7 @@ async fn speaking_recent_transcript_or_new_delegation_defers_even_high_confidenc
 }
 
 #[tokio::test]
-async fn old_running_work_does_not_starve_context_but_new_delegation_rearms_guard() {
+async fn quiet_facts_remain_available_during_new_requests_without_spoken_notice() {
     let f = fixture();
     let mut rx = quiet_browser(&f);
     f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'long-running',0,'dispatched','retained-work',?2)",params![f.id,now_ms()-60000]).unwrap();
@@ -664,8 +676,8 @@ async fn old_running_work_does_not_starve_context_but_new_delegation_rearms_guar
     observations(&f, vec![second]);
     f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'fresh-request',100,'waiting_transcript','new-work',?2)",params![f.id,now_ms()]).unwrap();
     run(&f).await.unwrap();
-    assert!(rx.try_recv().is_err());
-    assert!(states(&f).contains(&"ready".to_owned()));
+    assert_eq!(rx.try_recv().unwrap()["channel"], "thinking");
+    assert!(states(&f).iter().all(|v| v == "context_queued"));
     f.s.db
         .lock()
         .unwrap()
@@ -675,7 +687,7 @@ async fn old_running_work_does_not_starve_context_but_new_delegation_rearms_guar
         )
         .unwrap();
     run(&f).await.unwrap();
-    assert_eq!(rx.try_recv().unwrap()["channel"], "thinking");
+    assert!(rx.try_recv().is_err());
     assert_eq!(calls(&f, "decision").len(), 2);
     let work: String =
         f.s.db
@@ -1230,4 +1242,127 @@ async fn pending_source_policy_change_withdraws_before_any_paid_invocation() {
     assert!(calls(&f, "decision").is_empty());
     assert_eq!(states(&f), vec!["withdrawn"]);
     assert!(cards(&f).is_empty());
+}
+
+#[test]
+fn long_call_does_not_silently_exhaust_its_source_history() {
+    let f = fixture();
+    let (config, policy) = config(&f.s).unwrap().unwrap();
+    let source = &config.agents["default"][0];
+    for index in 0..520 {
+        let mut event = source_event();
+        event["id"] = json!(format!("long-call-{index}"));
+        assert!(record_source_event(&f.s, &f.id, source, &event, &policy, true).unwrap());
+    }
+    let count: i64 =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_awareness WHERE call_id=?1",
+                [&f.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(count, 520);
+}
+
+#[tokio::test]
+async fn unchanged_action_receipts_rotate_without_starving_older_requests() {
+    let f = fixture();
+    observations(&f, vec![]);
+    std::fs::write(
+        f.home.path().join("observer.py"),
+        r#"import json,pathlib,sys
+p=pathlib.Path(__file__).parent
+body=json.load(sys.stdin)
+with (p/'observer-calls.jsonl').open('a') as stream:stream.write(json.dumps(body)+'\n')
+result=json.loads((p/'observer-result.json').read_text())
+by_id={item['request_id']:item for item in result['actions']}
+result['actions']=[by_id[item['request_id']] for item in body['actions']]
+print(json.dumps(result))
+"#,
+    )
+    .unwrap();
+    let observed_at = timestamp(now_ms());
+    let mut originals = BTreeMap::new();
+    let mut outcomes = Vec::new();
+    {
+        let db = f.s.db.lock().unwrap();
+        for index in 0..6 {
+            let request = format!("rotation-request-{index}");
+            let receipt = json!({"request_id":request,"state":"queued","receipt":{"request_id":format!("domain-{index}"),"queued":true}});
+            let update = json!({"request_id":request,"connection_id":"minecraft","revision":"unchanged-v1","state":"accepted","scope":"task","verified":false,"observed_at":observed_at,"provenance":{"transport":"fixture","task_id":format!("task-{index}")}});
+            db.execute("INSERT INTO companion_actions(call_id,request_id,delegation_id,connection_id,instruction,source,state,result,created_at) VALUES(?1,?2,?3,'minecraft','Original request.','{}','queued',?4,?5)",params![f.id,request,format!("delegation-{index}"),receipt.to_string(),index]).unwrap();
+            // Every request already has a stable observation. Repeated identical
+            // outcomes still have to advance polling fairness, not create events.
+            db.execute("INSERT INTO companion_observations(call_id,request_id,revision,data,updated_at) VALUES(?1,?2,'unchanged-v1',?3,0)",params![f.id,request,update.to_string()]).unwrap();
+            let mut semantic = update.clone();
+            semantic.as_object_mut().unwrap().remove("observed_at");
+            db.execute("INSERT INTO companion_observation_revisions(call_id,request_id,revision,data) VALUES(?1,?2,'unchanged-v1',?3)",params![f.id,request,semantic.to_string()]).unwrap();
+            originals.insert(request, receipt);
+            outcomes.push(update);
+        }
+    }
+    let mut result: Value =
+        serde_json::from_slice(&std::fs::read(f.home.path().join("observer-result.json")).unwrap())
+            .unwrap();
+    result["actions"] = json!(outcomes);
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        result.to_string(),
+    )
+    .unwrap();
+    let mut counts = BTreeMap::<String, usize>::new();
+    for _ in 0..4 {
+        run(&f).await.unwrap();
+        let batches = calls(&f, "observer");
+        let batch = batches.last().unwrap()["actions"].as_array().unwrap();
+        assert_eq!(batch.len(), 4);
+        for item in batch {
+            let request = item["request_id"].as_str().unwrap();
+            assert_eq!(item["receipt"], originals[request]);
+            *counts.entry(request.to_owned()).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        counts.len(),
+        6,
+        "Older fifth/sixth requests must reach the observer"
+    );
+    assert!(
+        counts.values().all(|count| *count >= 2),
+        "Every unchanged receipt must keep being checked: {counts:?}"
+    );
+    assert!(calls(&f, "decision").is_empty());
+    assert!(cards(&f).is_empty());
+    let db = f.s.db.lock().unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM companion_observation_revisions WHERE call_id=?1",
+            [&f.id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        6
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='action_observation'",
+            [&f.id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    for (request, original) in originals {
+        let saved: String = db
+            .query_row(
+                "SELECT result FROM companion_actions WHERE call_id=?1 AND request_id=?2",
+                params![f.id, request],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), original);
+    }
 }

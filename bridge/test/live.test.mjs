@@ -52,7 +52,7 @@ test('SDK provider-error event and error callback preserve diagnostics without r
  sideband.emit('event',provider);
  const sdkError=new Error('private context');Object.defineProperty(sdkError,'error',{value:provider,enumerable:false});
  sideband.emit('error',sdkError);assert.equal(bridge.state,'active');
- assert.equal(events.find(e=>e.type==='event').event.error.client_event_id,'append-1');
+ assert.equal(events.find(e=>e.event?.type==='error').event.error.client_event_id,'append-1');
  assert.equal(sideband.sent.filter(e=>e.type==='session.commentary.append').length,1);
  assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,0);
  assert.equal(JSON.stringify(events).includes('private context'),false);
@@ -74,6 +74,27 @@ test('only matching terminal settlement confirms close',async()=>{
  assert.equal(events.some(e=>e.event?.session?.id==='different'),false);
  sideband.emit('event',{type:'session.closed',session:{id:'live_one'},reason:'close_requested',usage:{seconds:1}});
  await closing;assert.equal(events.at(-1).confirmed,true);assert.equal(sideband.sent.at(-1).type,'session.close');
+});
+test('default bridge has no local duration cutoff and honors provider expiry',async t=>{
+ t.mock.timers.enable({apis:['setTimeout']});
+ const {bridge,sideband,events}=fixture();await bridge.command(create);
+ t.mock.timers.tick(3_600_000);
+ assert.equal(bridge.state,'active');assert.equal(bridge.expiry,undefined);
+ assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,0);
+ sideband.emit('event',{type:'session.closed',session:{id:'live_one'},reason:'expired',usage:{seconds:3600}});
+ await bridge.done;
+ assert.equal(bridge.state,'closed');assert.equal(events.at(-1).confirmed,true);
+ assert.equal(events.find(e=>e.event?.type==='session.closed').event.reason,'expired');
+});
+test('an explicit fixture duration still requests close and awaits terminal settlement',async t=>{
+ t.mock.timers.enable({apis:['setTimeout']});
+ const {bridge,sideband,events}=fixture({maxCallMs:100});await bridge.command(create);
+ t.mock.timers.tick(99);assert.equal(bridge.state,'active');
+ t.mock.timers.tick(1);assert.equal(bridge.state,'closing');assert.equal(bridge.finished,false);
+ assert.equal(sideband.sent.filter(e=>e.type==='session.close').length,1);
+ assert.equal(events.some(e=>e.type==='closed'),false);
+ sideband.emit('event',{type:'session.closed',session:{id:'live_one'},reason:'close_requested',usage:{seconds:0.1}});
+ await bridge.done;assert.equal(events.at(-1).confirmed,true);
 });
 test('socket disappearance is unknown finalization, never fabricated completion',async()=>{
  const {bridge,sideband,events}=fixture();await bridge.command(create);sideband.emit('close');await bridge.done;
@@ -198,6 +219,9 @@ test('a matching current native end-call signal closes exactly once even without
  sideband.emit('event',endDecision('end-now'));await waitControl();
  assert.equal(sideband.sent.filter(v=>v.type==='session.close').length,1);
  assert.equal(events.filter(v=>v.type==='call_control').length,1);
+ const diagnostics=events.filter(v=>v.event?.type==='companion.native_call_control.diagnostic').map(v=>v.event.reason);
+ assert.ok(diagnostics.includes('close_requested'));
+ assert.equal(diagnostics.includes('pending_cancelled'),false,'A fired close decision is no longer a pending cancellation');
  assert.equal(events.at(-1).confirmed,false); // Socket/timeout is still not provider closure.
 });
 
@@ -259,5 +283,74 @@ test('native Decisions call control is an explicit optional capability, off by d
  const {bridge,sideband,events}=fixture({callControlGraceMs:10});await bridge.command(create);
  sideband.emit('event',inputEvent('disabled'));sideband.emit('event',endDecision('disabled'));await waitControl();
  assert.equal(events.some(e=>e.type==='call_control'),false);assert.equal(sideband.sent.length,0);
+ await bridge.close();
+});
+
+test('empty thinking suppresses automatic acknowledgement without accepting empty speech',async()=>{
+ const {bridge,sideband}=fixture();await bridge.command(create);
+ const quiet={op:'append',channel:'thinking',event_id:'silent-1',delegation_id:'d1',content:''};
+ await bridge.command(quiet);await bridge.command(quiet);
+ assert.deepEqual(sideband.sent,[{type:'session.thinking.append',event_id:'silent-1',delegation_id:'d1',content:''}]);
+ await assert.rejects(bridge.command({...quiet,event_id:'not-speech',channel:'commentary'}),/invalid_content/);
+ await assert.rejects(bridge.command({...quiet,event_id:'not-blank',content:' '}),/invalid_content/);
+ await bridge.close();
+});
+
+test('provider media closes while original official MCP listener serves saved receipts until disposal',async t=>{
+ const {createServer}=await import('node:http');
+ const {Client}=await import('@modelcontextprotocol/sdk/client/index.js');
+ const {StreamableHTTPClientTransport}=await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+ const seen=[];
+ const api=createServer((req,res)=>{
+  seen.push({method:req.method,url:req.url});
+  res.writeHead(req.method==='GET'?200:403,{'Content-Type':'application/json'});
+  res.end(JSON.stringify(req.method==='GET'?{kind:'call',state:'closed',provider_finalization:'confirmed'}:{error:'call_inactive'}));
+ });
+ await new Promise(resolve=>api.listen(0,'127.0.0.1',resolve));
+ t.after(()=>new Promise(resolve=>{api.close(resolve);api.closeAllConnections();}));
+ const token='fixture-private-call-grant-0123456789';
+ const {bridge,events,sideband,requests}=fixture();
+ t.after(()=>bridge.dispose());
+ await bridge.command({...create,retain_receipts:true,mcp:{api_base:`http://127.0.0.1:${api.address().port}`,call_id:'e0f36409-a5a6-4c1a-9355-0cd5ed10ce10',token}});
+ const endpoint=new URL(`http://127.0.0.1:${events.find(e=>e.type==='ready').mcp_port}/mcp`);
+ const client=new Client({name:'retained-receipt-fixture',version:'1.0.0'});
+ await client.connect(new StreamableHTTPClientTransport(endpoint,{requestInit:{headers:{Authorization:`Bearer ${token}`}}}));
+ const closing=bridge.close();
+ sideband.emit('event',{type:'session.closed',event_id:'closed-original',session:{id:'live_one'},reason:'close_requested',usage:{seconds:1}});
+ await closing;
+ assert.equal(bridge.state,'closed');assert.equal(bridge.disposed,false);
+ assert.equal(events.at(-1).confirmed,true);
+ const result=await client.callTool({name:'companion_surface_status',arguments:{}});
+ assert.equal(result.structuredContent.provider_finalization,'confirmed');
+ assert.deepEqual(seen,[{method:'GET',url:'/api/v1/companion/calls/e0f36409-a5a6-4c1a-9355-0cd5ed10ce10/tools/surface/current'}]);
+ assert.equal(requests.length,1);
+ await assert.rejects(bridge.command({op:'append',channel:'commentary',event_id:'late',delegation_id:null,content:'Live again'}),/call_not_active/);
+ await client.close();await bridge.command({op:'dispose'});await bridge.transportDone;
+ assert.equal(bridge.disposed,true);
+ await assert.rejects(fetch(endpoint,{method:'POST',body:'{}'}));
+});
+
+test('native control diagnostics distinguish no-close decisions and stale sources without recording reasoning',async()=>{
+ const {bridge,events,sideband}=fixture({callControlFreshMs:5});
+ await bridge.command({...create,native_call_control:true});
+ assert.ok(events.some(e=>e.event?.reason==='configured_enabled'));
+ sideband.emit('event',inputEvent('negative'));
+ const negative=endDecision('negative',.2);
+ negative.event.decision.reasoning='private rationale';negative.event.decision.headers={authorization:'secret'};
+ sideband.emit('event',negative);
+ assert.ok(events.some(e=>e.event?.reason==='no_close_decision'&&e.event.probability===.2));
+ sideband.emit('event',inputEvent('stale', 'Secret utterance', 200,300));
+ await new Promise(resolve=>setTimeout(resolve,15));
+ sideband.emit('event',endDecision('stale'));
+ assert.ok(events.some(e=>e.event?.reason==='stale_source'));
+ sideband.emit('event',endDecision('missing'));
+ assert.ok(events.some(e=>e.event?.reason==='awaiting_source'));
+ const diagnostics=events.filter(e=>e.event?.type==='companion.native_call_control.diagnostic');
+ const saved=JSON.stringify(diagnostics);
+ for(const value of ['private rationale','authorization','Secret utterance'])assert.equal(saved.includes(value),false);
+ assert.equal(sideband.sent.length,0);
+ for(let i=0;i<1100;i++)bridge.diagnostic('no_close_decision');
+ assert.equal(events.filter(e=>e.event?.type==='companion.native_call_control.diagnostic').length,1025);
+ assert.equal(events.at(-1).event.reason,'diagnostic_limit');
  await bridge.close();
 });

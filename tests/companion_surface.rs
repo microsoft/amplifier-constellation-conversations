@@ -1416,3 +1416,331 @@ async fn existing_shared_image_is_readable_without_recapture_and_stays_call_scop
         0
     );
 }
+
+#[tokio::test]
+async fn closed_call_receipts_preserve_terminal_evidence_without_reopening_authority() {
+    let f = fixture();
+    let c = call(&f);
+    let foreign = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    let operation = uuid::Uuid::new_v4().to_string();
+    delegation(&f, &c, "user");
+    presence(&f, &c, &browser, false, false).await;
+    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation"});
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "POST",
+            "hangup",
+            Some(body.clone()),
+            &c.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    ack(&f, &c, &browser, &operation, "accepted", vec![]).await;
+    ack(&f, &c, &browser, &operation, "executed", vec![]).await;
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute(
+            "UPDATE companion_calls SET state='closed',session_id='original-voice' WHERE id=?1",
+            [&c.id],
+        )
+        .unwrap();
+        db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'provider-terminal','provider',?2,?3)",params![c.id,json!({"type":"session.closed","session":{"id":"original-voice"},"reason":"close_requested","usage":{"seconds":12}}).to_string(),now_ms()]).unwrap();
+    }
+    let receipt = surface_status(&f, &c, &operation).await;
+    assert_eq!(receipt["state"], "executed");
+    assert_eq!(receipt["call"]["state"], "closed");
+    assert_eq!(receipt["call"]["provider_finalization"], "confirmed");
+    assert_eq!(receipt["call"]["provider_reason"], "close_requested");
+    assert_eq!(
+        surface_status(&f, &c, "current").await["provider_finalization"],
+        "confirmed"
+    );
+    let permission = |tool: &str, args: Value| json!({"toolCall":{"toolCallId":"late-receipt","title":format!("companion / {tool}"),"kind":"other","status":"pending","rawInput":{"server":"companion","tool":tool,"arguments":args}},"options":[{"optionId":"once","name":"Once","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]});
+    for args in [json!({}), json!({"operation_id":operation})] {
+        assert_eq!(
+            companion_tools::permission_once(
+                &f.s,
+                &c.room,
+                "owner",
+                "default",
+                true,
+                &permission("companion_surface_status", args)
+            )
+            .unwrap()
+            .unwrap()["outcome"]["optionId"],
+            "once"
+        );
+    }
+    assert_eq!(
+        companion_tools::permission_once(
+            &f.s,
+            &c.room,
+            "owner",
+            "default",
+            true,
+            &permission("companion_hangup", body.clone())
+        )
+        .unwrap()
+        .unwrap(),
+        agent_conversations::permissions::cancelled()
+    );
+    assert_eq!(
+        companion_tools::permission_once(
+            &f.s,
+            &c.room,
+            "owner",
+            "default",
+            true,
+            &permission("companion_surface_status", json!({"artifact_id":operation}))
+        )
+        .unwrap()
+        .unwrap(),
+        agent_conversations::permissions::cancelled()
+    );
+    assert!(
+        companion_tools::permission_once(
+            &f.s,
+            &c.room,
+            "other",
+            "default",
+            true,
+            &permission("companion_surface_status", json!({}))
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        companion_tools::permission_once(
+            &f.s,
+            &c.room,
+            "owner",
+            "default",
+            false,
+            &permission("companion_surface_status", json!({}))
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "GET",
+            &format!("surface/{operation}"),
+            None,
+            &foreign.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &f,
+            &foreign,
+            "GET",
+            &format!("surface/{operation}"),
+            None,
+            &foreign.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "GET",
+            &format!("surface/{operation}"),
+            None,
+            &c.token,
+            true
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_ne!(
+        request(&f, &c, "POST", "hangup", Some(body), &c.token, false)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_ne!(
+        request(&f, &c, "GET", "connections", None, &c.token, false)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_ne!(
+        request(
+            &f,
+            &c,
+            "GET",
+            &format!("surface/attachment:{operation}"),
+            None,
+            &c.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let calls: i64 =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_calls", [], |r| r.get(0))
+            .unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM input_deliveries WHERE conversation_id=?1",
+                [&c.room],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "submitted"
+    );
+}
+
+#[tokio::test]
+async fn closed_call_state_does_not_fabricate_matching_provider_finalization() {
+    let f = fixture();
+    let c = call(&f);
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute(
+            "UPDATE companion_calls SET state='closed',session_id='expected' WHERE id=?1",
+            [&c.id],
+        )
+        .unwrap();
+        db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'wrong-provider-terminal','provider',?2,?3)",params![c.id,json!({"type":"session.closed","session":{"id":"different"},"reason":"close_requested"}).to_string(),now_ms()]).unwrap();
+    }
+    let receipt = surface_status(&f, &c, "current").await;
+    assert_eq!(receipt["state"], "closed");
+    assert_eq!(receipt["provider_finalization"], "unknown");
+    assert!(receipt["provider_reason"].is_null());
+}
+
+#[tokio::test]
+async fn closed_call_mcp_proxy_forwards_only_saved_receipt_operations() {
+    let f = fixture();
+    let c = call(&f);
+    let foreign = call(&f);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured = calls.clone();
+    let app = Router::new().route(
+        "/mcp",
+        axum::routing::post(move || {
+            let captured = captured.clone();
+            async move {
+                captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(json!({"jsonrpc":"2.0","id":1,"result":{}}))
+            }
+        }),
+    );
+    let transport = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    companion_tools::record_mcp_port(&f.s, &c.id, port).unwrap();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    let mcp = |body: Value, token: String| {
+        let app = f.app.clone();
+        let id = c.id.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/companion/calls/{id}/mcp"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    let read = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"companion_surface_status","arguments":{}}});
+    assert_eq!(mcp(read.clone(), c.token.clone()).await, StatusCode::OK);
+    assert_eq!(mcp(read, foreign.token).await, StatusCode::FORBIDDEN);
+    for (tool, args) in [
+        (
+            "companion_hangup",
+            json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"d"}),
+        ),
+        (
+            "companion_connection_status",
+            json!({"connection_id":"minecraft"}),
+        ),
+        (
+            "companion_surface_status",
+            json!({"artifact_id":uuid::Uuid::new_v4().to_string()}),
+        ),
+    ] {
+        assert_eq!(mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}),c.token.clone()).await,StatusCode::FORBIDDEN);
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    transport.abort();
+}
+
+#[tokio::test]
+async fn context_view_is_an_exact_existing_call_surface_action() {
+    let f = fixture();
+    let c = call(&f);
+    delegation(&f, &c, "user");
+    let browser = uuid::Uuid::new_v4().to_string();
+    presence(&f, &c, &browser, false, false).await;
+    let operation = uuid::Uuid::new_v4().to_string();
+    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","action":"show_context"});
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(body.clone()), &c.token, false)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "accepted", vec![])
+            .await
+            .1["execute"],
+        true
+    );
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "executed", vec![])
+            .await
+            .1["state"],
+        "executed"
+    );
+    let mut changed = body;
+    changed["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+    changed["card_id"] = json!("123");
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(changed), &c.token, false)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+}

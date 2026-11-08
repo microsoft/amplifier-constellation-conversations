@@ -4,9 +4,12 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
+import os
 import pathlib
 import re
 import signal
+import subprocess
 import sys
 import time
 import urllib.request
@@ -60,10 +63,17 @@ def validate_input(value):
         raise ValueError("input_limit")
     cursor = value.get("cursor")
     if cursor is not None:
-        if not isinstance(cursor, dict) or set(cursor) != {"seen"} or not isinstance(cursor["seen"], list) or len(cursor["seen"]) > 64:
+        if (not isinstance(cursor, dict) or "seen" not in cursor or set(cursor) - {"seen", "presence"}
+                or not isinstance(cursor["seen"], list) or len(cursor["seen"]) > 64):
             raise ValueError("invalid_cursor")
         for row in cursor["seen"]:
             if not isinstance(row, dict) or set(row) != {"id", "revision"} or not valid_id(row["id"]) or not re.fullmatch(r"[a-f0-9]{64}", str(row["revision"])):
+                raise ValueError("invalid_cursor")
+        if "presence" in cursor:
+            present = cursor["presence"]
+            if (not isinstance(present, dict) or set(present) != {"semantic_revision", "revision", "occurred_at"}
+                    or any(not re.fullmatch(r"[a-f0-9]{64}", str(present[key])) for key in ["semantic_revision", "revision"])
+                    or not valid_time(present["occurred_at"])):
                 raise ValueError("invalid_cursor")
     actions = value.get("actions", [])
     if not isinstance(actions, list) or len(actions) > 4:
@@ -101,6 +111,41 @@ def task_projection(task):
             "progress": {"at": latest.get("at"), "summary": text(latest.get("summary"))}, "omitted_fields": omitted}
 
 
+def private_source(source, queued):
+    return (isinstance(source, dict) and source.get("id") == queued
+            and source.get("evidence_origin") == "authenticated_operator_control"
+            and source.get("audience", {}).get("kind") == "private")
+
+
+def conversation_observation(action, connection, observed_at, ledger, queued):
+    """Local reservation/settlement evidence is distinct from an answered request."""
+    admissions = [row for row in ledger.get("conversation_admissions", []) if isinstance(row, dict)
+                  and isinstance(row.get("ids"), list) and queued in row["ids"]]
+    turn = ledger.get("last_conversation_turn")
+    terminal = (isinstance(turn, dict) and turn.get("conversation_only") is True
+                and isinstance(turn.get("request_ids"), list) and queued in turn["request_ids"]
+                and type(turn.get("interrupted")) is bool)
+    if len(admissions) > 1:
+        return action_observation(action, connection, observed_at, scope="conversation",
+                                  reason="ambiguous_conversation_admission", fulfillment="not_established")
+    if not admissions and not terminal:
+        return None
+    state = "interrupted" if terminal and turn["interrupted"] else "settled" if terminal else "admitted"
+    admitted_at = admissions[0].get("at") if admissions else None
+    if type(admitted_at) not in (int, float) or not math.isfinite(admitted_at) or admitted_at < 0:
+        admitted_at = None
+    return action_observation(action, connection, observed_at, state, scope="conversation",
+                              reason="source_bound_local_conversation_state", fulfillment="not_established",
+                              receipt={"request_id": queued},
+                              conversation={"admitted_at_ms": admitted_at, "admission_scope": "conversation_only",
+                                            "admission_layer": "local_body", "host_forwarding_verified": False,
+                                            "local_turn_settled": terminal, "interrupted": turn["interrupted"] if terminal else None,
+                                            "settlement_evidence": "last_conversation_turn" if terminal else None,
+                                            "started_at": turn.get("started_at") if terminal and valid_time(turn.get("started_at")) else None,
+                                            "reply_verified": False, "task_acceptance_verified": False},
+                              provenance={"kind": "minecraft_local_conversation", "source_id": queued, "authority": False})
+
+
 def bind_action(action, connection, observed_at, ledger, current):
     original = action["receipt"]
     receipt = original.get("receipt", {})
@@ -109,22 +154,35 @@ def bind_action(action, connection, observed_at, ledger, current):
             or original.get("scope") != "private_operator_instruction" or receipt.get("queued") is not True or not valid_id(queued)):
         return action_observation(action, connection, observed_at, reason="no_confirmed_original_queue_receipt")
     tasks = ([current] if isinstance(current, dict) else []) + ledger.get("task_history", [])
+    authorizations = [row for row in ledger.get("task_authorizations", []) if isinstance(row, dict)
+                      and private_source(row.get("source"), queued)]
+    if len(authorizations) > 1:
+        return action_observation(action, connection, observed_at, reason="ambiguous_task_authorization")
+    authorization = authorizations[0] if authorizations else None
+    associated = authorization.get("result", {}).get("task_id") if authorization else None
     matches = [task for task in tasks if isinstance(task, dict) and
-               (task.get("request_id") == queued or task.get("authority", {}).get("source", {}).get("id") == queued)]
+               (task.get("request_id") == queued or task.get("authority", {}).get("source", {}).get("id") == queued
+                or task.get("id") == associated)]
     if len(matches) > 1:
         return action_observation(action, connection, observed_at, reason="ambiguous_task_binding")
     if not matches:
+        conversation = conversation_observation(action, connection, observed_at, ledger, queued)
+        if conversation:
+            return conversation
         # The original receipt proves historical queueing only, not current queue membership.
         return action_observation(action, connection, observed_at, reason="task_binding_not_retained",
                                   delivery_state="queued", receipt={"request_id": queued})
     task = matches[0]
-    source = task.get("authority", {}).get("source", {})
+    source = authorization["source"] if associated == task.get("id") else task.get("authority", {}).get("source", {})
     operator_event = any(isinstance(e, dict) and e.get("id") == queued and e.get("kind") == "chat"
                          and e.get("source") == "human" and e.get("accepted") is True
                          and e.get("provenance") == "operator_control"
                          and e.get("transport", {}).get("kind") == "authenticated_operator_control"
                          for e in ledger.get("events", []))
-    if (task.get("request_id") != queued or (source and (source.get("id") != queued
+    authorized_transition = (authorization is not None and associated == task.get("id")
+                             and authorization.get("operation") in ["accept", "amend"]
+                             and authorization.get("result", {}).get("accepted") is True)
+    if ((task.get("request_id") != queued and not authorized_transition) or (source and (source.get("id") != queued
             or source.get("evidence_origin") != "authenticated_operator_control" or source.get("audience", {}).get("kind") != "private"))
             or (not source and not operator_event) or not valid_id(task.get("id"))):
         return action_observation(action, connection, observed_at, reason="unverified_original_source_binding")
@@ -140,10 +198,59 @@ def bind_action(action, connection, observed_at, ledger, current):
                               receipt={"request_id": queued, "task_id": task["id"]},
                               provenance={"kind": "minecraft_retained_task" if retained else "minecraft_current_task",
                                           "source_id": queued, "source_revision": source.get("revision"),
+                                          "task_transition": authorization.get("operation") if authorized_transition else "original_acceptance",
                                           "completion": "agent_report_only", "authority": False})
 
 
-def observe(config_path, value, opener=None, now=None):
+def read_presence(port, token, username, timeout, node_executable):
+    helper = pathlib.Path(__file__).resolve().with_name("minecraft-presence.mjs")
+    result = subprocess.run([str(node_executable), str(helper)], input=encoded({"port": port, "token": token, "username": username,
+                             "timeout_ms": min(8000, max(1, int(timeout * 1000)))}),
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=True,
+                            env={key: os.environ[key] for key in ["HOME", "PATH", "SSL_CERT_FILE", "SSL_CERT_DIR"] if key in os.environ})
+    if len(result.stdout) > 524288:
+        raise ValueError("presence_limit")
+    return json.loads(result.stdout)
+
+
+def position(value):
+    if (not isinstance(value, dict) or any(type(value.get(k)) not in (int, float)
+            or not math.isfinite(value[k]) or abs(value[k]) > 30000000 for k in ["x", "y", "z"])):
+        return None
+    return {k: round(value[k], 2) for k in ["x", "y", "z"]}
+
+
+def presence_event(status, username, connection, previous=None):
+    if not isinstance(status, dict) or status.get("username") != username or not valid_time(status.get("observed_at")):
+        raise ValueError("invalid_presence")
+    here = position(status.get("position"))
+    players = []
+    for row in status.get("players", []) if isinstance(status.get("players"), list) else []:
+        if not isinstance(row, dict) or not valid_id(row.get("name")) or row["name"] == username:
+            continue
+        there = position(row.get("position"))
+        player = {"name": row["name"], "position": there}
+        if here and there:
+            player["distance_blocks"] = round(math.dist(list(here.values()), list(there.values())), 1)
+        players.append(player)
+    players.sort(key=lambda row: (row.get("distance_blocks", float("inf")), row["name"]))
+    value = {"username": username, "ready": status.get("ready") is True, "busy": status.get("busy") is True,
+             "turn_active": status.get("turn_active") is True, "position": here,
+             "players": players[:8], "players_omitted": max(0, len(players) - 8),
+             "meaning": "Observed position and activity flags; not proof of current work or request fulfillment."}
+    event = {"id": "minecraft:presence:" + username, "connection_id": connection, "kind": "presence_observation",
+             "actor": username, "audience": audience(connection),
+             "provenance": {"kind": "minecraft_public_presence", "authority": False}, "text": encoded(value).decode()}
+    semantic_revision = revision(event)
+    # A new observation time alone does not create a new announcement. Preserve
+    # the exact retained event identity; A -> B -> A still receives a new revision.
+    occurred_at = previous["occurred_at"] if previous and previous["semantic_revision"] == semantic_revision else status["observed_at"]
+    event["occurred_at"] = occurred_at
+    event["revision"] = revision(event)
+    return event, {"semantic_revision": semantic_revision, "revision": event["revision"], "occurred_at": occurred_at}
+
+
+def observe(config_path, value, opener=None, now=None, presence_reader=None):
     deadline = time.monotonic() + 9.5
     observed_at = now or datetime.datetime.now(datetime.timezone.utc).isoformat()
     connection = None
@@ -154,12 +261,17 @@ def observe(config_path, value, opener=None, now=None):
         if not config_path.is_absolute():
             raise ValueError("absolute_config_required")
         cfg = read_json(config_path, 32768)
-        if set(cfg) != {"minecraft_home", "connection_id", "expected_username"} or not valid_id(cfg["connection_id"]) or not valid_id(cfg["expected_username"]):
+        if (not {"minecraft_home", "connection_id", "expected_username"}.issubset(cfg)
+                or set(cfg) - {"minecraft_home", "connection_id", "expected_username", "node_executable"}
+                or not valid_id(cfg["connection_id"]) or not valid_id(cfg["expected_username"])):
             raise ValueError("invalid_config")
         connection = cfg["connection_id"]
         home = pathlib.Path(cfg["minecraft_home"])
         if not home.is_absolute():
             raise ValueError("absolute_home_required")
+        node_executable = pathlib.Path(cfg.get("node_executable", home / "bin" / "node"))
+        if not node_executable.is_absolute():
+            raise ValueError("absolute_node_executable_required")
         installation = read_json(home / "config.json", 65536)
         port, token = installation["control_port"], installation["token"]
         if (installation.get("username") != cfg["expected_username"] or type(port) is not int or not 0 < port < 65536
@@ -183,36 +295,61 @@ def observe(config_path, value, opener=None, now=None):
 
         live = get("/installation-state")
         private = get("/operator-inputs")
-        public = get("/conversation")
+        # The public presence projection includes this agent's own speech. The
+        # incoming-conversation route intentionally excludes it and is not changed.
+        public = {"messages": []}
+        presence = None
+        presence_available = False
+        presence_token = installation.get("presence_token")
+        if isinstance(presence_token, str) and re.fullmatch(r"[\x21-\x7e]{1,8192}", presence_token):
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    present = (presence_reader or read_presence)(port, presence_token, cfg["expected_username"], min(8, remaining), node_executable)
+                    public, presence = present["activity"], present["status"]
+                    if public.get("username") != cfg["expected_username"] or presence.get("username") != cfg["expected_username"]:
+                        raise ValueError("presence_identity_mismatch")
+                    presence_available = True
+                except Exception:
+                    public, presence = {"messages": []}, None
         ledger = read_json(home / "workshop.json", 8 * 1024 * 1024)
         current = live.get("task")
-        if (ledger.get("task") or {}).get("id") != (current or {}).get("id"):
+        if any((ledger.get("task") or {}).get(key) != (current or {}).get(key)
+               for key in ["id", "authority_revision", "progress_revision", "status", "turns"]):
             raise ValueError("concurrent_task_change")
         if not isinstance(ledger.get("task_history", []), list) or not isinstance(ledger.get("events", []), list):
             raise ValueError("invalid_ledger")
         events = []
         omitted_events = 0
+        presence_cursor = (cursor or {}).get("presence")
         for snapshot, is_private in [(public, False), (private, True)]:
             messages = snapshot.get("messages")
-            if not isinstance(messages, list) or len(messages) > 16:
+            if not isinstance(messages, list) or len(messages) > (16 if is_private else 20):
                 raise ValueError("invalid_messages")
             for message in messages:
                 if not isinstance(message, dict) or not valid_id(message.get("id")):
                     raise ValueError("invalid_message")
+                author, occurred = (message.get("author"), message.get("time")) if is_private else (message.get("actor"), message.get("at"))
                 if (not valid_id("minecraft:message:" + message["id"]) or not isinstance(message.get("text"), str)
                         or not message["text"].strip() or len(message["text"].encode()) > 4000
-                        or not valid_id(message.get("author")) or not valid_time(message.get("time"))):
+                        or not valid_id(author) or not valid_time(occurred)):
                     omitted_events += 1
                     continue
                 event = {"id": "minecraft:message:" + message["id"], "connection_id": connection,
-                         "occurred_at": text(message.get("time"), 64), "kind": "message",
-                         "actor": text(message.get("author"), 200), "audience": audience(connection, is_private),
+                         "occurred_at": text(occurred, 64), "kind": "message",
+                         "actor": text(author, 200), "audience": audience(connection, is_private),
                          "provenance": {"kind": "authenticated_operator_control" if is_private else "minecraft_public_chat",
                                         "source_id": message["id"], "authority": False}, "text": text(message.get("text"))}
                 if len(encoded(event)) <= 7800:
                     events.append({**event, "revision": revision(event)})
                 else:
                     omitted_events += 1
+        if presence is not None:
+            event, presence_cursor = presence_event(presence, cfg["expected_username"], connection, presence_cursor)
+            if len(event["text"].encode()) <= 4000:
+                events.append(event)
+            else:
+                omitted_events += 1
         if isinstance(current, dict) and valid_id(current.get("id")) and valid_id("minecraft:task:" + current["id"]):
             projection = task_projection(current)
             source = current.get("authority", {}).get("source", {})
@@ -228,17 +365,27 @@ def observe(config_path, value, opener=None, now=None):
                 omitted_events += 1
         seen = {row["id"]: row["revision"] for row in (cursor or {}).get("seen", [])}
         fresh = [event for event in events if seen.get(event["id"]) != event["revision"]]
-        for event in events:
-            seen.pop(event["id"], None)
-            seen[event["id"]] = event["revision"]
+
+        def emitted_cursor(emitted):
+            # The cursor acknowledges output, not everything read from the body.
+            # Keep deferred presence identity stable without marking it consumed.
+            delivered = dict(seen)
+            for event in emitted:
+                delivered.pop(event["id"], None)
+                delivered[event["id"]] = event["revision"]
+            return {"seen": [{"id": key, "revision": val} for key, val in list(delivered.items())[-64:]],
+                    **({"presence": presence_cursor} if presence_cursor else {})}
+
         gap = bool(cursor and any(row["id"].startswith("minecraft:message:") for row in cursor["seen"]) and
                    not any(event["id"] in {r["id"] for r in cursor["seen"]} for event in events if event["kind"] == "message"))
         result = {"version": 1, "connection_id": connection, "observed_at": observed_at, "availability": "available",
                   "presence": {"ready": live.get("ready") is True, "busy": live.get("busy") is True, "turn_active": live.get("turn_active") is True},
-                  "cursor": {"seen": [{"id": key, "revision": val} for key, val in list(seen.items())[-64:]]},
-                  "coverage": {"baseline": cursor is None, "bounded": True, "gap": gap or len(fresh) > 32 or omitted_events > 0,
+                  "cursor": emitted_cursor(fresh[-32:]),
+                  "coverage": {"baseline": cursor is None, "bounded": True, "gap": gap or len(fresh) > 32 or omitted_events > 0 or not presence_available,
+                               "deferred_events": max(0, len(fresh) - 32),
                                "omitted_events": omitted_events, "omission_reason": "event_text_or_identity_exceeded_bound" if omitted_events else None,
-                               "public_messages_omitted": bool(public.get("older_messages_omitted")),
+                               "public_presence_available": presence_available,
+                               "public_messages_omitted": len(public.get("messages", [])) >= 20 or not presence_available,
                                "private_messages_omitted": bool(private.get("older_messages_omitted")),
                                "task_history": "retained_only", "verified_completion_supported": False},
                   "events": fresh[-32:], "actions": [bind_action(a, connection, observed_at, ledger, current) for a in actions]}
@@ -248,6 +395,8 @@ def observe(config_path, value, opener=None, now=None):
             result["events"].pop(0)
             result["coverage"]["gap"] = True
             result["coverage"]["output_truncated"] = True
+            result["coverage"]["deferred_events"] = len(fresh) - len(result["events"])
+            result["cursor"] = emitted_cursor(result["events"])
         if len(encoded(result)) > MAX_OUTPUT:
             raise ValueError("output_limit")
         return result

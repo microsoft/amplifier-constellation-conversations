@@ -56,7 +56,7 @@
           <p id="foreground-note" class="small">Keep this page in the foreground. A screen lock or app switch may interrupt audio.</p>
         </div>
         <div class="shared-panel" aria-label="Shared conversation space">
-          <div class="shared-tabs" role="tablist" aria-label="Conversation detail"><button id="space-tab" role="tab" aria-selected="true" aria-controls="space-panel">Shared space <span id="card-count" class="count" hidden>0</span></button><button id="transcript-tab" role="tab" aria-selected="false" aria-controls="transcript-panel" tabindex="-1">Transcript</button></div>
+          <div class="shared-tabs" role="tablist" aria-label="Conversation detail"><button id="space-tab" role="tab" aria-selected="true" aria-controls="space-panel">Shared space <span id="card-count" class="count" hidden>0</span></button><button id="transcript-tab" role="tab" aria-selected="false" aria-controls="transcript-panel" tabindex="-1">Transcript</button><button id="context-tab" role="tab" aria-selected="false" aria-controls="context-panel" tabindex="-1">Context</button></div>
           <p id="connection-status" class="small connection-status" hidden></p>
           <button id="permission-alert" class="secondary permission-alert" type="button" hidden>Review requested action</button>
           <div id="work-status" class="work-status" role="status" hidden></div>
@@ -78,6 +78,7 @@
           </section>
           <button id="space-new" class="new-items secondary" type="button" hidden>New items ↓</button>
           <section id="transcript-panel" role="tabpanel" aria-labelledby="transcript-tab" tabindex="0" hidden><p class="transcript-note">Live transcript fragments may contain mistakes. Generated text does not confirm what you heard.</p><div id="transcript" class="transcript" role="log" aria-label="Call transcript" aria-live="off"></div><p id="transcript-empty" class="empty-state">The conversation will appear here.</p></section><button id="transcript-new" class="new-items secondary" type="button" hidden>New words ↓</button>
+          <section id="context-panel" role="tabpanel" aria-labelledby="context-tab" tabindex="0" hidden><p class="context-note">What this call supplied, and what connected services reported. Delivery receipts do not show what the agent understood or what you heard. Open an item to see its text and source.</p><p class="small">This is a record of supplied context, not a complete view of the model’s current memory. Older entries may have been replaced or summarized.</p><div id="context-items" class="context-items" aria-live="off"></div><p id="context-empty" class="empty-state">No context receipts have arrived yet. This does not mean the agent has no context.</p></section><button id="context-new" class="new-items secondary" type="button" hidden>New context ↓</button>
         </div>
       </section>
       <section id="call-ended" class="ended-card" hidden><p class="eyebrow">BACK WHEN YOU NEED THEM</p><h1 id="ended-title">Call ended.</h1><p id="ended-detail">Your microphone and camera are off.</p><div class="ended-actions"><button id="back-to-contacts" class="primary">Back to contacts</button><a id="ended-work-link" class="secondary" href="/" target="constellation-work" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a></div></section>

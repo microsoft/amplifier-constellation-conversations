@@ -27,6 +27,7 @@ const VIEW_ACTIONS: &[&str] = &[
     "previous_card",
     "show_shared",
     "show_transcript",
+    "show_context",
     "focus_card",
     "replace_board",
     "add_card",
@@ -268,6 +269,9 @@ fn status_shape_valid(args: &Value) -> bool {
                         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
                 }))
     })
+}
+pub(crate) fn terminal_status_shape_valid(args: &Value) -> bool {
+    status_shape_valid(args) && args.get("artifact_id").is_none()
 }
 pub(crate) fn permission_shape_valid(tool: &str, args: &Value) -> bool {
     match tool {
@@ -854,14 +858,46 @@ fn artifact_status(
     Ok(receipt)
 }
 
+/// Read only recorded closure evidence. Socket disappearance or a browser
+/// command marked executed does not establish provider finalization.
+fn terminal_call_status(s: &AppState, id: &str) -> Result<Option<Value>> {
+    let db = s.db.lock().unwrap();
+    let state: String =
+        db.query_row("SELECT state FROM companion_calls WHERE id=?1", [id], |r| {
+            r.get(0)
+        })?;
+    if matches!(state.as_str(), "connecting" | "connected") {
+        return Ok(None);
+    }
+    let reason: Option<String> = db.query_row(
+        "SELECT json_extract(e.data,'$.reason') FROM companion_events e JOIN companion_calls c ON c.id=e.call_id WHERE e.call_id=?1 AND e.kind='provider' AND json_extract(e.data,'$.type')='session.closed' AND json_extract(e.data,'$.session.id')=c.session_id ORDER BY e.seq DESC LIMIT 1",
+        [id], |r| r.get(0),
+    ).optional()?;
+    Ok(Some(json!({"kind":"call","call_id":id,"state":state,
+        "provider_finalization":if reason.is_some(){"confirmed"}else{"unknown"},
+        "provider_reason":reason,
+        "guidance":"This is a saved receipt for this exact call, not a human permission decision. Media has ended or is ending; no new call actions are authorized. Only matching provider finalization confirms closure. Accepted background work is independent."})))
+}
+
 pub async fn status(
     State(s): State<Arc<AppState>>,
     Path((id, operation)): Path<(String, String)>,
     h: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let (owner, _, room) = crate::companion_tools::authorize(&s, &id, &h)?;
+    // Only exact saved operations or this call's finalization status survive
+    // media closure. Artifact/live-surface access keeps its active-call gate.
+    let receipt_only = operation == "current" || uuid::Uuid::parse_str(&operation).is_ok();
+    let (owner, _, room) = if receipt_only {
+        crate::companion_tools::authorize_receipt(&s, &id, &h)?
+    } else {
+        crate::companion_tools::authorize(&s, &id, &h)?
+    };
+    let terminal = terminal_call_status(&s, &id)?;
     if operation == "current" {
-        return Ok(Json(current_status(&s, &id, &owner, &room)?));
+        return Ok(Json(match terminal {
+            Some(receipt) => receipt,
+            None => current_status(&s, &id, &owner, &room)?,
+        }));
     }
     if let Some(artifact) = operation.strip_prefix("attachment:") {
         return Ok(Json(artifact_status(&s, &id, &owner, &room, artifact)?));
@@ -878,6 +914,12 @@ pub async fn status(
         return Ok(Json(feedback_receipt(&operation, &delegation, &text, at)));
     }
     let mut receipt = row(&db, &id, &operation)?.ok_or_else(ApiError::missing)?;
+    if let Some(terminal) = terminal {
+        receipt["call"] = terminal;
+        // Saved operation evidence remains available; image transfer and live
+        // surface reads do not gain authority from this terminal receipt path.
+        return Ok(Json(receipt));
+    }
     if receipt["state"] == "uploaded" {
         let capability: Option<(Option<bool>,i64)> = db.query_row("SELECT image_input,observed_at FROM companion_surface_capabilities WHERE call_id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let image_input = capability.and_then(|v| v.0);

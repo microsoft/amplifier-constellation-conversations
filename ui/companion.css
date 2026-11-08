@@ -1231,7 +1231,7 @@ body.call-active {
 #call-voice-settings {padding:6px 0;font-size:11px}
 .shared-panel {display:flex;flex-direction:column;min-height:0;padding-bottom:16px}
 .shared-tabs {flex:0 0 auto;margin-bottom:0}
-#space-panel,#transcript-panel {min-height:0;flex:1;overflow:auto;overscroll-behavior:contain;padding:16px 3px 8px;scrollbar-gutter:stable}
+#space-panel,#transcript-panel,#context-panel {min-height:0;flex:1;overflow:auto;overscroll-behavior:contain;padding:16px 3px 8px;scrollbar-gutter:stable}
 #space-panel.dragging {outline:3px dashed #729267;outline-offset:-4px;background:#f0f5e9}
 .space-empty {min-height:220px;padding:25px 15px}
 .space-illustration {margin-bottom:20px}
@@ -1295,7 +1295,7 @@ video.shared-media,audio.shared-media {width:100%}
   .shared-panel {padding:0 15px 7px;overflow:hidden}
   .shared-tabs {gap:22px}
   .shared-tabs button {font-size:12px;padding:13px 0 11px}
-  #space-panel,#transcript-panel {padding-top:12px}
+  #space-panel,#transcript-panel,#context-panel {padding-top:12px}
   .share-toolbar {gap:8px}
   .share-toolbar button {padding:9px;font-size:10px}
   .share-toolbar p {font-size:10px}
@@ -1348,6 +1348,17 @@ video.shared-media,audio.shared-media {width:100%}
 .share-receipt span {flex:1;overflow-wrap:anywhere}
 .share-receipt button {font-size:11px}
 .new-items {align-self:center;flex:none;padding:7px 14px;font-size:11px;margin:6px 0}
+.context-note {font-size:13px;line-height:1.6;color:var(--muted);margin:0 0 10px}
+.context-items {display:flex;flex-direction:column;gap:10px;margin-top:18px}
+.context-entry {border:1px solid var(--line);border-radius:12px;background:var(--paper,#fff);padding:13px 15px;overflow-wrap:anywhere}
+.context-entry summary {cursor:pointer;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;font-size:13px;list-style:none}
+.context-entry summary strong {font-weight:600}
+.context-entry summary strong::before {content:'›';display:inline-block;margin-right:8px;transition:transform .15s}
+.context-entry[open] summary strong::before {transform:rotate(90deg)}
+.context-state {grid-column:1;font-size:11px;color:var(--muted)}
+.context-time {grid-column:2;grid-row:1 / span 2;font-size:11px;color:var(--muted);align-self:center}
+.context-source,.context-explanation {font-size:11px;line-height:1.6;color:var(--muted);margin:12px 0 0}
+.context-text {white-space:pre-wrap;font-size:13px;line-height:1.7;margin:12px 0 0}
 .model-facts {font-size:12px;margin:12px 0 20px}.model-facts dt {color:var(--muted);margin-top:8px}.model-facts dd {margin:2px 0;overflow-wrap:anywhere}
 .space-empty {min-height:150px}.space-empty h2 {font-size:21px}.space-illustration {transform:scale(.7);margin-bottom:4px}
 
