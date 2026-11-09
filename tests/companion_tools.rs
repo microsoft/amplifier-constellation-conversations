@@ -1285,3 +1285,126 @@ async fn explicit_status_response_queues_qualified_context_before_backend_paraph
     drop(db);
     assert!(effects(&f).is_empty());
 }
+
+#[tokio::test]
+async fn action_accepts_exact_mixed_whitespace_but_rejects_changed_or_only_blank_sources() {
+    for case in [
+        "exact",
+        "all_whitespace",
+        "text",
+        "event_id",
+        "start_ms",
+        "end_ms",
+        "role",
+    ] {
+        let f = fixture();
+        let c = call(&f);
+        let (did, _, _) = delegation(&f, &c, "user");
+        let old = now_ms() - 7_000_000;
+        let words = "Keep the blue door; explain what remains.";
+        let source = {
+            let db = f.s.db.lock().unwrap();
+            let mut fragments = Vec::new();
+            for (index, role, text, at) in [
+                (0, "assistant", "Earlier assistant context", old - 2000),
+                (1, "user", " ", old - 1000),
+                (
+                    2,
+                    "user",
+                    if case == "all_whitespace" {
+                        " \t"
+                    } else {
+                        words
+                    },
+                    old,
+                ),
+                (3, "user", " ", old + 1000),
+            ] {
+                let event_id = format!("retained-fragment-{index}");
+                let mut event = json!({"role":role,"event_id":event_id,"text":text,"start_ms":index*10+1,"end_ms":index*10+5});
+                db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'transcript',?3,?4)",params![c.id,event_id,event.to_string(),at]).unwrap();
+                event["seq"] = json!(db.last_insert_rowid());
+                fragments.push(event);
+            }
+            match case {
+                "text" => fragments[1]["text"] = json!("  "),
+                "event_id" => fragments[1]["event_id"] = json!("changed-event"),
+                "start_ms" => fragments[1]["start_ms"] = json!(12),
+                "end_ms" => fragments[1]["end_ms"] = json!(16),
+                "role" => fragments[1]["role"] = json!("assistant"),
+                _ => {}
+            }
+            let source =
+                json!({"version":1,"previous_anchor_ms":0,"offset_ms":100,"fragments":fragments});
+            db.execute("UPDATE companion_delegations SET source=?3,request_text=?4 WHERE call_id=?1 AND id=?2",params![c.id,did,source.to_string(),words]).unwrap();
+            source
+        };
+        let rid = uuid::Uuid::new_v4().to_string();
+        let (status, response) = request(
+            &f,
+            &c,
+            "POST",
+            "actions",
+            Some(action(&rid)),
+            &c.token,
+            false,
+        )
+        .await;
+        if case == "exact" {
+            assert_eq!(status, StatusCode::OK, "{response}");
+            let submitted = effects(&f);
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0]["source"]["occurred_at"], old);
+            assert_eq!(
+                submitted[0]["source"]["time_basis"],
+                "retained_human_transcript"
+            );
+            assert_eq!(submitted[0]["source"]["original_text"], words);
+            assert_eq!(
+                submitted[0]["source"]["source_revision"],
+                auth::digest(words)
+            );
+            let (duplicate_status, duplicate) = request(
+                &f,
+                &c,
+                "POST",
+                "actions",
+                Some(action(&rid)),
+                &c.token,
+                false,
+            )
+            .await;
+            assert_eq!(duplicate_status, StatusCode::OK);
+            assert_eq!(duplicate, response);
+            assert_eq!(effects(&f).len(), 1, "No replay on the same receipt");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {response}");
+            assert!(effects(&f).is_empty(), "{case}");
+            assert_eq!(
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{case}"
+            );
+        }
+        let retained: String =
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT source FROM companion_delegations WHERE call_id=?1 AND id=?2",
+                    params![c.id, did],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&retained).unwrap(),
+            source,
+            "Bound source must not be edited"
+        );
+    }
+}

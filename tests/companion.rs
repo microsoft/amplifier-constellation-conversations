@@ -1285,7 +1285,8 @@ async fn grounded_bootstrap_and_voice_preferences_do_not_create_backend_model_wo
         "2026-11-07T19:00:00Z",
         "If current state is unavailable, check it before giving a status answer",
         "<|SpawnThinking|>",
-        "Preserve original report dates",
+        "say how old that report is before describing the work",
+        "a fresh read does not verify an old report",
     ] {
         assert!(instructions.contains(expected), "{expected}");
     }
@@ -3124,6 +3125,7 @@ async fn explicit_acp_image_result_is_saved_published_and_available_for_scoped_r
         .as_str()
         .expect("explicit ACP image must be published with its settled answer");
     assert_eq!(card["data"]["attachments"][0]["mime_type"], "image/png");
+    assert_eq!(card["data"]["presentation"], "current");
     let token: String =
         f.s.db
             .lock()
@@ -3182,6 +3184,128 @@ async fn explicit_acp_image_result_is_saved_published_and_available_for_scoped_r
         "image reinspection must not recapture or dispatch another prompt"
     );
     end(&f, id).await;
+}
+
+#[tokio::test]
+async fn output_images_do_not_present_stale_closed_unlinked_or_nonterminal_results() {
+    for case in [
+        "late",
+        "corrected",
+        "closed",
+        "old-call-source",
+        "other-owner",
+        "other-agent",
+        "changed-endpoint",
+        "shared-room",
+        "unknown",
+        "streaming",
+        "text",
+    ] {
+        let f = fixture("quiet");
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        let room = call["conversation_id"].as_str().unwrap();
+        // Keep the target nonterminal until all provenance/state variants are set.
+        terminal_fixture(&f, &call, "image-target", "streaming");
+        if case != "text" {
+            agent_conversations::attachments::receive(
+                &f.s,
+                room,
+                "image-target",
+                "Coach",
+                &json!({"type":"image","mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="}),
+            ).unwrap();
+        }
+        settlement_source(&f, &call, "image-source", "incorporated", "image-target");
+        {
+            let db = f.s.db.lock().unwrap();
+            match case {
+                "late" => {
+                    db.execute(
+                        "UPDATE messages SET created_at=?1 WHERE id='image-source'",
+                        [now_ms() - 31_000],
+                    )
+                    .unwrap();
+                }
+                "corrected" => {
+                    db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'later-human','transcript',?2,?3)", rusqlite::params![id,json!({"role":"user","text":"Actually, leave that for later."}).to_string(),now_ms()+1]).unwrap();
+                }
+                "old-call-source" => {
+                    db.execute("UPDATE messages SET created_at=(SELECT created_at-1 FROM companion_calls WHERE id=?1) WHERE id='image-source'", [id]).unwrap();
+                }
+                "other-owner" => {
+                    db.execute(
+                        "UPDATE messages SET actor='someone-else' WHERE id='image-source'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "other-agent" => {
+                    db.execute(
+                        "UPDATE messages SET agent_id='someone-else' WHERE id='image-target'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "changed-endpoint" => {
+                    db.execute("UPDATE agent_endpoints SET config=json_set(config,'$.label','Changed endpoint') WHERE id='default'", []).unwrap();
+                }
+                "shared-room" => {
+                    db.execute("UPDATE conversations SET shared=1 WHERE id=?1", [room])
+                        .unwrap();
+                }
+                "unknown" => {
+                    db.execute(
+                        "UPDATE input_deliveries SET state='unknown' WHERE id='image-source'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+        }
+        if case == "closed" {
+            end(&f, id).await;
+        }
+        if case != "streaming" {
+            f.s.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE messages SET status='complete' WHERE id='image-target'",
+                    [],
+                )
+                .unwrap();
+        }
+        if ["unknown", "streaming", "other-agent", "changed-endpoint"].contains(&case) {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        } else {
+            wait_delegation(&f, &call, "image-source", "completed").await;
+        }
+        let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+        let cards = record["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "card")
+            .collect::<Vec<_>>();
+        if ["unknown", "streaming", "other-agent", "changed-endpoint"].contains(&case) {
+            assert!(
+                cards.is_empty(),
+                "{case}: incomplete or unrelated output must not publish"
+            );
+        } else {
+            assert_eq!(cards.len(), 1, "{case}");
+            assert_eq!(cards[0]["data"]["presentation"], "later", "{case}");
+        }
+        assert!(
+            !f.home.path().join("acp.jsonl").exists(),
+            "{case}: presentation must not dispatch work"
+        );
+        if case != "closed" {
+            end(&f, id).await;
+        }
+    }
 }
 
 #[tokio::test]

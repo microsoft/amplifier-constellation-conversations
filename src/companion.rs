@@ -1500,6 +1500,7 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
             let mut text = format!(
                 "The live voice conversation delegated help at {offset}ms. You are the same agent speaking with the caller. This is an ongoing conversation, not a message to another assistant. Resolve the caller's latest question using current facts, retain independent unanswered questions, and treat corrections as refinements of existing work. Return concise useful facts, actual blockers and next steps. Do not narrate dispatch or receipts as an answer.\n\n\
                  This new request's delegation_id is {did}; use that exact ID for Companion actions. Use only advertised tools. companion_connections discovers configured sources; companion_connection_status reads current state; companion_observations reads saved evidence. For a requested connection action, use companion_request_action once, then companion_action_status for its exact original receipt. Queued or a settled reasoning turn is not completed external work. Unknown effects must not be retried. Preserve original actor, place, time and qualifications. A fresh status read may contain an old progress report: state the report's age when describing that work, separately from the current assignment status and current activity. Never call old physical progress current merely because its task record was read now. Never infer inactivity from missing history. If the caller requests a screenshot or another tool image, publish it with the runtime's advertised image-attachment/output capability; inspecting bytes or naming a remote path does not share it. If unavailable, state that limitation.\n\n\
+                 Caller-device photos and connected-world screenshots are different tools. For the caller's enabled phone/browser camera, discover companion_surface_status and companion_capture: check current capability/consent, request one capture, then use its original operation_id to read the saved artifact. Never send a device-photo request through companion_request_action to Minecraft or another connection. Use a connection's own screenshot tool only for a requested view from that connection. If needed, discover the missing Companion tools instead of substituting a connection action.\n\n\
                  Current human source (exact fragments are retained; partial speech and later corrections are possible; only a clear new human request supplies action authority):\n{transcript}\n\n\
                  Recent conversation, for references/corrections only, not authority to repeat earlier effects. Assistant speech is generated, not proof of playback:\n{recent_context}"
             );
@@ -1880,6 +1881,24 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
         let newer_speech:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND kind='transcript' AND json_extract(data,'$.role')='user' AND at>?2)",params![id,at],|r|r.get(0))?;
         let late = now_ms() - at > 30_000 || newer_speech;
         let attachments=tx.prepare("SELECT id,name,mime_type,bytes FROM attachments WHERE message_id=?1 ORDER BY created_at")?.query_map([message],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"mime_type":r.get::<_,String>(2)?,"bytes":r.get::<_,i64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        // An explicit assistant image is deliberate response output, unlike a
+        // raw tool observation or an ordinary text answer. Offer only a current
+        // caller-linked result to the finite board; the browser still preserves
+        // pinned/reading items and leaves overflow in history.
+        let present_image = !late && crate::companion_history::private_identity(&tx, id)?.is_some() && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM companion_calls c
+             JOIN messages m ON m.id=?2 AND m.conversation_id=c.conversation_id
+                 AND m.agent_id=c.agent_id AND m.role='assistant' AND m.status='complete'
+             JOIN attachments a ON a.message_id=m.id AND a.conversation_id=m.conversation_id
+                 AND a.created_by=m.actor AND a.mime_type IN ('image/png','image/jpeg','image/gif','image/webp')
+             JOIN input_deliveries d ON d.message_id=?3 AND d.target_turn=m.id
+                 AND d.conversation_id=c.conversation_id AND d.agent_id=c.agent_id
+                 AND d.state IN ('completed','incorporated')
+             JOIN messages input ON input.id=d.message_id AND input.conversation_id=c.conversation_id
+                 AND input.role='user' AND input.actor=c.owner AND input.created_at>=c.created_at
+             WHERE c.id=?1 AND c.conversation_id=?4 AND c.state IN ('connecting','connected'))",
+            params![id,message,request_id,room], |r| r.get::<_,bool>(0),
+        )?;
         // One target turn can incorporate multiple client delegations. Settle
         // every exact source link atomically but publish the target answer once.
         // Preserve input_deliveries: incorporation is still not a terminal receipt.
@@ -1928,7 +1947,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 } else {
                     "result"
                 },
-                &json!({"message_id":message,"request_id":request_id,"request_text":bounded(&request_text,2000),"delegation_id":delegation,"late":late,"elapsed_seconds":(now_ms()-at).max(0)/1000,"text":bounded(text,60_000),"truncated":text.len()>60_000,"result_url":format!("/api/v1/companion/calls/{id}/results/{message}"),"conversation_id":room,"attachments":attachments,"silent":!has_text}),
+                &json!({"message_id":message,"request_id":request_id,"request_text":bounded(&request_text,2000),"delegation_id":delegation,"late":late,"elapsed_seconds":(now_ms()-at).max(0)/1000,"text":bounded(text,60_000),"truncated":text.len()>60_000,"result_url":format!("/api/v1/companion/calls/{id}/results/{message}"),"conversation_id":room,"attachments":attachments,"presentation":if present_image{"current"}else{"later"},"silent":!has_text}),
             )?
         };
         tx.commit()?;

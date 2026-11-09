@@ -2138,6 +2138,7 @@ async fn requested_status_preserves_old_progress_before_an_undated_backend_summa
     assert!(commands.iter().all(|v| v["channel"] == "thinking"));
     let text = commands[0]["content"].as_str().unwrap();
     assert!(text.contains(&format!("progress.at {old}")));
+    assert!(text.contains("progress report about 4 hours old at read"));
     assert!(text.contains(&format!("observed {observed}")));
     assert!(text.contains(&format!("Report source time {observed}")));
     assert!(text.contains("does not establish active physical work"));
@@ -2363,4 +2364,46 @@ async fn requested_qualifier_revisions_replace_only_unsent_same_source_context()
             .is_none()
     );
     assert!(calls(&f, "decision").is_empty());
+}
+
+#[test]
+fn requested_source_age_is_deterministic_and_never_refreshes_invalid_or_future_time() {
+    let read = json!(1794247200000_i64); // 2026-11-09T18:00:00Z
+    assert_eq!(
+        source_age_at_read(&json!("2026-11-09T14:00:00Z"), &read),
+        "about 4 hours old at read"
+    );
+    assert_eq!(
+        source_age_at_read(&json!("2026-11-09T06:00:00-08:00"), &read),
+        "about 4 hours old at read"
+    );
+    assert_eq!(
+        source_age_at_read(&json!(1794232800000_i64), &read),
+        "about 4 hours old at read"
+    );
+    for (at, expected) in [
+        (1794247199999_i64, "less than a minute old at read"),
+        (1794247140000, "about 1 minute old at read"),
+        (1794243600000, "about 1 hour old at read"),
+        (1794160800000, "about 1 day old at read"),
+    ] {
+        assert_eq!(source_age_at_read(&json!(at), &read), expected);
+    }
+    for invalid in [
+        Value::Null,
+        json!("yesterday"),
+        json!(0),
+        json!(-1),
+        json!(i64::MAX),
+    ] {
+        assert_eq!(source_age_at_read(&invalid, &read), "age unknown at read");
+    }
+    assert_eq!(
+        source_age_at_read(&json!("2026-11-09T18:00:01Z"), &read),
+        "future-dated relative to this read; age unknown"
+    );
+    assert_eq!(
+        source_age_at_read(&read, &Value::Null),
+        "age unknown at read"
+    );
 }

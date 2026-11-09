@@ -251,7 +251,7 @@ pub(crate) fn original_human_source_time(
     );
     let mut earliest = None;
     let mut seen = std::collections::HashSet::new();
-    for fragment in fragments.iter().filter(|f| f["role"] == "user") {
+    for fragment in fragments {
         let seq = fragment["seq"]
             .as_i64()
             .filter(|v| *v > 0)
@@ -265,21 +265,24 @@ pub(crate) fn original_human_source_time(
             row.ok_or_else(|| anyhow::anyhow!("Original human transcript is unavailable"))?;
         let event: Value = serde_json::from_str(&raw)?;
         ensure!(
-            event["role"] == "user"
+            matches!(event["role"].as_str(), Some("user" | "assistant"))
                 && at > 0
-                && fragment["text"]
-                    .as_str()
-                    .is_some_and(|text| !text.trim().is_empty())
+                && fragment["text"].is_string()
                 && fragment["start_ms"].as_i64().is_some_and(|n| n >= 0)
                 && fragment["end_ms"]
                     .as_i64()
                     .is_some_and(|n| n >= fragment["start_ms"].as_i64().unwrap())
-                && ["event_id", "text", "start_ms", "end_ms"]
+                && ["role", "event_id", "text", "start_ms", "end_ms"]
                     .iter()
                     .all(|key| fragment[key] == event[key]),
             "Original human transcript changed"
         );
-        earliest = Some(earliest.map_or(at, |prior: i64| prior.min(at)));
+        // Streaming transcripts can contain legitimate whitespace fragments.
+        // Validate them exactly, but only substantive human speech supplies the
+        // action's original time; assistant context never grants authority.
+        if event["role"] == "user" && !fragment["text"].as_str().unwrap().trim().is_empty() {
+            earliest = Some(earliest.map_or(at, |prior: i64| prior.min(at)));
+        }
     }
     ensure!(
         earliest.is_some(),
@@ -1127,6 +1130,37 @@ pub(crate) fn preserve_requested_status(
     Ok(())
 }
 
+// Age is a deterministic qualification of the original source time at this read,
+// not a new observation. Keep exact timestamps beside the human-readable form.
+fn source_age_at_read(timestamp: &Value, read_at: &Value) -> String {
+    let source_at = observed_time(timestamp).or_else(|| {
+        timestamp.as_i64().filter(|at| {
+            *at > 0
+                && time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(*at) * 1_000_000)
+                    .is_ok()
+        })
+    });
+    let Some((source_at, read_at)) = source_at.zip(read_at.as_i64().filter(|at| *at > 0)) else {
+        return "age unknown at read".into();
+    };
+    let Some(age) = read_at.checked_sub(source_at).filter(|age| *age >= 0) else {
+        return "future-dated relative to this read; age unknown".into();
+    };
+    let (amount, unit) = if age >= 86_400_000 {
+        (age / 86_400_000, "day")
+    } else if age >= 3_600_000 {
+        (age / 3_600_000, "hour")
+    } else if age >= 60_000 {
+        (age / 60_000, "minute")
+    } else {
+        return "less than a minute old at read".into();
+    };
+    format!(
+        "about {amount} {unit}{} old at read",
+        if amount == 1 { "" } else { "s" }
+    )
+}
+
 fn requested_report_qualifier(source: &Source, report: &Value, response: &Value) -> String {
     let attribution = &report["attribution"];
     let actor = attribution["actor"].as_str().unwrap_or("source");
@@ -1151,13 +1185,15 @@ fn requested_report_qualifier(source: &Source, report: &Value, response: &Value)
                     .unwrap_or_else(|| at.to_string())
             })
             .unwrap_or_else(|| "not recorded or invalid".into());
+        let progress_age = source_age_at_read(&task["progress"]["at"], &response["queried_at"]);
         return format!(
-            "{} / {actor} [{report_id}]: assignment {state} observed {observed}. Report source time {occurred}; progress.at {progress}. Current assignment state does not establish active physical work or newly verified progress.",
+            "{} / {actor} [{report_id}]: progress report {progress_age}; progress.at {progress}. Assignment {state} snapshot observed {observed}. Report source time {occurred}. Assignment status does not establish active physical work or newly verified progress.",
             source.label
         );
     }
+    let report_age = source_age_at_read(&attribution["occurred_at"], &response["queried_at"]);
     format!(
-        "{} / {actor} [{report_id}]: original report time {occurred}; observation time {observed}. This is a dated source report, not proof of a recent action or independent verification.",
+        "{} / {actor} [{report_id}]: original report {report_age}, time {occurred}; observation time {observed}. This is a dated source report, not proof of a recent action or independent verification.",
         source.label
     )
 }

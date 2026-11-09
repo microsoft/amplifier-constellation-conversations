@@ -34,6 +34,12 @@ and an item the caller is reading are protected; an incompatible change fails
 without partially rearranging the board. The caller can unpin or move an item to
 history. A saved presentation request is not confirmation that it is on screen.
 
+An image explicitly attached by the agent to a completed answer in the current
+call also requests whiteboard space. This requires an exact link to the caller's
+request and the same agent, connection, and private audience. Late or unlinked
+images remain in history. The request still respects pinned items, the item being
+read, and the three-item limit; receipt of an image does not prove it was visible.
+
 An explicit **Paste** control opens a text composer; pasted images use the saved
 upload path. A receipt says when material is available. New content follows the
 bottom only while the caller is already near the bottom; reading older content
