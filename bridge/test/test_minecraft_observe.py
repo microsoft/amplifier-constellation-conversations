@@ -296,6 +296,10 @@ class MinecraftObserveTests(unittest.TestCase):
         with patch.object(helper, "MAX_EVENTS", 16):
             batches = self.drain_burst()
         self.assertEqual(len(batches[0]["events"]), 16)
+        self.assertEqual([e["kind"] for e in batches[0]["events"][:2]], ["task_observation", "presence_observation"])
+        physical = json.loads(batches[0]["events"][1]["text"])
+        self.assertEqual(physical["position"], self.presence["position"])
+        self.assertEqual(physical["players"][0]["name"], "Brian")
         self.assertEqual(batches[0]["coverage"]["deferred_events"], 7)
         self.assertEqual(len(batches[1]["events"]), 7)
 
@@ -304,6 +308,7 @@ class MinecraftObserveTests(unittest.TestCase):
         with patch.object(helper, "MAX_OUTPUT", 80000):
             batches = self.drain_burst()
         self.assertTrue(batches[0]["coverage"]["output_truncated"])
+        self.assertEqual([e["kind"] for e in batches[0]["events"][:2]], ["task_observation", "presence_observation"])
         self.assertLess(len(batches[0]["events"]), 23)
         self.assertGreater(batches[0]["coverage"]["deferred_events"], 0)
 

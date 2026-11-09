@@ -86,6 +86,11 @@ pub fn migrate(db: &rusqlite::Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS companion_observers(call_id TEXT NOT NULL,connection_id TEXT NOT NULL,cursor TEXT NOT NULL,coverage TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(call_id,connection_id)); CREATE TABLE IF NOT EXISTS companion_observations(call_id TEXT NOT NULL,request_id TEXT NOT NULL,revision TEXT NOT NULL,data TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(call_id,request_id)); CREATE TABLE IF NOT EXISTS companion_awareness(call_id TEXT NOT NULL,event_key TEXT NOT NULL,connection_id TEXT NOT NULL,data TEXT NOT NULL,decision TEXT,state TEXT NOT NULL,created_at INTEGER NOT NULL,policy_hash TEXT NOT NULL DEFAULT '',PRIMARY KEY(call_id,event_key));")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS companion_awareness_appends(call_id TEXT NOT NULL,event_key TEXT NOT NULL,event_id TEXT NOT NULL,channel TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(call_id,event_id));")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS companion_action_observers(call_id TEXT NOT NULL,request_id TEXT NOT NULL,connection_id TEXT NOT NULL,source_hash TEXT NOT NULL,PRIMARY KEY(call_id,request_id));")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS companion_awareness_decisions(call_id TEXT NOT NULL,event_key TEXT NOT NULL,context_revision TEXT NOT NULL,request_id TEXT NOT NULL,state TEXT NOT NULL,decision TEXT,created_at INTEGER NOT NULL,PRIMARY KEY(call_id,event_key,context_revision));")?;
+    db.execute(
+        "UPDATE companion_awareness_decisions SET state='unknown' WHERE state='deciding'",
+        [],
+    )?;
     let columns = db
         .prepare("PRAGMA table_info(companion_awareness)")?
         .query_map([], |r| r.get::<_, String>(1))?
@@ -962,10 +967,26 @@ pub(crate) async fn connection_status(
     if !result["actions"].as_array().is_some_and(Vec::is_empty) {
         return Ok(empty("unavailable"));
     }
+    // A busy historical chat must not hide the selected connection's current
+    // task or physical snapshot. Keep each source fact whole and attributed.
+    let mut ordered: Vec<_> = events.iter().collect();
+    ordered.sort_by_key(|event| {
+        let priority = if current_snapshot(event) {
+            0
+        } else if event["kind"] == "presence_observation" {
+            1
+        } else {
+            2
+        };
+        (
+            priority,
+            std::cmp::Reverse(observed_time(&event["occurred_at"]).unwrap_or(0)),
+        )
+    });
     let mut reports = Vec::new();
     let mut bytes = 0;
     let mut eligible = 0;
-    for event in events {
+    for event in ordered {
         if !source.audiences.contains(&event["audience"])
             || observed_time(&event["occurred_at"]).is_none_or(|at| at > now + 5000)
         {
@@ -1555,8 +1576,7 @@ fn record_source_event(
     tx.commit()?;
     Ok(true)
 }
-fn transcript(s: &AppState, id: &str) -> Result<Vec<Value>> {
-    let db = s.db.lock().unwrap();
+fn transcript_in(db: &rusqlite::Connection, id: &str) -> Result<Vec<Value>> {
     let mut st=db.prepare("SELECT data FROM companion_events WHERE call_id=?1 AND kind='transcript' ORDER BY seq DESC LIMIT 128")?;
     let rows = st
         .query_map([id], |r| r.get::<_, String>(0))?
@@ -1595,6 +1615,149 @@ fn transcript(s: &AppState, id: &str) -> Result<Vec<Value>> {
         grouped.drain(..grouped.len() - 16);
     }
     Ok(grouped)
+}
+
+/// Preserve human selection independently of the volume of generated speech.
+/// These are retained fragments and request labels, not inferred final turns.
+fn request_context_in(db: &rusqlite::Connection, id: &str) -> Result<Value> {
+    let total_human:i64=db.query_row("SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='transcript' AND json_extract(data,'$.role')='user'",[id],|r|r.get(0))?;
+    let mut st=db.prepare("SELECT event_key,data FROM companion_events WHERE call_id=?1 AND kind='transcript' AND json_extract(data,'$.role')='user' ORDER BY seq DESC LIMIT 128")?;
+    let rows = st
+        .query_map([id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut human = Vec::new();
+    let mut bytes = 0;
+    for (key, raw) in rows {
+        let data: Value = serde_json::from_str(&raw)?;
+        let Some(text) = data["text"].as_str().filter(|text| !text.trim().is_empty()) else {
+            continue;
+        };
+        if human.len() >= 32 || bytes + text.len() > 4000 {
+            break;
+        }
+        bytes += text.len();
+        human.push(json!({"id":key,"text":text}));
+    }
+    human.reverse();
+    let total_requests: i64 = db.query_row(
+        "SELECT COUNT(*) FROM companion_delegations WHERE call_id=?1 AND request_text IS NOT NULL",
+        [id],
+        |r| r.get(0),
+    )?;
+    let mut st=db.prepare("SELECT id,request_text FROM companion_delegations WHERE call_id=?1 AND request_text IS NOT NULL ORDER BY created_at DESC,rowid DESC LIMIT 8")?;
+    let rows = st
+        .query_map([id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut requests = Vec::new();
+    let mut bytes = 0;
+    for (key, text) in rows {
+        if text.trim().is_empty() {
+            continue;
+        }
+        if requests.len() >= 4 || bytes + text.len() > 4000 {
+            break;
+        }
+        bytes += text.len();
+        requests.push(json!({"id":key,"text":text}));
+    }
+    requests.reverse();
+    Ok(
+        json!({"omitted_human_fragments":total_human-human.len() as i64,"omitted_requests":total_requests-requests.len() as i64,"human_fragments":human,"requests":requests}),
+    )
+}
+
+/// This is a relevance version, never a claim that silence completed a thought.
+/// Exact human fragments and explicit request identities invalidate old advice;
+/// generated assistant speech cannot silently change the caller's selection.
+fn human_context_revision(db: &rusqlite::Connection, id: &str) -> Result<String> {
+    let mut events = db.prepare("SELECT seq,data FROM companion_events WHERE call_id=?1 AND kind='transcript' AND json_extract(data,'$.role')='user' ORDER BY seq DESC LIMIT 128")?;
+    let events = events
+        .query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut requests = db.prepare("SELECT id,source,request_text FROM companion_delegations WHERE call_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 8")?;
+    let requests = requests
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(auth::digest(&json!([events, requests]).to_string()))
+}
+
+/// Validate the host's declared advisory policy, not a model-generated action.
+/// Predicate probabilities remain probabilities; legacy choice confidence is
+/// retained only for already enrolled older helper compatibility.
+fn decision_policy(decision: &Value) -> Option<(&'static str, bool)> {
+    if let Some(assessment) = decision.get("assessment").filter(|v| !v.is_null()) {
+        let object = assessment.as_object()?;
+        if object.len() != 3
+            || assessment["kind"] != "relevance_and_proactive_v1"
+            || !decision["confidence"].is_null()
+            || !decision["selected_probability"].is_null()
+            || !decision["provider_choice"].is_null()
+        {
+            return None;
+        }
+        let relevant = assessment["relevant_probability"]
+            .as_f64()
+            .filter(|v| (0.0..=1.0).contains(v))?;
+        let proactive = assessment["proactive_probability"]
+            .as_f64()
+            .filter(|v| (0.0..=1.0).contains(v))?;
+        let (expected, reason, state, notify) = if relevant <= 0.20 {
+            ("ignore", "irrelevant", "ignored", false)
+        } else if relevant >= 0.85 && proactive >= 0.90 {
+            ("notify", "relevant_proactive", "ready", true)
+        } else if relevant >= 0.85 {
+            ("quiet", "relevant_context", "ready", false)
+        } else {
+            ("quiet", "uncertain_relevance", "retained", false)
+        };
+        return (decision["decision"] == expected && decision["reason"] == reason)
+            .then_some((state, notify));
+    }
+    let confidence = decision["confidence"]
+        .as_f64()
+        .filter(|v| (0.0..=1.0).contains(v))?;
+    let selected = decision["selected_probability"]
+        .as_f64()
+        .filter(|v| (0.0..=1.0).contains(v))?;
+    let choice = decision["provider_choice"].as_str()?;
+    if !["ignore", "quiet", "later", "notify"].contains(&choice) {
+        return None;
+    }
+    let presentation = decision["decision"].as_str()?;
+    if !["ignore", "quiet", "later", "notify"].contains(&presentation) {
+        return None;
+    }
+    if presentation == "ignore" {
+        return Some(("ignored", false));
+    }
+    if decision["reason"] == "low_confidence"
+        || confidence < 0.6
+        || choice == "ignore"
+        || (choice == "quiet" && presentation != "quiet")
+    {
+        return Some(("retained", false));
+    }
+    Some((
+        "ready",
+        presentation == "notify" && choice == "notify" && confidence >= 0.8 && selected >= 0.8,
+    ))
+}
+
+fn ambient_relevance(event: &Value) -> bool {
+    !matches!(
+        event["kind"].as_str(),
+        Some("requested_status_qualifier" | "action_status")
+    )
 }
 fn save_observation(s: &AppState, id: &str, source: &Source, update: &Value) -> Result<bool> {
     let changed = {
@@ -1786,40 +1949,65 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
         {
             return Ok(());
         }
-        // Persist intent BEFORE spawning the paid helper. Uncertain calls never retry.
-        let claimed=s.db.lock().unwrap().execute("UPDATE companion_awareness SET state='deciding' WHERE call_id=?1 AND event_key=?2 AND state='pending'",params![id,key])?;
-        if claimed != 1 {
-            continue;
-        }
+        // Evaluate only at an observed conversational opportunity, using the
+        // same authenticated floor as delivery. This is not a semantic end-of-
+        // turn claim. The exact human context is checked again after the paid
+        // result and at final transport dispatch.
+        let (context_revision, transcript, request_context) = {
+            let mut db = s.db.lock().unwrap();
+            let tx = db.transaction()?;
+            if !crate::companion_delivery::floor_open_in(&tx, id)? {
+                continue;
+            }
+            let revision = human_context_revision(&tx, id)?;
+            let request_id = format!("{key}:{}", &revision[..16]);
+            let inserted = tx.execute("INSERT OR IGNORE INTO companion_awareness_decisions(call_id,event_key,context_revision,request_id,state,created_at) VALUES(?1,?2,?3,?4,'deciding',?5)",params![id,key,revision,request_id,now_ms()])?;
+            if inserted != 1 {
+                // An existing/uncertain provider operation for this exact
+                // context is evidence, never permission to repeat it.
+                tx.execute("UPDATE companion_awareness SET state='retained' WHERE call_id=?1 AND event_key=?2 AND state='pending'",params![id,key])?;
+                tx.commit()?;
+                continue;
+            }
+            let claimed=tx.execute("UPDATE companion_awareness SET state='deciding' WHERE call_id=?1 AND event_key=?2 AND state='pending'",params![id,key])?;
+            if claimed != 1 {
+                continue;
+            }
+            let transcript = transcript_in(&tx, id)?;
+            let request_context = request_context_in(&tx, id)?;
+            tx.commit()?;
+            (revision, transcript, request_context)
+        };
+        let request_id = format!("{key}:{}", &context_revision[..16]);
         let (user, agent, at) = crate::companion_surface::activity(s, id)?;
-        let request = json!({"version":1,"request_id":key,"event":{"id":event["id"],"revision":event["revision"],"source":source.label,"connection_id":source.id,"actor":event["actor"],"audience":"installation-authorized call owner","kind":event["kind"],"text":event["text"],"occurred_at":event["occurred_at"]},"transcript":transcript(s,id)?,"guidance":c.guidance,"context":{"user_speaking":if now_ms()-at<=5000{user}else{None},"agent_speaking":if now_ms()-at<=5000{agent}else{None}}});
-        let decision = invoke(&c.decision_command, &request, true).await.unwrap_or(
-            json!({"status":"fallback","decision":"later","reason":"helper_unavailable"}),
+        let request = json!({"version":1,"request_id":request_id,"event":{"id":event["id"],"revision":event["revision"],"source":source.label,"connection_id":source.id,"actor":event["actor"],"audience":"installation-authorized call owner","kind":event["kind"],"text":event["text"],"occurred_at":event["occurred_at"]},"transcript":transcript,"request_context":request_context,"guidance":c.guidance,"context":{"user_speaking":if now_ms()-at<=5000{user}else{None},"agent_speaking":if now_ms()-at<=5000{agent}else{None}}});
+        let mut decision = invoke(&c.decision_command, &request, true).await.unwrap_or(
+            json!({"status":"fallback","decision":"quiet","reason":"helper_unavailable"}),
         );
+        let policy = decision_policy(&decision);
         let valid = decision["version"] == 1
-            && decision["request_id"] == key
+            && decision["request_id"] == request_id
             && decision["event_id"] == event["id"]
             && decision["model"] == "gpt-6-luna"
             && decision["status"] == "decided"
-            && decision["confidence"]
-                .as_f64()
-                .is_some_and(|v| (0.0..=1.0).contains(&v))
-            && decision["selected_probability"]
-                .as_f64()
-                .is_some_and(|v| (0.0..=1.0).contains(&v))
-            && ["ignore", "quiet", "later", "notify"]
-                .contains(&decision["decision"].as_str().unwrap_or(""));
-        let state = if valid && decision["decision"] == "ignore" {
-            "ignored"
-        } else if valid && decision["status"] == "decided" {
-            "ready"
-        } else {
-            "retained"
+            && policy.is_some();
+        if !decision.is_object() {
+            decision = json!({"status":"fallback","decision":"quiet","reason":"invalid_response"});
+        }
+        decision["context_revision"] = json!(context_revision);
+        let state = {
+            let db = s.db.lock().unwrap();
+            let state = if valid && human_context_revision(&db, id)? != context_revision {
+                "pending"
+            } else if valid {
+                policy.unwrap().0
+            } else {
+                "retained"
+            };
+            db.execute("UPDATE companion_awareness_decisions SET state=?4,decision=?5 WHERE call_id=?1 AND event_key=?2 AND context_revision=?3",params![id,key,context_revision,if valid {"settled"}else{"unknown"},decision.to_string()])?;
+            db.execute("UPDATE companion_awareness SET state=?3,decision=?4 WHERE call_id=?1 AND event_key=?2",params![id,key,state,decision.to_string()])?;
+            state
         };
-        s.db.lock().unwrap().execute(
-            "UPDATE companion_awareness SET state=?3,decision=?4 WHERE call_id=?1 AND event_key=?2",
-            params![id, key, state, decision.to_string()],
-        )?;
         if state != "ignored"
             && active(s, id)?.is_some()
             && auth::check(s, h, "chat", false).is_ok()
@@ -1849,6 +2037,16 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
     if let Some((key, data, decision)) = ready {
         let event: Value = serde_json::from_str(&data)?;
         let decision: Value = serde_json::from_str(&decision)?;
+        {
+            let db = s.db.lock().unwrap();
+            if ambient_relevance(&event)
+                && decision["context_revision"].as_str()
+                    != Some(human_context_revision(&db, id)?.as_str())
+            {
+                db.execute("UPDATE companion_awareness SET state='pending' WHERE call_id=?1 AND event_key=?2 AND state='ready'",params![id,key])?;
+                return Ok(());
+            }
+        }
         if !fresh(&event, call_at, now_ms()) {
             s.db.lock().unwrap().execute(
                 "UPDATE companion_awareness SET state='stale' WHERE call_id=?1 AND event_key=?2",
@@ -1858,14 +2056,7 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
         }
         let notify = decision["status"] == "decided"
             && decision["model"] == "gpt-6-luna"
-            && decision["decision"] == "notify"
-            && decision["provider_choice"] == "notify"
-            && decision["confidence"]
-                .as_f64()
-                .is_some_and(|v| (0.8..=1.0).contains(&v))
-            && decision["selected_probability"]
-                .as_f64()
-                .is_some_and(|v| (0.8..=1.0).contains(&v));
+            && decision_policy(&decision).is_some_and(|(_, notify)| notify);
         let connection: String = s.db.lock().unwrap().query_row(
             "SELECT connection_id FROM companion_awareness WHERE call_id=?1 AND event_key=?2",
             params![id, key],
@@ -1882,8 +2073,9 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
         // Receipt retention is independent of the caller's conversational floor.
         let speak = notify && parts.len() == 1;
         let channel = if speak { "commentary" } else { "thinking" };
+        let context = decision["context_revision"].as_str().unwrap_or("legacy");
         let commands: Vec<_> = parts.iter().enumerate().map(|(index, content)| {
-            let event_id = if parts.len() == 1 {format!("awareness-{key}")} else {format!("awareness-{key}:{index}")};
+            let event_id = format!("awareness-{key}:{}:{index}", &context[..context.len().min(16)]);
             json!({"op":"append","channel":channel,"event_id":event_id,"delegation_id":null,"content":content})
         }).collect();
         {
@@ -1941,8 +2133,8 @@ pub(crate) fn presentation_allowed(
         return Ok(false);
     };
     for key in awareness {
-        let row:Option<(String,String,String)>=db.query_row("SELECT connection_id,data,policy_hash FROM companion_awareness WHERE call_id=?1 AND event_key=?2",params![call,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        let Some((connection, raw, policy)) = row else {
+        let row:Option<(String,String,String,Option<String>)>=db.query_row("SELECT connection_id,data,policy_hash,decision FROM companion_awareness WHERE call_id=?1 AND event_key=?2",params![call,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let Some((connection, raw, policy, decision)) = row else {
             return Ok(false);
         };
         if policy != fingerprint {
@@ -1958,6 +2150,24 @@ pub(crate) fn presentation_allowed(
             return Ok(false);
         };
         let event: Value = serde_json::from_str(&raw)?;
+        if ambient_relevance(&event) {
+            let decision: Value = decision
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            if decision["context_revision"].as_str()
+                != Some(human_context_revision(db, call)?.as_str())
+            {
+                // This batch has not crossed the transport boundary. Withdraw
+                // it, preserving its evidence, then assess the settled prior
+                // decision against the new human context on a later tick.
+                if decision["status"] == "decided" {
+                    db.execute("UPDATE companion_awareness SET state='pending' WHERE call_id=?1 AND event_key=?2 AND state='context_queued'",params![call,key])?;
+                    db.execute("UPDATE companion_awareness_appends SET state='withdrawn' WHERE call_id=?1 AND event_key=?2 AND state='queued'",params![call,key])?;
+                }
+                return Ok(false);
+            }
+        }
         let private = event["audience"] == json!({"kind":"private","owner":identity.owner})
             && bound_private_event(db, call, source, &event)?;
         if !private && !source.audiences.contains(&event["audience"]) {
@@ -2000,7 +2210,7 @@ pub(crate) fn provider_event(s: &AppState, id: &str, event: &Value) -> Result<()
     if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(());
     }
-    let part: Option<String> = s.db.lock().unwrap().query_row("SELECT channel FROM companion_awareness_appends WHERE call_id=?1 AND event_key=?2 AND event_id=?3",params![id,key,client],|r|r.get(0)).optional()?;
+    let part: Option<String> = s.db.lock().unwrap().query_row("SELECT channel FROM companion_awareness_appends WHERE call_id=?1 AND event_key=?2 AND event_id=?3 AND state!='withdrawn'",params![id,key,client],|r|r.get(0)).optional()?;
     if let Some(channel) = part {
         if kind != "error" && kind != format!("session.{channel}.appended") {
             return Ok(());
@@ -2015,7 +2225,7 @@ pub(crate) fn provider_event(s: &AppState, id: &str, event: &Value) -> Result<()
         let mut db = s.db.lock().unwrap();
         let tx = db.transaction()?;
         tx.execute("UPDATE companion_awareness_appends SET state=?4 WHERE call_id=?1 AND event_key=?2 AND event_id=?3 AND state='queued'",params![id,key,client,next])?;
-        let (total, accepted, rejected, unknown): (i64,i64,i64,i64) = tx.query_row("SELECT COUNT(*),SUM(state='accepted'),SUM(state='rejected'),SUM(state='unknown') FROM companion_awareness_appends WHERE call_id=?1 AND event_key=?2",params![id,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let (total, accepted, rejected, unknown): (i64,i64,i64,i64) = tx.query_row("SELECT COUNT(*),SUM(state='accepted'),SUM(state='rejected'),SUM(state='unknown') FROM companion_awareness_appends WHERE call_id=?1 AND event_key=?2 AND state!='withdrawn'",params![id,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         let state = if rejected > 0 {
             "context_rejected"
         } else if unknown > 0 {

@@ -72,7 +72,7 @@ p=pathlib.Path(__file__).parent
 body=json.load(sys.stdin)
 with (p/'observer-calls.jsonl').open('a') as f:f.write(json.dumps(body)+'\n')
 (p/'observer-entered').write_text('entered')
-while (p/'observer-block').exists():time.sleep(.005)
+while (p/'observer-block').exists():time.sleep(0.005)
 print((p/'observer-result.json').read_text())
 "#,
     )
@@ -82,10 +82,19 @@ p=pathlib.Path(__file__).parent
 body=json.load(sys.stdin)
 with (p/'decision-calls.jsonl').open('a') as f:f.write(json.dumps(body)+'\n')
 (p/'decision-entered').write_text('entered')
-while (p/'decision-block').exists():time.sleep(.005)
+while (p/'decision-block').exists():time.sleep(0.005)
 mode=(p/'decision-mode').read_text() if (p/'decision-mode').exists() else 'quiet'
 if mode=='fail':sys.exit(1)
-result={'version':1,'request_id':body['request_id'],'event_id':body['event']['id'],'status':'decided','decision':'notify' if mode=='notify' else 'quiet','provider_choice':'notify' if mode=='notify' else 'quiet','confidence':.95,'selected_probability':.95,'model':'gpt-6-luna','reason':'provider_decision','model_requests':1}
+result={'version':1,'request_id':body['request_id'],'event_id':body['event']['id'],'status':'decided','decision':'notify' if mode=='notify' else 'quiet','provider_choice':'notify' if mode=='notify' else 'quiet','confidence':0.95,'selected_probability':0.95,'model':'gpt-6-luna','reason':'provider_decision','model_requests':1}
+if mode=='low-confidence':result.update(decision='later',provider_choice='quiet',confidence=0.19,selected_probability=0.39,reason='low_confidence')
+if mode.startswith('predicate-'):
+ for key in ['confidence','selected_probability','provider_choice']:result.pop(key)
+ result.update(assessment={'kind':'relevance_and_proactive_v1','relevant_probability':0.95,'proactive_probability':0.5},decision='quiet',reason='relevant_context')
+ if mode=='predicate-notify':result['assessment']['proactive_probability']=0.95;result.update(decision='notify',reason='relevant_proactive')
+ if mode=='predicate-uncertain':result['assessment']['relevant_probability']=0.5;result['reason']='uncertain_relevance'
+ if mode=='predicate-malformed':result['assessment']['relevant_probability']='yes'
+ if mode=='predicate-mismatch':result.update(decision='notify',reason='relevant_proactive')
+ if mode=='predicate-refused':result.update(status='fallback',assessment=None,reason='provider_refusal')
 if mode=='wrong-request':result['request_id']='another-request'
 if mode=='wrong-event':result['event_id']='another-event'
 if mode=='wrong-model':result['model']='different-model'
@@ -117,6 +126,9 @@ print(json.dumps(result))
         headers,
     };
     observations(&f, vec![source_event()]);
+    // Most worker fixtures explicitly model an authenticated quiet browser.
+    // Unknown/stale/speaking cases remove or change this observation themselves.
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,user_speaking,agent_speaking,updated_at) VALUES(?1,'browser','fixture',0,0,0,0,?2)",params![f.id,now_ms()]).unwrap();
     f
 }
 fn observations(f: &Fixture, events: Vec<Value>) {
@@ -311,8 +323,9 @@ async fn entered(f: &Fixture, name: &str) {
 }
 async fn run(f: &Fixture) -> Result<()> {
     tick(&f.s, &f.id, &f.headers).await?;
-    while let Some(batch) = crate::companion_delivery::take_ready(&f.s, &f.id)? {
-        if let Some(sender) = f.s.companion.controls.lock().unwrap().get(&f.id).cloned() {
+    let sender = f.s.companion.controls.lock().unwrap().get(&f.id).cloned();
+    if let Some(sender) = sender {
+        while let Some(batch) = crate::companion_delivery::take_ready(&f.s, &f.id)? {
             for command in batch["commands"].as_array().unwrap() {
                 let _ = sender.try_send(command.clone());
             }
@@ -331,7 +344,7 @@ async fn worker_deduplicates_before_paid_subprocess_and_refuses_changed_immutabl
     assert_eq!(cards(&f).len(), 1);
     let paid = calls(&f, "decision")[0].clone();
     assert_eq!(paid["event"]["revision"], "r1");
-    assert_eq!(paid["context"]["user_speaking"], Value::Null);
+    assert_eq!(paid["context"]["user_speaking"], false);
     let mut event = source_event();
     event["text"] = json!("Changed content under unchanged revision");
     observations(&f, vec![event.clone()]);
@@ -621,7 +634,7 @@ async fn official_nested_append_error_requires_unambiguous_identity_and_never_re
 
 #[tokio::test]
 async fn speaking_recent_transcript_or_unknown_floor_defers_even_high_confidence_notice() {
-    for blocked in ["speaking", "transcript", "stale-browser"] {
+    for blocked in ["speaking", "transcript", "stale-browser", "unknown-browser"] {
         let f = fixture();
         std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
         let mut rx = quiet_browser(&f);
@@ -638,8 +651,9 @@ async fn speaking_recent_transcript_or_unknown_floor_defers_even_high_confidence
                 "transcript" => {
                     db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'fragment','transcript',?2,?3)",params![f.id,json!({"role":"user","text":"Also wait because"}).to_string(),now_ms()]).unwrap();
                 }
-                "delegation" => {
-                    db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'pending',0,'waiting_transcript','not-admitted',?2)",params![f.id,now_ms()]).unwrap();
+                "unknown-browser" => {
+                    db.execute("DELETE FROM companion_surfaces WHERE call_id=?1", [&f.id])
+                        .unwrap();
                 }
                 _ => {
                     db.execute(
@@ -652,8 +666,9 @@ async fn speaking_recent_transcript_or_unknown_floor_defers_even_high_confidence
         }
         run(&f).await.unwrap();
         assert!(rx.try_recv().is_err(), "{blocked}");
-        assert_eq!(states(&f), vec!["context_queued"], "{blocked}");
-        assert_eq!(cards(&f).len(), 1);
+        assert_eq!(states(&f), vec!["pending"], "{blocked}");
+        assert!(cards(&f).is_empty(), "{blocked}");
+        assert!(calls(&f, "decision").is_empty(), "{blocked}");
     }
 }
 
@@ -2123,7 +2138,12 @@ async fn requested_status_preserves_old_progress_before_an_undated_backend_summa
     preserve_requested_status(&f.s, &f.id, &read).unwrap();
     let summary = "The assignment is running and the blue door linkage is unfinished.";
     crate::companion_delivery::enqueue_batch(&f.s, &f.id, "result:undated", vec![json!({"op":"append","channel":"commentary","event_id":"undated-result","delegation_id":null,"content":summary})]).unwrap();
-    // No authenticated quiet surface yet: neither qualification nor answer bypasses it.
+    // No authenticated quiet surface: neither qualification nor answer bypasses it.
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM companion_surfaces WHERE call_id=?1", [&f.id])
+        .unwrap();
     assert!(
         crate::companion_delivery::take_ready(&f.s, &f.id)
             .unwrap()
@@ -2406,4 +2426,330 @@ fn requested_source_age_is_deterministic_and_never_refreshes_invalid_or_future_t
         source_age_at_read(&read, &Value::Null),
         "age unknown at read"
     );
+}
+
+#[tokio::test]
+async fn explicit_status_reserves_current_physical_and_task_facts_before_historical_chat() {
+    let f = fixture();
+    let old = timestamp(now_ms() - 4 * 60 * 60 * 1000);
+    let mut events: Vec<Value> = (0..20)
+        .map(|index| {
+            let mut event = source_event();
+            event["id"] = json!(format!("historical-{index}"));
+            event["occurred_at"] = json!(old);
+            event["kind"] = json!("message");
+            event
+        })
+        .collect();
+    let mut physical = source_event();
+    physical["id"] = json!("current-physical");
+    physical["kind"] = json!("presence_observation");
+    physical["text"] = json!(r#"{"position":{"x":17,"y":64,"z":3},"players":[],"busy":false}"#);
+    events.push(physical);
+    let mut task = source_event();
+    task["id"] = json!("current-task");
+    task["kind"] = json!("task_observation");
+    task["observed_at"] = json!(timestamp(now_ms()));
+    task["provenance"] = json!({"kind":"minecraft_current_task","current_state_snapshot":true});
+    task["text"] = json!(
+        json!({"status":"running","progress":{"at":old,"text":"Inspection still pending."}})
+            .to_string()
+    );
+    events.push(task);
+    fresh_result(&f, events);
+    let read = connection_status(&f.s, &f.id, "minecraft").await.unwrap();
+    assert_eq!(read["reports"].as_array().unwrap().len(), 16);
+    assert_eq!(read["reports"][0]["id"], "current-task");
+    assert_eq!(read["reports"][1]["id"], "current-physical");
+    assert_eq!(read["omitted"], 6);
+    assert_eq!(read["coverage"]["gap"], true);
+    let physical: Value =
+        serde_json::from_str(read["reports"][1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(physical["players"], json!([]));
+    assert_eq!(physical["position"]["x"], 17);
+    let task: Value = serde_json::from_str(read["reports"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(task["progress"]["at"], old);
+    assert_eq!(
+        read["reports"][0]["attribution"]["connection_id"],
+        "minecraft"
+    );
+}
+
+#[tokio::test]
+async fn uncertain_quiet_is_retained_without_voice_context_but_explicit_read_remains_available() {
+    let f = fixture();
+    std::fs::write(f.home.path().join("decision-mode"), "low-confidence").unwrap();
+    let mut rx = quiet_browser(&f);
+    run(&f).await.unwrap();
+    run(&f).await.unwrap();
+    assert_eq!(calls(&f, "decision").len(), 1);
+    assert_eq!(states(&f), vec!["retained"]);
+    assert!(rx.try_recv().is_err());
+    {
+        let db = f.s.db.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM companion_awareness_appends WHERE call_id=?1",
+                [&f.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+    fresh_result(&f, vec![source_event()]);
+    let status = connection_status(&f.s, &f.id, "minecraft").await.unwrap();
+    assert_eq!(status["reports"][0]["id"], "source-event-1");
+    assert_eq!(status["authority"], false);
+}
+
+fn add_human_context(f: &Fixture, key: &str, text: &str) {
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'transcript',?3,?4)",params![f.id,key,json!({"role":"user","text":text}).to_string(),now_ms()-2000]).unwrap();
+}
+
+#[tokio::test]
+async fn human_context_change_during_settled_decision_requires_a_new_context_evaluation() {
+    let f = fixture();
+    std::fs::write(f.home.path().join("decision-block"), "").unwrap();
+    let s = f.s.clone();
+    let id = f.id.clone();
+    let h = f.headers.clone();
+    let task = tokio::spawn(async move { tick(&s, &id, &h).await });
+    entered(&f, "decision").await;
+    add_human_context(
+        &f,
+        "selection",
+        "Please use the personal connection, not the shared one.",
+    );
+    std::fs::remove_file(f.home.path().join("decision-block")).unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(states(&f), vec!["pending"]);
+    assert!(
+        crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    let mut rx = quiet_browser(&f);
+    run(&f).await.unwrap();
+    let decisions = calls(&f, "decision");
+    assert_eq!(decisions.len(), 2);
+    assert_ne!(decisions[0]["request_id"], decisions[1]["request_id"]);
+    assert_eq!(
+        decisions[1]["transcript"][0]["text"],
+        "Please use the personal connection, not the shared one."
+    );
+    assert!(rx.try_recv().is_ok());
+    run(&f).await.unwrap();
+    assert_eq!(calls(&f, "decision").len(), 2);
+}
+
+#[tokio::test]
+async fn changed_unsent_context_withdraws_old_parts_without_satisfying_new_append_receipts() {
+    let f = fixture();
+    let mut event = source_event();
+    event["kind"] = json!("presence_observation");
+    event["text"] = json!(r#"{"position":{"x":17,"y":64,"z":3},"players":[],"busy":false}"#);
+    observations(&f, vec![event]);
+    tick(&f.s, &f.id, &f.headers).await.unwrap();
+    let old: Vec<String> = {
+        let db = f.s.db.lock().unwrap();
+        let mut st = db
+            .prepare("SELECT event_id FROM companion_awareness_appends WHERE call_id=?1")
+            .unwrap();
+        st.query_map([&f.id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(!old.is_empty());
+    add_human_context(
+        &f,
+        "changed-selection",
+        "Actually I meant my personal server.",
+    );
+    let _rx = quiet_browser(&f);
+    assert!(
+        crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(states(&f), vec!["pending"]);
+    let withdrawn:i64=f.s.db.lock().unwrap().query_row("SELECT COUNT(*) FROM companion_awareness_appends WHERE call_id=?1 AND state='withdrawn'",[&f.id],|r|r.get(0)).unwrap();
+    assert_eq!(withdrawn, old.len() as i64);
+    tick(&f.s, &f.id, &f.headers).await.unwrap();
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    let commands = batch["commands"].as_array().unwrap();
+    assert!(
+        commands
+            .iter()
+            .all(|v| !old.contains(&v["event_id"].as_str().unwrap().to_owned()))
+    );
+    for id in old {
+        provider_event(
+            &f.s,
+            &f.id,
+            &json!({"type":"session.thinking.appended","client_event_id":id}),
+        )
+        .unwrap();
+    }
+    assert_eq!(states(&f), vec!["context_queued"]);
+    for command in commands {
+        provider_event(
+            &f.s,
+            &f.id,
+            &json!({"type":"session.thinking.appended","client_event_id":command["event_id"]}),
+        )
+        .unwrap();
+    }
+    assert_eq!(states(&f), vec!["context_accepted"]);
+    assert_eq!(calls(&f, "decision").len(), 2);
+}
+
+#[tokio::test]
+async fn unknown_paid_decision_or_append_is_not_retried_for_a_new_human_context() {
+    for unknown in ["decision", "append"] {
+        let f = fixture();
+        let mut rx = quiet_browser(&f);
+        if unknown == "decision" {
+            std::fs::write(f.home.path().join("decision-mode"), "fail").unwrap();
+        }
+        run(&f).await.unwrap();
+        if unknown == "append" {
+            let command = rx.try_recv().unwrap();
+            provider_event(&f.s,&f.id,&json!({"type":"error","error":{"type":"server_error","client_event_id":command["event_id"]}})).unwrap();
+        }
+        add_human_context(&f, "new-question", "Now tell me about my other connection.");
+        run(&f).await.unwrap();
+        assert_eq!(calls(&f, "decision").len(), 1, "{unknown}");
+        assert!(rx.try_recv().is_err(), "{unknown}");
+        assert_eq!(
+            states(&f),
+            vec![if unknown == "append" {
+                "unknown"
+            } else {
+                "retained"
+            }]
+        );
+    }
+}
+
+#[tokio::test]
+async fn long_agent_speech_cannot_evict_retained_human_selection_from_decision_evidence() {
+    let f = fixture();
+    add_human_context(
+        &f,
+        "world-selection",
+        "Only my personal connection, please.",
+    );
+    {
+        let db = f.s.db.lock().unwrap();
+        for index in 0..130 {
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'transcript',?3,?4)",params![f.id,format!("agent-{index}"),json!({"role":"agent","text":"A long answer fragment. "}).to_string(),now_ms()-2000]).unwrap();
+        }
+        db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,request_text,created_at) VALUES(?1,'selected-request',0,'completed','retained-message','Only my personal connection, please.',?2)",params![f.id,now_ms()-10000]).unwrap();
+    }
+    add_human_context(&f, "acknowledgement", "Mm-hm, is that current?");
+    run(&f).await.unwrap();
+    let decision = &calls(&f, "decision")[0];
+    assert!(
+        !decision["transcript"]
+            .to_string()
+            .contains("Only my personal")
+    );
+    assert_eq!(
+        decision["request_context"]["human_fragments"][0],
+        json!({"id":"world-selection","text":"Only my personal connection, please."})
+    );
+    assert_eq!(
+        decision["request_context"]["human_fragments"][1]["text"],
+        "Mm-hm, is that current?"
+    );
+    assert_eq!(
+        decision["request_context"]["requests"][0]["id"],
+        "selected-request"
+    );
+    assert_eq!(decision["request_context"]["omitted_human_fragments"], 0);
+}
+
+#[tokio::test]
+async fn independent_relevance_allows_quiet_evidence_and_only_strong_proactive_advice_notifies() {
+    for (mode, channel) in [
+        ("predicate-quiet", "thinking"),
+        ("predicate-notify", "commentary"),
+    ] {
+        let f = fixture();
+        std::fs::write(f.home.path().join("decision-mode"), mode).unwrap();
+        let mut rx = quiet_browser(&f);
+        run(&f).await.unwrap();
+        let command = rx.try_recv().unwrap();
+        assert_eq!(command["channel"], channel);
+        assert_eq!(states(&f), vec!["context_queued"]);
+        let raw: String =
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT decision FROM companion_awareness WHERE call_id=?1",
+                    [&f.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        let decision: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decision["assessment"]["relevant_probability"], 0.95);
+        assert!(decision.get("confidence").is_none());
+        assert!(decision.get("provider_choice").is_none());
+        run(&f).await.unwrap();
+        assert_eq!(calls(&f, "decision").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn uncertain_refused_or_malformed_predicate_advice_never_appends_or_retries() {
+    for mode in [
+        "predicate-uncertain",
+        "predicate-malformed",
+        "predicate-mismatch",
+        "predicate-refused",
+    ] {
+        let f = fixture();
+        std::fs::write(f.home.path().join("decision-mode"), mode).unwrap();
+        let mut rx = quiet_browser(&f);
+        run(&f).await.unwrap();
+        add_human_context(&f, "next-human-context", "Tell me more.");
+        run(&f).await.unwrap();
+        assert!(rx.try_recv().is_err(), "{mode}");
+        assert_eq!(states(&f), vec!["retained"], "{mode}");
+        assert_eq!(calls(&f, "decision").len(), 1, "{mode}");
+    }
+}
+
+#[test]
+fn predicate_policy_keeps_raw_probabilities_and_legacy_confidence_distinct() {
+    for (relevant, proactive, decision, reason, state, notify) in [
+        (0.85, 0.5, "quiet", "relevant_context", "ready", false),
+        (0.85, 0.9, "notify", "relevant_proactive", "ready", true),
+        (
+            0.849,
+            0.99,
+            "quiet",
+            "uncertain_relevance",
+            "retained",
+            false,
+        ),
+        (0.2, 0.99, "ignore", "irrelevant", "ignored", false),
+    ] {
+        let mut value = json!({"assessment":{"kind":"relevance_and_proactive_v1","relevant_probability":relevant,"proactive_probability":proactive},"decision":decision,"reason":reason});
+        assert_eq!(decision_policy(&value), Some((state, notify)));
+        value["confidence"] = json!(0.99);
+        assert!(decision_policy(&value).is_none());
+    }
+    let mut legacy = json!({"confidence":0.19,"selected_probability":0.39,"provider_choice":"quiet","decision":"later","reason":"low_confidence"});
+    assert_eq!(decision_policy(&legacy), Some(("retained", false)));
+    legacy["confidence"] = json!(0.95);
+    legacy["selected_probability"] = json!(0.95);
+    legacy["decision"] = json!("quiet");
+    legacy["reason"] = json!("provider_decision");
+    assert_eq!(decision_policy(&legacy), Some(("ready", false)));
 }

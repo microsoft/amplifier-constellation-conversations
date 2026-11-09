@@ -87,7 +87,7 @@ pub(crate) fn enqueue_batch(
 
 /// Recheck at the final transport boundary. Neither a quiet microphone nor a
 /// transcript gap claims that the person finished their thought.
-fn floor_open_in(db: &Connection, call: &str) -> Result<bool> {
+pub(crate) fn floor_open_in(db: &Connection, call: &str) -> Result<bool> {
     type Surface = (Option<bool>, Option<bool>, i64, Option<String>);
     let surface: Option<Surface> = db.query_row("SELECT user_speaking,agent_speaking,updated_at,playback FROM companion_surfaces WHERE call_id=?1", [call], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let Some((Some(false), Some(false), at, playback)) = surface else {
@@ -157,6 +157,7 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     if !active
         || crate::companion_history::private_identity(&tx, call)?.is_none()
         || !crate::companion_awareness::presentation_allowed(s, &tx, call, &commands)?
+        || !crate::companion_surface::board_presentation_allowed(&tx, call, &commands)?
     {
         tx.execute(
             "UPDATE companion_voice_batches SET state='withdrawn',updated_at=?2 WHERE id=?1",

@@ -609,6 +609,14 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
                 omitted_events += 1
         seen = {row["id"]: row["revision"] for row in (cursor or {}).get("seen", [])}
         fresh = [event for event in events if seen.get(event["id"]) != event["revision"]]
+        # Current selected-world facts must survive a bounded burst of older
+        # chat. Unemitted records retain their cursor identity and drain later;
+        # this changes presentation order, never source timestamps or authority.
+        fresh.sort(key=lambda event: (
+            0 if event["kind"] == "task_observation" else 1 if event["kind"] == "presence_observation" else 2,
+            -datetime.datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00")).timestamp(),
+            event["id"]))
+        selected_events = fresh[:MAX_EVENTS]
 
         def emitted_cursor(emitted):
             # The cursor acknowledges output, not everything read from the body.
@@ -642,7 +650,7 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
             action_updates.append(update)
         result = {"version": 1, "connection_id": connection, "observed_at": observed_at, "availability": "available",
                   "presence": {"ready": live.get("ready") is True, "busy": live.get("busy") is True, "turn_active": live.get("turn_active") is True},
-                  "cursor": emitted_cursor(fresh[-MAX_EVENTS:]),
+                  "cursor": emitted_cursor(selected_events),
                   "coverage": {"baseline": cursor is None, "bounded": True, "gap": gap or len(fresh) > MAX_EVENTS or omitted_events > 0 or not presence_available,
                                "deferred_events": max(0, len(fresh) - MAX_EVENTS),
                                "omitted_events": omitted_events, "omission_reason": "event_text_or_identity_exceeded_bound" if omitted_events else None,
@@ -654,11 +662,11 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
                                "private_task_withheld": private_task_withheld,
                                "input_outcomes": outcome_availability, "installation_input_outcomes": scoped_availability,
                                "task_history": "retained_only", "verified_completion_supported": False},
-                  "events": fresh[-MAX_EVENTS:], "actions": action_updates}
+                  "events": selected_events, "actions": action_updates}
         result["actions"] = [update if len(encoded(update)) <= 16000 else action_observation(
             action, connection, observed_at, reason="source_report_exceeded_bound") for action, update in zip(actions, result["actions"])]
         while len(encoded(result)) > MAX_OUTPUT and result["events"]:
-            result["events"].pop(0)
+            result["events"].pop()
             result["coverage"]["gap"] = True
             result["coverage"]["output_truncated"] = True
             result["coverage"]["deferred_events"] = len(fresh) - len(result["events"])
