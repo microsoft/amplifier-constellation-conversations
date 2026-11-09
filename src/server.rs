@@ -50,6 +50,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(|| async { Html(include_str!("../ui/companion.html")) }),
         )
         .route(
+            "/companion-floor.mjs",
+            get(|| async {
+                (
+                    [("content-type", "text/javascript; charset=utf-8")],
+                    include_str!("../ui/companion-floor.mjs"),
+                )
+            }),
+        )
+        .route(
             "/companion.js",
             get(|| async {
                 (

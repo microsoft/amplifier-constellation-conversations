@@ -34,6 +34,33 @@ and an item the caller is reading are protected; an incompatible change fails
 without partially rearranging the board. The caller can unpin or move an item to
 history. A saved presentation request is not confirmation that it is on screen.
 
+An image explicitly attached by the agent to a completed answer in the current
+call also requests whiteboard space. This requires an exact link to the caller's
+request and the same agent, connection, and private audience. A newer distinct
+request can supersede that presentation; a listening acknowledgment or slow
+response alone does not. Unlinked or superseded images remain in history. The
+request still respects pinned items, the item being read, and the three-item
+limit; receipt of an image does not prove it was visible. Native image attachments
+are published with the completed answer. An empty board before that answer is
+not evidence that attachment publication is unavailable.
+
+Changes to the authenticated browser's current board are also supplied as concise
+application context. Repeated presence heartbeats do not create repeated notices;
+pending membership updates coalesce to the latest board and wait for the same
+conversational floor as other context. Card identities link this observation to
+the saved answer. Browser-reported membership does not establish that the person
+looked at, decoded, or understood an image. It does establish that the matching
+item is currently on the board, superseding the earlier publication-time
+uncertainty. An empty-board observation establishes absence from the current
+board, not deletion from history.
+
+Publication identifiers and screen-state facts are supplied as quiet context.
+Spoken updates contain concise, speakable results; application instructions and
+receipt-processing details are not sent as commentary. The original backend
+answer stays intact in history. These channel choices guide the voice model,
+but do not guarantee its wording: qualification includes recorded playback as
+well as provider transcripts and browser display evidence.
+
 An explicit **Paste** control opens a text composer; pasted images use the saved
 upload path. A receipt says when material is available. New content follows the
 bottom only while the caller is already near the bottom; reading older content
@@ -167,6 +194,14 @@ an artifact never licenses a claim that it has been seen or read.
 For the native Constellation runtime, `provider.native.image_input` controls the
 enabled image path. An omitted or disabled setting can make an image-capable model
 advertise `image: false`; that flag alone does not establish the model's abilities.
+The voice starts with image inspection support **unknown**. Its current-call
+capability is learned from the actual selected backend's ACP initialization and
+sent as a quiet capability update. A previous call's settings, static profile,
+camera permission, or installed tools do not establish support for this call.
+An explicit `image: false` means the voice must not promise photo inspection;
+files can still be saved or displayed. `image: true` enables the inspection path,
+but does not prove that any particular image was delivered or understood.
+
 The optional `image_input` in `companion.json` is informational, not an override of
 ACP capabilities. Enable a supported path in the agent installation, reconnect,
 then verify fresh initialization and an actual image prompt. Preserve the selected
@@ -297,7 +332,10 @@ a changed payload is rejected. A timeout, lost response, or restart during
 submission leaves an unknown outcome that must not be retried automatically.
 Hanging up closes new call-tool actions. The original call grant can still read
 saved operation receipts while already accepted backend work settles; it cannot
-create a new effect, capture, or live observation. Already submitted connector
+create a new effect, capture, or live observation. Once that call's tool transport
+is disposed, a recognized late Companion tool permission is cancelled rather than
+opening an approval for the closed browser. Saved receipts remain stored; this
+does not replay work or turn an uncertain delivery into success. Already submitted connector
 work retains its original authority and must be inspected through its owning
 connector's controls when no retained receipt establishes the outcome.
 
@@ -374,6 +412,10 @@ leaving the call, or losing the browser's live presence closes that permission.
 A capture receipt progresses through queued, accepted, executed (one frame), and
 uploaded (saved bytes). The browser executes only after its first confirmed
 atomic acceptance; uncertain acknowledgments never recapture or resend a photo.
+An already queued browser operation can survive successful completion of its
+originating reasoning turn until its own expiry. That completion does not grant
+a new operation; revoked/unknown sources, expired commands and duplicate
+acceptances cannot create another effect.
 The status tool can return the actual owned JPEG/PNG as MCP image content for a
 reasoning engine only when this call's actual ACP initialization advertises image input. Unsupported or unconfirmed support retains the saved artifact and omits image bytes. Uploaded does not mean inspected. Camera images
 from this path are capped at 512 KiB. A local-only engine remains local-only; the
@@ -461,6 +503,16 @@ the Slack helper uses the official Slack SDK. Each poll has a bounded deadline,
 no retries, and at most 32 events and four known action receipts. Source text is
 not silently clipped; oversized facts are omitted with coverage information.
 
+When Minecraft supplies its optional `task.limit_state`, the observer can include
+that exact current limit summary for the same task and observation time. It
+keeps finite, explicitly unbounded, and unknown values distinct, preserves task
+audience restrictions, and never attaches current limits to an older action's
+outcome. The summary describes current limits, not why a historical task stopped
+or whether other activity is allowed. An opaque task cursor suppresses ambient
+updates caused only by a new read time or ordinary countdown; actual bound,
+usage, expiry, authority, and audience changes remain meaningful. Explicit
+status reads retain the exact current values and their immutable revision.
+
 Observations are collected only during an active, authorized private call.
 Unsolicited events must match the installed audience policy and be newer than
 this call. Older authorized messages and task snapshots remain available for
@@ -476,25 +528,53 @@ Durable prior receipts remain available in the installation's call history.
 
 ### Decision models and presentation
 
-The official OpenAI SDK's Decisions endpoint with `gpt-6-luna` advises ignore,
-quiet, later, or notify from the intact event, bounded recent transcript fragments,
-and owner guidance. Decisions receive no credentials and grant no action
-permission. The host records intent before the single provider request, deduplicates
+The official OpenAI SDK's Decisions endpoint with `gpt-6-luna` answers two
+independent predicates in one request: whether the event is relevant to the
+caller's current topic and whether a proactive spoken mention would be useful.
+Both use the intact event, bounded recent transcript fragments, and owner guidance.
+Independently bounded human fragments and retained request
+IDs/text preserve an explicit selection when a long agent answer fills the recent
+transcript; omission counts remain explicit. Decisions receive no credentials and grant no action
+permission. The host records intent before each event/context decision, deduplicates
 immutable revisions, disables retries, and keeps uncertain outcomes uncertain.
-Provider failure/refusal/invalid output retains a quiet card. At most two new facts are evaluated per worker cycle. Durable source history has
+Raw provider probabilities remain in the receipt. The declared pilot policy admits
+quiet context at relevance probability 0.85 or above; a proactive notice also
+requires proactive probability 0.90 or above. Relevance at or below 0.20 is ignored;
+intermediate estimates retain evidence without adding voice context. The host
+validates the assessment and its derived disposition independently. Older
+configured choice helpers retain their conservative confidence checks.
+Provider failure, refusal, and invalid output also retain evidence without adding
+it to the speaking model's context. At most two facts are evaluated
+per worker cycle. Durable source history has
 no lifetime event quota that silently stops a long call receiving new facts;
 per-query and per-transport bounds remain. Known action receipts rotate through
 bounded polls so newer requests cannot permanently hide older unresolved ones.
 
+An outcome for an already requested action is a result, not optional ambient
+news. A validated saved observation bound to its original caller, request and
+connection enters quiet context without a relevance-model decision. It still
+waits for the conversational floor and passes the same private-audience, source,
+revision and call checks. Arbitrary observer text cannot claim this route by
+labeling itself an action result. A result receipt does not establish fulfillment
+or require a spoken interruption. Waiting behind a long human explanation does
+not erase a bound result; its original timestamp remains explicit.
+
 Full relevant facts are retained as shared cards and supplied with their actor,
 connection, scope and original time. Long facts use numbered source-data parts,
-not clipped summaries or opaque retrieval pointers. Each provider append stays
+not clipped summaries or opaque retrieval pointers. For a shared connection ID,
+use the same user-facing label in action and awareness configuration so the caller's
+selected name also identifies background observations. Labels are presentation
+metadata; the stable connection ID and caller/source binding establish identity.
+Each provider append stays
 below its transport bound; all matching receipts are needed to mark the whole
 observation accepted. A missing part means the source must not be summarized.
-Quiet context can arrive while the caller speaks or other work runs. Deliberately
-spoken notices wait for fresh browser quiet hints and six seconds without a
-transcript fragment or a newly created delegation; this is a presentation
-heuristic, not proof that speech played or a human turn ended. An unavailable
+Both quiet context and spoken notices wait for the shared conversational floor:
+fresh authenticated browser activity, available playback, and a gap after the
+latest human transcript. Ambient relevance is evaluated against that current
+context and checked again before dispatch. A newer human context withdraws an
+unsent ambient batch; a known completed decision can be reconsidered for the new
+context, but an uncertain decision or append is never replayed. These checks are
+presentation heuristics, not proof that speech played or a human turn ended. An unavailable
 observer does not block the others. Model scores are pilot thresholds, not
 calibrated accuracy or a delivery guarantee.
 
@@ -543,6 +623,33 @@ that answer once. Source incorporation alone is not completion. Repeated elapsed
 time does not generate repeated waiting speech. After hang-up, accepted work can
 finish and retain its result, but cannot dispatch another voice request or append
 more voice context.
+
+Results are durably queued separately from the voice transport. Fresh authenticated
+browser observations decide when a result may enter the speaking context: both
+parties must be quiet and playback available. Unknown or stale observations defer
+presentation; a transcript pause is not a semantic turn-completion signal. A newer
+unsent revision replaces only the same fact, never a distinct unanswered question.
+The final dispatch rechecks private-room membership, endpoint identity and source
+policy. A process interruption during dispatch leaves delivery unknown rather
+than replaying it. Queue pressure keeps the canonical result available without
+disconnecting the call. Provider append acknowledgment does not prove playback.
+
+The browser preserves short listening cues but suppresses sustained overlapping
+agent speech when the caller takes the floor. Muted audio is consumed and discarded,
+not paused for later playback. Fixed application instructions ask GPT-Live to yield;
+the browser guard does not rely on the model obeying them. Playback resumes only
+after fresh observed quiet, never from buffering, a hidden page, or an instruction
+acknowledgment. These acoustic boundaries remain heuristics, not sentence or intent
+recognition. Stopping speech does not cancel accepted work.
+
+Current task observations distinguish snapshot time from the original progress
+report time. Prior-call context carries human goals and exact result references;
+old assistant prose is not automatically reused as current status. Newly submitted
+connection actions freeze their observer and original source binding. After hang-up,
+read-only polling can collect the exact outcome for up to an hour; a later private
+call can continue that lookup after revalidating owner, agent, endpoint, observer
+policy and original audience. No new action, model call or retry is performed by
+this observer. Older actions without the binding are not retroactively adopted.
 
 Native permissions outside the narrowly validated Companion tool policy appear
 as single-request choices on the call screen. They are still actor- and
@@ -640,6 +747,20 @@ times remain separate from query time. Missing facts or a failed read do not mea
 inactivity. This avoids a redundant native approval for an already-enrolled read;
 it does not allow arbitrary external tools. Expired call-scoped native requests
 are rejected directly instead of creating approvals on a closed call screen.
+Current task and physical-state snapshots take priority over historical chatter
+in the bounded result. Deferred source records remain available through their
+unchanged cursor identity; prioritization does not change their original time.
+
+Before returning that explicit read, the host also queues a bounded set of source
+qualifiers directly as thinking context. Up to four whole report facts preserve
+original report time and observation time; current assignment snapshots also keep
+`progress.at` separate from assignment status. A coverage note states omissions
+and that missing reports do not establish inactivity or independent verification.
+This protects the original qualifications if a reasoning model omits them while
+summarizing. The same private caller, configured source, audience and current
+policy are revalidated before delivery, and the normal conversational floor still
+applies. These facts grant no speech or action authority, invoke no decision model,
+and never convert a queued input or running assignment into completed work.
 
 ### Coherent speech and bounded presentation
 
@@ -686,8 +807,9 @@ by default; existing projects do not gain a new provider prerequisite silently.
 No failed creation is retried with a different configuration.
 
 The official GPT-Live input-transcript Decisions trigger evaluates only whether
-the human explicitly requests ending the current call. It runs independently of
-the reasoning queue. Its sole effect is existing call closure; it cannot cancel
+the human expresses a complete current intention to end the call, including a
+polite indirect request or a clear closing farewell. A bare “thanks” or ending a
+work step is insufficient. It runs independently of the reasoning queue. Its sole effect is existing call closure; it cannot cancel
 agent work, resolve unknown delivery or affect another call. Quoted, hypothetical,
 incomplete, negated and revoked requests, and requests to stop other work, are
 excluded. The host requires the exact current session and source event/times,
@@ -698,7 +820,8 @@ A matching provider terminal event still confirms closure separately.
 This native decision may incur provider usage and requires the project's
 Decisions access. Automated signal/ordering tests do not establish semantic
 accuracy for real speech. Qualify with explicit, quoted, corrected and negative
-utterances before treating it as dependable hands-free control; the on-screen
+utterances, natural farewells, incomplete phrases, and stop-work requests before
+treating it as dependable hands-free control; the on-screen
 End call button remains available independently. See OpenAI's
 [voice Decisions guidance](https://developers.openai.com/api/docs/guides/decisions-voice).
 
@@ -712,16 +835,20 @@ was played. Historical content without a retained receipt remains unknown.
 `companion_view` can open this tab with `action: "show_context"`.
 
 At delegation receipt the host sends the documented empty thinking append to
-cancel a pending automatic acknowledgment. Dispatch remains visible without
-injecting waiting narration. It is not a guarantee of silence: already-generated
+cancel a pending automatic acknowledgment. A separate fixed instruction marks
+the delegated question as still awaiting checked facts, so a waiting interval is
+not an invitation to invent status or plausible work details. Both are recorded
+once per delegation. Dispatch remains visible without injecting waiting narration. It is not a guarantee of silence: already-generated
 speech and independent model speech remain separate.
 
-Useful attributed observations are supplied directly to voice. A long observation
+Relevant attributed observations are supplied directly to voice. Facts from one
+connection must not answer a question about another connection, even when the
+agent identity is shared. A long observation
 is delivered as numbered source-data parts, preserving its full qualifiers; it no
 longer requires a second reasoning turn merely to retrieve its text. All matching
 part acknowledgments are required before the recorded observation becomes
-`context_accepted`. Quiet context can arrive while another request is active;
-deliberately spoken notifications still wait for a conversational gap.
+`context_accepted`. Quiet context can inform speech, so it follows the same
+current-context and conversational-floor checks as spoken notifications.
 
 See [Minecraft observations](companion-minecraft-observation.md) for the official
 MCP SDK presence client. It reads own and other players' public chat, current
@@ -734,3 +861,20 @@ already accepted backend work settles. Only authenticated saved receipt reads
 remain available; ending a call does not reopen actions or another call's context.
 Native hang-up diagnostics retain bounded decision status and source identities,
 not private reasoning or raw provider configuration.
+
+### Reproducible duplex evaluation
+
+`tests/companion-duplex-eval.mjs` provides deterministic self-checks, a real browser
+audio-graph check, and opt-in `--run-live CONFIG` evaluation. Live evaluation requires
+an explicitly marked disposable loopback installation and synthetic caller identity;
+it refuses the production preview address. The actual Companion UI/API/official
+GPT-Live bridge is paired with an independent synthetic caller. Both audio channels
+share one browser clock, and the caller hears the application's post-playback-gate
+output. Hidden expected outcomes are not sent to the caller model. Domain tools
+remain disposable fixtures; record their effects and receipts separately.
+
+Retain scenario, binary/configuration hashes, application events, source-to-result
+links, PCM audio and final state. Review coherent answers, corrections, honest
+blockers, silence and overlap in context; overlap counts alone are not a naturalness
+score. Headless audio and simulated callers do not establish physical phone speaker,
+echo cancellation, background operation, or human usability.

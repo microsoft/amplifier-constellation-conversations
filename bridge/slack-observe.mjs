@@ -1,7 +1,8 @@
 /** Read-only, fixed-channel Slack observations. Retrieved messages never authorize actions. */
 import {readFile} from 'node:fs/promises';
 import {isAbsolute,join} from 'node:path';
-import {pathToFileURL} from 'node:url';
+import {fileURLToPath} from 'node:url';
+import {realpathSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 import {z} from 'zod/v4';
 import {makeSlackClient} from './slack-action.mjs';
@@ -127,4 +128,9 @@ async function main(){
   }catch{input=null;}
   process.stdout.write(JSON.stringify(await observeSlack({configPath:process.argv[3]??'',input}))+'\n');
 }
-if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)await main();
+// Match Node's canonical module URL even through a versioned install symlink.
+let invokedAsEntry=false;
+if(process.argv[1]){
+  try{invokedAsEntry=realpathSync(fileURLToPath(import.meta.url))===realpathSync(process.argv[1]);}catch{}
+}
+if(invokedAsEntry) await main();

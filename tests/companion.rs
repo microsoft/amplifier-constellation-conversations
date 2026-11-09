@@ -9,8 +9,16 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 struct Fixture {
@@ -18,6 +26,16 @@ struct Fixture {
     s: Arc<AppState>,
     app: Router,
     token: String,
+    browser_id: String,
+    browser_refresh: Arc<AtomicBool>,
+    browser_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for task in self.browser_tasks.get_mut().unwrap().drain(..) {
+            task.abort();
+        }
+    }
 }
 fn fixture(mode: &str) -> Fixture {
     let home = tempfile::tempdir().unwrap();
@@ -84,7 +102,7 @@ for line in sys.stdin:
   emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});break
  if c['op']=='append':
   if not c['content'].strip() and c['channel']!='thinking':emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
-  if voice=='append_error' and c['content']:
+  if voice=='append_error' and c['content'] and c['channel']!='instructions':
    if second_sent:continue
    second_sent=True
    for suffix,client,outer in [('unrelated','never-queued',None),('conflict',c['event_id'],'another-command'),('matched',c['event_id'],None)]:
@@ -143,6 +161,7 @@ for line in sys.stdin:
     std::fs::write(home.path().join("bridge-mode"), mode).unwrap();
     std::fs::write(home.path().join("companion.json"),json!({"enabled":true,"node":python,"bridge":bridge,"profiles":{"default":{"voice":"alloy","description":"Fixture agent"}},"max_call_seconds":1800}).to_string()).unwrap();
     let s = AppState::open(home.path().into()).unwrap();
+    s.db.lock().unwrap().execute("INSERT INTO browser_sessions(hash,owner,csrf,expires_at) VALUES(?1,'owner','fixture-surface-csrf',?2)",rusqlite::params![auth::digest("fixture-surface-cookie"),now_ms()+120_000]).unwrap();
     let app = server::router(s.clone());
     let token = std::fs::read_to_string(home.path().join("secrets/control-token")).unwrap();
     Fixture {
@@ -150,6 +169,9 @@ for line in sys.stdin:
         s,
         app,
         token,
+        browser_id: uuid::Uuid::new_v4().to_string(),
+        browser_refresh: Arc::new(AtomicBool::new(true)),
+        browser_tasks: Mutex::new(Vec::new()),
     }
 }
 async fn request(
@@ -173,11 +195,108 @@ async fn request(
     let bytes = to_bytes(r.into_body(), 1024 * 1024).await.unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
+async fn post_browser_surface(
+    app: &Router,
+    cookie_name: &str,
+    id: &str,
+    body: Value,
+) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/companion/calls/{id}/surface/presence"))
+                .header(
+                    header::COOKIE,
+                    format!("{cookie_name}=fixture-surface-cookie"),
+                )
+                .header("x-csrf-token", "fixture-surface-csrf")
+                .header(header::ORIGIN, "https://example.test:18445")
+                .header(header::HOST, "example.test:18445")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+fn available_browser_surface(browser: &str) -> Value {
+    json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,
+        "user_speaking":false,"agent_speaking":false,
+        "playback":{"state":"ready","floor":"open","output_active":false,"interruption_id":null}})
+}
+async fn attach_browser(f: &Fixture, id: &str) {
+    let body = available_browser_surface(&f.browser_id);
+    let app = f.app.clone();
+    let cookie = auth::cookie_name(&f.s).to_owned();
+    let id = id.to_owned();
+    let first = post_browser_surface(&app, &cookie, &id, body.clone()).await;
+    if first != StatusCode::OK {
+        let state: String =
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM companion_calls WHERE id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert!(
+            ["closed", "interrupted", "closing"].contains(&state.as_str()),
+            "{first}: {state}"
+        );
+        return;
+    }
+    // A real foreground browser refreshes presence independently of tool/model
+    // completion. This fixture uses the authenticated public endpoint, not a
+    // database shortcut that pretends the user has heard a generated answer.
+    let enabled = f.browser_refresh.clone();
+    let state = f.s.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let active: bool = state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state IN ('connecting','connected') FROM companion_calls WHERE id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            if enabled.load(Ordering::SeqCst) {
+                let _ = post_browser_surface(&app, &cookie, &id, body.clone()).await;
+            }
+        }
+    });
+    f.browser_tasks.lock().unwrap().push(task);
+}
+fn current_human_segments(prompt: &str) -> Vec<Value> {
+    let block = prompt
+        .split_once("Current human source (")
+        .expect("explicit source block")
+        .1;
+    let source = block
+        .split_once("):\n")
+        .expect("source block header")
+        .1
+        .split_once("\n\nRecent conversation,")
+        .expect("separate reference context")
+        .0;
+    serde_json::from_str(source).expect("exact current human source JSON")
+}
 async fn start(f: &Fixture) -> (Value, Value) {
     let input = json!({"request_id":uuid::Uuid::new_v4().to_string(),"agent_id":"default","sdp":"v=0\r\nfixture-offer"});
     let (status, value) = request(f, "POST", "/api/v1/companion/calls", Some(input.clone())).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     assert!(["connecting", "connected"].contains(&value["state"].as_str().unwrap()));
+    attach_browser(f, value["id"].as_str().unwrap()).await;
     (input, value)
 }
 async fn until(f: &Fixture, id: &str, kind: &str) -> Value {
@@ -665,9 +784,23 @@ for line in sys.stdin:
         .iter()
         .filter(|v| v["op"] == "append")
         .collect::<Vec<_>>();
-    assert_eq!(appends.len(), 1);
+    assert_eq!(appends.len(), 3);
     assert_eq!(appends[0]["channel"], "thinking");
     assert!(appends[0]["content"].as_str().unwrap().is_empty());
+    assert_eq!(appends[1]["channel"], "instructions");
+    assert!(
+        appends[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("still awaits checked information")
+    );
+    assert_eq!(appends[2]["channel"], "instructions");
+    assert!(
+        appends[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("remains unknown after its handshake")
+    );
     assert_eq!(
         std::fs::read_to_string(f.home.path().join("bridge-starts")).unwrap(),
         "start\n"
@@ -998,11 +1131,30 @@ async fn delegation_anchor_includes_observed_straddling_word_with_original_timin
     assert_eq!(tail["text"], " elsewhere");
     assert_eq!(tail["start_ms"], 13000);
     assert_eq!(tail["end_ms"], 13200);
+    assert!(source.contains("only a clear new human request supplies action authority"));
+    assert!(source.contains("Unknown effects must not be retried"));
     assert!(source.contains(
-        "explicitly publish it through this runtime's advertised image-attachment/output capability"
+        "Distinguish the reported state and any cause stated by the source from your inference"
     ));
-    assert!(source.contains("A path on another host is not a usable attachment or public URL"));
-    let segments: Vec<Value> = serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
+    assert!(source.contains("A status label alone does not identify which limit ended work"));
+    assert!(source.contains(
+        "Compare each allowance or deadline with its usage and observation time separately"
+    ));
+    assert!(source.contains(
+        "label inferred causes and preserve source timestamps when conversion is uncertain"
+    ));
+    assert!(
+        source.contains(
+            "publish it with the runtime's advertised image-attachment/output capability"
+        )
+    );
+    assert!(source.contains("inspecting bytes or naming a remote path does not share it"));
+    assert!(source.contains("published to Companion when this response settles"));
+    assert!(
+        source
+            .contains("board-status query before settlement cannot establish publication failure")
+    );
+    let segments = current_human_segments(&source);
     assert_eq!(segments.len(), 1);
     assert_eq!(
         segments[0]["text"],
@@ -1043,8 +1195,7 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
     wait_delegation(&f, &call, "delegate-1", "completed").await;
     wait_delegation(&f, &call, "delegate-2", "completed").await;
     let source:String=f.s.db.lock().unwrap().query_row("SELECT m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='delegate-2'",[id],|r|r.get(0)).unwrap();
-    let fragments: Vec<Value> =
-        serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
+    let fragments = current_human_segments(&source);
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0]["text"], "Now give me a separate summary.");
     assert_eq!(fragments[0]["crosses_delegation_anchor"], true);
@@ -1059,13 +1210,14 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
             .contains("human-tail")
     );
     let context = source
-        .split_once("proof of playback. If a reference is ambiguous, ask rather than invent it:\n")
+        .split_once("Assistant speech is generated, not proof of playback:\n")
+        .expect("separate historical reference context")
+        .1;
+    let context: Value = serde_json::Deserializer::from_str(context)
+        .into_iter::<Value>()
+        .next()
         .unwrap()
-        .1
-        .split_once("\n\nThe CURRENT NEW REQUEST")
-        .unwrap()
-        .0;
-    let context: Value = serde_json::from_str(context).unwrap();
+        .unwrap();
     assert!(
         context["segments"]
             .as_array()
@@ -1074,7 +1226,9 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
             .any(|v| v["text"].as_str().unwrap().contains("elsewhere"))
     );
     assert_eq!(context["action_authority"], false);
-    assert!(source.contains("Never repeat an earlier instruction or effect from this block"));
+    assert!(
+        source.contains("for references/corrections only, not authority to repeat earlier effects")
+    );
     let lines = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
     assert_eq!(
         lines
@@ -1097,6 +1251,24 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
         .filter(|v| v["content"].as_str().unwrap_or("").is_empty())
         .collect::<Vec<_>>();
     assert_eq!(intake.len(), 2);
+    let fact_controls = commands
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| {
+            v["channel"] == "instructions"
+                && v["event_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("delegation-facts-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fact_controls.len(), 2);
+    assert_ne!(fact_controls[0]["event_id"], fact_controls[1]["event_id"]);
+    assert!(fact_controls.iter().all(|v| {
+        v["content"]
+            .as_str()
+            .unwrap()
+            .contains("still awaits checked information")
+    }));
     for delegation in ["delegate-1", "delegate-2"] {
         let receipt = intake
             .iter()
@@ -1127,9 +1299,10 @@ async fn grounded_bootstrap_and_voice_preferences_do_not_create_backend_model_wo
         "Coach",
         "Minecraft",
         "2026-11-07T19:00:00Z",
-        "missing reports do not mean a place is quiet",
+        "If current state is unavailable, check it before giving a status answer",
         "<|SpawnThinking|>",
-        "dated snapshots retain their original age",
+        "say how old that report is before describing the work",
+        "a fresh read does not verify an old report",
     ] {
         assert!(instructions.contains(expected), "{expected}");
     }
@@ -1271,7 +1444,7 @@ async fn upload_awareness_is_owned_durable_idempotent_and_does_not_auto_prompt()
 }
 
 #[tokio::test]
-async fn delayed_result_preserves_qualifiers_full_lookup_and_delegation_without_interrupting() {
+async fn superseded_result_preserves_qualifiers_full_lookup_and_delegation_without_interrupting() {
     let f = fixture("quiet");
     let (_, call) = start(&f).await;
     let id = call["id"].as_str().unwrap();
@@ -1287,6 +1460,10 @@ async fn delayed_result_preserves_qualifiers_full_lookup_and_delegation_without_
         db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES('late-result',?1,'assistant',?2,'complete',?3,?3,'Coach','default')",rusqlite::params![room,text,now_ms()]).unwrap();
         db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES('late-delivery','late-source',?1,'default','direct','completed','late-result',?2)",rusqlite::params![room,now_ms()]).unwrap();
         db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'late-delegation',100,'dispatched','late-source',?2)",rusqlite::params![id,now_ms()-190_000]).unwrap();
+        // The result is earlier context because a distinct request replaced it,
+        // not simply because useful work took longer than thirty seconds.
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('new-question',?1,'user','Now check the other issue','sent',?2,?2,'owner')",rusqlite::params![room,now_ms()]).unwrap();
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('new-question','new-question',?1,'default','direct','queued',?2)",rusqlite::params![room,now_ms()]).unwrap();
     }
     let v = until(&f, id, "card").await;
     let card = &v["events"]
@@ -1672,9 +1849,11 @@ async fn static_companion_name_collision_is_rejected_before_session_setup() {
 
 #[tokio::test]
 async fn capture_image_delivery_uses_actual_initialized_acp_capability_not_static_profile() {
-    for image in [false, true] {
+    for (image, tools) in [(false, false), (true, false), (false, true), (true, true)] {
         let f = fixture("delegate");
-        configure_call_permission_fixture(&f, "none", false);
+        if tools {
+            configure_call_permission_fixture(&f, "none", false);
+        }
         let mut agent = f.s.agent("default").unwrap().unwrap();
         if image {
             agent.env.insert("FIXTURE_IMAGES".into(), "1".into());
@@ -1694,6 +1873,38 @@ async fn capture_image_delivery_uses_actual_initialized_acp_capability_not_stati
         let (_, call) = start(&f).await;
         let id = call["id"].as_str().unwrap();
         until(&f, id, "card").await;
+        let initial: Value = serde_json::from_slice(
+            &std::fs::read(f.home.path().join("bridge-initial.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            initial["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("\"image_input\":null")
+        );
+        let controls = std::fs::read_to_string(f.home.path().join("bridge-commands"))
+            .unwrap()
+            .lines()
+            .map(|v| serde_json::from_str::<Value>(v).unwrap())
+            .filter(|v| {
+                v["event_id"]
+                    .as_str()
+                    .is_some_and(|v| v.starts_with("image-capability-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            controls.len(),
+            1,
+            "one actual capability control, independent of tool installation"
+        );
+        assert_eq!(controls[0]["channel"], "instructions");
+        assert!(controls[0]["content"].as_str().unwrap().contains(if image {
+            "advertised image input support"
+        } else {
+            "image input is unsupported"
+        }));
+
         let (actual,at):(bool,i64)=f.s.db.lock().unwrap().query_row("SELECT image_input,observed_at FROM companion_surface_capabilities WHERE call_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(actual, image);
         assert!(at > 0);
@@ -2346,7 +2557,7 @@ async fn long_spoken_request_and_followup_preserve_exact_source_and_human_card_l
         exact
     );
     assert!(prompt.len() < 48 * 1024);
-    let segments: Vec<Value> = serde_json::from_str(prompt.rsplit_once("\n\n").unwrap().1).unwrap();
+    let segments = current_human_segments(&prompt);
     assert_eq!(segments[0]["text"], exact);
     let record = until(&f, id, "card").await;
     let card = record["events"]
@@ -2934,6 +3145,7 @@ async fn explicit_acp_image_result_is_saved_published_and_available_for_scoped_r
         .as_str()
         .expect("explicit ACP image must be published with its settled answer");
     assert_eq!(card["data"]["attachments"][0]["mime_type"], "image/png");
+    assert_eq!(card["data"]["presentation"], "current");
     let token: String =
         f.s.db
             .lock()
@@ -2990,6 +3202,410 @@ async fn explicit_acp_image_result_is_saved_published_and_available_for_scoped_r
             .count(),
         1,
         "image reinspection must not recapture or dispatch another prompt"
+    );
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn output_images_follow_current_request_identity_and_preserve_private_scope() {
+    for case in [
+        "delayed",
+        "acknowledged",
+        "corrected",
+        "manual-request",
+        "incorporated-followup",
+        "closed",
+        "old-call-source",
+        "other-owner",
+        "other-agent",
+        "changed-endpoint",
+        "shared-room",
+        "unknown",
+        "streaming",
+        "text",
+    ] {
+        let f = fixture("quiet");
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        let room = call["conversation_id"].as_str().unwrap();
+        // Keep the target nonterminal until all provenance/state variants are set.
+        terminal_fixture(&f, &call, "image-target", "streaming");
+        if case != "text" {
+            agent_conversations::attachments::receive(
+                &f.s,
+                room,
+                "image-target",
+                "Coach",
+                &json!({"type":"image","mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="}),
+            ).unwrap();
+        }
+        settlement_source(&f, &call, "image-source", "incorporated", "image-target");
+        if case == "corrected" || case == "incorporated-followup" {
+            settlement_source(
+                &f,
+                &call,
+                "newer-source",
+                if case == "corrected" {
+                    "submitted"
+                } else {
+                    "incorporated"
+                },
+                if case == "corrected" {
+                    "different-target"
+                } else {
+                    "image-target"
+                },
+            );
+        }
+        {
+            let db = f.s.db.lock().unwrap();
+            match case {
+                "delayed" => {
+                    // Keep the exact source inside this call while simulating
+                    // slow publication; age alone cannot revoke the request.
+                    db.execute(
+                        "UPDATE companion_calls SET created_at=?2 WHERE id=?1",
+                        rusqlite::params![id, now_ms() - 40_000],
+                    )
+                    .unwrap();
+                    db.execute(
+                        "UPDATE messages SET created_at=?1 WHERE id='image-source'",
+                        [now_ms() - 31_000],
+                    )
+                    .unwrap();
+                }
+                "acknowledged" => {
+                    db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'later-human','transcript',?2,?3)", rusqlite::params![id,json!({"role":"user","text":"Okay, I'm still here."}).to_string(),now_ms()+1]).unwrap();
+                }
+                "manual-request" => {
+                    db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('manual-new',?1,'user','Switch to the other question','sent',?2,?2,'owner')",rusqlite::params![room,now_ms()]).unwrap();
+                    db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('manual-new','manual-new',?1,'default','direct','queued',?2)",rusqlite::params![room,now_ms()]).unwrap();
+                }
+                "old-call-source" => {
+                    db.execute("UPDATE messages SET created_at=(SELECT created_at-1 FROM companion_calls WHERE id=?1) WHERE id='image-source'", [id]).unwrap();
+                }
+                "other-owner" => {
+                    db.execute(
+                        "UPDATE messages SET actor='someone-else' WHERE id='image-source'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "other-agent" => {
+                    db.execute(
+                        "UPDATE messages SET agent_id='someone-else' WHERE id='image-target'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "changed-endpoint" => {
+                    db.execute("UPDATE agent_endpoints SET config=json_set(config,'$.label','Changed endpoint') WHERE id='default'", []).unwrap();
+                }
+                "shared-room" => {
+                    db.execute("UPDATE conversations SET shared=1 WHERE id=?1", [room])
+                        .unwrap();
+                }
+                "unknown" => {
+                    db.execute(
+                        "UPDATE input_deliveries SET state='unknown' WHERE id='image-source'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+        }
+        if case == "closed" {
+            end(&f, id).await;
+        }
+        if case != "streaming" {
+            f.s.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE messages SET status='complete' WHERE id='image-target'",
+                    [],
+                )
+                .unwrap();
+        }
+        if ["unknown", "streaming", "other-agent", "changed-endpoint"].contains(&case) {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        } else {
+            wait_delegation(&f, &call, "image-source", "completed").await;
+        }
+        let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+        let cards = record["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "card")
+            .collect::<Vec<_>>();
+        if ["unknown", "streaming", "other-agent", "changed-endpoint"].contains(&case) {
+            assert!(
+                cards.is_empty(),
+                "{case}: incomplete or unrelated output must not publish"
+            );
+        } else {
+            assert_eq!(cards.len(), 1, "{case}");
+            let current = ["delayed", "acknowledged", "incorporated-followup"].contains(&case);
+            assert_eq!(
+                cards[0]["data"]["presentation"],
+                if current { "current" } else { "later" },
+                "{case}"
+            );
+            if current {
+                assert_eq!(cards[0]["data"]["late"], false, "{case}");
+            }
+            if case == "delayed" {
+                assert!(cards[0]["data"]["elapsed_seconds"].as_i64().unwrap() >= 31);
+            }
+        }
+        assert!(
+            !f.home.path().join("acp.jsonl").exists(),
+            "{case}: presentation must not dispatch work"
+        );
+        if case != "closed" {
+            end(&f, id).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn settled_image_publication_receipt_accompanies_unmodified_backend_answer() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    terminal_fixture(&f, &call, "image-receipt-target", "streaming");
+    let answer = "Attached the screenshot. I could not upload it to the board because no local upload tool exists.";
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET text=?1 WHERE id='image-receipt-target'",
+            [answer],
+        )
+        .unwrap();
+    agent_conversations::attachments::receive(&f.s,room,"image-receipt-target","Coach",&json!({"type":"image","mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="})).unwrap();
+    settlement_source(
+        &f,
+        &call,
+        "image-receipt-source",
+        "incorporated",
+        "image-receipt-target",
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET status='complete' WHERE id='image-receipt-target'",
+            [],
+        )
+        .unwrap();
+    let mut batch = None;
+    for _ in 0..100 {
+        batch = f.s.db.lock().unwrap().query_row("SELECT updates FROM companion_voice_batches WHERE call_id=?1 AND semantic_key='result:image-receipt-target'",[id],|r|r.get::<_,String>(0)).optional().unwrap();
+        if batch.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let updates: Value =
+        serde_json::from_str(&batch.expect("publication facts must travel with answer")).unwrap();
+    let updates = updates.as_array().unwrap();
+    assert!(
+        updates.len() >= 4,
+        "Evidence, complete answer, publication facts and speakable update stay together"
+    );
+    let answer_parts = &updates[1..updates.len() - 2];
+    assert!(answer_parts.iter().all(|v| v["channel"] == "thinking"));
+    let sentences: Vec<_> = answer_parts
+        .iter()
+        .flat_map(|v| v["content"].as_str().unwrap().lines())
+        .collect();
+    assert_eq!(
+        sentences,
+        vec![
+            "Attached the screenshot.",
+            "I could not upload it to the board because no local upload tool exists."
+        ],
+        "All source sentences remain complete and ordered before the authoritative publication receipt"
+    );
+    let receipt = &updates[updates.len() - 2];
+    assert_eq!(receipt["channel"], "thinking");
+    let content = receipt["content"].as_str().unwrap();
+    assert!(
+        content.contains("image-receipt-target"),
+        "Quiet result identity still matches board membership"
+    );
+    assert!(content.contains("1 image(s) in shared space"));
+    assert!(content.contains("offered to the current board"));
+    assert!(content.contains("At publication time, board membership was not yet confirmed"));
+    let spoken = updates.last().unwrap();
+    assert_eq!(spoken["channel"], "commentary");
+    assert_eq!(spoken["content"], "The image is saved in our shared space.");
+    for command in updates {
+        assert!(command["content"].as_str().unwrap().len() <= 480);
+    }
+    let spoken_content = spoken["content"].as_str().unwrap();
+    assert!(!spoken_content.contains("image-receipt-target"));
+    assert!(!spoken_content.contains("receipt"));
+    assert!(!spoken_content.contains("Do not"));
+    assert!(
+        !updates[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("instructions")
+    );
+    let card: String = f.s.db.lock().unwrap().query_row("SELECT data FROM companion_events WHERE call_id=?1 AND event_key='result:image-receipt-target'",[id],|r|r.get(0)).unwrap();
+    let card: Value = serde_json::from_str(&card).unwrap();
+    assert_eq!(
+        card["text"], answer,
+        "Canonical model answer is evidence, not rewritten"
+    );
+    assert_eq!(card["presentation"], "current");
+    assert!(
+        !f.home.path().join("acp.jsonl").exists(),
+        "Publication must not recapture or reprompt"
+    );
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn tools_disabled_browser_floor_defers_saved_result_until_fresh_open_without_replaying_work()
+{
+    let f = fixture("quiet");
+    f.browser_refresh.store(false, Ordering::SeqCst);
+    assert!(!f.home.path().join("companion-actions.json").exists());
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let cookie = auth::cookie_name(&f.s);
+    let mut unknown = available_browser_surface(&f.browser_id);
+    unknown["user_speaking"] = Value::Null;
+    unknown["agent_speaking"] = Value::Null;
+    unknown["playback"]["state"] = json!("unknown");
+    unknown["playback"]["floor"] = json!("unknown");
+    unknown["playback"]["output_active"] = Value::Null;
+    assert_eq!(
+        post_browser_surface(&f.app, &cookie, id, unknown).await,
+        StatusCode::OK
+    );
+    terminal_fixture(&f, &call, "floor-target", "complete");
+    settlement_source(&f, &call, "floor-source", "completed", "floor-target");
+    let saved = until(&f, id, "card").await;
+    assert!(
+        saved["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "card" && e["data"]["message_id"] == "floor-target")
+    );
+    wait_delegation(&f, &call, "floor-source", "completed").await;
+    let assert_unsent = || {
+        assert!(
+            !std::fs::read_to_string(f.home.path().join("bridge-commands"))
+                .unwrap_or_default()
+                .lines()
+                .any(|line| serde_json::from_str::<Value>(line).unwrap()["op"] == "append")
+        );
+        assert_eq!(f.s.db.lock().unwrap().query_row("SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1 AND state='pending'",[id],|r|r.get::<_,i64>(0)).unwrap(),1);
+    };
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_unsent();
+    // Model an otherwise-open browser observation that has expired. No new
+    // live presence is fabricated to make the pending result dispatch.
+    let open = available_browser_surface(&f.browser_id);
+    f.s.db.lock().unwrap().execute("UPDATE companion_surfaces SET user_speaking=0,agent_speaking=0,playback=?2,updated_at=?3 WHERE call_id=?1",rusqlite::params![id,open["playback"].to_string(),now_ms()-6000]).unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_unsent();
+    let mut speaking = open.clone();
+    speaking["user_speaking"] = json!(true);
+    speaking["playback"]["floor"] = json!("user");
+    assert_eq!(
+        post_browser_surface(&f.app, &cookie, id, speaking).await,
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_unsent();
+    assert_eq!(
+        post_browser_surface(&f.app, &cookie, id, open).await,
+        StatusCode::OK
+    );
+    let mut accepted = false;
+    for _ in 0..80 {
+        accepted=f.s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND kind='context_delivery' AND json_extract(data,'$.state')='accepted')",[id],|r|r.get(0)).unwrap();
+        if accepted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        accepted,
+        "fresh open browser should deliver the saved exact result"
+    );
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    let appends: Vec<Value> = commands
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|v: &Value| v["op"] == "append")
+        .collect();
+    assert_eq!(appends.len(), 1);
+    assert_eq!(appends[0]["delegation_id"], "floor-source");
+    assert!(
+        appends[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("One settled answer")
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM input_deliveries WHERE id='floor-source'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_tool_grants WHERE call_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let capture = request(
+        &f,
+        "POST",
+        &format!("/api/v1/companion/calls/{id}/tools/capture"),
+        Some(
+            json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"floor-source"}),
+        ),
+    )
+    .await;
+    assert!(
+        capture.0.is_client_error(),
+        "telemetry must not enable disabled capture tools"
+    );
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_surface_commands WHERE call_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
     );
     end(&f, id).await;
 }

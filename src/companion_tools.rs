@@ -154,8 +154,10 @@ pub fn permission_once(
         return Ok(None);
     }
     let cfg = config(s).ok();
-    let call:Option<(String,String)>=s.db.lock().unwrap().query_row("SELECT c.id,c.state FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.owner=?2 AND c.agent_id=?3 AND g.port>0",params![room,actor,agent],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    let Some((call, state)) = call else {
+    // A disconnected listener does not erase this injected server's ownership.
+    // Recognize its retained grant before deciding whether it can still run.
+    let call:Option<(String,String,Option<i64>)>=s.db.lock().unwrap().query_row("SELECT c.id,c.state,g.port FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.owner=?2 AND c.agent_id=?3",params![room,actor,agent],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((call, state, port)) = call else {
         return Ok(None);
     };
     if !crate::companion::room_identity_valid(s, room)?
@@ -222,7 +224,7 @@ pub fn permission_once(
             .iter()
             .filter(|o| o["kind"] == "reject_once")
             .collect::<Vec<_>>();
-        let automatic_end = reason == "call_inactive";
+        let automatic_end = matches!(reason, "call_inactive" | "transport_unavailable");
         let outcome = if rejects.len() == 1 && !automatic_end {
             json!({"outcome":{"outcome":"selected","optionId":rejects[0]["optionId"]}})
         } else {
@@ -231,6 +233,9 @@ pub fn permission_once(
         s.audit("permission.companion.denied", Some(room), json!({"agent_id":agent,"actor":actor,"call_id":call,"tool":raw.tool,"reason":reason,"kind":if rejects.len() == 1 && !automatic_end {"reject_once"} else {"cancelled"},"human_decision":false}))?;
         Ok(Some(outcome))
     };
+    if port.is_none_or(|port| port <= 0) {
+        return deny("transport_unavailable");
+    }
     let inactive = !matches!(state.as_str(), "connecting" | "connected");
     let saved_receipt = raw.tool == "companion_surface_status"
         && crate::companion_surface::terminal_status_shape_valid(&raw.arguments);
@@ -478,10 +483,12 @@ pub async fn connection_status(
     if !valid_connection_id(&query.connection_id) {
         return Err(ApiError::bad("Choose a configured observation source"));
     }
-    let response =
-        crate::companion_awareness::connection_status(&s, &id, &query.connection_id).await?;
+    let read = crate::companion_awareness::connection_status(&s, &id, &query.connection_id).await?;
     authorize(&s, &id, &h)?;
-    Ok(Json(response))
+    // Preserve original source qualifiers before a backend can paraphrase them.
+    // This queues context only; the ordinary floor and policy checks still apply.
+    crate::companion_awareness::preserve_requested_status(&s, &id, &read)?;
+    Ok(Json(read.response))
 }
 
 #[derive(Deserialize)]
@@ -519,9 +526,11 @@ pub async fn status(
     h: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authorize(&s, &id, &h)?;
-    Ok(Json(
-        action_row(&s, &id, &rid)?.ok_or_else(ApiError::missing)?,
-    ))
+    Ok(Json(match action_row(&s, &id, &rid)? {
+        Some(value) => value,
+        None => crate::companion_awareness::action_observation_for_call(&s, &id, &rid)?
+            .ok_or_else(ApiError::missing)?,
+    }))
 }
 pub async fn action(
     State(s): State<Arc<AppState>>,
@@ -582,8 +591,30 @@ pub async fn action(
             drop(db);
             return Ok(Json(action_row(&s, &id, &rid)?.unwrap()));
         }
-        let source = json!({"call_id":id,"conversation_id":room,"actor":owner,"audience":"private","delegation_id":did,"message_id":mid,"occurred_at":at,"original_text":text,"source_revision":auth::digest(&text)});
+        let original_text: Option<String> = tx.query_row(
+            "SELECT request_text FROM companion_delegations WHERE call_id=?1 AND id=?2",
+            params![id, did],
+            |r| r.get(0),
+        )?;
+        let original_text = original_text
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| text.clone());
+        let original_at = crate::companion_awareness::original_human_source_time(&tx, &id, &did)
+            .map_err(|_| ApiError::bad("The original human source cannot be verified"))?;
+        let time_basis = if original_at.is_some() {
+            "retained_human_transcript"
+        } else {
+            "delegation_created_at"
+        };
+        let source = json!({"call_id":id,"conversation_id":room,"actor":owner,"audience":"private","delegation_id":did,"intent_id":did,"message_id":mid,"occurred_at":original_at.unwrap_or(at),"time_basis":time_basis,"original_text":original_text,"source_revision":auth::digest(&original_text),"evidence_revision":auth::digest(&text)});
         tx.execute("INSERT INTO companion_actions(call_id,request_id,delegation_id,connection_id,instruction,source,state,result,created_at) VALUES(?1,?2,?3,?4,?5,?6,'submitting','{}',?7)",params![id,a.request_id,did,a.connection_id,a.instruction,source.to_string(),now_ms()])?;
+        crate::companion_awareness::bind_action_observer(
+            &s,
+            &tx,
+            &id,
+            &a.request_id,
+            &a.connection_id,
+        )?;
         tx.commit()?;
         source
     };

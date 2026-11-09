@@ -57,6 +57,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
         ("board_card_ids", "TEXT NOT NULL DEFAULT '[]'"),
         ("pinned_card_ids", "TEXT NOT NULL DEFAULT '[]'"),
         ("focused_card_id", "TEXT"),
+        ("playback", "TEXT"),
     ] {
         if !surface_columns.iter().any(|c| c == name) {
             db.execute(
@@ -76,8 +77,38 @@ pub fn migrate(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Capture the actual initialize result for the ACP connection receiving this
-/// call's MCP descriptor. A browser probe or static profile is not authoritative.
+/// Read only this call's actual ACP handshake. Profile hints, browser probes and
+/// another call's saved settings cannot establish its current image capability.
+pub(crate) fn current_capabilities(
+    s: &AppState,
+    call: &str,
+    room: &str,
+    agent: &str,
+) -> Result<Value> {
+    let db = s.db.lock().unwrap();
+    let valid: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND conversation_id=?2 AND agent_id=?3 AND state IN ('connecting','connected'))",
+        params![call, room, agent], |r| r.get(0),
+    )?;
+    let observed: Option<(Option<bool>, i64)> =
+        if valid && crate::companion_history::private_identity(&db, call)?.is_some() {
+            db.query_row(
+            "SELECT image_input,observed_at FROM companion_surface_capabilities WHERE call_id=?1",
+            [call],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        } else {
+            None
+        };
+    Ok(
+        json!({"image_input":observed.and_then(|v|v.0),"observed_at":observed.map(|v|v.1),"source":if observed.is_some(){"acp_initialize"}else{"not_yet_observed"}}),
+    )
+}
+
+/// Capture the actual initialize result for this exact call and selected agent.
+/// The fixed control updates the voice's knowledge without asking it to speak.
+/// A recorded control or provider acknowledgment is not proof of spoken output.
 pub(crate) fn record_capabilities(
     s: &AppState,
     room: &str,
@@ -85,7 +116,44 @@ pub(crate) fn record_capabilities(
     capabilities: &Value,
 ) -> Result<()> {
     let image = capabilities["promptCapabilities"]["image"].as_bool();
-    s.db.lock().unwrap().execute("INSERT INTO companion_surface_capabilities(call_id,image_input,observed_at) SELECT id,?3,?4 FROM companion_calls WHERE conversation_id=?1 AND agent_id=?2 AND state IN ('connecting','connected') ON CONFLICT(call_id) DO UPDATE SET image_input=excluded.image_input,observed_at=excluded.observed_at",params![room,agent,image,now_ms()])?;
+    let mut updates = Vec::new();
+    {
+        let mut db = s.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let calls = tx.prepare("SELECT id FROM companion_calls WHERE conversation_id=?1 AND agent_id=?2 AND state IN ('connecting','connected')")?
+            .query_map(params![room,agent], |r|r.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for call in calls {
+            if crate::companion_history::private_identity(&tx, &call)?.is_none() {
+                continue;
+            }
+            let old: Option<Option<bool>> = tx
+                .query_row(
+                    "SELECT image_input FROM companion_surface_capabilities WHERE call_id=?1",
+                    [&call],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if old == Some(image) {
+                continue;
+            }
+            let at = now_ms();
+            let event = format!("image-capability-{}", uuid::Uuid::new_v4());
+            tx.execute("INSERT INTO companion_surface_capabilities(call_id,image_input,observed_at) VALUES(?1,?2,?3) ON CONFLICT(call_id) DO UPDATE SET image_input=excluded.image_input,observed_at=excluded.observed_at",params![call,image,at])?;
+            let facts = json!({"image_input":image,"observed_at":at,"source":"acp_initialize"});
+            tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'context_supplied',?3,?4)",params![call,format!("{event}:observed"),json!({"id":"current_call_capabilities","title":"Current call image capability","target":"voice","state":"observed","content":facts.to_string(),"source_label":"This call's actual ACP initialize"}).to_string(),at])?;
+            updates.push((call, event));
+        }
+        tx.commit()?;
+    }
+    for (call, event) in updates {
+        crate::companion::instruction(
+            s,
+            &call,
+            &event,
+            crate::companion_identity::image_capability_instruction(image),
+        )?;
+    }
     Ok(())
 }
 
@@ -102,6 +170,52 @@ pub struct Presence {
     #[serde(default)]
     pinned_card_ids: Vec<String>,
     focused_card_id: Option<String>,
+    playback: Option<Playback>,
+    interruption: Option<Interruption>,
+}
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Playback {
+    state: String,
+    interruption_id: Option<String>,
+    output_active: Option<bool>,
+    floor: String,
+}
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Interruption {
+    id: String,
+    reason: String,
+    phase: String,
+}
+fn valid_playback(p: &Presence) -> bool {
+    let Some(playback) = &p.playback else {
+        return p.interruption.is_none();
+    };
+    if !["ready", "suppressed", "unknown"].contains(&playback.state.as_str())
+        || !["user", "open", "unknown"].contains(&playback.floor.as_str())
+        || playback
+            .interruption_id
+            .as_ref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+        || (playback.state == "suppressed"
+            && (playback.interruption_id.is_none() || playback.floor == "open"))
+        || (playback.floor == "open" && p.user_speaking != Some(false))
+    {
+        return false;
+    }
+    p.interruption.as_ref().is_none_or(|i| {
+        uuid::Uuid::parse_str(&i.id).is_ok()
+            && playback.interruption_id.as_deref() == Some(i.id.as_str())
+            && [
+                "sustained_speech",
+                "explicit_interrupt",
+                "continued_explanation",
+            ]
+            .contains(&i.reason.as_str())
+            && ((i.phase == "suppressed" && playback.state == "suppressed")
+                || (i.phase == "released" && playback.state == "ready"))
+    })
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -249,6 +363,72 @@ fn source_authorized(
         None => Ok(false),
     }
 }
+/// An already queued browser operation retains its original authorization until
+/// its own expiry. A fast successful backend return is not revocation. This
+/// lookup also permits read-only duplicate acknowledgment of a terminal operation;
+/// the atomic acceptance transition still rejects expiry and repeat execution.
+/// It cannot admit a new operation or revive failed/unknown source delivery.
+fn operation_source_authorized_in(
+    s: &AppState,
+    db: &Connection,
+    id: &str,
+    operation: &str,
+    owner: &str,
+    agent: &str,
+    room: &str,
+) -> Result<bool> {
+    let source: Option<String> = db.query_row(
+        "SELECT d.message_id FROM companion_surface_commands o JOIN companion_delegations d ON d.call_id=o.call_id AND d.id=o.delegation_id JOIN messages m ON m.id=d.message_id JOIN input_deliveries i ON i.message_id=m.id AND i.agent_id=?4 AND i.conversation_id=?5 LEFT JOIN messages result ON result.id=i.target_turn AND result.conversation_id=?5 AND result.agent_id=?4 AND result.role='assistant' WHERE o.call_id=?1 AND o.operation_id=?2 AND m.role='user' AND m.actor=?3 AND m.conversation_id=?5 AND ((d.state='dispatched' AND i.state IN ('submitted','received_remote','incorporated')) OR (d.state='completed' AND i.state IN ('completed','incorporated') AND result.status='complete'))",
+        params![id,operation,owner,agent,room], |r|r.get(0)).optional()?;
+    match source {
+        Some(source) => crate::delivery::authorized_in(s, db, &source, owner),
+        None => Ok(false),
+    }
+}
+
+/// Revalidate the current call, browser consent and original source under the
+/// same transaction that changes queued to accepted. Earlier route/credential
+/// checks are not authority for this final transition.
+fn accept_operation_in(
+    s: &AppState,
+    db: &rusqlite::Transaction<'_>,
+    id: &str,
+    operation: &str,
+    owner: &str,
+    browser: &str,
+    session: &str,
+) -> ApiResult<bool> {
+    if !crate::companion_tools::enabled(s)? || !s.config.allows_user(owner) {
+        return Err(ApiError::forbidden());
+    }
+    let Some(identity) = crate::companion_history::private_identity(db, id)? else {
+        return Err(ApiError::forbidden());
+    };
+    if identity.owner != owner {
+        return Err(ApiError::forbidden());
+    }
+    let at = now_ms();
+    let current: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM companion_surface_commands o JOIN companion_calls c ON c.id=o.call_id JOIN companion_tool_grants g ON g.call_id=c.id JOIN companion_surfaces p ON p.call_id=o.call_id AND p.browser_id=o.browser_id AND p.session_hash=o.session_hash JOIN browser_sessions b ON b.hash=p.session_hash AND b.owner=c.owner WHERE o.call_id=?1 AND o.operation_id=?2 AND p.browser_id=?3 AND p.session_hash=?4 AND c.owner=?5 AND c.state IN ('connecting','connected') AND c.heartbeat_at>=?6 AND g.port>0 AND p.updated_at>=?6 AND b.expires_at>?7 AND (o.kind!='capture' OR (p.camera_enabled=1 AND p.capture_consent=1)))",
+        params![id,operation,browser,session,owner,at-FRESH_MS,at],
+        |r| r.get(0),
+    )?;
+    if !current
+        || !operation_source_authorized_in(
+            s,
+            db,
+            id,
+            operation,
+            owner,
+            &identity.agent,
+            &identity.room,
+        )?
+    {
+        return Err(ApiError::forbidden());
+    }
+    Ok(db.execute("UPDATE companion_surface_commands SET state='accepted',accepted_at=?3 WHERE call_id=?1 AND operation_id=?2 AND state='queued' AND expires_at>=?3",params![id,operation,at])?==1)
+}
+
 fn card_exists(s: &AppState, id: &str, card: &str) -> Result<bool> {
     if let Some(upload) = card.strip_prefix("upload:") {
         return Ok(s.db.lock().unwrap().query_row(
@@ -375,6 +555,37 @@ fn record_event(
     db.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,?3,?4,?5)",params![id,format!("surface:{operation}:{state}"),kind,data.to_string(),now_ms()])?;
     Ok(())
 }
+/// Do not send obsolete browser membership after it waited for the caller's
+/// floor. Ownership/private identity is checked by the common delivery gate.
+pub(crate) fn board_presentation_allowed(
+    db: &rusqlite::Connection,
+    call: &str,
+    commands: &[Value],
+) -> Result<bool> {
+    for command in commands {
+        let Some(event) = command["event_id"]
+            .as_str()
+            .filter(|v| v.starts_with("board:"))
+        else {
+            continue;
+        };
+        let latest: Option<(String,String,String)> = db.query_row(
+            "SELECT e.event_key,e.data,p.board_card_ids FROM companion_events e JOIN companion_surfaces p ON p.call_id=e.call_id WHERE e.call_id=?1 AND e.kind='surface_observation' ORDER BY e.seq DESC LIMIT 1",
+            [call],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        let Some((key, data, raw)) = latest else {
+            return Ok(false);
+        };
+        let mut current: Vec<String> = serde_json::from_str(&raw)?;
+        current.sort();
+        let saved: Value = serde_json::from_str(&data)?;
+        if key != event || saved["card_ids"] != json!(current) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub async fn presence(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -383,6 +594,7 @@ pub async fn presence(
 ) -> ApiResult<Json<Value>> {
     let (p, _) = browser(&s, &id, &h, true)?;
     if uuid::Uuid::parse_str(&presence.browser_id).is_err()
+        || !valid_playback(&presence)
         || (presence.capture_consent && !presence.camera_enabled)
         || presence.board_card_ids.len() > 3
         || presence.board_card_ids.iter().any(|id| !valid_card_id(id))
@@ -411,7 +623,10 @@ pub async fn presence(
             "Use an enabled camera for capture consent and at most three owned board cards",
         ));
     }
-    if !active(&s, &id)? {
+    // Playback telemetry belongs to the call, including plain ACP calls without
+    // optional Companion MCP tools. It grants no camera or connector authority.
+    let live: bool = s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND state IN ('connecting','connected') AND heartbeat_at>=?2)",params![id,now_ms()-FRESH_MS],|r|r.get(0))?;
+    if !live || crate::companion_history::private_identity(&s.db.lock().unwrap(), &id)?.is_none() {
         return Err(ApiError::forbidden());
     }
     for card in &presence.board_card_ids {
@@ -419,22 +634,98 @@ pub async fn presence(
             return Err(ApiError::missing());
         }
     }
-    let db = s.db.lock().unwrap();
+    let mut db = s.db.lock().unwrap();
+    let tx = db.transaction()?;
     // A fresh different browser cannot silently take over this call surface.
-    let current: Option<(String, String, i64)> = db
+    let current: Option<(String, String, i64, String)> = tx
         .query_row(
-            "SELECT browser_id,session_hash,updated_at FROM companion_surfaces WHERE call_id=?1",
+            "SELECT browser_id,session_hash,updated_at,board_card_ids FROM companion_surfaces WHERE call_id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    if current.is_some_and(|(browser, session, at)| {
-        at >= now_ms() - FRESH_MS
-            && (browser != presence.browser_id || Some(session) != p.session_hash)
+    if current.as_ref().is_some_and(|(browser, session, at, _)| {
+        *at >= now_ms() - FRESH_MS
+            && (browser != &presence.browser_id || Some(session) != p.session_hash.as_ref())
     }) {
         return Err(ApiError::busy());
     }
-    db.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,user_speaking,agent_speaking,updated_at,board_card_ids,pinned_card_ids,focused_card_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(call_id) DO UPDATE SET browser_id=excluded.browser_id,session_hash=excluded.session_hash,camera_enabled=excluded.camera_enabled,capture_consent=excluded.capture_consent,user_speaking=excluded.user_speaking,agent_speaking=excluded.agent_speaking,updated_at=excluded.updated_at,board_card_ids=excluded.board_card_ids,pinned_card_ids=excluded.pinned_card_ids,focused_card_id=excluded.focused_card_id",params![id,presence.browser_id,p.session_hash,presence.camera_enabled,presence.capture_consent,presence.user_speaking,presence.agent_speaking,now_ms(),serde_json::to_string(&presence.board_card_ids).unwrap(),serde_json::to_string(&presence.pinned_card_ids).unwrap(),presence.focused_card_id])?;
+    let mut old_board: Vec<String> = current
+        .as_ref()
+        .map(|(_, _, _, raw)| serde_json::from_str(raw))
+        .transpose()
+        .map_err(anyhow::Error::from)?
+        .unwrap_or_default();
+    let mut board = presence.board_card_ids.clone();
+    old_board.sort();
+    board.sort();
+    let board_changed = old_board != board;
+    tx.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,user_speaking,agent_speaking,updated_at,board_card_ids,pinned_card_ids,focused_card_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(call_id) DO UPDATE SET browser_id=excluded.browser_id,session_hash=excluded.session_hash,camera_enabled=excluded.camera_enabled,capture_consent=excluded.capture_consent,user_speaking=excluded.user_speaking,agent_speaking=excluded.agent_speaking,updated_at=excluded.updated_at,board_card_ids=excluded.board_card_ids,pinned_card_ids=excluded.pinned_card_ids,focused_card_id=excluded.focused_card_id",params![id,presence.browser_id,p.session_hash,presence.camera_enabled,presence.capture_consent,presence.user_speaking,presence.agent_speaking,now_ms(),serde_json::to_string(&presence.board_card_ids).unwrap(),serde_json::to_string(&presence.pinned_card_ids).unwrap(),presence.focused_card_id])?;
+    tx.execute(
+        "UPDATE companion_surfaces SET playback=?2 WHERE call_id=?1",
+        params![id, presence.playback.as_ref().map(|p| json!(p).to_string())],
+    )?;
+    let board_control = if board_changed {
+        let mut identities = Vec::new();
+        for card in &board {
+            let result: Option<String> = if card.starts_with("upload:") {
+                None
+            } else {
+                tx.query_row("SELECT json_extract(data,'$.message_id') FROM companion_events WHERE call_id=?1 AND seq=?2 AND kind='card'",params![id,card],|r|r.get(0)).optional()?.flatten()
+            };
+            identities.push(json!({"card":card,"result":result}));
+        }
+        let event_id = format!("board:{}", uuid::Uuid::new_v4());
+        // Membership is affirmative evidence about this board, independent
+        // of whether an image decoded or the person looked at it. Keep these
+        // distinct from the earlier publication offer and from image analysis.
+        let content = if board.is_empty() {
+            "The shared board is now empty. Previously saved items remain in history.".to_owned()
+        } else {
+            format!(
+                "The shared board currently contains these saved items: {}. This confirms they are on the board. Image decoding and whether the caller looked at them are unknown.",
+                json!(identities)
+            )
+        };
+        if content.len() > 480 {
+            return Err(anyhow::anyhow!("Board observation exceeds context bound").into());
+        }
+        tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'surface_observation',?3,?4)",params![id,event_id,json!({"card_ids":board,"identities":identities,"source":"authenticated_browser_membership","board_state":if board.is_empty(){"empty"}else{"items_present"},"membership_verified":true,"human_viewed":null,"image_decoded":null}).to_string(),now_ms()])?;
+        Some((event_id, content))
+    } else {
+        None
+    };
+    let interruption_control = if let Some(interruption) = &presence.interruption {
+        let key = format!("playback:{}:{}", interruption.id, interruption.phase);
+        let data = json!({"browser_id":presence.browser_id,"interruption":interruption,"playback":presence.playback,"work_cancelled":false,"generated_speech_is_not_playback":true});
+        let inserted = tx.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'playback',?3,?4)",params![id,key,data.to_string(),now_ms()])?;
+        (inserted > 0).then(|| (key, if interruption.phase == "suppressed" {
+            "The caller has taken the floor. Stop speaking and listen through their explanation. Do not acknowledge this control message. Do not resume the interrupted wording or narrate task routing. This stops speech only; accepted work is unchanged."
+        } else {
+            "Playback is available after an interruption. Continue listening; when appropriate answer the caller's latest point naturally. Do not resume the unheard middle or tail of earlier speech, acknowledge this control message, or infer that work completed."
+        }))
+    } else {
+        None
+    };
+    tx.commit()?;
+    drop(db);
+    if let Some((event_id, content)) = board_control {
+        crate::companion_delivery::enqueue_batch(
+            &s,
+            &id,
+            "surface:board",
+            vec![
+                json!({"op":"append","channel":"thinking","event_id":event_id,"delegation_id":null,"content":content}),
+            ],
+        )?;
+        s.changed();
+    }
+    if let Some((event_id, content)) = interruption_control {
+        // Application-authored controls only. Browser text is never promoted to
+        // model instructions; authorization and world effects are unchanged.
+        crate::companion::instruction(&s, &id, &event_id, content)?;
+        s.changed();
+    }
     Ok(Json(
         json!({"browser_id":presence.browser_id,"camera_enabled":presence.camera_enabled,"capture_consent":presence.capture_consent,"expires_at":now_ms()+FRESH_MS}),
     ))
@@ -694,42 +985,24 @@ pub async fn ack(
     {
         return Err(ApiError::bad("Use one supported browser acknowledgment"));
     }
-    let current = {
-        let db = s.db.lock().unwrap();
-        row(&db, &id, &operation)?.ok_or_else(ApiError::missing)?
-    };
-    if current["browser_id"] != a.browser_id {
-        return Err(ApiError::forbidden());
-    }
-    if a.state == "accepted" {
-        let agent: String = s.db.lock().unwrap().query_row(
-            "SELECT agent_id FROM companion_calls WHERE id=?1",
-            [&id],
-            |r| r.get(0),
-        )?;
-        if surface(&s, &id, current["kind"] == "capture")?.as_deref() != Some(&a.browser_id)
-            || !source_authorized(
-                &s,
-                &id,
-                &p.actor,
-                &agent,
-                &room,
-                current["delegation_id"].as_str().unwrap_or(""),
-            )?
-        {
-            return Err(ApiError::forbidden());
-        }
-    }
     let mut db = s.db.lock().unwrap();
     let tx = db.transaction()?;
+    let previous = row(&tx, &id, &operation)?.ok_or_else(ApiError::missing)?;
     let bound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_surfaces p JOIN companion_surface_commands c ON c.call_id=p.call_id AND c.browser_id=p.browser_id AND c.session_hash=p.session_hash WHERE p.call_id=?1 AND p.browser_id=?2 AND p.session_hash=?3 AND c.operation_id=?4)",params![id,a.browser_id,p.session_hash,operation],|r|r.get(0))?;
     if !bound {
         return Err(ApiError::forbidden());
     }
-    let previous = row(&tx, &id, &operation)?.ok_or_else(ApiError::missing)?;
     let mut execute = false;
     if a.state == "accepted" {
-        execute=tx.execute("UPDATE companion_surface_commands SET state='accepted',accepted_at=?3 WHERE call_id=?1 AND operation_id=?2 AND state='queued' AND expires_at>=?3",params![id,operation,now_ms()])?==1;
+        execute = accept_operation_in(
+            &s,
+            &tx,
+            &id,
+            &operation,
+            &p.actor,
+            &a.browser_id,
+            p.session_hash.as_deref().ok_or_else(ApiError::forbidden)?,
+        )?;
     } else {
         let accepted:bool=tx.query_row("SELECT accepted_at IS NOT NULL FROM companion_surface_commands WHERE call_id=?1 AND operation_id=?2",params![id,operation],|r|r.get(0))?;
         if !accepted {
@@ -996,4 +1269,369 @@ pub async fn status(
         }
     }
     Ok(Json(receipt))
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::*;
+    use crate::config::{Agent, Config};
+    use std::collections::BTreeMap;
+
+    struct Fixture {
+        _home: tempfile::TempDir,
+        state: Arc<AppState>,
+        call: String,
+        room: String,
+        operation: String,
+        browser: String,
+        session: String,
+        message: String,
+    }
+
+    fn fixture() -> Fixture {
+        let home = tempfile::tempdir().unwrap();
+        Config {
+            id: uuid::Uuid::new_v4().to_string(),
+            label: "Surface acceptance fixture".into(),
+            owner: "owner".into(),
+            allowed_users: vec![],
+            embed_origins: vec![],
+            bind: "127.0.0.1".into(),
+            port: 0,
+            public_url: "https://example.test".into(),
+            pam_service: "fixture".into(),
+            tls_cert: home.path().join("cert"),
+            tls_key: home.path().join("key"),
+            tls_ca: None,
+            import_source: "fixture".into(),
+            import_surface: "fixture".into(),
+            agent: Agent {
+                label: "Coach".into(),
+                command: "/bin/true".into(),
+                args: vec![],
+                cwd: home.path().to_string_lossy().into_owned(),
+                session_cwd: None,
+                env: BTreeMap::new(),
+                mcp_servers: vec![],
+                timeout_seconds: 30,
+                client: Default::default(),
+            },
+        }
+        .save(home.path())
+        .unwrap();
+        std::fs::write(
+            home.path().join("companion-actions.json"),
+            r#"{"enabled":true,"agents":{}}"#,
+        )
+        .unwrap();
+        let state = AppState::open(home.path().into()).unwrap();
+        let room = state.create("Private call").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let call = uuid::Uuid::new_v4().to_string();
+        let operation = uuid::Uuid::new_v4().to_string();
+        let browser = uuid::Uuid::new_v4().to_string();
+        let message = uuid::Uuid::new_v4().to_string();
+        let session = auth::digest("browser");
+        let fingerprint = auth::digest(
+            &serde_json::to_string(&state.agent("default").unwrap().unwrap()).unwrap(),
+        );
+        let at = now_ms();
+        let control = std::fs::read_to_string(home.path().join("secrets/control-token")).unwrap();
+        {
+            let db = state.db.lock().unwrap();
+            db.execute("INSERT INTO browser_sessions(hash,owner,csrf,expires_at) VALUES(?1,'owner','csrf',?2)",params![session,at+60_000]).unwrap();
+            db.execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at,endpoint_hash) VALUES(?1,'owner',?1,'fixture','default',?2,'connected',?3,?3,?4)",params![call,room,at,fingerprint]).unwrap();
+            db.execute(
+                "INSERT INTO companion_tool_grants(call_id,token,port) VALUES(?1,'fixture',12345)",
+                [&call],
+            )
+            .unwrap();
+            db.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,updated_at) VALUES(?1,?2,?3,1,1,?4)",params![call,browser,session,at]).unwrap();
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user','Show me what the camera sees.','complete',?3,?3,'owner')",params![message,room,at]).unwrap();
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES('result',?1,'assistant','','streaming',?2,?2,'Coach','default')",params![room,at]).unwrap();
+            db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'delegation',100,'dispatched',?2,?3)",params![call,message,at]).unwrap();
+            db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES(?1,?1,?2,'default','direct','submitted','result',?3)",params![message,room,at]).unwrap();
+            db.execute(
+                "INSERT INTO input_authority(message_id,token_hash) VALUES(?1,?2)",
+                params![message, auth::digest(control.trim())],
+            )
+            .unwrap();
+            db.execute("INSERT INTO companion_surface_commands(call_id,operation_id,delegation_id,browser_id,session_hash,kind,command,state,created_at,expires_at) VALUES(?1,?2,'delegation',?3,?4,'capture','{}','queued',?5,?6)",params![call,operation,browser,session,at,at+TTL_MS]).unwrap();
+        }
+        Fixture {
+            _home: home,
+            state,
+            call,
+            room,
+            operation,
+            browser,
+            session,
+            message,
+        }
+    }
+
+    #[test]
+    fn queued_board_observation_waits_for_floor_and_rejects_superseded_membership() {
+        let f = fixture();
+        let append = |id: &str| json!({"op":"append","channel":"thinking","event_id":id,"delegation_id":null,"content":"Browser membership observation only"});
+        {
+            let db = f.state.db.lock().unwrap();
+            db.execute("UPDATE companion_surfaces SET user_speaking=1,agent_speaking=0,board_card_ids='[\"1\"]' WHERE call_id=?1",[&f.call]).unwrap();
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'board:first','surface_observation','{\"card_ids\":[\"1\"]}',?2)",params![f.call,now_ms()]).unwrap();
+        }
+        crate::companion_delivery::enqueue_batch(
+            &f.state,
+            &f.call,
+            "surface:board",
+            vec![append("board:first")],
+        )
+        .unwrap();
+        assert!(
+            crate::companion_delivery::take_ready(&f.state, &f.call)
+                .unwrap()
+                .is_none()
+        );
+        {
+            let db = f.state.db.lock().unwrap();
+            db.execute("UPDATE companion_surfaces SET user_speaking=0,board_card_ids='[]' WHERE call_id=?1",[&f.call]).unwrap();
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'board:empty','surface_observation','{\"card_ids\":[]}',?2)",params![f.call,now_ms()]).unwrap();
+            assert!(!board_presentation_allowed(&db, &f.call, &[append("board:first")]).unwrap());
+        }
+        // The older pending item cannot leak after the browser changed it.
+        assert!(
+            crate::companion_delivery::take_ready(&f.state, &f.call)
+                .unwrap()
+                .is_none()
+        );
+        crate::companion_delivery::enqueue_batch(
+            &f.state,
+            &f.call,
+            "surface:board",
+            vec![append("board:empty")],
+        )
+        .unwrap();
+        let ready = crate::companion_delivery::take_ready(&f.state, &f.call)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready["commands"][0]["event_id"], "board:empty");
+    }
+
+    #[test]
+    fn negotiated_image_capability_is_current_call_scoped_and_idempotent() {
+        let f = fixture();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        crate::companion::test_control(&f.state, &f.call, tx);
+        assert_eq!(
+            current_capabilities(&f.state, &f.call, &f.room, "default").unwrap(),
+            json!({"image_input":null,"observed_at":null,"source":"not_yet_observed"})
+        );
+        // The wrong agent or room cannot seed this call's negotiated state.
+        record_capabilities(
+            &f.state,
+            &f.room,
+            "another-agent",
+            &json!({"promptCapabilities":{"image":true}}),
+        )
+        .unwrap();
+        record_capabilities(
+            &f.state,
+            "another-room",
+            "default",
+            &json!({"promptCapabilities":{"image":true}}),
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        for image in [false, true, false] {
+            record_capabilities(
+                &f.state,
+                &f.room,
+                "default",
+                &json!({"promptCapabilities":{"image":image},"private_field":"never copied"}),
+            )
+            .unwrap();
+            let observed = current_capabilities(&f.state, &f.call, &f.room, "default").unwrap();
+            assert_eq!(observed["image_input"], image);
+            assert_eq!(observed["source"], "acp_initialize");
+            let control = rx.try_recv().unwrap();
+            assert_eq!(control["channel"], "instructions");
+            assert_eq!(
+                control["content"],
+                crate::companion_identity::image_capability_instruction(Some(image))
+            );
+            assert!(!control.to_string().contains("never copied"));
+            record_capabilities(
+                &f.state,
+                &f.room,
+                "default",
+                &json!({"promptCapabilities":{"image":image}}),
+            )
+            .unwrap();
+            assert!(
+                rx.try_recv().is_err(),
+                "repeated initialize must not repeat the capability control"
+            );
+        }
+        assert!(current_capabilities(&f.state,&f.call,&f.room,"another-agent").unwrap()["image_input"].is_null());
+        assert!(current_capabilities(&f.state,&f.call,"another-room","default").unwrap()["image_input"].is_null());
+        assert!(current_capabilities(&f.state,"another-call",&f.room,"default").unwrap()["image_input"].is_null());
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE companion_calls SET endpoint_hash='changed' WHERE id=?1",
+                [&f.call],
+            )
+            .unwrap();
+        assert!(
+            current_capabilities(&f.state, &f.call, &f.room, "default").unwrap()["image_input"]
+                .is_null()
+        );
+        record_capabilities(
+            &f.state,
+            &f.room,
+            "default",
+            &json!({"promptCapabilities":{"image":true}}),
+        )
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "changed endpoint must not receive stale capability updates"
+        );
+    }
+
+    #[test]
+    fn absent_or_malformed_image_capability_stays_unknown_and_closed_calls_are_ignored() {
+        let f = fixture();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        crate::companion::test_control(&f.state, &f.call, tx);
+        record_capabilities(&f.state, &f.room, "default", &json!({})).unwrap();
+        let observed = current_capabilities(&f.state, &f.call, &f.room, "default").unwrap();
+        assert!(observed["image_input"].is_null());
+        assert_eq!(observed["source"], "acp_initialize");
+        assert_eq!(
+            rx.try_recv().unwrap()["content"],
+            crate::companion_identity::image_capability_instruction(None)
+        );
+        record_capabilities(
+            &f.state,
+            &f.room,
+            "default",
+            &json!({"promptCapabilities":{"image":"true"}}),
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE companion_calls SET state='closed' WHERE id=?1",
+                [&f.call],
+            )
+            .unwrap();
+        record_capabilities(
+            &f.state,
+            &f.room,
+            "default",
+            &json!({"promptCapabilities":{"image":true}}),
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            current_capabilities(&f.state, &f.call, &f.room, "default").unwrap()["source"],
+            "not_yet_observed"
+        );
+    }
+
+    #[test]
+    fn stale_prechecks_cannot_authorize_surface_acceptance_after_revocation() {
+        for mutation in [
+            "DELETE FROM input_authority",
+            "UPDATE tokens SET scopes='[]'",
+            "UPDATE browser_sessions SET expires_at=0",
+            "UPDATE companion_surfaces SET camera_enabled=0",
+            "UPDATE companion_surfaces SET capture_consent=0",
+            "UPDATE companion_surfaces SET updated_at=0",
+            "UPDATE companion_surfaces SET browser_id='replacement'",
+            "UPDATE companion_calls SET state='closing'",
+            "UPDATE companion_calls SET heartbeat_at=0",
+            "UPDATE companion_calls SET endpoint_hash='changed'",
+            "UPDATE companion_tool_grants SET port=0",
+            "UPDATE conversations SET shared=1",
+            "UPDATE input_deliveries SET state='unknown'",
+        ] {
+            let f = fixture();
+            // Reproduce the old successful route/source precheck, then change
+            // the protected fact before entering the final acceptance boundary.
+            assert_eq!(
+                surface(&f.state, &f.call, true).unwrap().as_deref(),
+                Some(f.browser.as_str())
+            );
+            assert!(
+                source_authorized(&f.state, &f.call, "owner", "default", &f.room, "delegation")
+                    .unwrap()
+            );
+            assert!(crate::delivery::authorized(&f.state, &f.message, "owner").unwrap());
+            let mut db = f.state.db.lock().unwrap();
+            db.execute_batch(mutation).unwrap();
+            let tx = db.transaction().unwrap();
+            let before = tx.total_changes();
+            let error = accept_operation_in(
+                &f.state,
+                &tx,
+                &f.call,
+                &f.operation,
+                "owner",
+                &f.browser,
+                &f.session,
+            )
+            .unwrap_err();
+            assert_eq!(error.0, axum::http::StatusCode::FORBIDDEN, "{mutation}");
+            assert_eq!(tx.total_changes(), before, "{mutation}");
+            let status: (String, Option<i64>) = tx.query_row("SELECT state,accepted_at FROM companion_surface_commands WHERE operation_id=?1",[&f.operation],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(status, ("queued".into(), None), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn atomic_acceptance_preserves_completed_source_once_and_expired_nonexecution() {
+        for expired in [false, true] {
+            let f = fixture();
+            let mut db = f.state.db.lock().unwrap();
+            db.execute_batch("UPDATE companion_delegations SET state='completed'; UPDATE input_deliveries SET state='completed'; UPDATE messages SET status='complete' WHERE id='result';").unwrap();
+            if expired {
+                db.execute("UPDATE companion_surface_commands SET expires_at=0", [])
+                    .unwrap();
+            }
+            let tx = db.transaction().unwrap();
+            assert_eq!(
+                accept_operation_in(
+                    &f.state,
+                    &tx,
+                    &f.call,
+                    &f.operation,
+                    "owner",
+                    &f.browser,
+                    &f.session
+                )
+                .unwrap(),
+                !expired
+            );
+            assert!(
+                !accept_operation_in(
+                    &f.state,
+                    &tx,
+                    &f.call,
+                    &f.operation,
+                    "owner",
+                    &f.browser,
+                    &f.session
+                )
+                .unwrap()
+            );
+        }
+    }
 }

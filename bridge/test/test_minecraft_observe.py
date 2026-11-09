@@ -1,4 +1,5 @@
 """Only temporary owner files and fake transports; no installed service calls."""
+import copy
 import importlib.util
 import io
 import json
@@ -81,6 +82,15 @@ OWNER_OUTCOMES_FIXTURE = json.loads(r'''{
       "reason": "not_retained"
     }
   ]
+}''')
+
+# Exact Node22 task-bounds.limitState output from Minecraft PR84 66db9d3.
+# Three of eight turns consumed; deadline elapsed, without asserting stop cause.
+OWNER_LIMIT_STATE_FIXTURE = json.loads(r'''{
+  "observed_at": "2026-11-07T20:00:00.000Z",
+  "deadline": {"kind": "finite", "elapsed": true, "remaining_ms": 0},
+  "turns": {"kind": "finite", "reached": false, "remaining": 5},
+  "meaning": "Current assignment limits only; not the recorded reason for status, proof of completion, or permission for other activity."
 }''')
 
 
@@ -167,6 +177,26 @@ class MinecraftObserveTests(unittest.TestCase):
             self.assertFalse(action["verified"])
             self.assertNotEqual(action["state"], "completed")
 
+    def test_current_status_snapshot_preserves_old_progress_time_and_stable_revision(self):
+        old = "2026-11-06T20:00:00+00:00"
+        self.task.update(status="running", progress_revision=2,
+                         progress=[{"at": old, "summary": "Old progress, not current activity"}])
+        first = self.observe()
+        event = next(e for e in first["events"] if e["kind"] == "task_observation")
+        self.assertEqual(event["occurred_at"], old)
+        self.assertEqual(event["observed_at"], NOW)
+        self.assertTrue(event["provenance"]["current_state_snapshot"])
+        self.assertEqual(json.loads(event["text"])["status"], "running")
+        self.assertEqual(json.loads(event["text"])["progress"]["at"], old)
+        second = helper.observe(self.config, {**self.input, "cursor": first["cursor"]},
+                                opener=self, now="2026-11-07T20:10:00+00:00", presence_reader=self.read_presence)
+        self.assertFalse(any(e["kind"] == "task_observation" for e in second["events"]))
+        self.task["status"] = "waiting"
+        changed = self.observe({**self.input, "cursor": first["cursor"]})
+        current = next(e for e in changed["events"] if e["kind"] == "task_observation")
+        self.assertNotEqual(current["revision"], event["revision"])
+        self.assertEqual(current["occurred_at"], old)
+
     def test_different_current_task_cannot_complete_old_action_but_retained_binding_can_be_superseded(self):
         old = self.task.copy()
         self.task = {**self.task, "id": str(uuid.uuid4()), "request_id": "unrelated", "authority": {}}
@@ -178,6 +208,195 @@ class MinecraftObserveTests(unittest.TestCase):
         self.assertEqual(action["state"], "superseded")
         self.assertEqual(action["reported_state"], "reported_complete")
         self.assertFalse(action["verified"])
+
+    def install_limit_state(self, limits=None):
+        self.presence["observed_at"] = OWNER_LIMIT_STATE_FIXTURE["observed_at"]
+        self.presence["task"] = {"id": self.task["id"], "limit_state": copy.deepcopy(
+            OWNER_LIMIT_STATE_FIXTURE if limits is None else limits)}
+
+    def test_current_domain_limits_preserve_report_time_and_do_not_invent_stop_cause(self):
+        old = "2026-11-06T20:00:00+00:00"
+        self.task.update(status="budget_exhausted", turns=3,
+                         progress=[{"at": old, "summary": "Earlier build report"}])
+        self.install_limit_state()
+        before = copy.deepcopy(self.task)
+        result = self.observe()
+        event = next(e for e in result["events"] if e["kind"] == "task_observation")
+        projection = json.loads(event["text"])
+        self.assertEqual(projection["limit_state"], OWNER_LIMIT_STATE_FIXTURE)
+        self.assertEqual(projection["status"], "budget_exhausted")
+        self.assertEqual(projection["turns"], 3)
+        self.assertEqual(projection["progress"]["at"], old)
+        self.assertEqual(event["occurred_at"], old)
+        self.assertEqual(event["observed_at"], NOW)
+        self.assertNotIn("stop_reason", projection)
+        self.assertFalse(event["provenance"]["verified"])
+        self.assertEqual(self.task, before)
+        # The domain's reported values are not re-derived from a different read.
+        self.task.update(turns=4)
+        unchanged_domain = next(e for e in self.observe()["events"] if e["kind"] == "task_observation")
+        self.assertEqual(json.loads(unchanged_domain["text"])["limit_state"], OWNER_LIMIT_STATE_FIXTURE)
+
+    def test_limit_state_distinguishes_unbounded_unknown_and_finite_without_granting_work(self):
+        for limits in [
+            {**OWNER_LIMIT_STATE_FIXTURE, "deadline": {"kind": "no_configured_bound", "elapsed": False, "remaining_ms": None}},
+            {**OWNER_LIMIT_STATE_FIXTURE, "turns": {"kind": "no_configured_bound", "reached": False, "remaining": None}},
+            {**OWNER_LIMIT_STATE_FIXTURE,
+             "deadline": {"kind": "unknown", "elapsed": None, "remaining_ms": None},
+             "turns": {"kind": "unknown", "reached": None, "remaining": None}},
+        ]:
+            with self.subTest(limits=limits):
+                self.install_limit_state(limits)
+                event = next(e for e in self.observe()["events"] if e["kind"] == "task_observation")
+                self.assertEqual(json.loads(event["text"])["limit_state"], limits)
+                self.assertFalse(event["provenance"]["authority"])
+                self.assertFalse(event["provenance"]["verified"])
+
+    def test_limit_summary_requires_same_current_task_and_exact_status_observation(self):
+        for change in [
+            lambda status: status["task"].update(id="another-task"),
+            lambda status: status["task"].pop("id"),
+            lambda status: status["task"].pop("limit_state"),
+            lambda status: status["task"]["limit_state"].update(observed_at=NOW),
+            lambda status: status["task"]["limit_state"].update(observed_at="invalid"),
+        ]:
+            self.install_limit_state()
+            change(self.presence)
+            result = self.observe()
+            self.assertEqual(result["availability"], "available")
+            event = next(e for e in result["events"] if e["kind"] == "task_observation")
+            self.assertNotIn("limit_state", json.loads(event["text"]))
+        # A limit_state on the private ledger/current control read is not a
+        # substitute for the independently identified public MCP observation.
+        self.presence.pop("task")
+        self.task["limit_state"] = copy.deepcopy(OWNER_LIMIT_STATE_FIXTURE)
+        event = next(e for e in self.observe()["events"] if e["kind"] == "task_observation")
+        self.assertNotIn("limit_state", json.loads(event["text"]))
+
+    def test_malformed_or_extended_limit_schema_is_omitted_without_losing_current_status(self):
+        malformed = [None, [], {}, {**OWNER_LIMIT_STATE_FIXTURE, "version": 2},
+                     {**OWNER_LIMIT_STATE_FIXTURE, "meaning": "Can start other work"}]
+        for axis, flag, remaining in [("deadline", "elapsed", "remaining_ms"), ("turns", "reached", "remaining")]:
+            for changes in [{flag: 1}, {flag: None}, {remaining: True}, {remaining: -1},
+                            {remaining: float("nan")}, {remaining: float("inf")},
+                            {remaining: 9007199254740992}, {remaining: "5"},
+                            {"kind": "unlimited"}, {"other": "private metadata"},
+                            {"kind": "unknown", flag: False, remaining: None},
+                            {"kind": "no_configured_bound", flag: None, remaining: None},
+                            {"kind": "no_configured_bound", flag: False, remaining: 0},
+                            {"kind": "finite", flag: True, remaining: 1},
+                            {"kind": "finite", flag: False, remaining: 0}]:
+                limits = copy.deepcopy(OWNER_LIMIT_STATE_FIXTURE)
+                limits[axis].update(changes)
+                malformed.append(limits)
+        fractional_turns = copy.deepcopy(OWNER_LIMIT_STATE_FIXTURE)
+        fractional_turns["turns"]["remaining"] = 4.5
+        malformed.append(fractional_turns)
+        for limits in malformed:
+            with self.subTest(limits=limits):
+                self.install_limit_state()
+                self.presence["task"]["limit_state"] = limits
+                result = self.observe()
+                self.assertEqual(result["availability"], "available")
+                event = next(e for e in result["events"] if e["kind"] == "task_observation")
+                self.assertNotIn("limit_state", json.loads(event["text"]))
+                self.assertNotIn("private metadata", json.dumps(result))
+
+    def test_current_limits_respect_private_task_withholding_and_never_enrich_action_history(self):
+        self.install_limit_state()
+        # Even if retained/control task data happens to contain this field, its
+        # timestamp describes a current observation, never this action's outcome.
+        self.task["limit_state"] = copy.deepcopy(OWNER_LIMIT_STATE_FIXTURE)
+        owned = self.observe()
+        self.assertNotIn("limit_state", owned["actions"][0]["task"])
+        foreign = self.observe({"version": 1, "actions": []})
+        self.assertTrue(foreign["coverage"]["private_task_withheld"])
+        self.assertFalse(any(e["kind"] == "task_observation" for e in foreign["events"]))
+        self.assertNotIn("limit_state", json.dumps(foreign))
+        previous = copy.deepcopy(self.task)
+        self.task.update(id=str(uuid.uuid4()), request_id="other", authority={"source": {"audience": {"kind": "public"}}})
+        self.ledger["task_history"] = [previous]
+        self.install_limit_state()
+        result = self.observe()
+        event = next(e for e in result["events"] if e["kind"] == "task_observation")
+        self.assertEqual(json.loads(event["text"])["id"], self.task["id"])
+        self.assertEqual(json.loads(event["text"])["limit_state"], OWNER_LIMIT_STATE_FIXTURE)
+        self.assertEqual(result["actions"][0]["state"], "superseded")
+        self.assertNotIn("limit_state", result["actions"][0]["task"])
+
+    def test_limit_countdown_polling_is_quiet_but_direct_reads_keep_exact_immutable_values(self):
+        self.install_limit_state()
+        self.presence["task"]["limit_state"]["deadline"].update(elapsed=False, remaining_ms=10000)
+        self.task.update(deadline=1794081610000, max_turns=8)
+        first = self.observe()
+        original = next(e for e in first["events"] if e["kind"] == "task_observation")
+        repeated = self.observe({**self.input, "cursor": first["cursor"]})
+        self.assertFalse(any(e["kind"] == "task_observation" for e in repeated["events"]))
+        changed_at = "2026-11-07T20:00:01.000Z"
+        self.presence["observed_at"] = changed_at
+        self.presence["task"]["limit_state"]["observed_at"] = changed_at
+        self.presence["task"]["limit_state"]["deadline"]["remaining_ms"] = 9000
+        polled = self.observe({**self.input, "cursor": first["cursor"]})
+        self.assertFalse(any(e["kind"] == "task_observation" for e in polled["events"]))
+        self.assertEqual(polled["cursor"], first["cursor"])
+        direct = self.observe()
+        event = next(e for e in direct["events"] if e["kind"] == "task_observation")
+        self.assertEqual(event["occurred_at"], self.task["started_at"])
+        current = json.loads(event["text"])["limit_state"]
+        self.assertEqual(current["observed_at"], changed_at)
+        self.assertEqual(current["deadline"]["remaining_ms"], 9000)
+        self.assertNotEqual(event["revision"], original["revision"])
+        # Deadline amendment has meaning even before the elapsed boundary and
+        # remains detectable with a legacy record lacking an authority revision.
+        self.task["deadline"] += 5000
+        amended = self.observe({**self.input, "cursor": polled["cursor"]})
+        self.assertTrue(any(e["kind"] == "task_observation" for e in amended["events"]))
+        self.presence["task"]["limit_state"]["deadline"].update(elapsed=True, remaining_ms=0)
+        elapsed = self.observe({**self.input, "cursor": amended["cursor"]})
+        self.assertTrue(any(e["kind"] == "task_observation" for e in elapsed["events"]))
+        self.task["turns"] = 8
+        self.presence["task"]["limit_state"]["turns"].update(reached=True, remaining=0)
+        used = self.observe({**self.input, "cursor": elapsed["cursor"]})
+        self.assertTrue(any(e["kind"] == "task_observation" for e in used["events"]))
+
+    def test_task_semantic_cursor_only_acknowledges_emitted_authorized_facts_and_accepts_old_shape(self):
+        self.install_limit_state()
+        with patch.object(helper, "MAX_EVENTS", 0):
+            deferred = self.observe()
+        self.assertEqual(deferred["events"], [])
+        self.assertNotIn("task", deferred["cursor"])
+        with patch.object(helper, "MAX_OUTPUT", len(helper.encoded(deferred)) + 100):
+            byte_limited = self.observe()
+        self.assertEqual(byte_limited["availability"], "available")
+        self.assertTrue(byte_limited["coverage"]["output_truncated"])
+        self.assertEqual(byte_limited["events"], [])
+        self.assertNotIn("task", byte_limited["cursor"])
+        byte_retry = self.observe({**self.input, "cursor": byte_limited["cursor"]})
+        self.assertTrue(any(e["kind"] == "task_observation" for e in byte_retry["events"]))
+        delivered = self.observe({**self.input, "cursor": deferred["cursor"]})
+        self.assertTrue(any(e["kind"] == "task_observation" for e in delivered["events"]))
+        self.assertEqual(set(delivered["cursor"]["task"]), {"id", "semantic_revision"})
+        self.assertEqual(delivered["cursor"]["task"]["id"], self.task["id"])
+        self.task["authority_revision"] += 1
+        withheld = self.observe({"version": 1, "actions": [], "cursor": delivered["cursor"]})
+        self.assertTrue(withheld["coverage"]["private_task_withheld"])
+        self.assertEqual(withheld["cursor"]["task"], delivered["cursor"]["task"])
+        legacy = {key: val for key, val in delivered["cursor"].items() if key != "task"}
+        read = self.observe({**self.input, "cursor": legacy})
+        self.assertEqual(read["availability"], "available")
+        self.assertTrue(any(e["kind"] == "task_observation" for e in read["events"]))
+
+    def test_malformed_task_cursors_fail_closed_without_reset_or_transport(self):
+        for task in [None, {}, {"id": "task", "semantic_revision": "bad"},
+                     {"id": "x" * 161, "semantic_revision": "a" * 64},
+                     {"id": "task", "semantic_revision": "a" * 64, "private": "not accepted"}]:
+            cursor = {"seen": [], "task": task}
+            result = self.observe({**self.input, "cursor": cursor})
+            self.assertEqual(result["availability"], "unavailable")
+            self.assertEqual(result["cursor"], cursor)
+            self.assertEqual(result["events"], [])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.presence_calls, [])
 
     def test_mismatched_receipt_source_and_snapshot_fail_closed(self):
         self.task["authority"]["source"]["id"] = "different"
@@ -276,6 +495,10 @@ class MinecraftObserveTests(unittest.TestCase):
         with patch.object(helper, "MAX_EVENTS", 16):
             batches = self.drain_burst()
         self.assertEqual(len(batches[0]["events"]), 16)
+        self.assertEqual([e["kind"] for e in batches[0]["events"][:2]], ["task_observation", "presence_observation"])
+        physical = json.loads(batches[0]["events"][1]["text"])
+        self.assertEqual(physical["position"], self.presence["position"])
+        self.assertEqual(physical["players"][0]["name"], "Brian")
         self.assertEqual(batches[0]["coverage"]["deferred_events"], 7)
         self.assertEqual(len(batches[1]["events"]), 7)
 
@@ -284,6 +507,7 @@ class MinecraftObserveTests(unittest.TestCase):
         with patch.object(helper, "MAX_OUTPUT", 80000):
             batches = self.drain_burst()
         self.assertTrue(batches[0]["coverage"]["output_truncated"])
+        self.assertEqual([e["kind"] for e in batches[0]["events"][:2]], ["task_observation", "presence_observation"])
         self.assertLess(len(batches[0]["events"]), 23)
         self.assertGreater(batches[0]["coverage"]["deferred_events"], 0)
 

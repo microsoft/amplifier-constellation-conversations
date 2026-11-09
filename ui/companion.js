@@ -1,3 +1,4 @@
+import {ConversationFloor} from './companion-floor.mjs';
 // The browser owns media and presentation only. Provider commands, delegation,
 // authorization and persisted call events belong to the Companion service.
 const $ = id => document.getElementById(id);
@@ -174,6 +175,17 @@ async function startCall(contact) {
   const call = {generation:++state.generation, authGeneration:state.authGeneration, contact, id:null, request:null, ended:false, connected:false,
     browserId:crypto.randomUUID(), keepScreenAwake:true, surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), cards:new Map(), contextItems:new Map(), board:[], muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
   state.call = call;
+  audio.muted = false;
+  call.floor = new ConversationFloor({changed:({playback,interruption})=>{
+    if (!current(call)) return;
+    call.playback = playback; call.interruption = interruption;
+    call.userSpeaking = playback.floor === 'unknown' ? null : playback.floor === 'user';
+    // Muting consumes the live track; pause() would leave stale playback to
+    // resume. Provider controls do not acknowledge what reached the speaker.
+    audio.muted = playback.state === 'suppressed';
+    call.agentSpeaking = playback.output_active === null ? null : playback.output_active && !audio.muted && !audio.paused;
+    surfacePresence(call);
+  }});
   document.body.classList.add('call-active');
   notice(''); $('phonebook').hidden = true; $('call-ended').hidden = true; $('call-screen').hidden = false;
   $('call-avatar').textContent = initials(contact.label); $('call-name').textContent = contact.label || 'Your agent';
@@ -246,7 +258,7 @@ async function startCall(contact) {
 
 function attachRemoteAudio(call, stream) {
   if (!current(call)) { stream.getTracks().forEach(track => track.stop()); return; }
-  call.remoteStream = stream; audio.srcObject = stream;
+  call.remoteStream = stream; call.outputReady = false; audio.srcObject = stream;
   audio.play().catch(() => { if (current(call)) { $('enable-audio').hidden = false; $('speaker-state').textContent = 'Tap to hear'; } });
   if (call.audioContext) {
     try {
@@ -260,17 +272,19 @@ function attachRemoteAudio(call, stream) {
         const level = Math.sqrt(values.reduce((sum, x) => sum + ((x - 128) / 128) ** 2, 0) / values.length);
         // A continuous WebRTC track can be playing silence. Animate speaking
         // only when audio is actually playing and carries measured energy.
-        const speaking = !audio.paused && !audio.muted && audio.volume > 0 && level > .012;
+        call.rawOutputActive = level > .012;
+        sampleConversationFloor(call);
+        const speaking = !audio.paused && !audio.muted && audio.volume > 0 && call.rawOutputActive;
         call.agentSpeaking = call.audioContext.state === 'running' && !audio.paused ? speaking : null;
         $('presence').classList.toggle('speaking', speaking);
-        $('speaker-state').textContent = speaking ? `${call.contact.label} speaking` : audio.paused ? 'Speaker paused' : 'Speaker on';
+        $('speaker-state').textContent = audio.muted ? 'Listening to you' : speaking ? `${call.contact.label} speaking` : audio.paused ? 'Speaker paused' : 'Speaker on';
       }, 100);
     } catch { /* Do not fabricate a speaking indicator if analysis is unavailable. */ }
   }
 }
-audio.addEventListener('playing', () => { if (state.call) { $('enable-audio').hidden = true; $('speaker-state').textContent = 'Speaker on'; } });
+audio.addEventListener('playing', () => { if (state.call) { state.call.outputReady = true; sampleConversationFloor(state.call); $('enable-audio').hidden = true; $('speaker-state').textContent = 'Speaker on'; } });
 for (const name of ['pause','ended','waiting']) audio.addEventListener(name, () => {
-  $('presence').classList.remove('speaking'); if (state.call) $('speaker-state').textContent = name === 'waiting' ? 'Speaker buffering' : 'Speaker paused';
+  $('presence').classList.remove('speaking'); if (state.call) { state.call.outputReady = false; sampleConversationFloor(state.call); $('speaker-state').textContent = name === 'waiting' ? 'Speaker buffering' : 'Speaker paused'; }
 });
 $('enable-audio').onclick = async () => {
   try { await state.call?.audioContext?.resume(); await audio.play(); $('enable-audio').hidden = true; }
@@ -1076,6 +1090,7 @@ function releaseTransport(call) {
   call.channel?.close(); call.peer?.close(); call.audioSource?.disconnect(); call.audioContext?.close().catch(() => {});
 }
 function releaseMedia(call, retainTransport = false) {
+  call.floor?.close(); clearTimeout(call.surfaceRetryTimer);
   clearInterval(call.surfaceTimer); clearInterval(call.micMeterTimer); call.micSource?.disconnect();
   clearTimeout(call.pollTimer); clearInterval(call.heartbeatTimer); clearInterval(call.durationTimer); clearInterval(call.meterTimer); clearInterval(call.controlTimer);
   call.pollRequest?.abort.abort(); call.heartbeatRequest?.abort.abort();
@@ -1237,8 +1252,8 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     releaseWakeLock(call);
     $('foreground-note').textContent = 'This page is out of view. Your browser may pause audio; return here to continue.';
-    heartbeat(call,'visibility_hidden');
-  } else { $('foreground-note').textContent = 'Keep this page in the foreground. A screen lock or app switch may interrupt audio.'; resumeCall(call,'visibility_visible'); }
+    sampleConversationFloor(call); heartbeat(call,'visibility_hidden');
+  } else { $('foreground-note').textContent = 'Keep this page in the foreground. A screen lock or app switch may interrupt audio.'; sampleConversationFloor(call); resumeCall(call,'visibility_visible'); }
 });
 for (const event of ['focus','pageshow','online']) window.addEventListener(event, () => { if (state.call) resumeCall(state.call,event); else checkRecovery(); });
 for (const event of ['blur','offline']) window.addEventListener(event, () => heartbeat(state.call,event));
@@ -1255,18 +1270,26 @@ function startMicrophoneMeter(call) {
     call.micSource.connect(call.micAnalyser); const values = new Uint8Array(256);
     call.micMeterTimer = setInterval(() => {
       if (!current(call)) return;
-      if (call.audioContext.state !== 'running') { call.userSpeaking = null; return; }
+      if (call.audioContext.state !== 'running') { call.userSpeaking = null; call.rawMicActive = null; sampleConversationFloor(call); return; }
       call.micAnalyser.getByteTimeDomainData(values);
       const level = Math.sqrt(values.reduce((sum,x) => sum + ((x-128)/128)**2,0)/values.length);
       // Energy is an activity hint, not speaker identity or a completed turn.
-      if (level > .02 && !call.muted) call.lastMicEnergy = Date.now();
-      call.userSpeaking = !call.muted && Date.now() - (call.lastMicEnergy || 0) < 2000;
+      call.rawMicActive = level > .02 && !call.muted;
+      if (call.rawMicActive) call.lastMicEnergy = Date.now();
+      sampleConversationFloor(call);
     },100);
   } catch { call.userSpeaking = null; }
 }
+function sampleConversationFloor(call) {
+  if (!current(call)) return;
+  call.floor?.sample({mic:call.rawMicActive,output:call.rawOutputActive,
+    available:!document.hidden && call.audioContext?.state === 'running' && !audio.paused
+      && call.outputReady === true && call.peer?.connectionState === 'connected'});
+}
 async function surfacePresence(call) {
-  if (!current(call) || !call.id || call.surfaceUpdating) return;
-  call.surfaceUpdating = true;
+  if (!current(call) || !call.id) return;
+  if (call.surfaceUpdating) { call.surfaceDirty = true; return; }
+  call.surfaceUpdating = true; call.surfaceDirty = false;
   const board = call.board.filter(id=>/^\d+$/.test(id) || (id.startsWith('upload:') && call.shares.get(id.slice(7))?.availableRecorded));
   try {
     await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/presence`, 'POST', {
@@ -1275,10 +1298,12 @@ async function surfacePresence(call) {
       board_card_ids:board,pinned_card_ids:board.filter(id=>call.cards.get(id)?.pinned),focused_card_id:board.find(id=>readingProtected(call,call.cards.get(id))) || null,
       user_speaking:document.hidden ? null : call.userSpeaking,
       agent_speaking:document.hidden ? null : call.agentSpeaking,
+      playback:call.playback || {state:'unknown',floor:'unknown',output_active:null,interruption_id:null},
+      ...(call.interruption ? {interruption:call.interruption} : {}),
     });
     if (current(call)) call.surfaceReady = true;
   } catch { if (current(call)) call.surfaceReady = false; }
-  finally { call.surfaceUpdating = false; }
+  finally { call.surfaceUpdating = false; if (current(call) && call.surfaceDirty) { clearTimeout(call.surfaceRetryTimer); call.surfaceRetryTimer = setTimeout(()=>surfacePresence(call),100); } }
 }
 $('voice-photos').onchange = () => {
   $('voice-photo-hint').textContent = $('voice-photos').checked

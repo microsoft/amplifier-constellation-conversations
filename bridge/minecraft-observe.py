@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -17,9 +18,15 @@ import urllib.parse
 import uuid
 
 
+_source_spec = importlib.util.spec_from_file_location("minecraft_instruction_contract", pathlib.Path(__file__).with_name("minecraft-instruction.py"))
+source_contract = importlib.util.module_from_spec(_source_spec)
+_source_spec.loader.exec_module(source_contract)
+
+
 MAX_INPUT = 65536
 MAX_OUTPUT = 131072
 MAX_EVENTS = 32
+LIMIT_STATE_MEANING = "Current assignment limits only; not the recorded reason for status, proof of completion, or permission for other activity."
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -65,11 +72,17 @@ def validate_input(value):
         raise ValueError("input_limit")
     cursor = value.get("cursor")
     if cursor is not None:
-        if (not isinstance(cursor, dict) or "seen" not in cursor or set(cursor) - {"seen", "presence"}
+        if (not isinstance(cursor, dict) or "seen" not in cursor or set(cursor) - {"seen", "presence", "task"}
                 or not isinstance(cursor["seen"], list) or len(cursor["seen"]) > 64):
             raise ValueError("invalid_cursor")
         for row in cursor["seen"]:
             if not isinstance(row, dict) or set(row) != {"id", "revision"} or not valid_id(row["id"]) or not re.fullmatch(r"[a-f0-9]{64}", str(row["revision"])):
+                raise ValueError("invalid_cursor")
+        if "task" in cursor:
+            task = cursor["task"]
+            if (not isinstance(task, dict) or set(task) != {"id", "semantic_revision"}
+                    or not valid_id(task["id"])
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(task["semantic_revision"]))):
                 raise ValueError("invalid_cursor")
         if "presence" in cursor:
             present = cursor["presence"]
@@ -111,6 +124,42 @@ def task_projection(task):
             "authority_revision": task.get("authority_revision"), "progress_revision": task.get("progress_revision"),
             "turns": task.get("turns"), "started_at": task.get("started_at"),
             "progress": {"at": latest.get("at"), "summary": text(latest.get("summary"))}, "omitted_fields": omitted}
+
+
+def current_limit_state(status, current):
+    """Copy only the domain's current, same-task observation; never derive a stop cause."""
+    if (not isinstance(status, dict) or not isinstance(current, dict)
+            or not valid_id(current.get("id")) or not valid_time(status.get("observed_at"))):
+        return None
+    task = status.get("task")
+    if not isinstance(task, dict) or task.get("id") != current["id"]:
+        return None
+    value = task.get("limit_state")
+    if (not isinstance(value, dict) or set(value) != {"observed_at", "deadline", "turns", "meaning"}
+            or value.get("observed_at") != status["observed_at"] or value.get("meaning") != LIMIT_STATE_MEANING):
+        return None
+    result = {"observed_at": value["observed_at"], "meaning": LIMIT_STATE_MEANING}
+    for name, flag, remaining in [("deadline", "elapsed", "remaining_ms"), ("turns", "reached", "remaining")]:
+        axis = value[name]
+        if not isinstance(axis, dict) or set(axis) != {"kind", flag, remaining}:
+            return None
+        kind, limit_reached, amount = axis["kind"], axis[flag], axis[remaining]
+        if kind == "finite":
+            if (type(limit_reached) is not bool or type(amount) not in (int, float)
+                    or (name == "turns" and type(amount) is not int)
+                    or not 0 <= amount <= 9007199254740991 or not math.isfinite(amount)
+                    or limit_reached != (amount == 0)):
+                return None
+        elif kind == "no_configured_bound":
+            if limit_reached is not False or amount is not None:
+                return None
+        elif kind == "unknown":
+            if limit_reached is not None or amount is not None:
+                return None
+        else:
+            return None
+        result[name] = {"kind": kind, flag: limit_reached, remaining: amount}
+    return result
 
 
 def private_source(source, queued):
@@ -209,7 +258,7 @@ def outcome_queue(action):
     original = action["receipt"]
     receipt = original.get("receipt")
     if (original.get("request_id") != action["request_id"] or original.get("state") != "queued"
-            or original.get("scope") != "private_operator_instruction" or not isinstance(receipt, dict)
+            or original.get("scope") not in ["private_operator_instruction", "private_installation_input"] or not isinstance(receipt, dict)
             or receipt.get("queued") is not True):
         return None
     queued = receipt.get("request_id")
@@ -217,6 +266,71 @@ def outcome_queue(action):
         return queued if isinstance(queued, str) and str(uuid.UUID(queued)) == queued else None
     except ValueError:
         return None
+
+
+def is_scoped(action):
+    original = action["receipt"]
+    return original.get("scope") == "private_installation_input" or "protocol" in original
+
+
+def scoped_original(action):
+    original, queued = action["receipt"], outcome_queue(action)
+    if (queued is None or original.get("scope") != "private_installation_input"
+            or original.get("protocol") != "installation_inputs.v1"
+            or not source_contract.valid_source(original.get("source"))
+            or original["source"]["request_id"] != action["request_id"]
+            or original["receipt"].get("source_request_id") != action["request_id"]
+            or not isinstance(original.get("caller_id"), str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", original["caller_id"])):
+        raise ValueError("unbound_scoped_receipt")
+    return queued, original["source"], original["caller_id"]
+
+
+def read_scoped_outcomes(exchange, actions, client):
+    if not actions:
+        return "not_requested", {}
+    if client is None:
+        return "not_configured", {}
+    try:
+        originals = [scoped_original(action) for action in actions]
+        if len({row[0] for row in originals}) != len(originals) or any(row[2] != client["caller_id"] for row in originals):
+            raise ValueError("scoped_caller_mismatch")
+        if not source_contract.source_capability(exchange("GET", "/source-capabilities", None, client["token"])):
+            raise ValueError("scoped_capability_unavailable")
+        expected = {queue: source for queue, source, _ in originals}
+        snapshot = exchange("POST", "/source-outcomes", {"version": 1, "requests": [
+            {"request_id": queue, "source": source} for queue, source, _ in originals]}, client["token"])
+        if (type(snapshot.get("version")) is not int or snapshot["version"] != 1 or not valid_time(snapshot.get("observed_at"))
+                or not isinstance(snapshot.get("outcomes"), list) or len(snapshot["outcomes"]) > len(originals)):
+            raise ValueError("invalid_scoped_outcomes")
+        outcomes = {}
+        for row in snapshot["outcomes"]:
+            if not isinstance(row, dict) or row.get("request_id") not in expected or row["request_id"] in outcomes:
+                raise ValueError("scoped_queue_mismatch")
+            # Lack of retention/authorization is deliberately non-enumerating.
+            # It carries no caller, response, admission or terminal facts.
+            if row == {"request_id": row["request_id"], "delivery": "unknown", "reason": "not_retained_or_not_authorized", "completion": "not_established"}:
+                outcomes[row["request_id"]] = row
+                continue
+            bound = row.get("source")
+            if not isinstance(bound, dict) or set(bound) != set(expected[row["request_id"]]) | {"caller"}:
+                raise ValueError("scoped_source_missing")
+            caller = bound["caller"]
+            if (not isinstance(caller, dict) or set(caller) != {"id", "label"} or caller.get("id") != client["caller_id"]
+                    or not valid_id(caller.get("label")) or {k: v for k, v in bound.items() if k != "caller"} != expected[row["request_id"]]
+                    or row.get("private_game_responses_included") is not False
+                    or row.get("response_association") not in ["shared_turn", "single_source", "not_established"]
+                    or "source_ids" in row):
+                raise ValueError("scoped_original_source_mismatch")
+            validate_outcome(row)
+            if any(reply["audience"] != "public" for reply in row["responses"]):
+                raise ValueError("scoped_private_response")
+            outcomes[row["request_id"]] = row
+        return "available", outcomes
+    except Exception:
+        # A scoped lookup must never broaden to owner /input-outcomes or today's
+        # task when the token, capability or complete source does not match.
+        return "unavailable", {}
 
 
 def validate_outcome(row):
@@ -302,6 +416,9 @@ def outcome_observation(action, connection, observed_at, outcomes, availability)
         return action_observation(action, connection, observed_at, scope="conversation", fulfillment="not_established",
                                   reason="input_outcome_not_retained" if availability == "available" else "input_outcomes_unavailable",
                                   **({"receipt": {"request_id": queued}} if queued else {}))
+    if row.get("reason") == "not_retained_or_not_authorized":
+        return action_observation(action, connection, observed_at, scope="conversation", fulfillment="not_established",
+                                  reason="source_outcome_not_retained_or_not_authorized", receipt={"request_id": queued})
     responses, response_bytes, omitted = [], 0, 0
     private_count = 0
     for response in row["responses"]:
@@ -324,6 +441,10 @@ def outcome_observation(action, connection, observed_at, outcomes, availability)
     domain_evidence = {"domain_" + flag: row[flag] for flag in ["private_responses_withheld", "responses_omitted"] if flag in row}
     if "source_ids" in row:
         domain_evidence["source_ids"] = row["source_ids"]
+    if is_scoped(action):
+        domain_evidence["domain_response_association"] = row["response_association"]
+        domain_evidence["installation_source"] = row["source"]
+        domain_evidence["private_game_responses_included"] = False
     if row.get("reason") in ["not_retained", "terminal_not_retained"]:
         domain_evidence["outcome_reason"] = row["reason"]
     return action_observation(action, connection, observed_at, state, scope="conversation", fulfillment="not_established",
@@ -397,12 +518,16 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
     cursor = None
     actions = []
     try:
+        # A malformed bounded cursor is an unavailable read, not permission to
+        # reset its history and emit everything again on the next poll.
+        if isinstance(value, dict) and len(encoded(value)) <= MAX_INPUT:
+            cursor = value.get("cursor")
         cursor, actions = validate_input(value)
         if not config_path.is_absolute():
             raise ValueError("absolute_config_required")
         cfg = read_json(config_path, 32768)
         if (not {"minecraft_home", "connection_id", "expected_username"}.issubset(cfg)
-                or set(cfg) - {"minecraft_home", "connection_id", "expected_username", "node_executable"}
+                or set(cfg) - {"minecraft_home", "connection_id", "expected_username", "node_executable", "source_config"}
                 or not valid_id(cfg["connection_id"]) or not valid_id(cfg["expected_username"])):
             raise ValueError("invalid_config")
         connection = cfg["connection_id"]
@@ -419,11 +544,13 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
             raise ValueError("installation_identity_mismatch")
         transport = opener if opener is not None else urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-        def get(path):
+        def exchange(method, path, payload, selected_token):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("observation_deadline")
-            request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="GET", headers={"Authorization": "Bearer " + token})
+            request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method,
+                data=encoded(payload) if payload is not None else None,
+                headers={"Authorization": "Bearer " + selected_token, "Content-Type": "application/json"})
             with transport.open(request, timeout=min(5, remaining)) as response:
                 raw = response.read(524289)
             if len(raw) > 524288:
@@ -433,13 +560,24 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
                 raise ValueError("invalid_snapshot")
             return result
 
+        def get(path):
+            return exchange("GET", path, None, token)
+
         live = get("/installation-state")
+        legacy_actions = [action for action in actions if not is_scoped(action)]
+        scoped_actions = [action for action in actions if is_scoped(action)]
         confirmed_queues = [queued for action in actions if (queued := outcome_queue(action)) is not None]
         # A duplicated domain ID cannot establish which original call request
         # owns it. Broad control credentials do not fill that provenance gap.
-        private_queues = {queued for queued in confirmed_queues if confirmed_queues.count(queued) == 1}
+        unique_queues = {queued for queued in confirmed_queues if confirmed_queues.count(queued) == 1}
+        private_queues = {queued for action in legacy_actions if (queued := outcome_queue(action)) in unique_queues}
         private = get("/operator-inputs") if private_queues else {"messages": []}
-        outcome_availability, outcomes = read_outcomes(get, actions)
+        outcome_availability, outcomes = read_outcomes(get, legacy_actions)
+        try:
+            client = source_contract.source_client(cfg.get("source_config"), installation)
+        except Exception:
+            client = None
+        scoped_availability, scoped_outcomes = read_scoped_outcomes(exchange, scoped_actions, client)
         # The public presence projection includes this agent's own speech. The
         # incoming-conversation route intentionally excludes it and is not changed.
         public = {"messages": []}
@@ -468,6 +606,8 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
         omitted_events = 0
         private_messages_withheld = 0
         presence_cursor = (cursor or {}).get("presence")
+        previous_task_cursor = (cursor or {}).get("task")
+        task_cursor = None
         for snapshot, is_private in [(public, False), (private, True)]:
             messages = snapshot.get("messages")
             if not isinstance(messages, list) or len(messages) > (16 if is_private else 20):
@@ -505,19 +645,51 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
         if (isinstance(current, dict) and valid_id(current.get("id")) and valid_id("minecraft:task:" + current["id"])
                 and not private_task_withheld):
             projection = task_projection(current)
+            # The public MCP summary is a separate observation, not saved task
+            # history. Only attach it after this call's task audience is checked.
+            limits = current_limit_state(presence, current)
+            if limits is not None:
+                projection["limit_state"] = limits
             source = current.get("authority", {}).get("source", {})
             event = {"id": "minecraft:task:" + current["id"], "connection_id": connection,
-                     "occurred_at": projection["progress"]["at"] or projection["started_at"], "kind": "task_observation",
+                     "occurred_at": projection["progress"]["at"] or projection["started_at"], "observed_at": observed_at, "kind": "task_observation",
                      "actor": cfg["expected_username"], "audience": audience(connection, source.get("audience", {}).get("kind") != "public"),
-                     "provenance": {"kind": "minecraft_current_task", "task_id": current["id"], "authority": False, "verified": False},
+                     "provenance": {"kind": "minecraft_current_task", "task_id": current["id"], "current_state_snapshot": True, "authority": False, "verified": False},
                      "text": text(json.dumps(projection, ensure_ascii=False))}
             if (len(json.dumps(projection, ensure_ascii=False).encode()) <= 4000 and not projection["omitted_fields"]
                     and len(encoded(event)) <= 7800 and valid_time(event["occurred_at"])):
-                events.append({**event, "revision": revision(event)})
+                # Re-observation and an ordinary countdown are not new ambient
+                # facts. Retain a separate semantic cursor: cursorless direct
+                # reads still get exact values under a full immutable revision.
+                semantic_projection = dict(projection)
+                if limits is not None:
+                    semantic_projection["limit_state"] = {
+                        key: val for key, val in limits.items() if key != "observed_at"}
+                    semantic_projection["limit_state"]["deadline"] = {
+                        key: val for key, val in limits["deadline"].items() if key != "remaining_ms"}
+                semantic = {key: val for key, val in event.items() if key not in ("observed_at", "text")}
+                semantic["task"] = semantic_projection
+                # A new/restricted assignment is meaningful even if both old
+                # and new deadlines are still future. These raw bounds are
+                # fingerprint inputs only, never additional public metadata.
+                semantic["assignment_bounds"] = {key: current.get(key) for key in ["bounds", "deadline", "max_turns"]}
+                task_cursor = {"id": current["id"], "semantic_revision": revision(semantic)}
+                if task_cursor != previous_task_cursor:
+                    immutable = {key: val for key, val in event.items() if key != "observed_at"}
+                    immutable["assignment_bounds"] = semantic["assignment_bounds"]
+                    events.append({**event, "revision": revision(immutable)})
             else:
                 omitted_events += 1
         seen = {row["id"]: row["revision"] for row in (cursor or {}).get("seen", [])}
         fresh = [event for event in events if seen.get(event["id"]) != event["revision"]]
+        # Current selected-world facts must survive a bounded burst of older
+        # chat. Unemitted records retain their cursor identity and drain later;
+        # this changes presentation order, never source timestamps or authority.
+        fresh.sort(key=lambda event: (
+            0 if event["kind"] == "task_observation" else 1 if event["kind"] == "presence_observation" else 2,
+            -datetime.datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00")).timestamp(),
+            event["id"]))
+        selected_events = fresh[:MAX_EVENTS]
 
         def emitted_cursor(emitted):
             # The cursor acknowledges output, not everything read from the body.
@@ -526,17 +698,26 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
             for event in emitted:
                 delivered.pop(event["id"], None)
                 delivered[event["id"]] = event["revision"]
+            delivered_task = task_cursor if any(event["kind"] == "task_observation" for event in emitted) else previous_task_cursor
             return {"seen": [{"id": key, "revision": val} for key, val in list(delivered.items())[-64:]],
-                    **({"presence": presence_cursor} if presence_cursor else {})}
+                    **({"presence": presence_cursor} if presence_cursor else {}),
+                    **({"task": delivered_task} if delivered_task else {})}
 
         gap = bool(cursor and any(row["id"].startswith("minecraft:message:") for row in cursor["seen"]) and
                    not any(event["id"] in {r["id"] for r in cursor["seen"]} for event in events if event["kind"] == "message"))
         action_updates = []
         for action in actions:
             queued = outcome_queue(action)
-            if queued is not None and queued not in private_queues:
+            if queued is not None and queued not in unique_queues:
                 update = action_observation(action, connection, observed_at, scope="conversation", fulfillment="not_established",
                                             reason="ambiguous_original_queue_binding")
+            elif is_scoped(action):
+                try:
+                    scoped_original(action)
+                    update = outcome_observation(action, connection, observed_at, scoped_outcomes, scoped_availability)
+                except Exception:
+                    update = action_observation(action, connection, observed_at, scope="conversation", fulfillment="not_established",
+                                                reason="scoped_original_binding_unavailable")
             elif outcomes is not None and queued is not None:
                 update = outcome_observation(action, connection, observed_at, outcomes, outcome_availability)
             else:
@@ -544,7 +725,7 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
             action_updates.append(update)
         result = {"version": 1, "connection_id": connection, "observed_at": observed_at, "availability": "available",
                   "presence": {"ready": live.get("ready") is True, "busy": live.get("busy") is True, "turn_active": live.get("turn_active") is True},
-                  "cursor": emitted_cursor(fresh[-MAX_EVENTS:]),
+                  "cursor": emitted_cursor(selected_events),
                   "coverage": {"baseline": cursor is None, "bounded": True, "gap": gap or len(fresh) > MAX_EVENTS or omitted_events > 0 or not presence_available,
                                "deferred_events": max(0, len(fresh) - MAX_EVENTS),
                                "omitted_events": omitted_events, "omission_reason": "event_text_or_identity_exceeded_bound" if omitted_events else None,
@@ -554,13 +735,13 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
                                "private_input_scope": "this_call_confirmed_queue_receipts",
                                "private_messages_withheld": private_messages_withheld,
                                "private_task_withheld": private_task_withheld,
-                               "input_outcomes": outcome_availability,
+                               "input_outcomes": outcome_availability, "installation_input_outcomes": scoped_availability,
                                "task_history": "retained_only", "verified_completion_supported": False},
-                  "events": fresh[-MAX_EVENTS:], "actions": action_updates}
+                  "events": selected_events, "actions": action_updates}
         result["actions"] = [update if len(encoded(update)) <= 16000 else action_observation(
             action, connection, observed_at, reason="source_report_exceeded_bound") for action, update in zip(actions, result["actions"])]
         while len(encoded(result)) > MAX_OUTPUT and result["events"]:
-            result["events"].pop(0)
+            result["events"].pop()
             result["coverage"]["gap"] = True
             result["coverage"]["output_truncated"] = True
             result["coverage"]["deferred_events"] = len(fresh) - len(result["events"])

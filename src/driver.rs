@@ -633,6 +633,12 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         init["protocolVersion"] == 1,
         "Unsupported ACP protocol version"
     );
+    crate::companion_surface::record_capabilities(
+        &state,
+        &conversation,
+        &agent_id,
+        &init["agentCapabilities"],
+    )?;
     let can_load = init["agentCapabilities"]["loadSession"] == true;
     let mut params = json!({"cwd":agent.session_cwd.as_ref().unwrap_or(&agent.cwd),"mcpServers":agent.mcp_servers});
     let mut companion_injected = false;
@@ -646,12 +652,6 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
             "This call's shared-space tools require advertised HTTP MCP support"
         );
         params["mcpServers"].as_array_mut().unwrap().push(tool);
-        crate::companion_surface::record_capabilities(
-            &state,
-            &conversation,
-            &agent_id,
-            &init["agentCapabilities"],
-        )?;
         companion_injected = true;
     }
     if crate::companion::context_registered(&state, &conversation)? {
