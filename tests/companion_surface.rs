@@ -143,7 +143,9 @@ async fn request(
         .await
         .unwrap();
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
     (
         status,
         serde_json::from_slice(&bytes)
@@ -182,7 +184,9 @@ async fn browser_request(
         .await
         .unwrap();
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
     (
         status,
         serde_json::from_slice(&bytes)
@@ -1743,4 +1747,273 @@ async fn context_view_is_an_exact_existing_call_surface_action() {
             .0,
         StatusCode::BAD_REQUEST
     );
+}
+
+const RESULT_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3XcAAAAASUVORK5CYII=";
+
+fn published_agent_image(f: &Fixture, c: &Call) -> (String, String, String) {
+    let (_, input, turn) = delegation(f, c, "user");
+    agent_conversations::attachments::receive(
+        &f.s,
+        &c.room,
+        &turn,
+        "Coach",
+        &json!({"type":"image","mimeType":"image/png","data":RESULT_PNG}),
+    )
+    .unwrap();
+    let db = f.s.db.lock().unwrap();
+    db.execute("UPDATE messages SET status='complete',text='Here is the requested screenshot.' WHERE id=?1", [&turn]).unwrap();
+    db.execute(
+        "UPDATE input_deliveries SET state='completed' WHERE message_id=?1",
+        [&input],
+    )
+    .unwrap();
+    let artifact: String = db
+        .query_row(
+            "SELECT id FROM attachments WHERE message_id=?1",
+            [&turn],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'card',?3,?4)",
+        params![c.id,format!("result:{turn}"),json!({"conversation_id":c.room,"message_id":turn,"request_id":input,"attachments":[{"id":artifact}]}).to_string(),now_ms()],
+    ).unwrap();
+    (artifact, input, turn)
+}
+
+#[tokio::test]
+async fn published_agent_image_can_be_inspected_without_another_capture() {
+    let f = fixture();
+    let c = call(&f);
+    let (artifact, input, turn) = published_agent_image(&f, &c);
+    for delivery in ["completed", "incorporated"] {
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE input_deliveries SET state=?2 WHERE message_id=?1",
+                params![input, delivery],
+            )
+            .unwrap();
+        let current = surface_status(&f, &c, "current").await;
+        assert_eq!(current["artifacts"][0]["id"], artifact);
+        assert_eq!(current["artifacts"][0]["source"], "agent_result");
+        let receipt = surface_status(&f, &c, &format!("attachment:{artifact}")).await;
+        assert_eq!(receipt["source"], "agent_result");
+        assert_eq!(receipt["message_id"], turn);
+        assert_eq!(receipt["inspection"], false);
+        assert_eq!(receipt["image_delivery"], "provided");
+        assert_eq!(receipt["image"]["data"], RESULT_PNG);
+    }
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_surface_capabilities SET image_input=0 WHERE call_id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    let unsupported = surface_status(&f, &c, &format!("attachment:{artifact}")).await;
+    assert_eq!(unsupported["image_delivery"], "unsupported");
+    assert_eq!(unsupported["source"], "agent_result");
+    assert!(unsupported.get("image").is_none());
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_surface_commands", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn agent_image_requires_exact_published_call_source_and_terminal_answer() {
+    for mutation in [
+        "UPDATE messages SET status='streaming' WHERE role='assistant'",
+        "UPDATE messages SET status='interrupted' WHERE role='assistant'",
+        "UPDATE messages SET agent_id='another-agent' WHERE role='assistant'",
+        "UPDATE messages SET actor='other' WHERE role='user'",
+        "UPDATE input_deliveries SET state='unknown'",
+        "UPDATE input_deliveries SET state='submitted'",
+        "UPDATE input_deliveries SET agent_id='another-agent'",
+        "UPDATE input_deliveries SET target_turn='unrelated-turn'",
+        "DELETE FROM companion_events WHERE kind='card'",
+        "UPDATE companion_events SET data=json_set(data,'$.request_id','unrelated-input') WHERE kind='card'",
+        "UPDATE companion_events SET data=json_set(data,'$.message_id','unrelated-turn') WHERE kind='card'",
+        "UPDATE companion_events SET data=json_set(data,'$.attachments',json('[]')) WHERE kind='card'",
+        "UPDATE attachments SET created_by='another-agent'",
+    ] {
+        let f = fixture();
+        let c = call(&f);
+        let (artifact, _, _) = published_agent_image(&f, &c);
+        f.s.db.lock().unwrap().execute(mutation, []).unwrap();
+        let (status, receipt) = request(
+            &f,
+            &c,
+            "GET",
+            &format!("surface/attachment:{artifact}"),
+            None,
+            &c.token,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{mutation}: {receipt}");
+        assert_eq!(
+            surface_status(&f, &c, "current").await["artifacts"],
+            json!([]),
+            "{mutation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn published_agent_image_cannot_cross_calls_even_in_the_same_room() {
+    let f = fixture();
+    let original = call(&f);
+    let (artifact, _, _) = published_agent_image(&f, &original);
+    let other = call(&f);
+    for room in [&other.room, &original.room] {
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE companion_calls SET conversation_id=?2 WHERE id=?1",
+                params![other.id, room],
+            )
+            .unwrap();
+        assert_eq!(
+            request(
+                &f,
+                &other,
+                "GET",
+                &format!("surface/attachment:{artifact}"),
+                None,
+                &other.token,
+                false
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            surface_status(&f, &other, "current").await["artifacts"],
+            json!([])
+        );
+    }
+    // A copied card is still insufficient when the actual caller has changed.
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET owner='other' WHERE id=?1",
+            [&original.id],
+        )
+        .unwrap();
+    assert_eq!(
+        request(
+            &f,
+            &original,
+            "GET",
+            &format!("surface/attachment:{artifact}"),
+            None,
+            &original.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn saved_agent_image_budget_is_separate_from_camera_and_preserves_oversize_artifacts() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    for size in [2 * 1024 * 1024, 2 * 1024 * 1024 + 1] {
+        let f = fixture();
+        let c = call(&f);
+        let (artifact, _, _) = published_agent_image(&f, &c);
+        // Transport-size fixture: no renderer or visual-understanding claim.
+        let mut data = vec![0_u8; size];
+        data[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE attachments SET data=?2,bytes=?3 WHERE id=?1",
+                params![artifact, data, size as i64],
+            )
+            .unwrap();
+        let receipt = surface_status(&f, &c, &format!("attachment:{artifact}")).await;
+        assert_eq!(receipt["artifact_ids"], json!([artifact]));
+        assert_eq!(receipt["inspection"], false);
+        if size <= 2 * 1024 * 1024 {
+            assert_eq!(receipt["image_delivery"], "provided");
+            assert_eq!(
+                STANDARD
+                    .decode(receipt["image"]["data"].as_str().unwrap())
+                    .unwrap(),
+                data
+            );
+        } else {
+            assert_eq!(receipt["image_delivery"], "size_limit");
+            assert!(receipt.get("image").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn own_mcp_proxy_allows_bounded_image_reads_without_expanding_other_responses() {
+    let f = fixture();
+    let c = call(&f);
+    let payload = Arc::new(std::sync::Mutex::new("x".repeat(2800000)));
+    let copy = payload.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    companion_tools::record_mcp_port(&f.s, &c.id, listener.local_addr().unwrap().port()).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/mcp",
+                axum::routing::post(move || {
+                    let copy = copy.clone();
+                    async move { copy.lock().unwrap().clone() }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let artifact = uuid::Uuid::new_v4().to_string();
+    for (tool, args, expected) in [
+        (
+            "companion_surface_status",
+            json!({"artifact_id":artifact}),
+            StatusCode::OK,
+        ),
+        ("companion_connections", json!({}), StatusCode::BAD_REQUEST),
+        (
+            "companion_surface_status",
+            json!({"artifact_id":artifact,"call_id":"other"}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response=f.app.clone().oneshot(Request::builder().method("POST")
+            .uri(format!("/api/v1/companion/calls/{}/mcp",c.id))
+            .header("authorization",format!("Bearer {}",c.token))
+            .header("content-type","application/json")
+            .body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected, "{tool}: {args}");
+    }
+    *payload.lock().unwrap() = "x".repeat(3 * 1024 * 1024 + 1);
+    let response=f.app.clone().oneshot(Request::builder().method("POST")
+        .uri(format!("/api/v1/companion/calls/{}/mcp",c.id))
+        .header("authorization",format!("Bearer {}",c.token))
+        .header("content-type","application/json")
+        .body(Body::from(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"companion_surface_status","arguments":{"artifact_id":artifact}}}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    server.abort();
 }

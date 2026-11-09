@@ -356,6 +356,22 @@ pub async fn mcp(
     if body.len() > 256 * 1024 {
         return Err(ApiError::bad("Tool request too large"));
     }
+    // Saved images have the same 2 MiB decoded budget as ordinary uploads.
+    // Only the existing, schema-checked surface read receives room for base64
+    // and its receipt; all other tool responses keep the smaller budget.
+    let image_read = serde_json::from_slice::<Value>(&body).is_ok_and(|value| {
+        value["method"] == "tools/call"
+            && value["params"]["name"] == "companion_surface_status"
+            && crate::companion_surface::permission_shape_valid(
+                "companion_surface_status",
+                value["params"].get("arguments").unwrap_or(&json!({})),
+            )
+    });
+    let response_limit = if image_read {
+        3 * 1024 * 1024
+    } else {
+        1024 * 1024
+    };
     let active: bool = s.db.lock().unwrap().query_row(
         "SELECT state IN ('connecting','connected') FROM companion_calls WHERE id=?1",
         [&id],
@@ -413,7 +429,7 @@ pub async fn mcp(
         .await
         .map_err(|_| ApiError::bad("Tool response interrupted"))?
     {
-        if data.len() + chunk.len() > 1024 * 1024 {
+        if data.len() + chunk.len() > response_limit {
             return Err(ApiError::bad("Tool response too large"));
         }
         data.extend_from_slice(&chunk);

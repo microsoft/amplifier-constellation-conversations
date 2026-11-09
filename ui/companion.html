@@ -47,12 +47,12 @@
           <button id="enable-audio" class="secondary" hidden>Tap to hear the call</button>
           <div class="call-controls" aria-label="Call controls">
             <button id="mute" class="round-control" aria-pressed="false" disabled><span class="control-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3M8 22h8"/></svg></span><span id="mute-label">Mute mic</span></button>
-            <button id="camera-toggle" class="round-control" aria-pressed="false" disabled><span class="control-symbol camera-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m15 9 6-4v14l-6-4"/><rect x="2" y="6" width="13" height="12" rx="2"/></svg></span><span id="camera-label">Camera</span></button>
+            <button id="camera-toggle" class="round-control" aria-pressed="false" disabled><span class="control-symbol camera-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m15 9 6-4v14l-6-4"/><rect x="2" y="6" width="13" height="12" rx="2"/></svg></span><span id="camera-label">Show something</span></button>
             <button id="hangup" class="round-control end-control"><span class="control-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 13c5-5 13-5 18 0l-2 5-4-1v-3a12 12 0 0 0-6 0v3l-4 1Z"/></svg></span><span>End call</span></button>
           </div>
           <p class="call-footnote">Ending this call releases your microphone and camera. Already-authorized agent work can continue.</p>
           <a id="continue-work" class="work-link" href="/" target="constellation-work" hidden>Open conversation &amp; work controls <span aria-hidden="true">↗</span></a>
-          <button id="call-voice-settings" class="text-button" type="button">Voice settings · next call</button>
+          <div class="call-display-controls"><button id="call-voice-settings" class="text-button" type="button">Voice settings · next call</button><label class="screen-awake"><input id="screen-awake" type="checkbox" checked aria-describedby="screen-awake-status"> Keep screen on</label></div><span id="screen-awake-status" class="sr-only" role="status"></span>
           <p id="foreground-note" class="small">Keep this page in the foreground. A screen lock or app switch may interrupt audio.</p>
         </div>
         <div class="shared-panel" aria-label="Shared conversation space">
@@ -67,12 +67,12 @@
             <div id="share-receipt" class="share-receipt" role="status" hidden><span id="share-receipt-text"></span><button id="reveal-share" class="text-button" type="button">View</button></div>
             <p id="share-capability" class="small">Images and PDFs can be saved; inspection depends on this agent’s capabilities.</p>
             <section id="camera-panel" class="camera-panel" aria-label="Optional camera" hidden>
-              <div class="camera-heading"><h2>Your camera</h2><span class="preview-badge">LOCAL PREVIEW</span></div>
+              <div class="camera-heading"><h2>Show and help</h2><button id="capture-photo" class="secondary">Capture &amp; share</button></div>
+              <p id="camera-guide">Point at what you want help with, then share a photo and tell your agent what you’re trying to do.</p>
               <label id="camera-picker" class="camera-picker" hidden>Camera<select id="camera-choice" aria-label="Choose camera"></select></label>
-              <video id="camera-preview" autoplay playsinline muted aria-label="Local camera preview"></video>
-              <p id="camera-note" class="small">The preview stays on your device. Capture &amp; share saves one photo and lets your agent know it is available. The live camera feed is never shared.</p>
-              <label class="camera-consent"><input id="voice-photos" type="checkbox"> Allow one photo when I ask by voice</label><p class="small">This setting lets a spoken request capture one photo during this call. A tool’s Allow button does not turn it on. Turning off the camera turns it off.</p>
-              <button id="capture-photo" class="secondary">Capture &amp; share</button>
+              <span class="preview-badge">LOCAL PREVIEW</span><video id="camera-preview" autoplay playsinline muted aria-label="Local camera preview"></video>
+              <p id="camera-note" class="small">This preview stays on your device. Only photos you choose to share leave it; the live camera feed is never shared.</p>
+              <label class="camera-consent"><input id="voice-photos" type="checkbox"> Allow a photo when I ask by voice</label><p id="voice-photo-hint" class="small">Enable this to ask for a photo hands-free. Each request takes one photo; turning off the camera revokes permission.</p><p id="camera-progress" class="camera-progress" role="status" hidden></p>
             </section>
             <div class="board-heading"><h2>On the whiteboard</h2><span id="board-count" class="small">0 of 3</span></div><p id="board-note" class="small">A few things to focus on. Pin anything you want to keep.</p><div id="space-empty" class="space-empty"><div class="space-illustration" aria-hidden="true"><span></span><span></span><span></span></div><h2>A little room to think.</h2><p>Your agent can put something here when it helps. You can also choose an item from history.</p></div><div id="board-items" class="cards" aria-live="polite" aria-relevant="additions text"></div><details id="board-history" class="board-history"><summary>History <span id="history-count">0</span></summary><p class="small">Saved answers, shared items, and updates from this call.</p><div id="cards" class="cards"></div></details>
           </section>

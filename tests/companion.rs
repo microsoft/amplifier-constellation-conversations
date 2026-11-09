@@ -998,6 +998,10 @@ async fn delegation_anchor_includes_observed_straddling_word_with_original_timin
     assert_eq!(tail["text"], " elsewhere");
     assert_eq!(tail["start_ms"], 13000);
     assert_eq!(tail["end_ms"], 13200);
+    assert!(source.contains(
+        "explicitly publish it through this runtime's advertised image-attachment/output capability"
+    ));
+    assert!(source.contains("A path on another host is not a usable attachment or public URL"));
     let segments: Vec<Value> = serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(
@@ -2896,4 +2900,96 @@ async fn media_close_retains_original_receipt_transport_only_until_accepted_work
         !f.home.path().join("acp.jsonl").exists(),
         "Receipt lifecycle must not create a model turn"
     );
+}
+
+#[tokio::test]
+async fn explicit_acp_image_result_is_saved_published_and_available_for_scoped_reinspection() {
+    // Actual ACP fixture transport and result publication, synthetic PNG bytes;
+    // this is not a Minecraft renderer or model-understanding test.
+    let f = fixture("quiet");
+    configure_call_permission_fixture(&f, "none", false);
+    let mut agent = f.s.agent("default").unwrap().unwrap();
+    agent.env.insert("FIXTURE_IMAGES".into(), "1".into());
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+            [serde_json::to_string(&agent).unwrap()],
+        )
+        .unwrap();
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let (_,accepted)=request(&f,"POST",&format!("/api/v1/conversations/{room}/messages"),Some(json!({"request_id":uuid::Uuid::new_v4().to_string(),"text":"media proof: explicitly share this fixture image","target_agent_ids":["default"],"attachment_ids":[]}))).await;
+    assert!(accepted.get("error").is_none(), "{accepted}");
+    let saved = until(&f, id, "card").await;
+    let card = saved["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "card")
+        .unwrap();
+    let artifact = card["data"]["attachments"][0]["id"]
+        .as_str()
+        .expect("explicit ACP image must be published with its settled answer");
+    assert_eq!(card["data"]["attachments"][0]["mime_type"], "image/png");
+    let token: String =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT token FROM companion_tool_grants WHERE call_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/companion/calls/{id}/tools/surface/attachment:{artifact}"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        receipt["image"]["data"],
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
+    );
+    assert_eq!(receipt["image_delivery"], "provided");
+    assert_eq!(receipt["source"], "agent_result");
+    assert_eq!(receipt["message_id"], card["data"]["message_id"]);
+    assert_eq!(receipt["inspection"], false);
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_surface_commands WHERE call_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let acp = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    assert_eq!(
+        acp.lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|e| e["method"] == "session/prompt")
+            .count(),
+        1,
+        "image reinspection must not recapture or dispatch another prompt"
+    );
+    end(&f, id).await;
 }

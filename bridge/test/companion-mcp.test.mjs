@@ -262,3 +262,17 @@ test('one existing show tool can author a short plain note without URL or HTML a
  for(const args of [{title:'None'},{title:'Both',text:'note',url:'https://example.test'},{title:'Long',text:'漢'.repeat(401)},{title:'Blank',text:' '},{title:'Wrong kind',text:'Note',kind:'image'},{title:'Wrong kind',url:'https://example.test',kind:'note'},{title:'HTML',text:'plain',html:'<script/>'}])assert.equal((await client.callTool({name:'companion_show',arguments:args})).isError,true);
  assert.equal(requests.length,1);
 });
+
+test('saved result images use a bounded 2 MiB transport without increasing phone capture limits',async t=>{
+ const artifact=randomUUID(),bytes=Buffer.alloc(2*1024*1024);Buffer.from([137,80,78,71,13,10,26,10]).copy(bytes);
+ const receipt={kind:'attachment',state:'available',source:'agent_result',message_id:randomUUID(),artifact_ids:[artifact],inspection:false,image_input:true,image:{mimeType:'image/png',data:bytes.toString('base64')}};
+ const {client,requests}=await fixture(t,(_req,res)=>res.end(JSON.stringify(receipt)));
+ const read=()=>client.callTool({name:'companion_surface_status',arguments:{artifact_id:artifact}});
+ let result=await read();assert.notEqual(result.isError,true);assert.equal(result.content[1].data,bytes.toString('base64'));assert.equal(result.structuredContent.source,'agent_result');assert.equal(result.structuredContent.inspection,false);assert.equal(result.structuredContent.image,undefined);
+ receipt.image.data=Buffer.concat([bytes,Buffer.alloc(1)]).toString('base64');
+ result=await read();assert.equal(result.isError,true);assert.ok(!result.content.some(v=>v.type==='image'));
+ receipt.image.data=bytes.toString('base64').slice(0,-1);result=await read();assert.equal(result.isError,true);
+ receipt.image.data=bytes.toString('base64');receipt.image.mimeType='text/plain';result=await read();assert.equal(result.isError,true);
+ receipt.image.mimeType='image/png';receipt.kind='capture';receipt.state='uploaded';result=await read();assert.equal(result.isError,true,'camera output still has its own 512 KiB boundary');
+ assert.equal(requests.length,5,'read failures never recapture or retry');
+});

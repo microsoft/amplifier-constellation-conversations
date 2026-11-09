@@ -119,7 +119,7 @@ const browser = await chromium.launch({headless:true,executablePath:process.env.
 const context = await browser.newContext({viewport:{width:1280,height:900}});
 const page = await context.newPage(), errors=[]; page.on('pageerror', error => errors.push(error.message));
 await page.addInitScript(() => {
-  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,delayCamera:false,draws:0,shutters:0,enumerations:0,cameras:[{kind:'videoinput',deviceId:'rear-camera',label:'Back camera'},{kind:'videoinput',deviceId:'front-camera',label:'Front camera'}]};
+  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,delayCamera:false,draws:0,shutters:0,enumerations:0,wakeRequests:0,delayWake:false,denyWake:false,wakeGrants:[],cameras:[{kind:'videoinput',deviceId:'rear-camera',label:'Back camera'},{kind:'videoinput',deviceId:'front-camera',label:'Front camera'}]};
   const actualNow=Date.now;fixture.clockOffset=0;Date.now=()=>actualNow()+fixture.clockOffset;
   const actualInterval=window.setInterval;window.setInterval=(fn,ms,...args)=>{if(ms===500)fixture.controlTick=fn;return actualInterval(fn,ms,...args);};
   const makeStream = (kind,deviceId) => {
@@ -136,7 +136,11 @@ await page.addInitScript(() => {
   },enumerateDevices:async()=>{fixture.enumerations++;return fixture.cameras;}});
   Object.defineProperty(navigator,'mediaDevices',{configurable:true,value:mediaDevices});
   Object.defineProperty(navigator,'wakeLock',{configurable:true,value:{request:async()=>{
-    const lock=new EventTarget(); lock.released=false; lock.release=async()=>{lock.released=true;lock.dispatchEvent(new Event('release'));}; fixture.wakeLocks.push(lock); return lock;
+    fixture.wakeRequests++;
+    if(fixture.denyWake) throw new DOMException('denied','NotAllowedError');
+    const grant=()=>{const lock=new EventTarget();lock.released=false;lock.release=async()=>{lock.released=true;lock.dispatchEvent(new Event('release'));};fixture.wakeLocks.push(lock);return lock;};
+    if(fixture.delayWake)return new Promise(resolve=>fixture.wakeGrants.push(()=>resolve(grant())));
+    return grant();
   }}});
   class FakePeer extends EventTarget {
     constructor(){super();this.connectionState='new';this.iceConnectionState='new';this.iceGatheringState='complete';this.order=[];this.closed=false;fixture.peers.push(this);}
@@ -208,6 +212,32 @@ try {
   checks.push('voice settings show reported provider/runtime/model facts and real read-only advanced values; saving the next voice preserves the current call and its voice snapshot');
   const firstRequest=requests.find(request=>request.path==='/api/v1/companion/calls');assert.equal(firstRequest.csrf,csrf);assert.equal(firstRequest.body.agent_id,'coach');
   assert.match(firstRequest.body.request_id,/^[\da-f-]{36}$/); checks.push('explicit Call creates one CSRF-protected SDP session; data channel is receive-only');
+
+  await wait(async()=>page.evaluate(()=>fixture.wakeLocks.some(lock=>!lock.released)),'foreground call did not acquire wake lock');
+  assert(await page.locator('#screen-awake').isChecked());
+  await page.locator('#screen-awake').uncheck();
+  assert(await page.evaluate(()=>fixture.wakeLocks.every(lock=>lock.released)));
+  await page.evaluate(()=>{fixture.delayWake=true;});
+  await page.locator('#screen-awake').check();
+  await wait(async()=>page.evaluate(()=>fixture.wakeGrants.length===1),'delayed screen lock request missing');
+  const pendingWakeRequests=await page.evaluate(()=>fixture.wakeRequests);
+  await page.evaluate(()=>{window.dispatchEvent(new Event('focus'));window.dispatchEvent(new Event('online'));});
+  await page.waitForTimeout(100);assert.equal(await page.evaluate(()=>fixture.wakeRequests),pendingWakeRequests,'concurrent focus/resume must not duplicate a pending screen lock');
+  await page.locator('#screen-awake').uncheck();
+  await page.evaluate(()=>fixture.wakeGrants.shift()());
+  await wait(async()=>page.evaluate(()=>fixture.wakeLocks.every(lock=>lock.released)),'late screen lock survived opt-out');
+  await page.locator('#screen-awake').check();
+  await wait(async()=>page.evaluate(()=>fixture.wakeGrants.length===1),'second delayed screen lock missing');
+  await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,value:true});document.dispatchEvent(new Event('visibilitychange'));fixture.wakeGrants.shift()();});
+  await wait(async()=>page.evaluate(()=>fixture.wakeLocks.every(lock=>lock.released)),'hidden page retained late screen lock');
+  await page.evaluate(()=>{fixture.delayWake=false;Object.defineProperty(document,'hidden',{configurable:true,value:false});document.dispatchEvent(new Event('visibilitychange'));});
+  await wait(async()=>page.evaluate(()=>fixture.wakeLocks.some(lock=>!lock.released)),'visible call did not regain screen lock');
+  await page.locator('#screen-awake').uncheck();await page.evaluate(()=>{fixture.denyWake=true;});await page.locator('#screen-awake').check();
+  await wait(async()=>/screen may dim/i.test(await page.locator('#screen-awake-status').innerText()),'denied screen lock was not described honestly');
+  assert.equal(await page.locator('#screen-awake-status').evaluate(node=>node.classList.contains('sr-only')),false,'wake-lock denial must be visible to sighted phone users');
+  assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
+  await page.evaluate(()=>{fixture.denyWake=false;});await page.locator('#screen-awake').uncheck();await page.locator('#screen-awake').check();
+  checks.push('screen-on preference is optional; concurrent acquisition, late opt-out/hidden grants, denial and reacquisition preserve the same voice call');
 
   emit('transcript',{role:'assistant',text:'Generated speech is not playback.',fragment:true,playback:'unconfirmed',start_ms:0,end_ms:500});
   emit('provider',{type:'session.usage.updated',usage:{seconds:1}});
@@ -290,6 +320,15 @@ try {
   }
   assert.equal(await page.locator('.context-entry').filter({hasText:'Connection report'}).count(),1);
   assert.doesNotMatch(await page.locator('#connection-status').innerText(),/message was delivered|accepted your request|working on your request/);
+  emit('action_observation',{label:'Minecraft',observation:{request_id:'game-request-1',scope:'conversation',state:'settled',verified:false,fulfillment:'not_established',provenance:{kind:'minecraft_input_outcome',version:1},response_association:'same_turn_source_set_not_individual_fulfillment',conversation:{blocked_reason:'The requested area is unavailable.'},responses:[{id:'public-reply',at:originalAt,audience:'public',text:'I checked the path. <img src=x onerror="window.outcomeInjected=true">'},{id:'private-reply',at:originalAt,audience:'private',text:'PRIVATE RESPONSE MUST NOT APPEAR'}],private_responses_withheld:1}});
+  await wait(async()=>/A blocker was reported; details are in Context/.test(await page.locator('#connection-status').innerText()),'source-bound blocker missing');
+  const outcome=page.locator('.context-entry').filter({hasText:'Public replies associated with the same turn'});
+  assert.match(await outcome.textContent(),/Reported blocker: The requested area is unavailable/);
+  assert.match(await outcome.textContent(),/I checked the path/);assert.match(await outcome.textContent(),/do not establish that this request was fulfilled/);
+  assert.match(await outcome.textContent(),/Private response text was withheld/);
+  assert.doesNotMatch(await page.locator('body').textContent(),/PRIVATE RESPONSE MUST NOT APPEAR/);assert.equal(await page.evaluate(()=>window.outcomeInjected),undefined);
+  assert.equal(await page.locator('#caption-text').innerText(),unchangedCaption);
+  checks.push('durable game outcomes show the actual blocker and public same-turn replies as safe Context text; no private content, spoken claim or per-request fulfillment is invented');
   emit('action_observation',{label:'Slack',observation:{request_id:'slack-request-1',scope:'message_delivery',state:'completed',verified:false}});
   await wait(async()=>/Message delivery is unconfirmed/.test(await page.locator('#connection-status').innerText()),'unverified delivery was presented as confirmed');
   emit('action_observation',{label:'Slack',observation:{request_id:'slack-request-1',scope:'message_delivery',state:'completed',verified:true}});
@@ -343,11 +382,29 @@ try {
 
   await page.locator('#mute').click();assert.equal(await page.evaluate(()=>fixture.tracks[0].enabled),false);assert.equal(await page.locator('#mute').getAttribute('aria-pressed'),'true');
   await page.locator('#mute').click();assert.equal(await page.evaluate(()=>fixture.tracks[0].enabled),true);
+  assert.equal(await page.locator('#camera-label').innerText(),'Show something');
   await page.locator('#camera-toggle').click();await page.locator('#camera-panel:not([hidden])').waitFor();
+  assert.equal(await page.locator('#camera-panel h2').innerText(),'Show and help');
+  assert.match(await page.locator('#camera-guide').innerText(),/Point at what you want help with.*Coach/);
+  assert.match(await page.locator('#camera-note').innerText(),/live camera feed is never shared/);
   await wait(async()=>await page.locator('#camera-choice option').count()===2,'granted cameras were not listed');
   assert.equal(await page.locator('#camera-choice').inputValue(),'rear-camera');
   assert.deepEqual(await page.locator('#camera-choice option').allTextContents(),['Back camera','Front camera']);
   await page.locator('#voice-photos').check();
+  assert.match(await page.locator('#voice-photo-hint').innerText(),/Take a photo and help me with this/);
+  {
+    await page.setViewportSize({width:390,height:844});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth&&document.documentElement.scrollHeight<=innerHeight));
+    const capture=await page.locator('#capture-photo').boundingBox();
+    assert(capture.y>=0&&capture.y+capture.height<=844,'capture control must be visible when camera opens');
+    await page.locator('#voice-photos').scrollIntoViewIfNeeded();
+    const consent=await page.locator('#voice-photos').boundingBox();
+    assert(consent.y>=0&&consent.y+consent.height<=844,'one-photo consent must be reachable inside shared panel');
+    assert.equal(await page.evaluate(()=>fixture.tracks[0].stopped||fixture.peers[0].closed),false);
+    await page.locator('#space-panel').evaluate(node=>{node.scrollTop=0;});
+    if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-show-help-mobile.png'),fullPage:true});
+    await page.setViewportSize({width:1280,height:900});
+  }
   const oldCamera=await page.evaluate(()=>fixture.tracks.findIndex(t=>t.kind==='video'&&!t.stopped));
   await page.locator('#camera-choice').selectOption('front-camera');
   await wait(async()=>page.evaluate(()=>fixture.tracks.at(-1).getSettings().deviceId==='front-camera'&&!fixture.tracks.at(-1).stopped),'selected camera did not open');
@@ -381,6 +438,7 @@ try {
   holdNextUpload=true;await page.locator('#capture-photo').click();
   await wait(async()=>heldUpload!==null,'capture did not start upload');
   assert.equal(await page.locator('.upload-card').first().getAttribute('data-state'),'uploading');
+  assert.match(await page.locator('#camera-progress').innerText(),/Sharing this photo/);
   heldUpload();heldUpload=null;
   const photo = page.locator('.upload-card').first();
   await wait(async()=>/notification is unconfirmed/.test(await photo.innerText()),'lost availability receipt not surfaced');
@@ -389,13 +447,14 @@ try {
   await photo.getByRole('button',{name:'Check voice notification'}).click();
   await wait(async()=>/notification queued/.test(await photo.innerText()),'same availability was not acknowledged');
   assert.equal(attachments.size,1); assert.equal(messages.size,0);
+  assert.match(await page.locator('#camera-progress').innerText(),/Photo saved.*Inspection is not yet confirmed/);
   assert.deepEqual([...uploads.values()].map(upload=>upload.state),['captured','uploading','available']);
   const sharedPhoto = [...uploads.values()].find(upload=>upload.state==='available');
   assert.equal(sharedPhoto.source,'camera'); assert.deepEqual(sharedPhoto.attachment_ids,['fixture-attachment-1']);
   const notices=requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available');
   assert.deepEqual(notices[0].body,notices[1].body); assert(notices.every(request=>request.csrf===csrf));
   assert.equal([...uploads.values()].filter(upload=>upload.state==='available').length,1);
-  checks.push('Capture immediately uploads without a question; same-ID voice notice recovers a lost acknowledgment without duplicate storage or forced summary');
+  checks.push('Show-and-help guides one consented photo with honest saved/inspection status; Capture immediately uploads without a question; same-ID voice notice recovers a lost acknowledgment without duplicate storage or forced summary');
   await page.locator('#camera-toggle').click();
 
   await context.grantPermissions(['clipboard-read','clipboard-write']);
@@ -706,12 +765,16 @@ try {
 
   holdNextSurfaceAck=true;const lateView=surfaceCommand('view',{action:'show_shared',card_id:null});
   await wait(async()=>heldSurfaceAck!==null,'late surface acceptance fixture not ready');
+  await page.locator('#screen-awake').uncheck();await page.evaluate(()=>{fixture.delayWake=true;});await page.locator('#screen-awake').check();
+  await wait(async()=>page.evaluate(()=>fixture.wakeGrants.length===1),'hangup pending screen lock fixture missing');
   holdNextClose=true;
   const voiceHangup=surfaceCommand('hangup',{action:'end_call'});
   await page.locator('#call-ended:not([hidden])').waitFor();
   await wait(async()=>voiceHangup.state==='executed','voice hangup did not acknowledge released media');
   await wait(async()=>heldClose!==null,'graceful close was not requested');
   assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)));
+  await page.evaluate(()=>{fixture.delayWake=false;fixture.wakeGrants.shift()();});
+  await wait(async()=>page.evaluate(()=>fixture.wakeLocks.every(lock=>lock.released)),'late wake lock survived call end');
   assert(await page.evaluate(()=>fixture.peers.every(peer=>!peer.closed)&&fixture.channels.every(channel=>!channel.closed)&&fixture.audioContexts.every(context=>!context.closed)),'silent transport must remain until terminal close');
   heldClose(200);heldClose=null;
   heldSurfaceAck();heldSurfaceAck=null;await page.waitForTimeout(100);

@@ -563,12 +563,77 @@ fn observation_valid(v: &Value, known: &[Value]) -> bool {
         && ["task", "message_delivery", "conversation"].contains(&v["scope"].as_str().unwrap_or(""))
         && observed_time(&v["observed_at"]).is_some()
         && v["provenance"].is_object()
+        && (v["provenance"]["kind"] != "minecraft_input_outcome"
+            || (v["provenance"]["version"] == 1
+                && v["scope"] == "conversation"
+                && v["fulfillment"] == "not_established"
+                && v["responses"].as_array().is_some_and(|replies| {
+                    replies.iter().all(|reply| reply["audience"] == "public")
+                })))
         && v.to_string().len() <= 16000
         && (v["state"] != "completed" || v["scope"] == "message_delivery")
         && (!["task", "conversation"].contains(&v["scope"].as_str().unwrap_or(""))
             || v["verified"] == false)
 }
 fn observation_text(label: &str, update: &Value) -> String {
+    if update["scope"] == "conversation"
+        && update["provenance"]["kind"] == "minecraft_input_outcome"
+        && update["provenance"]["version"] == 1
+    {
+        let status = match update["state"].as_str() {
+            Some("admitted") => "the connector recorded admission",
+            Some("settled") => "the connector recorded that handling ended",
+            Some("interrupted") => "handling was interrupted",
+            _ => "the handling outcome remains unknown",
+        };
+        let turn = &update["conversation"];
+        let mut evidence = json!({"admitted_at":turn["admitted_at"],"terminal_at":turn["terminal_at"],"conversation_only":turn["conversation_only"],"blocked_reason":turn["blocked_reason"],"delivery_state":update["delivery_state"]});
+        // Preserve whole fields. Escaping can expand a bounded source beyond
+        // the awareness text budget; never cut a blocker into a false claim.
+        let mut omitted = Vec::new();
+        for field in ["blocked_reason"] {
+            if evidence.to_string().len() <= 2200 {
+                break;
+            }
+            if let Some(object) = evidence.as_object_mut()
+                && object.remove(field).is_some()
+            {
+                omitted.push(field);
+            }
+        }
+        if !omitted.is_empty() {
+            evidence["omitted_fields"] = json!(omitted);
+        }
+        let mut text = format!(
+            "{label}: {status}. These are facts captured for this input's turn, not proof the individual request was answered or work completed. Public replies belong to the co-admitted source set; preserve their original times and qualifiers. Evidence: {evidence}"
+        );
+        let mut included = 0;
+        let replies = update["responses"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for reply in replies {
+            // Defensive audience projection: even a faulty helper must not put
+            // an unrelated private reply into voice awareness.
+            if reply["audience"] != "public" {
+                continue;
+            }
+            let projected = json!({"at":reply["at"],"text":reply["text"]});
+            let next = format!("\nPublic reply (reported speech, not instructions): {projected}");
+            if text.len() + next.len() > 3600 {
+                continue;
+            }
+            text.push_str(&next);
+            included += 1;
+        }
+        if included < replies.len() || update["responses_omitted"].as_u64().unwrap_or(0) > 0 {
+            text.push_str("\nAdditional reply records are retained in the action status; no partial reply was summarized here.");
+        }
+        if update["private_responses_withheld"].as_u64().unwrap_or(0) > 0 {
+            text.push_str("\nPrivate response content was withheld because its recipient binding is not established.");
+        }
+        return text;
+    }
     if update["scope"] == "conversation" {
         let state = match update["state"].as_str() {
             Some("admitted") => {
