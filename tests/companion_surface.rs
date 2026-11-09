@@ -2426,6 +2426,15 @@ async fn browser_board_membership_is_scoped_deduplicated_and_tracks_return_to_im
         let observation: Value = serde_json::from_str(raw).unwrap();
         assert!(observation.get("human_viewed").unwrap().is_null());
         assert!(observation.get("image_decoded").unwrap().is_null());
+        assert_eq!(observation["membership_verified"], true);
+        assert_eq!(
+            observation["board_state"],
+            if observation["card_ids"].as_array().unwrap().is_empty() {
+                "empty"
+            } else {
+                "items_present"
+            }
+        );
     }
     assert_eq!(
         serde_json::from_str::<Value>(&events[1].1).unwrap()["card_ids"],
@@ -2441,7 +2450,13 @@ async fn browser_board_membership_is_scoped_deduplicated_and_tracks_return_to_im
     assert_eq!(latest[0]["event_id"], events[2].0);
     let text = latest[0]["content"].as_str().unwrap();
     assert!(text.contains(&result) && text.contains(&card));
-    assert!(text.contains("does not prove image decoding"));
+    assert!(text.contains("This confirms they are on the board"));
+    assert!(text.contains("Image decoding and whether the caller looked at them are unknown"));
+    let empty: Value = serde_json::from_str(&batches[1].1).unwrap();
+    assert_eq!(
+        empty[0]["content"],
+        "The shared board is now empty. Previously saved items remain in history."
+    );
     assert!(
         !text.contains("Here is the requested screenshot"),
         "No model prose is promoted to UI evidence"

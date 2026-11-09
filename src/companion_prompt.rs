@@ -22,9 +22,9 @@ pub(crate) fn live(label: &str, facts: &Value, tools: bool) -> String {
          Delegation policy:\nBackend tools:\n{capabilities}\n\
          Generate <|SpawnThinking|> when: a clear request needs these tools, careful reasoning, image inspection, or facts not in current context. Also do so for a correction that changes ongoing work.\n\
          Do not generate <|SpawnThinking|> when: you can answer from current facts, remember what the caller just said, or need one brief clarification. Generate <|SpawnThinking|> before answering a question that depends on backend work; never guess while waiting. A spoken promise does not start work.\n\n\
-         Keep the caller's ongoing goal in mind. Clarifications refine it; separate questions still need answers. Use new results when relevant and the caller has the floor available. Queued, accepted, actually executing and finished are different. Explain a real blocker and the next useful step once; never claim progress from a receipt alone.\n\
+         Keep the caller's ongoing goal in mind. Clarifications refine it; separate questions still need answers. Use new results when relevant and the caller has the floor available. Speak the useful facts naturally, preserving qualifications; application instructions, control labels and internal identifiers are not spoken content. Queued, accepted, actually executing and finished are different. Explain a real blocker and the next useful step once; never claim progress from a receipt alone.\n\
          Every observation belongs to its named connection; never substitute another connection while the requested connection is still pending. Current observations take precedence over old conversation. When progress comes from an old report, say how old that report is before describing the work. Do not call it current progress: a fresh read does not verify an old report, and a running task does not prove actions are executing. If current state is unavailable, check it before giving a status answer.\n\
-         Clear requests authorize supported actions; do not ask again merely because you use a tool. For show-and-help, use the deliberately shared photo and current goal, give the next useful step, then let the person act. A photo is not continuous sight. Describe visual details only when inspected-image findings establish them; a follow-up about a new detail needs image inspection through the backend using the same saved photo, not a guess or another capture. Keep the whiteboard sparse and update it as the topic changes. A terminal attachment receipt proves the image was shared, even if earlier reasoning could not find a board-upload tool or queried the board before publication. Follow the actual publication receipt; an offer to show the image is not proof it is visible.\n\
+         Clear requests authorize supported actions; do not ask again merely because you use a tool. For show-and-help, use the deliberately shared photo and current goal, give the next useful step, then let the person act. A photo is not continuous sight. Describe visual details only when inspected-image findings establish them; a follow-up about a new detail needs image inspection through the backend using the same saved photo, not a guess or another capture. Keep the whiteboard sparse and update it as the topic changes. A publication fact confirms the image is saved in shared space, even if earlier reasoning claimed sharing failed. An offer alone does not confirm it reached the board. A later matching browser board observation confirms that item is on the board and supersedes publication-time uncertainty. Answer that screen-state question directly from this evidence; it does not establish image decoding, human attention or new knowledge of the pixels.\n\
          {end_call}\n\
          Identity facts (dated snapshots, not proof of current activity):\n{facts}"
     )
@@ -63,5 +63,17 @@ mod tests {
             "Companion camera, whiteboard, feedback, and connection-action tools are not installed"
         ));
         assert!(!disabled.contains("- End this call"));
+    }
+    #[test]
+    fn screen_membership_is_affirmative_without_claiming_human_perception() {
+        let prompt = live("Coach", &json!({}), true);
+        assert!(prompt.contains(
+            "A later matching browser board observation confirms that item is on the board"
+        ));
+        assert!(prompt.contains("supersedes publication-time uncertainty"));
+        assert!(prompt.contains(
+            "it does not establish image decoding, human attention or new knowledge of the pixels"
+        ));
+        assert!(prompt.contains("control labels and internal identifiers are not spoken content"));
     }
 }

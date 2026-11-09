@@ -676,14 +676,21 @@ pub async fn presence(
             identities.push(json!({"card":card,"result":result}));
         }
         let event_id = format!("board:{}", uuid::Uuid::new_v4());
-        let content = format!(
-            "Browser reports current board: {}. Result IDs match publication receipts. Membership does not prove image decoding or that the caller saw or understood it. Empty means no current items, not deleted history. Use quietly.",
-            json!(identities)
-        );
+        // Membership is affirmative evidence about this board, independent
+        // of whether an image decoded or the person looked at it. Keep these
+        // distinct from the earlier publication offer and from image analysis.
+        let content = if board.is_empty() {
+            "The shared board is now empty. Previously saved items remain in history.".to_owned()
+        } else {
+            format!(
+                "The shared board currently contains these saved items: {}. This confirms they are on the board. Image decoding and whether the caller looked at them are unknown.",
+                json!(identities)
+            )
+        };
         if content.len() > 480 {
             return Err(anyhow::anyhow!("Board observation exceeds context bound").into());
         }
-        tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'surface_observation',?3,?4)",params![id,event_id,json!({"card_ids":board,"identities":identities,"source":"authenticated_browser_membership","human_viewed":null,"image_decoded":null}).to_string(),now_ms()])?;
+        tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'surface_observation',?3,?4)",params![id,event_id,json!({"card_ids":board,"identities":identities,"source":"authenticated_browser_membership","board_state":if board.is_empty(){"empty"}else{"items_present"},"membership_verified":true,"human_viewed":null,"image_decoded":null}).to_string(),now_ms()])?;
         Some((event_id, content))
     } else {
         None
