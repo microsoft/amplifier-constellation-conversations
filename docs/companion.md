@@ -49,7 +49,17 @@ application context. Repeated presence heartbeats do not create repeated notices
 pending membership updates coalesce to the latest board and wait for the same
 conversational floor as other context. Card identities link this observation to
 the saved answer. Browser-reported membership does not establish that the person
-looked at, decoded, or understood an image.
+looked at, decoded, or understood an image. It does establish that the matching
+item is currently on the board, superseding the earlier publication-time
+uncertainty. An empty-board observation establishes absence from the current
+board, not deletion from history.
+
+Publication identifiers and screen-state facts are supplied as quiet context.
+Spoken updates contain concise, speakable results; application instructions and
+receipt-processing details are not sent as commentary. The original backend
+answer stays intact in history. These channel choices guide the voice model,
+but do not guarantee its wording: qualification includes recorded playback as
+well as provider transcripts and browser display evidence.
 
 An explicit **Paste** control opens a text composer; pasted images use the saved
 upload path. A receipt says when material is available. New content follows the
