@@ -998,6 +998,10 @@ async fn delegation_anchor_includes_observed_straddling_word_with_original_timin
     assert_eq!(tail["text"], " elsewhere");
     assert_eq!(tail["start_ms"], 13000);
     assert_eq!(tail["end_ms"], 13200);
+    assert!(source.contains(
+        "explicitly publish it through this runtime's advertised image-attachment/output capability"
+    ));
+    assert!(source.contains("A path on another host is not a usable attachment or public URL"));
     let segments: Vec<Value> = serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(
