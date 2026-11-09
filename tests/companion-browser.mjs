@@ -5,7 +5,9 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const files = new Map(await Promise.all(['companion.html','companion.js','companion.css','companion-floor.mjs'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
+const files = new Map(await Promise.all(['companion.html','companion.js','companion.css','companion-floor.mjs','companion-cards.mjs','markdown.js','markdown-renderer.js','markdown.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
+files.set('markdown.js', Buffer.concat([files.get('markdown.js'),files.get('markdown-renderer.js')]));
+files.set('companion.css', Buffer.concat([files.get('markdown.css'),files.get('companion.css')]));
 const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
 const surfaces = new Map(), surfaceCommands = new Map(), permissions = new Map();
 let holdNextSurfaceAck = false, heldSurfaceAck = null;
@@ -18,7 +20,7 @@ const csrf = 'fixture-csrf';
 const server = createServer(async (request,response) => {
   const url = new URL(request.url,'http://fixture');
   const send = (status,value) => { response.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'}); response.end(JSON.stringify(value)); };
-  if (['/companion','/companion.html','/companion.js','/companion.css','/companion-floor.mjs'].includes(url.pathname)) {
+  if (['/companion','/companion.html','/companion.js','/companion.css','/companion-floor.mjs','/companion-cards.mjs','/markdown.js'].includes(url.pathname)) {
     const name = url.pathname === '/companion' ? 'companion.html' : url.pathname.slice(1);
     response.writeHead(200,{'Content-Type':name.endsWith('.html')?'text/html':name.endsWith('.css')?'text/css':'text/javascript'}); response.end(files.get(name)); return;
   }
@@ -285,13 +287,19 @@ try {
   emit('progress',{delegation_id:'d1',request_id:'request-1',state:'awaiting_permission',elapsed_seconds:75});
   await wait(async()=>/waiting for your decision/.test(await page.locator('#work-status').innerText()),'permission receipt missing');
   checks.push('durable progress updates remain quiet status, preserve captions, and distinguish a pending result from a decision');
-  emit('card',{delegation_id:'d1',text:'<script>window.injected=true</script> A useful result. [Project](https://example.com/project) [Bad](javascript:alert(1)) https://media.example/clip.mp4',media:[{url:'data:text/html,<script>alert(1)</script>',mime_type:'video/mp4'},{url:'/auth/logout',mime_type:'image/png'}],conversation_id:'room-coach'});
+  const savedResultAt = '2026-11-08T20:42:17.003Z';
+  emit('card',{delegation_id:'d1',text:'<script>window.injected=true</script>\n\nA useful result. [Project](https://example.com/project) [Bad](javascript:alert(1)) https://media.example/clip.mp4\n\n- **Message:** It was submitted.\n- **Status:** Delivery remains unknown.',media:[{url:'data:text/html,<script>alert(1)</script>',mime_type:'video/mp4'},{url:'/auth/logout',mime_type:'image/png'}],conversation_id:'room-coach',event_at:'2099-01-01T00:00:00Z'},savedResultAt);
   emit('delegation',{id:'d1',state:'completed'});
   await wait(async()=>await page.locator('.output-card').count()===1,'result card missing');
   assert.equal(await page.locator('.output-card script').count(),0); assert.equal(await page.evaluate(()=>window.injected),undefined);
   assert(await page.locator('#board-history').evaluate(node=>!node.open));assert.equal(await page.locator('#board-items .output-card').count(),0);
   await page.locator('#board-history summary').click();
-  assert.match(await page.locator('.output-card p').innerText(),/<script>/);
+  assert.match(await page.locator('.output-card .card-text').innerText(),/<script>/);
+  assert.equal(await page.locator('.output-card .card-text li').count(),2);
+  assert.equal(await page.locator('.output-card .card-text strong').first().innerText(),'Message:');
+  assert.match(await page.locator('.output-card .card-text').innerText(),/Delivery remains unknown/);
+  assert.equal(await page.locator('.output-card > h2 time').getAttribute('datetime'),savedResultAt,'saved result time must use the durable event, not render time or card content');
+  assert.match(await page.locator('.output-card > h2 time').innerText(),/^Saved /);
   await page.waitForTimeout(1100); assert.equal(await page.locator('.output-card').count(),1);assert.equal(await page.locator('#work-status').isHidden(),true);
   checks.push('durable transcript/result events deduplicate; only actual audio energy animates speaking');
 

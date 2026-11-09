@@ -59,6 +59,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             }),
         )
         .route(
+            "/companion-cards.mjs",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/companion-cards.mjs"),
+                )
+            }),
+        )
+        .route(
             "/companion.js",
             get(|| async {
                 (
@@ -72,7 +81,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../ui/companion.css"),
+                    concat!(
+                        include_str!("../ui/markdown.css"),
+                        include_str!("../ui/companion.css")
+                    ),
                 )
             }),
         )

@@ -1,4 +1,5 @@
 import {ConversationFloor} from './companion-floor.mjs';
+import {safeCardLink, renderCardText, savedCardTime} from './companion-cards.mjs';
 // The browser owns media and presentation only. Provider commands, delegation,
 // authorization and persisted call events belong to the Companion service.
 const $ = id => document.getElementById(id);
@@ -448,12 +449,12 @@ function renderEvent(call, event) {
     const waiting = ['waiting_transcript','dispatched'].includes(data.state);
     if (waiting) call.working.set(data.id, data.state); else { call.working.delete(data.id); call.progress.delete(data.id); }
     refreshWorkStatus(call);
-    if (['failed','unknown','held'].includes(data.state) && data.message) addCard(call, 'Work update', data.message, call.conversationId, {card_id:`update:${event.seq}`});
+    if (['failed','unknown','held'].includes(data.state) && data.message) addCard(call, 'Work update', data.message, call.conversationId, {card_id:`update:${event.seq}`,event_at:event.at});
     refreshStatus(call);
   } else if (event.kind === 'progress' && call.working.has(data.delegation_id)) {
     call.progress.set(data.delegation_id, data); refreshWorkStatus(call);
   } else if (event.kind === 'card' && typeof data.text === 'string') {
-    addCard(call, typeof data.title === 'string' && data.title ? data.title.slice(0,300) : `From ${call.contact.label}`, data.text, data.conversation_id || call.conversationId, {...data,card_id:String(event.seq)});
+    addCard(call, typeof data.title === 'string' && data.title ? data.title.slice(0,300) : `From ${call.contact.label}`, data.text, data.conversation_id || call.conversationId, {...data,card_id:String(event.seq),event_at:event.at});
   } else if (event.kind === 'surface_command') {
     executeSurface(call, data);
   } else if (event.kind === 'action_observation') {
@@ -620,19 +621,10 @@ function refreshWorkStatus(call) {
     ? (update.state === 'blocked' ? 'An earlier request needs review before more work can start. Open the conversation to review it.' : update.state === 'awaiting_permission' ? 'A request is waiting for your decision. Open work controls to review it.' : `Last update: a request was still pending${elapsed}. No completed result has arrived.`) + (call.working.size > 1 ? ` ${call.working.size} requests pending.` : '')
     : `${call.contact.label} has ${call.working.size === 1 ? 'a pending request' : call.working.size + ' pending requests'}. You can keep talking.`;
 }
-// All answer content is built from DOM text and validated links. No HTML,
+// Answer content uses sanitized Markdown and validated links. No raw HTML,
 // executable URL schemes, frames, or arbitrary same-origin media endpoints.
 function safeLink(value, conversationId) {
-  if (typeof value !== 'string' || /[\u0000-\u0020\u007f]/.test(value)) return null;
-  try {
-    const url = new URL(value, location.origin);
-    if (!['http:','https:'].includes(url.protocol) || url.username || url.password) return null;
-    if (url.origin === location.origin) {
-      const prefix = `/api/v1/conversations/${encodeURIComponent(conversationId)}/attachments/`;
-      if (!conversationId || !url.pathname.startsWith(prefix) || !/^[^/]+$/.test(url.pathname.slice(prefix.length)) || url.search || url.hash) return null;
-    } else if (!/^https?:\/\//i.test(value)) return null;
-    return url.href;
-  } catch { return null; }
+  return safeCardLink(value, conversationId, location.origin);
 }
 function mediaType(url) {
   try { return ({png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp',gif:'image/gif',mp4:'video/mp4',webm:'video/webm',ogv:'video/ogg',mp3:'audio/mpeg',wav:'audio/wav',ogg:'audio/ogg'})[new URL(url).pathname.split('.').at(-1).toLowerCase()]; } catch { return null; }
@@ -662,17 +654,8 @@ function appendMedia(card, item, conversationId) {
   card.append(area);
 }
 function appendRichText(card, text, conversationId, includeMedia = true) {
-  const body = element('p'), media = new Map(); let at = 0;
-  const pattern = /!?\[([^\]\n]{1,240})\]\(([^\s)]+)\)|https?:\/\/[^\s<>]+/g;
-  for (const match of String(text).matchAll(pattern)) {
-    body.append(document.createTextNode(String(text).slice(at, match.index)));
-    const raw = match[2] || match[0].replace(/[.,;!?]+$/, ''), href = safeLink(raw, conversationId);
-    if (href) { body.append(resultLink(match[1] || raw, href)); if (mediaType(href)) media.set(href, {url:href,name:match[1] || 'Linked media'}); }
-    else body.append(document.createTextNode(match[0]));
-    if (!match[2] && href && raw.length < match[0].length) body.append(document.createTextNode(match[0].slice(raw.length)));
-    at = match.index + match[0].length;
-  }
-  body.append(document.createTextNode(String(text).slice(at))); card.append(body);
+  const links = renderCardText(card, text, conversationId, location.origin), media = new Map();
+  for (const item of links) if (mediaType(item.url)) media.set(item.url, item);
   if (includeMedia) for (const item of [...media.values()].slice(0,8)) appendMedia(card, item, conversationId);
 }
 const BOARD_LIMIT = 3;
@@ -764,7 +747,7 @@ function addCard(call, title, text, conversationId, data = {}) {
   if (!current(call)) return;
   const card = element('article', 'output-card');
   if (data.card_id) card.dataset.cardId = String(data.card_id);
-  const heading = element('h2', null, title); heading.append(element('small', null, new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})));
+  const heading = element('h2', null, title); heading.append(savedCardTime(data.event_at));
   card.append(heading);
   if (data.late) card.append(element('p', 'card-context', 'Answer to your earlier request'));
   const answer = element('div', 'card-answer'), note = data.kind === 'note', explicitMedia = !note && safeLink(data.url, conversationId);
