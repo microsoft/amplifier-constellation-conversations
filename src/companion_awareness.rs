@@ -436,6 +436,114 @@ fn bound_private_event(
         && original_source_valid(db, origin, request)?)
 }
 
+/// The domain outcome is already requested work, not unsolicited interest
+/// advice. Derive presentation only from its saved validated receipt chain.
+fn requested_outcome_event(owner: &str, source: &Source, origin: &str, update: &Value) -> Value {
+    let mut provenance = update["provenance"].clone();
+    provenance["source_call_id"] = json!(origin);
+    json!({"id":format!("action:{}",update["request_id"].as_str().unwrap()),"revision":update["revision"],"kind":"action_status","text":observation_text(&source.label,update),"occurred_at":update["observed_at"],"audience":{"kind":"private","owner":owner},"provenance":provenance})
+}
+
+fn requested_outcome_bound(
+    db: &rusqlite::Connection,
+    destination: &str,
+    source: &Source,
+    event: &Value,
+) -> Result<bool> {
+    if event["kind"] != "action_status" {
+        return Ok(false);
+    }
+    let Some(request) = event["id"].as_str().and_then(|v| v.strip_prefix("action:")) else {
+        return Ok(false);
+    };
+    let Some(origin) = event["provenance"]["source_call_id"].as_str() else {
+        return Ok(false);
+    };
+    let Some(identity) = crate::companion_history::private_identity(db, destination)? else {
+        return Ok(false);
+    };
+    if !source.owners.contains(&identity.owner)
+        || !bound_private_event(db, destination, source, event)?
+        || !crate::companion_history::same_private_identity(db, destination, origin)?
+        || !original_source_valid(db, origin, request)?
+    {
+        return Ok(false);
+    }
+    let row:Option<(String,String)>=db.query_row(
+        "SELECT a.result,o.data FROM companion_actions a JOIN companion_action_observers b ON b.call_id=a.call_id AND b.request_id=a.request_id JOIN companion_observations o ON o.call_id=a.call_id AND o.request_id=a.request_id WHERE a.call_id=?1 AND a.request_id=?2 AND a.connection_id=?3 AND a.state!='submitting' AND b.connection_id=?3 AND b.source_hash=?4",
+        params![origin,request,source.id,source_hash(source)?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((receipt, raw)) = row else {
+        return Ok(false);
+    };
+    let receipt: Value = serde_json::from_str(&receipt)?;
+    let update: Value = serde_json::from_str(&raw)?;
+    if let Some(queue) = receipt["receipt"]["request_id"].as_str() {
+        let count:i64=db.query_row("SELECT COUNT(*) FROM companion_actions WHERE connection_id=?1 AND json_extract(result,'$.receipt.request_id')=?2",params![source.id,queue],|r|r.get(0))?;
+        if count != 1 {
+            return Ok(false);
+        }
+    }
+    Ok(
+        observation_valid(&update, &[json!({"request_id":request,"receipt":receipt})])
+            && event_valid(event)
+            // A requested result remains relevant evidence after waiting for
+            // the caller's floor. Its exact current revision, not age, governs
+            // replacement; preserve the original timestamp without refreshing it.
+            && observed_time(&event["occurred_at"]).is_some_and(|at| at <= now_ms() + 5000)
+            && *event == requested_outcome_event(&identity.owner, source, origin, &update),
+    )
+}
+
+fn preserve_requested_outcome(
+    s: &AppState,
+    destination: &str,
+    origin: &str,
+    source: &Source,
+    update: &Value,
+    policy: &str,
+) -> Result<bool> {
+    let Some((owner, _, room, _)) = active(s, destination)? else {
+        return Ok(false);
+    };
+    if config(s)?.is_none_or(|(_, hash)| hash != policy) {
+        return Ok(false);
+    }
+    let event = requested_outcome_event(&owner, source, origin, update);
+    if !requested_outcome_bound(&s.db.lock().unwrap(), destination, source, &event)? {
+        return Ok(false);
+    }
+    if !record_source_event(s, destination, source, &event, policy, false)? {
+        return Ok(false);
+    }
+    let key = event_key(&source.id, &event);
+    let mut db = s.db.lock().unwrap();
+    let tx = db.transaction()?;
+    // The final transport boundary repeats this check. A policy/source change
+    // cannot turn this marker into a general private-event bypass.
+    let live: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND state IN ('connecting','connected'))",[destination],|r|r.get(0))?;
+    if !live || !requested_outcome_bound(&tx, destination, source, &event)? {
+        return Ok(false);
+    }
+    let changed = tx.execute("UPDATE companion_awareness SET state='ready',decision=?3 WHERE call_id=?1 AND event_key=?2 AND state='observed'",params![destination,key,json!({"status":"not_requested","reason":"bound_requested_outcome"}).to_string()])? == 1;
+    if changed {
+        // Keep the full attributed receipt visible in call history even though
+        // optional ambient judgment and proactive speech are not requested.
+        crate::companion::insert_event(
+            &tx,
+            destination,
+            &format!("awareness-card:{key}"),
+            "card",
+            &json!({"title":format!("{} · Requested result",source.label),"text":event["text"],"conversation_id":room,"awareness_id":key,"source":event,"attribution":attribution(source,&event),"presentation":"quiet","observed_only":true}),
+        )?;
+    }
+    tx.commit()?;
+    drop(db);
+    if changed {
+        s.changed();
+    }
+    Ok(changed)
+}
+
 fn all_action_outcomes(s: &AppState, destination: &str) -> Result<Vec<Value>> {
     let identity = {
         let db = s.db.lock().unwrap();
@@ -585,10 +693,7 @@ async fn followthrough_tick(
             }
             let changed = save_observation(s, origin, source, update)?;
             if changed && live && active(s, destination)?.is_some() {
-                let mut provenance = update["provenance"].clone();
-                provenance["source_call_id"] = json!(origin);
-                let event = json!({"id":format!("action:{}",update["request_id"].as_str().unwrap()),"revision":update["revision"],"kind":"action_status","text":observation_text(&source.label,update),"occurred_at":update["observed_at"],"audience":{"kind":"private","owner":identity.owner},"provenance":provenance});
-                record_event(s, destination, source, &event, &fingerprint)?;
+                preserve_requested_outcome(s, destination, origin, source, update, &fingerprint)?;
             }
         }
     }
@@ -1533,6 +1638,7 @@ fn event_semantics(event: &Value) -> Value {
     semantic
 }
 
+#[cfg(test)]
 fn record_event(
     s: &AppState,
     id: &str,
@@ -1898,13 +2004,11 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
         for update in updates {
             let changed = save_observation(s,id,source,update)?;
             if changed {
-                let text = observation_text(&source.label, update);
-                let event = json!({"id":format!("action:{}",update["request_id"].as_str().unwrap()),"revision":update["revision"],"kind":"action_status","text":text,"occurred_at":update["observed_at"],"audience":{"kind":"private","owner":owner},"provenance":update["provenance"]});
-                record_event(s, id, source, &event, &fingerprint)?;
+                preserve_requested_outcome(s,id,id,source,update,&fingerprint)?;
             }
         }
         for event in events {
-            if source.audiences.contains(&event["audience"]) && observed_time(&event["occurred_at"]).is_some_and(|at|at<=now_ms()+5000) {
+            if !matches!(event["kind"].as_str(),Some("action_status"|"requested_status_qualifier")) && source.audiences.contains(&event["audience"]) && observed_time(&event["occurred_at"]).is_some_and(|at|at<=now_ms()+5000) {
                 record_source_event(s, id, source, event, &fingerprint, fresh(event,call_at,now_ms()))?;
             }
         }
@@ -2047,13 +2151,6 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
                 return Ok(());
             }
         }
-        if !fresh(&event, call_at, now_ms()) {
-            s.db.lock().unwrap().execute(
-                "UPDATE companion_awareness SET state='stale' WHERE call_id=?1 AND event_key=?2",
-                params![id, key],
-            )?;
-            return Ok(());
-        }
         let notify = decision["status"] == "decided"
             && decision["model"] == "gpt-6-luna"
             && decision_policy(&decision).is_some_and(|(_, notify)| notify);
@@ -2068,6 +2165,20 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
         else {
             return Ok(());
         };
+        let requested = decision["status"] == "not_requested"
+            && decision["reason"] == "bound_requested_outcome";
+        let present = if requested {
+            requested_outcome_bound(&s.db.lock().unwrap(), id, source, &event)?
+        } else {
+            fresh(&event, call_at, now_ms())
+        };
+        if !present {
+            s.db.lock().unwrap().execute(
+                "UPDATE companion_awareness SET state=?3 WHERE call_id=?1 AND event_key=?2",
+                params![id, key, if requested { "withdrawn" } else { "stale" }],
+            )?;
+            return Ok(());
+        }
         let parts = context_parts(source, &event, &key);
         // Both thinking and commentary wait in the shared durable delivery queue.
         // Receipt retention is independent of the caller's conversational floor.
@@ -2150,23 +2261,28 @@ pub(crate) fn presentation_allowed(
             return Ok(false);
         };
         let event: Value = serde_json::from_str(&raw)?;
-        if ambient_relevance(&event) {
-            let decision: Value = decision
-                .map(|raw| serde_json::from_str(&raw))
-                .transpose()?
-                .unwrap_or(Value::Null);
-            if decision["context_revision"].as_str()
+        let decision: Value = decision
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?
+            .unwrap_or(Value::Null);
+        if decision["reason"] == "bound_requested_outcome"
+            && (decision["status"] != "not_requested"
+                || !requested_outcome_bound(db, call, source, &event)?)
+        {
+            return Ok(false);
+        }
+        if ambient_relevance(&event)
+            && decision["context_revision"].as_str()
                 != Some(human_context_revision(db, call)?.as_str())
-            {
-                // This batch has not crossed the transport boundary. Withdraw
-                // it, preserving its evidence, then assess the settled prior
-                // decision against the new human context on a later tick.
-                if decision["status"] == "decided" {
-                    db.execute("UPDATE companion_awareness SET state='pending' WHERE call_id=?1 AND event_key=?2 AND state='context_queued'",params![call,key])?;
-                    db.execute("UPDATE companion_awareness_appends SET state='withdrawn' WHERE call_id=?1 AND event_key=?2 AND state='queued'",params![call,key])?;
-                }
-                return Ok(false);
+        {
+            // This batch has not crossed the transport boundary. Withdraw
+            // it, preserving its evidence, then assess the settled prior
+            // decision against the new human context on a later tick.
+            if decision["status"] == "decided" {
+                db.execute("UPDATE companion_awareness SET state='pending' WHERE call_id=?1 AND event_key=?2 AND state='context_queued'",params![call,key])?;
+                db.execute("UPDATE companion_awareness_appends SET state='withdrawn' WHERE call_id=?1 AND event_key=?2 AND state='queued'",params![call,key])?;
             }
+            return Ok(false);
         }
         let private = event["audience"] == json!({"kind":"private","owner":identity.owner})
             && bound_private_event(db, call, source, &event)?;
