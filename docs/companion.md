@@ -295,9 +295,11 @@ reads the recorded receipt; it is not independent verification of downstream wor
 Reusing the same request ID returns the existing receipt rather than resubmitting;
 a changed payload is rejected. A timeout, lost response, or restart during
 submission leaves an unknown outcome that must not be retried automatically.
-Hanging up revokes call-tool access, including status access through that expired
-call. Already submitted connector work retains its original authority and must be
-inspected through the owning connector's controls.
+Hanging up closes new call-tool actions. The original call grant can still read
+saved operation receipts while already accepted backend work settles; it cannot
+create a new effect, capture, or live observation. Already submitted connector
+work retains its original authority and must be inspected through its owning
+connector's controls when no retained receipt establishes the outcome.
 
 ## API reference
 
@@ -376,6 +378,32 @@ The status tool can return the actual owned JPEG/PNG as MCP image content for a
 reasoning engine only when this call's actual ACP initialization advertises image input. Unsupported or unconfirmed support retains the saved artifact and omits image bytes. Uploaded does not mean inspected. Camera images
 from this path are capped at 512 KiB. A local-only engine remains local-only; the
 connector does not add a cloud vision fallback.
+
+### Show and help
+
+During a call, choose **Show something** to open the camera preview, then share
+one photo or enable one-photo-by-voice consent and ask the agent to look. Merely
+opening the camera does not share an image or begin a model request. Explain the
+goal naturally; the agent should offer the next useful step and use the existing
+whiteboard only when an image, short instruction, or comparison helps. A saved
+photo is a moment in time, not continuous vision. Changed scenes require a fresh
+deliberate photo when the difference matters.
+
+The optional **Keep screen on** setting uses the browser's screen wake lock only
+while the active call is visible. Revocation, hiding the page, ending the call,
+or turning the setting off releases it. Unsupported or denied wake lock does not
+prevent a call. This is a foreground web experience; it does not promise audio
+continuity after locking the phone or switching applications.
+
+An agent-generated screenshot must be explicitly published as an ACP assistant
+image to appear as a result. Raw tool images are not automatically shared. Once
+published for this call, the agent may inspect that exact saved artifact again
+through `companion_surface_status`, without asking for a replacement photo.
+The call, selected agent, terminal result and original caller input must match.
+Saved JPEG/PNG image delivery is bounded to 2 MiB; phone capture stays at 512 KiB.
+Larger saved artifacts retain their identity with an explicit delivery limit.
+Neither saving/displaying an image nor returning its bytes proves inspection or
+completion of a real-world task.
 
 Browser routes use the owner's authenticated session and CSRF protection:
 

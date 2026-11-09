@@ -1366,3 +1366,61 @@ print(json.dumps(result))
         assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), original);
     }
 }
+
+#[test]
+fn input_outcomes_keep_turn_evidence_and_public_reply_qualifiers_without_fulfillment_claims() {
+    let update = json!({"scope":"conversation","state":"settled","request_id":"call-request",
+        "provenance":{"kind":"minecraft_input_outcome","version":1,"source_id":"queued-input"},
+        "conversation":{"terminal_at":"2026-11-09T10:00:00Z","blocked_reason":"permission_required","conversation_only":true},
+        "responses":[{"id":"reply","at":"2026-11-09T09:59:59Z","audience":"public","text":"I checked the path, but the bridge is still unfinished."},
+            {"id":"private","audience":"private","text":"unrelated-private-secret"}],"private_responses_withheld":1});
+    let text = observation_text("Coach / world one", &update);
+    assert!(text.contains("permission_required"));
+    assert!(text.contains("2026-11-09T09:59:59Z"));
+    assert!(text.contains("bridge is still unfinished"));
+    assert!(text.contains("co-admitted source set"));
+    assert!(text.contains("not proof the individual request was answered"));
+    assert!(!text.contains("unrelated-private-secret"));
+    assert!(!text.contains("call-request"));
+    assert!(!text.contains("queued-input"));
+    let mut other = update;
+    other["provenance"]["kind"] = json!("minecraft_local_conversation");
+    let old = observation_text("Coach", &other);
+    assert!(!old.contains("bridge is still unfinished"));
+    assert!(old.contains("does not confirm task acceptance"));
+}
+
+#[test]
+fn input_outcome_awareness_omits_oversized_whole_reply_instead_of_dropping_its_qualifier() {
+    let long = format!(
+        "{}BUT THIS WAS NOT COMPLETED",
+        "Reported detail. ".repeat(400)
+    );
+    let update = json!({"scope":"conversation","state":"settled","provenance":{"kind":"minecraft_input_outcome","version":1},
+        "conversation":{},"responses":[{"id":"large","at":"2026-11-09T10:00:00Z","audience":"public","text":long}]});
+    let text = observation_text("Coach", &update);
+    assert!(text.len() < 4000);
+    assert!(!text.contains("Reported detail"));
+    assert!(text.contains("no partial reply"));
+}
+
+#[test]
+fn input_outcomes_reject_private_response_payload_before_retention_and_bound_escaped_blocker() {
+    let request = "req";
+    let mut update = json!({"request_id":request,"revision":"revision","observed_at":timestamp(now_ms()),
+        "scope":"conversation","state":"settled","verified":false,"fulfillment":"not_established",
+        "provenance":{"kind":"minecraft_input_outcome","version":1},
+        "conversation":{"blocked_reason":"\u{0001}".repeat(1000)},
+        "responses":[{"id":"secret","audience":"private","text":"private-secret"}]});
+    assert!(!observation_valid(
+        &update,
+        &[json!({"request_id":request})]
+    ));
+    update["responses"] = json!([]);
+    assert!(observation_valid(&update, &[json!({"request_id":request})]));
+    let text = observation_text("Coach", &update);
+    assert!(text.len() <= 4000);
+    assert!(text.contains("omitted_fields"));
+    assert!(text.contains("blocked_reason"));
+    assert!(!text.contains("\\u0001"));
+}

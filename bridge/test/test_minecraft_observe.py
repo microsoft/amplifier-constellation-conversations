@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 import uuid
 from unittest.mock import patch
 
@@ -35,6 +36,7 @@ class MinecraftObserveTests(unittest.TestCase):
                                                "evidence_origin": "authenticated_operator_control", "audience": {"kind": "private"}}}}
         self.ledger = {"task": self.task, "task_history": [], "events": []}
         self.snapshots = {"/installation-state": {"ready": True, "task": self.task},
+                          "/status": {},
                           "/operator-inputs": {"messages": [{"id": self.queued, "time": NOW, "author": "Operator", "text": "Private instruction"}]}}
         self.public = {"username": "Coach", "messages": [{"id": "public-event", "at": NOW, "actor": "Other player", "text": "Public question"},
                        {"id": "own-event", "at": NOW, "actor": "Coach", "text": "The passage is open; the mechanism is not tested."}]}
@@ -76,7 +78,7 @@ class MinecraftObserveTests(unittest.TestCase):
     def test_fixed_reads_bind_accepted_task_to_original_private_queue(self):
         result = self.observe()
         self.assertEqual(result["availability"], "available")
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
         self.assertEqual(self.presence_calls, [(12345, "Coach")])
         action = result["actions"][0]
         self.assertEqual(action["state"], "accepted")
@@ -168,7 +170,8 @@ class MinecraftObserveTests(unittest.TestCase):
         self.assertLessEqual(len(helper.encoded(result)), 131072)
         self.assertLessEqual(len(result["events"]), 32)
         self.assertTrue(result["coverage"]["gap"])
-        self.assertEqual(result["coverage"]["omitted_events"], 32)
+        self.assertEqual(result["coverage"]["omitted_events"], 16)
+        self.assertEqual(result["coverage"]["private_messages_withheld"], 16)
         self.assertFalse(any(e["kind"] == "message" for e in result["events"]), "Oversize source text must be omitted whole, never clipped")
         self.assertTrue(all(len(e["text"].encode()) <= 4000 for e in result["events"]))
         self.calls.clear()
@@ -177,7 +180,7 @@ class MinecraftObserveTests(unittest.TestCase):
 
     def burst(self, message):
         self.snapshots["/operator-inputs"]["messages"] = [
-            {"id": f"private-{i}", "time": NOW, "author": "Operator", "text": message} for i in range(16)]
+            {"id": self.queued if i == 0 else f"private-{i}", "time": NOW, "author": "Operator", "text": message} for i in range(16)]
         self.public["messages"] = [
             {"id": f"own-public-{i}", "at": NOW, "actor": "Coach", "text": message} for i in range(20)]
 
@@ -199,24 +202,26 @@ class MinecraftObserveTests(unittest.TestCase):
             batches.append(result)
             if not result["events"]:
                 break
-        self.assertEqual(len(emitted), 38, "All 36 messages, presence and task must eventually be emitted")
+        self.assertEqual(len(emitted), 23, "This call's private input, 20 public messages, presence and task must drain")
         self.assertEqual(sum(event["actor"] == "Coach" and event["kind"] == "message" for event in emitted.values()), 20)
         self.assertEqual(batches[-1]["events"], [])
         return batches
 
     def test_count_bounded_burst_advances_only_emitted_records(self):
         self.burst("Distinct public and private source records")
-        batches = self.drain_burst()
-        self.assertEqual(len(batches[0]["events"]), 32)
-        self.assertEqual(batches[0]["coverage"]["deferred_events"], 6)
-        self.assertEqual(len(batches[1]["events"]), 6)
+        with patch.object(helper, "MAX_EVENTS", 16):
+            batches = self.drain_burst()
+        self.assertEqual(len(batches[0]["events"]), 16)
+        self.assertEqual(batches[0]["coverage"]["deferred_events"], 7)
+        self.assertEqual(len(batches[1]["events"]), 7)
 
     def test_byte_bounded_burst_is_delivered_on_following_identical_polls(self):
         self.burst("x" * 4000)
-        batches = self.drain_burst()
+        with patch.object(helper, "MAX_OUTPUT", 80000):
+            batches = self.drain_burst()
         self.assertTrue(batches[0]["coverage"]["output_truncated"])
-        self.assertLess(len(batches[0]["events"]), 32)
-        self.assertGreater(batches[0]["coverage"]["deferred_events"], 6)
+        self.assertLess(len(batches[0]["events"]), 23)
+        self.assertGreater(batches[0]["coverage"]["deferred_events"], 0)
 
     def test_deferred_presence_keeps_identity_without_becoming_acknowledged(self):
         self.burst("x" * 4000)
@@ -327,6 +332,227 @@ class MinecraftObserveTests(unittest.TestCase):
         self.assertEqual(self.task["request_id"], "original-public-task-source")
         self.ledger["task_authorizations"][0]["source"]["audience"] = {"kind": "public"}
         self.assertEqual(self.observe()["actions"][0]["scope"], "conversation")
+
+    def advertise_outcome(self, delivery="terminal", **overrides):
+        self.snapshots["/status"]["input_outcomes"] = {"version": 1, "method": "GET", "path": "/input-outcomes", "max_ids": 16}
+        outcome = {"request_id": self.queued, "delivery": delivery, "admitted_at": NOW, "terminal_at": NOW,
+                   "conversation_only": True, "turn_task_id": None, "blocked_reason": "task_interrupted",
+                   "responses": [{"id": "captured-public-reply", "at": NOW, "text": "I need the interrupted task reviewed.", "audience": "public"}],
+                   "task_authorizations": [], "completion": "not_established", **overrides}
+        path = "/input-outcomes?" + urllib.parse.urlencode({"ids": self.queued})
+        self.snapshots[path] = {"version": 1, "observed_at": NOW, "outcomes": [outcome]}
+        return outcome, self.snapshots[path]
+
+    def test_durable_terminal_keeps_captured_blockage_and_is_not_fulfillment(self):
+        self.advertise_outcome()
+        # Today's task is running; it cannot rewrite the earlier input's blocker.
+        action = self.observe()["actions"][0]
+        self.assertEqual(action["state"], "settled")
+        self.assertEqual(action["scope"], "conversation")
+        self.assertEqual(action["delivery_state"], "terminal")
+        self.assertEqual(action["conversation"]["blocked_reason"], "task_interrupted")
+        self.assertEqual(action["conversation"]["terminal_at"], NOW)
+        self.assertEqual(action["responses"][0]["text"], "I need the interrupted task reviewed.")
+        self.assertEqual(action["response_association"], "same_turn_source_set_not_individual_fulfillment")
+        self.assertEqual(action["fulfillment"], "not_established")
+        self.assertFalse(action["verified"])
+        self.assertFalse(action["conversation"]["reply_verified"])
+        self.assertNotIn("task", action)
+        self.assertEqual(action["provenance"]["source_id"], self.queued)
+        self.assertEqual(action["provenance"]["version"], 1)
+
+    def test_capability_negotiation_never_follows_an_advertised_arbitrary_route(self):
+        base = {"version": 1, "method": "GET", "path": "/input-outcomes", "max_ids": 16}
+        for change in [{"version": True}, {"version": 2}, {"method": "POST"}, {"path": "https://attacker.invalid"},
+                       {"path": "/task"}, {"max_ids": True}, {"max_ids": 0}, {"max_ids": 17}]:
+            with self.subTest(change=change):
+                self.calls.clear()
+                self.snapshots["/status"]["input_outcomes"] = {**base, **change}
+                result = self.observe()
+                self.assertEqual(result["coverage"]["input_outcomes"], "unsupported")
+                self.assertEqual(result["actions"][0]["state"], "accepted", "Legacy exact task evidence stays available")
+                self.assertEqual([call.full_url.split(":12345")[1] for call in self.calls],
+                                 ["/installation-state", "/operator-inputs", "/status"])
+
+    def test_no_actions_or_unconfirmed_queue_never_queries_outcomes(self):
+        self.advertise_outcome()
+        for value in [{"version": 1, "actions": []},
+                      {**self.input, "actions": [{**self.input["actions"][0], "receipt": {"state": "unknown"}}]}]:
+            self.calls.clear()
+            result = self.observe(value)
+            self.assertEqual(result["coverage"]["input_outcomes"], "not_requested")
+            self.assertEqual(len(self.calls), 1)
+        self.input["actions"][0]["receipt"]["receipt"]["request_id"] = "/task?secret=bad"
+        self.calls.clear()
+        self.assertEqual(self.observe()["coverage"]["input_outcomes"], "not_requested")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_private_response_content_never_escapes_a_coadmitted_turn(self):
+        private = "Different caller's private answer must not enter this call"
+        row, _ = self.advertise_outcome()
+        row["responses"].append({"id": "private-reply", "at": NOW, "text": private, "audience": "private", "secret": TOKEN})
+        result = self.observe()
+        action = result["actions"][0]
+        self.assertEqual(action["private_responses_withheld"], 1)
+        self.assertEqual(len(action["responses"]), 1)
+        self.assertNotIn(private, json.dumps(result))
+        self.assertNotIn(TOKEN, json.dumps(result))
+        self.assertEqual(action["audience"]["kind"], "private")
+
+    def test_accepted_authority_receipt_is_separate_from_terminal_or_completion(self):
+        row, _ = self.advertise_outcome("admitted", terminal_at=None, conversation_only=False,
+                                       turn_task_id=self.task["id"], blocked_reason=None)
+        row["task_authorizations"] = [{"operation": "amend", "task_id": self.task["id"], "authority_revision": 2,
+                                        "private_original_text": "must-not-be-copied"}]
+        action = self.observe()["actions"][0]
+        self.assertEqual(action["state"], "admitted")
+        self.assertFalse(action["conversation"]["local_turn_settled"])
+        self.assertEqual(action["task_authorizations"], [{"operation": "amend", "task_id": self.task["id"], "authority_revision": 2}])
+        self.assertFalse(action["verified"])
+        self.assertEqual(action["fulfillment"], "not_established")
+
+    def test_outcome_states_never_masquerade_as_successful_task_completion(self):
+        for delivery, expected in [("queued", "unknown"), ("admitted", "admitted"), ("terminal", "settled"),
+                                   ("interrupted", "interrupted"), ("unknown", "unknown")]:
+            self.advertise_outcome(delivery)
+            action = self.observe()["actions"][0]
+            self.assertEqual(action["state"], expected)
+            self.assertEqual(action["delivery_state"], delivery)
+            self.assertEqual(action["fulfillment"], "not_established")
+            self.assertFalse(action["verified"])
+
+    def test_missing_retained_outcome_does_not_fall_back_to_current_task(self):
+        _, snapshot = self.advertise_outcome()
+        snapshot["outcomes"] = []
+        result = self.observe()
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(result["actions"][0]["state"], "unknown")
+        self.assertEqual(result["actions"][0]["reason"], "input_outcome_not_retained")
+        self.assertNotIn("task", result["actions"][0])
+
+    def test_malformed_or_cross_source_outcomes_are_unknown_without_content_leak(self):
+        for change in [{"request_id": str(uuid.uuid4())}, {"delivery": "completed"}, {"completion": "verified"},
+                       {"conversation_only": "true"}, {"terminal_at": "yesterday"},
+                       {"task_authorizations": [{"operation": "accept", "task_id": "task", "authority_revision": True}]},
+                       {"responses": [{"id": "unknown-audience", "at": NOW, "text": TOKEN, "audience": "everybody"}]}]:
+            with self.subTest(change=change):
+                self.advertise_outcome(**change)
+                result = self.observe()
+                self.assertEqual(result["availability"], "available")
+                self.assertEqual(result["actions"][0]["state"], "unknown")
+                self.assertEqual(result["coverage"]["input_outcomes"], "unavailable")
+                self.assertNotIn(TOKEN, json.dumps(result))
+
+    def test_duplicate_outcome_identity_and_unknown_version_are_rejected(self):
+        row, snapshot = self.advertise_outcome()
+        snapshot["outcomes"].append(row)
+        self.assertEqual(self.observe()["actions"][0]["state"], "unknown")
+        snapshot["outcomes"] = [row]
+        snapshot["version"] = 2
+        self.assertEqual(self.observe()["actions"][0]["state"], "unknown")
+
+    def test_public_replies_are_bounded_whole_and_omissions_remain_explicit(self):
+        row, _ = self.advertise_outcome()
+        row["responses"] = [{"id": f"reply-{i}", "at": NOW, "text": "x" * 3990 + " not done", "audience": "public"}
+                            for i in range(6)]
+        action = self.observe()["actions"][0]
+        self.assertEqual(len(action["responses"]), 1)
+        self.assertEqual(action["responses_omitted"], 5)
+        self.assertTrue(action["responses"][0]["text"].endswith(" not done"))
+        self.assertLessEqual(len(helper.encoded(action)), 16000)
+
+    def test_outcome_observation_poll_time_does_not_change_revision(self):
+        self.advertise_outcome()
+        first = self.observe()["actions"][0]
+        second = helper.observe(self.config, self.input, opener=self, now="2026-11-07T20:01:00+00:00",
+                                presence_reader=self.read_presence)["actions"][0]
+        self.assertEqual(first["revision"], second["revision"])
+        self.assertNotEqual(first["observed_at"], second["observed_at"])
+
+    def test_outcome_query_failure_does_not_retry_or_erase_other_observations(self):
+        self.advertise_outcome()
+        original = self.open
+        def fail_outcomes(request, timeout):
+            if "/input-outcomes?" in request.full_url:
+                self.calls.append(request)
+                raise TimeoutError(TOKEN)
+            return original(request, timeout)
+        with patch.object(self, "open", side_effect=fail_outcomes):
+            result = self.observe()
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(result["actions"][0]["state"], "unknown")
+        self.assertTrue(result["events"])
+        self.assertEqual(sum("/input-outcomes?" in call.full_url for call in self.calls), 1)
+        self.assertNotIn(TOKEN, json.dumps(result))
+
+    def test_negotiated_batch_limit_and_original_request_mapping_are_preserved(self):
+        row, _ = self.advertise_outcome()
+        self.snapshots["/status"]["input_outcomes"]["max_ids"] = 1
+        second_request, second_queue = str(uuid.uuid4()), str(uuid.uuid4())
+        self.input["actions"].append({"request_id": second_request,
+            "receipt": {"request_id": second_request, "state": "queued", "scope": "private_operator_instruction",
+                        "receipt": {"request_id": second_queue, "queued": True}}})
+        self.snapshots["/input-outcomes?ids=" + second_queue] = {"version": 1, "observed_at": NOW,
+            "outcomes": [{**row, "request_id": second_queue, "delivery": "interrupted"}]}
+        result = self.observe()
+        self.assertEqual([(a["request_id"], a["receipt"]["request_id"], a["state"]) for a in result["actions"]],
+                         [(self.request, self.queued, "settled"), (second_request, second_queue, "interrupted")])
+        queried = [urllib.parse.parse_qs(urllib.parse.urlparse(call.full_url).query)["ids"][0]
+                   for call in self.calls if "/input-outcomes?" in call.full_url]
+        self.assertEqual(queried, [self.queued, second_queue])
+
+    def test_two_companion_requests_cannot_claim_one_original_queue_outcome(self):
+        self.advertise_outcome()
+        second_request = str(uuid.uuid4())
+        self.input["actions"].append({"request_id": second_request,
+            "receipt": {**self.input["actions"][0]["receipt"], "request_id": second_request}})
+        result = self.observe()
+        self.assertEqual([a["state"] for a in result["actions"]], ["unknown", "unknown"])
+        self.assertFalse(any("/input-outcomes?" in call.full_url for call in self.calls))
+
+    def test_two_calls_only_receive_their_original_private_instructions(self):
+        other_request, other_queue = str(uuid.uuid4()), str(uuid.uuid4())
+        self.snapshots["/operator-inputs"]["messages"].append(
+            {"id": other_queue, "time": NOW, "author": "Operator", "text": "Other caller's private instruction"})
+        first = self.observe()
+        self.assertIn("Private instruction", json.dumps(first))
+        self.assertNotIn("Other caller's private instruction", json.dumps(first))
+        second_input = {"version": 1, "actions": [{"request_id": other_request,
+            "receipt": {"request_id": other_request, "state": "queued", "scope": "private_operator_instruction",
+                        "receipt": {"request_id": other_queue, "queued": True}}}]}
+        second = self.observe(second_input)
+        self.assertIn("Other caller's private instruction", json.dumps(second))
+        self.assertNotIn("Private instruction", json.dumps(second))
+        self.assertNotIn("Build the tower", json.dumps(second), "Another caller's private task must also be withheld")
+        for result in [first, second]:
+            self.assertTrue(any(e["id"] == "minecraft:message:own-event" for e in result["events"]),
+                            "Public speech remains available to either call")
+            self.assertEqual(result["coverage"]["private_messages_withheld"], 1)
+
+    def test_direct_status_has_no_private_instruction_or_task_access(self):
+        result = self.observe({"version": 1, "actions": []})
+        self.assertEqual(result["availability"], "available")
+        self.assertFalse(any(e["audience"]["kind"] == "private" for e in result["events"]))
+        self.assertNotIn("Private instruction", json.dumps(result))
+        self.assertNotIn("Build the tower", json.dumps(result))
+        self.assertFalse(any("/operator-inputs" in call.full_url for call in self.calls))
+        self.assertTrue(result["coverage"]["private_task_withheld"])
+        self.task["authority"]["source"]["audience"] = {"kind": "public"}
+        result = self.observe({"version": 1, "actions": []})
+        self.assertTrue(any(e["kind"] == "task_observation" for e in result["events"]),
+                        "Public task observations are not private call data")
+
+    def test_unknown_and_duplicate_receipts_do_not_grant_private_context(self):
+        unknown = {**self.input["actions"][0], "receipt": {**self.input["actions"][0]["receipt"], "state": "unknown"}}
+        duplicate_id = str(uuid.uuid4())
+        duplicate = {"request_id": duplicate_id, "receipt": {**self.input["actions"][0]["receipt"], "request_id": duplicate_id}}
+        for actions in [[unknown], [*self.input["actions"], duplicate]]:
+            self.calls.clear()
+            result = self.observe({"version": 1, "actions": actions})
+            self.assertEqual([a["state"] for a in result["actions"]], ["unknown"] * len(actions))
+            self.assertNotIn("Private instruction", json.dumps(result))
+            self.assertNotIn("Build the tower", json.dumps(result))
+            self.assertFalse(any("/operator-inputs" in call.full_url for call in self.calls))
 
     def test_cli_invalid_json_is_sanitized(self):
         result = subprocess.run([sys.executable, str(HELPER), "--config", str(self.config)], input="bad " + TOKEN,

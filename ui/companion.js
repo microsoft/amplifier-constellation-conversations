@@ -129,14 +129,40 @@ function waitForIce(peer, call) {
     const timer = setTimeout(finish, 1800); peer.addEventListener('icegatheringstatechange', changed);
   });
 }
+function wakeLockStatus(call) {
+  if (!current(call)) return;
+  const supported = Boolean(navigator.wakeLock?.request);
+  $('screen-awake').disabled = !supported;
+  $('screen-awake').checked = supported && call.keepScreenAwake;
+  const message = !supported ? 'This browser cannot keep the screen awake. Keep this page open during the call.'
+    : !call.keepScreenAwake ? 'Your usual screen timeout applies. Locking the phone may interrupt this call.'
+    : call.wakeLock && !call.wakeLock.released ? 'Keeping the screen awake while this call is visible. Switching apps may interrupt audio.'
+    : call.wakeRequest ? 'Asking to keep the screen awake.'
+    : 'The screen may dim. Keep this page open; the browser can release the screen lock.';
+  const warning = !supported || (call.keepScreenAwake && !call.wakeLock && !call.wakeRequest && !document.hidden);
+  $('screen-awake-status').classList.toggle('sr-only', !warning);
+  $('screen-awake-status').classList.toggle('screen-awake-warning', warning);
+  $('screen-awake-status').textContent = warning ? (supported ? 'Screen may dim. Keep this page open.' : 'Screen-on unavailable in this browser.') : message;
+  $('screen-awake').parentElement.title = message;
+}
+function releaseWakeLock(call) {
+  // Invalidate any pending acquisition too. A late grant must not outlive the
+  // caller's choice, page visibility, or this call.
+  call.wakeRequest = null;
+  const lock = call.wakeLock; call.wakeLock = null;
+  lock?.release().catch(() => {});
+  wakeLockStatus(call);
+}
 async function requestWakeLock(call) {
-  if (!current(call) || document.hidden || !navigator.wakeLock || call.wakeLock) return;
+  if (!current(call) || !call.keepScreenAwake || document.hidden || !navigator.wakeLock?.request || call.wakeLock || call.wakeRequest) { wakeLockStatus(call); return; }
+  const request = {}; call.wakeRequest = request; wakeLockStatus(call);
   try {
     const lock = await navigator.wakeLock.request('screen');
-    if (!current(call)) { await lock.release(); return; }
+    if (!current(call) || !call.keepScreenAwake || document.hidden || call.wakeRequest !== request) { await lock.release(); return; }
     call.wakeLock = lock;
-    lock.addEventListener('release', () => { if (call.wakeLock === lock) call.wakeLock = null; });
+    lock.addEventListener('release', () => { if (call.wakeLock === lock) { call.wakeLock = null; wakeLockStatus(call); } });
   } catch { /* A denied wake lock never prevents a call. */ }
+  finally { if (call.wakeRequest === request) call.wakeRequest = null; wakeLockStatus(call); }
 }
 function updateDuration(call) {
   if (!current(call)) return;
@@ -146,7 +172,7 @@ function updateDuration(call) {
 async function startCall(contact) {
   if (state.call || state.recovery || !state.available) return;
   const call = {generation:++state.generation, authGeneration:state.authGeneration, contact, id:null, request:null, ended:false, connected:false,
-    browserId:crypto.randomUUID(), surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), cards:new Map(), contextItems:new Map(), board:[], muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
+    browserId:crypto.randomUUID(), keepScreenAwake:true, surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), cards:new Map(), contextItems:new Map(), board:[], muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
   state.call = call;
   document.body.classList.add('call-active');
   notice(''); $('phonebook').hidden = true; $('call-ended').hidden = true; $('call-screen').hidden = false;
@@ -160,7 +186,7 @@ async function startCall(contact) {
   $('card-count').hidden = true; $('card-count').textContent = '0'; $('continue-work').hidden = true;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = 'Take your time. There’s room for a pause.';
   $('speaker-state').textContent = 'Speaker waiting'; $('enable-audio').hidden = true;
-  $('hangup').disabled = false; setTab('space'); refreshStatus(call); updateShareCapability(call);
+  $('hangup').disabled = false; setTab('space'); refreshStatus(call); updateShareCapability(call); wakeLockStatus(call);
   refreshCapabilities(call);
   try {
     if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) throw new Error('Voice calling needs a browser with WebRTC and microphone access on HTTPS.');
@@ -207,7 +233,7 @@ async function startCall(contact) {
     call.surfaceTimer = setInterval(() => surfacePresence(call), 2000); surfacePresence(call);
     call.heartbeatTimer = setInterval(() => heartbeat(call), 5000);
     call.controlTimer = setInterval(() => checkControl(call), 500);
-    await requestWakeLock(call); heartbeat(call); poll(call);
+    requestWakeLock(call); heartbeat(call); poll(call);
   } catch (error) {
     if (call.authGeneration === state.authGeneration && (current(call) || state.recovery?.call === call) && !call.recoverySettled && call.requestPending && (!error.status || error.uncertain)) {
       if (state.recovery?.call !== call) state.recovery = {request:call.request,callId:call.id,call};
@@ -265,6 +291,7 @@ function controlReceived(call, heartbeatReceived = false) {
 }
 function resumeCall(call, trigger) {
   if (!current(call) || !call.id) return;
+  requestWakeLock(call);
   const now = Date.now(), stale = now - call.lastControlAt > 5000 || (call.peerLostAt && now - call.peerLostAt > 5000);
   // One bounded opportunity to reconcile after suspension. Repeated focus or
   // online events cannot extend it; only fresh control plus healthy media resets it.
@@ -276,7 +303,7 @@ function resumeCall(call, trigger) {
     if (pending && now - pending.startedAt > 2500) { call[key] = null; pending.abort.abort(); }
   }
   heartbeat(call,trigger); clearTimeout(call.pollTimer); poll(call);
-  requestWakeLock(call); call.audioContext?.resume().catch(() => {});
+  call.audioContext?.resume().catch(() => {});
   if (audio.srcObject && audio.paused) audio.play().catch(() => { if (current(call)) $('enable-audio').hidden = false; });
   refreshStatus(call);
 }
@@ -435,6 +462,11 @@ function renderEvent(call, event) {
 function connectionObservationText(data) {
   const observation = data.observation || {}, state = observation.state, label = typeof data.label === 'string' && data.label ? data.label : 'The connection';
   if (observation.scope === 'conversation') {
+    const outcome = inputOutcomeDetails(observation);
+    if (outcome) {
+      const wording = ({admitted:'The game connector admitted this request.',settled:'The game turn ended.',interrupted:'The game turn was interrupted.'})[state] || 'Game handling remains unconfirmed.';
+      return `${label}: ${wording}${outcome.blocker ? ' A blocker was reported; details are in Context.' : ''}${outcome.responses.length ? ' Public replies from the same turn are in Context.' : ''} The result of this request is not confirmed.`;
+    }
     const wording = ({admitted:'The game connector admitted your request; forwarding to the agent is not confirmed.',settled:'The conversation turn ended; a reply and work outcome are not confirmed.',interrupted:'Conversation handling was interrupted; the outcome is unconfirmed.'})[state]
       || (state === 'replied' && observation.conversation?.reply_verified === true ? 'The agent replied. A reply does not confirm task acceptance or resumed work.' : 'Conversation handling remains unconfirmed.');
     return `${label}: ${wording}`;
@@ -445,6 +477,29 @@ function connectionObservationText(data) {
     return `${label} ${wording}. Reported status; not independently verified.`;
   }
   return `${label}: No recognized status is available. The work outcome is unconfirmed.`;
+}
+function inputOutcomeDetails(observation) {
+  if (observation.scope !== 'conversation' || observation.provenance?.kind !== 'minecraft_input_outcome'
+      || observation.provenance.version !== 1 || observation.fulfillment !== 'not_established'
+      || observation.response_association !== 'same_turn_source_set_not_individual_fulfillment') return null;
+  return {blocker:typeof observation.conversation?.blocked_reason === 'string' ? observation.conversation.blocked_reason.slice(0,1000) : '',
+    responses:(Array.isArray(observation.responses) ? observation.responses : []).filter(response=>response && response.audience === 'public' && typeof response.text === 'string').slice(0,8)};
+}
+function connectionObservationContent(data) {
+  const observation = data.observation || {}, outcome = inputOutcomeDetails(observation);
+  let content = connectionObservationText(data);
+  if (!outcome) return content;
+  if (outcome.blocker) content += `\n\nReported blocker: ${outcome.blocker}`;
+  if (outcome.responses.length) {
+    content += '\n\nPublic replies associated with the same turn. Other requests may have been handled in that turn; these replies do not establish that this request was fulfilled.';
+    for (const response of outcome.responses) {
+      const at = contextTime(response.at);
+      content += `\n\n${at ? at.toLocaleString() : 'Time not recorded'} — ${response.text.slice(0,4000)}`;
+    }
+  }
+  if (Number.isSafeInteger(observation.private_responses_withheld) && observation.private_responses_withheld > 0) content += '\n\nPrivate response text was withheld from this call.';
+  if (Number.isSafeInteger(observation.responses_omitted) && observation.responses_omitted > 0) content += '\n\nAdditional public replies were omitted from this bounded report.';
+  return content;
 }
 function contextTime(value) {
   const date = typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? new Date(value)
@@ -532,7 +587,7 @@ function renderContextEvent(call, event) {
     const observation = data.observation || {};
     contextReceipt(call, `action:${text(observation.request_id) || text(data.request_id) || event.seq}`, {
       title:text(data.label) || 'Connection request',status:'Connection report',source:text(data.label) || 'Connected service',
-      sourceAt:observation.observed_at,content:connectionObservationText(data),
+      sourceAt:observation.observed_at,content:connectionObservationContent(data),
       note:'This report is separate from voice delivery and from what was spoken.'
     }, event);
   }
@@ -742,12 +797,12 @@ for (const name of detailTabs) {
 }
 
 function stopCamera(call) {
-  if (call) { call.cameraRequest = null; call.cameraLoading = false; }
+  if (call) { call.cameraRequest = null; call.cameraLoading = false; call.lastCameraSharedId = null; }
   call?.cameraStream?.getTracks().forEach(track => track.stop()); if (call) call.cameraStream = null;
-  $('voice-photos').checked = false; if (current(call)) surfacePresence(call);
-  $('camera-preview').srcObject = null; $('camera-toggle').setAttribute('aria-pressed', 'false'); $('camera-label').textContent = 'Camera';
+  $('voice-photos').checked = false; $('voice-photo-hint').textContent = 'Enable this to ask for a photo hands-free. Each request takes one photo; turning off the camera revokes permission.'; if (current(call)) surfacePresence(call);
+  $('camera-preview').srcObject = null; $('camera-toggle').setAttribute('aria-pressed', 'false'); $('camera-label').textContent = 'Show something';
   $('camera-choice').replaceChildren(); $('camera-picker').hidden = true; $('camera-choice').disabled = false;
-  $('camera-panel').hidden = true;
+  $('camera-panel').hidden = true; $('camera-progress').hidden = true;
 }
 function updateShareCapability(call) {
   if (!current(call)) return;
@@ -756,6 +811,9 @@ function updateShareCapability(call) {
     : call.contact.image_input === true
       ? 'Images can be inspected when you ask.'
       : 'Image inspection is not verified. Files can still be saved.';
+  $('camera-guide').textContent = call.contact.image_input === false
+    ? `${call.contact.label} cannot inspect photos through this connection. You can still save a photo and describe what you see.`
+    : `Point at what you want help with, then share a photo and tell ${call.contact.label} what you’re trying to do.`;
 }
 async function refreshCapabilities(call) {
   try {
@@ -844,6 +902,11 @@ function fileMime(file) {
 function shareStatus(share, status, message) {
   const following = followsEnd($('space-panel'));
   share.card.dataset.state = status; share.status.textContent = message; share.retry.hidden = true;
+  const call = state.call;
+  if (current(call) && share.source === 'camera' && call.lastCameraSharedId === share.id) {
+    $('camera-progress').hidden = false;
+    $('camera-progress').textContent = ({captured:'Photo taken. Preparing to share…',uploading:'Sharing this photo…',available:call.contact.image_input === false ? 'Photo saved. This agent cannot inspect it; describe what you see.' : 'Photo saved. Tell your agent what you’d like help with. Inspection is not yet confirmed.',failed:'This photo was not shared. You can keep talking.',unconfirmed:'The photo may be saved, but its receipt is missing. Check the conversation before sharing it again.'})[status] || message;
+  }
   if (state.call?.lastSharedId === share.id) { $('share-receipt').hidden = false; $('share-receipt-text').textContent = `${share.name} · ${({captured:'Preparing to share…',uploading:'Uploading…',available:'Saved. Inspection not confirmed.',failed:'Not shared.',unconfirmed:'Upload receipt unknown.'})[status] || message}`; }
   followChange($('space-panel'),following);
 }
@@ -881,6 +944,7 @@ async function shareFile(call, file, source, uploadId = null) {
   const mime = fileMime(file), allowed = ['image/png','image/jpeg','image/gif','image/webp','application/pdf','text/plain','text/markdown','text/csv','application/json'];
   const name = (file.name || 'shared-file').replace(/[\\/"\u0000-\u001f\u007f]/g,'_').slice(0,150);
   const share = shareCard(call, uploadId || crypto.randomUUID(), name); Object.assign(share,{source,mime,sending:true,local:true});
+  if (source === 'camera') call.lastCameraSharedId = share.id;
   share.retry.onclick = () => announceAvailable(call, share);
   if (call.board.includes(share.card.dataset.boardId)) revealEntry(call,call.cards.get(share.card.dataset.boardId));
   shareStatus(share,'captured',source === 'camera' ? 'Captured. Preparing to share…' : 'Selected. Preparing to share…');
@@ -1018,7 +1082,7 @@ function releaseMedia(call, retainTransport = false) {
   // event. Devices stop immediately; an unavailable service cannot retain it.
   if (retainTransport) { state.finalizingCalls.add(call); call.transportCloseTimer = setTimeout(() => releaseTransport(call), 15000); }
   else releaseTransport(call);
-  call.wakeLock?.release().catch(() => {}); call.wakeLock = null; $('presence').classList.remove('speaking');
+  releaseWakeLock(call); $('presence').classList.remove('speaking');
 }
 async function confirmClose(id, result, ownsRecovery) {
   for (let attempt = 0; attempt < 12; attempt++) {
@@ -1145,6 +1209,7 @@ $('mute').onclick = () => { const call = state.call; if (!current(call) || !call
 $('hangup').onclick = () => endCall();
 $('camera-toggle').onclick = toggleCamera;
 $('capture-photo').onclick = capturePhoto;
+$('screen-awake').onchange = () => { const call = state.call; if (!current(call)) return; call.keepScreenAwake = $('screen-awake').checked; if (call.keepScreenAwake) requestWakeLock(call); else releaseWakeLock(call); };
 $('back-to-contacts').onclick = async () => {
   $('call-ended').hidden = true; $('phonebook').hidden = false; showRecovery();
   checkRecovery();
@@ -1166,6 +1231,7 @@ $('sign-out').onclick = async () => {
 document.addEventListener('visibilitychange', () => {
   const call = state.call; if (!current(call)) { if (!document.hidden) checkRecovery(); return; }
   if (document.hidden) {
+    releaseWakeLock(call);
     $('foreground-note').textContent = 'This page is out of view. Your browser may pause audio; return here to continue.';
     heartbeat(call,'visibility_hidden');
   } else { $('foreground-note').textContent = 'Keep this page in the foreground. A screen lock or app switch may interrupt audio.'; resumeCall(call,'visibility_visible'); }
@@ -1210,7 +1276,12 @@ async function surfacePresence(call) {
   } catch { if (current(call)) call.surfaceReady = false; }
   finally { call.surfaceUpdating = false; }
 }
-$('voice-photos').onchange = () => surfacePresence(state.call);
+$('voice-photos').onchange = () => {
+  $('voice-photo-hint').textContent = $('voice-photos').checked
+    ? 'You can say “Take a photo and help me with this.” Each request shares one photo, not a live feed.'
+    : 'Enable this to ask for a photo hands-free. Each request takes one photo; turning off the camera revokes permission.';
+  surfacePresence(state.call);
+};
 async function pollSurface(call) {
   if (!current(call) || !call.surfaceReady || call.surfacePolling) return;
   call.surfacePolling = true;

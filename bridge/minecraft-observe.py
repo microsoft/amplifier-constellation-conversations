@@ -13,11 +13,13 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.parse
 import uuid
 
 
 MAX_INPUT = 65536
 MAX_OUTPUT = 131072
+MAX_EVENTS = 32
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -202,6 +204,126 @@ def bind_action(action, connection, observed_at, ledger, current):
                                           "completion": "agent_report_only", "authority": False})
 
 
+def outcome_queue(action):
+    """Only a confirmed original queue receipt can choose a lookup ID."""
+    original = action["receipt"]
+    receipt = original.get("receipt")
+    if (original.get("request_id") != action["request_id"] or original.get("state") != "queued"
+            or original.get("scope") != "private_operator_instruction" or not isinstance(receipt, dict)
+            or receipt.get("queued") is not True):
+        return None
+    queued = receipt.get("request_id")
+    try:
+        return queued if isinstance(queued, str) and str(uuid.UUID(queued)) == queued else None
+    except ValueError:
+        return None
+
+
+def validate_outcome(row):
+    if (not isinstance(row, dict) or not valid_id(row.get("request_id"))
+            or row.get("delivery") not in ["queued", "admitted", "terminal", "interrupted", "unknown"]
+            or row.get("completion") != "not_established"
+            or type(row.get("conversation_only")) is not bool
+            or row.get("turn_task_id") is not None and not valid_id(row["turn_task_id"])
+            or any(row.get(key) is not None and not valid_time(row[key]) for key in ["admitted_at", "terminal_at"])
+            or row.get("blocked_reason") is not None and not text(row["blocked_reason"], 1000)
+            or not isinstance(row.get("responses"), list) or len(row["responses"]) > 64
+            or not isinstance(row.get("task_authorizations"), list) or len(row["task_authorizations"]) > 16):
+        raise ValueError("invalid_input_outcome")
+    response_ids = set()
+    for response in row["responses"]:
+        if (not isinstance(response, dict) or not valid_id(response.get("id"))
+                or response["id"] in response_ids or not valid_time(response.get("at"))
+                or response.get("audience") not in ["public", "private"]
+                or not isinstance(response.get("text"), str) or not response["text"].strip()
+                or len(response["text"].encode()) > 4000):
+            raise ValueError("invalid_outcome_response")
+        response_ids.add(response["id"])
+    for authorization in row["task_authorizations"]:
+        if (not isinstance(authorization, dict) or authorization.get("operation") not in ["accept", "amend"]
+                or not valid_id(authorization.get("task_id")) or type(authorization.get("authority_revision")) is not int
+                or authorization["authority_revision"] < 1):
+            raise ValueError("invalid_outcome_authorization")
+
+
+def read_outcomes(get, actions):
+    """Negotiate one fixed read-only route; unsupported hosts keep legacy evidence."""
+    queued = [value for action in actions if (value := outcome_queue(action)) is not None]
+    if not queued:
+        return "not_requested", None
+    try:
+        capability = get("/status").get("input_outcomes")
+    except Exception:
+        return "discovery_unavailable", None
+    if capability is None:
+        return "not_advertised", None
+    if (not isinstance(capability, dict) or type(capability.get("version")) is not int or capability["version"] != 1
+            or capability.get("method") != "GET" or capability.get("path") != "/input-outcomes"
+            or type(capability.get("max_ids")) is not int or not 1 <= capability["max_ids"] <= 16):
+        return "unsupported", None
+    try:
+        if len(set(queued)) != len(queued):
+            raise ValueError("ambiguous_original_queue_binding")
+        outcomes = {}
+        for offset in range(0, len(queued), capability["max_ids"]):
+            batch = queued[offset:offset + capability["max_ids"]]
+            snapshot = get("/input-outcomes?" + urllib.parse.urlencode({"ids": ",".join(batch)}))
+            if (type(snapshot.get("version")) is not int or snapshot["version"] != 1
+                    or not valid_time(snapshot.get("observed_at")) or not isinstance(snapshot.get("outcomes"), list)
+                    or len(snapshot["outcomes"]) > len(batch)):
+                raise ValueError("invalid_input_outcomes")
+            for row in snapshot["outcomes"]:
+                validate_outcome(row)
+                if row["request_id"] not in batch or row["request_id"] in outcomes:
+                    raise ValueError("input_outcome_binding_mismatch")
+                outcomes[row["request_id"]] = row
+        return "available", outcomes
+    except Exception:
+        # An advertised lookup that failed does not fall back to today's task
+        # or a nearby reply and manufacture a source-specific terminal result.
+        return "unavailable", {}
+
+
+def outcome_observation(action, connection, observed_at, outcomes, availability):
+    queued = outcome_queue(action)
+    row = outcomes.get(queued)
+    if row is None:
+        return action_observation(action, connection, observed_at, scope="conversation", fulfillment="not_established",
+                                  reason="input_outcome_not_retained" if availability == "available" else "input_outcomes_unavailable",
+                                  **({"receipt": {"request_id": queued}} if queued else {}))
+    responses, response_bytes, omitted = [], 0, 0
+    private_count = 0
+    for response in row["responses"]:
+        if response["audience"] == "private":
+            # The proposed v1 projection has no per-response recipient or
+            # co-admitted source set. A broad control token is not call consent.
+            private_count += 1
+            continue
+        projected = {key: response[key] for key in ["id", "at", "text", "audience"]}
+        size = len(encoded(projected))
+        if len(responses) >= 8 or response_bytes + size > 8000:
+            omitted += 1
+            continue
+        responses.append(projected)
+        response_bytes += size
+    state = {"queued": "unknown", "admitted": "admitted", "terminal": "settled",
+             "interrupted": "interrupted", "unknown": "unknown"}[row["delivery"]]
+    return action_observation(action, connection, observed_at, state, scope="conversation", fulfillment="not_established",
+                              reason="source_bound_input_outcome", receipt={"request_id": queued}, delivery_state=row["delivery"],
+                              conversation={"admitted_at": row.get("admitted_at"), "terminal_at": row.get("terminal_at"),
+                                            "admission_layer": "minecraft_input_outcome", "conversation_only": row["conversation_only"],
+                                            "turn_task_id": row.get("turn_task_id"), "blocked_reason": row.get("blocked_reason"),
+                                            "host_forwarding_verified": False, "local_turn_settled": row["delivery"] == "terminal",
+                                            "interrupted": row["delivery"] == "interrupted", "reply_verified": False,
+                                            "task_acceptance_verified": False},
+                              responses=responses, responses_omitted=omitted, private_responses_withheld=private_count,
+                              response_association="same_turn_source_set_not_individual_fulfillment",
+                              task_authorizations=[{key: item[key] for key in ["operation", "task_id", "authority_revision"]}
+                                                   for item in row["task_authorizations"]],
+                              provenance={"kind": "minecraft_input_outcome", "source_id": queued, "version": 1,
+                                          "completion": "not_established", "authority": False})
+
+
 def read_presence(port, token, username, timeout, node_executable):
     helper = pathlib.Path(__file__).resolve().with_name("minecraft-presence.mjs")
     result = subprocess.run([str(node_executable), str(helper)], input=encoded({"port": port, "token": token, "username": username,
@@ -294,7 +416,12 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
             return result
 
         live = get("/installation-state")
-        private = get("/operator-inputs")
+        confirmed_queues = [queued for action in actions if (queued := outcome_queue(action)) is not None]
+        # A duplicated domain ID cannot establish which original call request
+        # owns it. Broad control credentials do not fill that provenance gap.
+        private_queues = {queued for queued in confirmed_queues if confirmed_queues.count(queued) == 1}
+        private = get("/operator-inputs") if private_queues else {"messages": []}
+        outcome_availability, outcomes = read_outcomes(get, actions)
         # The public presence projection includes this agent's own speech. The
         # incoming-conversation route intentionally excludes it and is not changed.
         public = {"messages": []}
@@ -321,6 +448,7 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
             raise ValueError("invalid_ledger")
         events = []
         omitted_events = 0
+        private_messages_withheld = 0
         presence_cursor = (cursor or {}).get("presence")
         for snapshot, is_private in [(public, False), (private, True)]:
             messages = snapshot.get("messages")
@@ -329,6 +457,9 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
             for message in messages:
                 if not isinstance(message, dict) or not valid_id(message.get("id")):
                     raise ValueError("invalid_message")
+                if is_private and message["id"] not in private_queues:
+                    private_messages_withheld += 1
+                    continue
                 author, occurred = (message.get("author"), message.get("time")) if is_private else (message.get("actor"), message.get("at"))
                 if (not valid_id("minecraft:message:" + message["id"]) or not isinstance(message.get("text"), str)
                         or not message["text"].strip() or len(message["text"].encode()) > 4000
@@ -350,7 +481,11 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
                 events.append(event)
             else:
                 omitted_events += 1
-        if isinstance(current, dict) and valid_id(current.get("id")) and valid_id("minecraft:task:" + current["id"]):
+        task_source = (current or {}).get("authority", {}).get("source", {})
+        private_task_withheld = bool(current and task_source.get("audience", {}).get("kind") != "public"
+                                    and not any(private_source(task_source, queued) for queued in private_queues))
+        if (isinstance(current, dict) and valid_id(current.get("id")) and valid_id("minecraft:task:" + current["id"])
+                and not private_task_withheld):
             projection = task_projection(current)
             source = current.get("authority", {}).get("source", {})
             event = {"id": "minecraft:task:" + current["id"], "connection_id": connection,
@@ -378,17 +513,32 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
 
         gap = bool(cursor and any(row["id"].startswith("minecraft:message:") for row in cursor["seen"]) and
                    not any(event["id"] in {r["id"] for r in cursor["seen"]} for event in events if event["kind"] == "message"))
+        action_updates = []
+        for action in actions:
+            queued = outcome_queue(action)
+            if queued is not None and queued not in private_queues:
+                update = action_observation(action, connection, observed_at, scope="conversation", fulfillment="not_established",
+                                            reason="ambiguous_original_queue_binding")
+            elif outcomes is not None and queued is not None:
+                update = outcome_observation(action, connection, observed_at, outcomes, outcome_availability)
+            else:
+                update = bind_action(action, connection, observed_at, ledger, current)
+            action_updates.append(update)
         result = {"version": 1, "connection_id": connection, "observed_at": observed_at, "availability": "available",
                   "presence": {"ready": live.get("ready") is True, "busy": live.get("busy") is True, "turn_active": live.get("turn_active") is True},
-                  "cursor": emitted_cursor(fresh[-32:]),
-                  "coverage": {"baseline": cursor is None, "bounded": True, "gap": gap or len(fresh) > 32 or omitted_events > 0 or not presence_available,
-                               "deferred_events": max(0, len(fresh) - 32),
+                  "cursor": emitted_cursor(fresh[-MAX_EVENTS:]),
+                  "coverage": {"baseline": cursor is None, "bounded": True, "gap": gap or len(fresh) > MAX_EVENTS or omitted_events > 0 or not presence_available,
+                               "deferred_events": max(0, len(fresh) - MAX_EVENTS),
                                "omitted_events": omitted_events, "omission_reason": "event_text_or_identity_exceeded_bound" if omitted_events else None,
                                "public_presence_available": presence_available,
                                "public_messages_omitted": len(public.get("messages", [])) >= 20 or not presence_available,
                                "private_messages_omitted": bool(private.get("older_messages_omitted")),
+                               "private_input_scope": "this_call_confirmed_queue_receipts",
+                               "private_messages_withheld": private_messages_withheld,
+                               "private_task_withheld": private_task_withheld,
+                               "input_outcomes": outcome_availability,
                                "task_history": "retained_only", "verified_completion_supported": False},
-                  "events": fresh[-32:], "actions": [bind_action(a, connection, observed_at, ledger, current) for a in actions]}
+                  "events": fresh[-MAX_EVENTS:], "actions": action_updates}
         result["actions"] = [update if len(encoded(update)) <= 16000 else action_observation(
             action, connection, observed_at, reason="source_report_exceeded_bound") for action, update in zip(actions, result["actions"])]
         while len(encoded(result)) > MAX_OUTPUT and result["events"]:

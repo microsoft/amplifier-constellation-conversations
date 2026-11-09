@@ -1369,3 +1369,15 @@ video.shared-media,audio.shared-media {width:100%}
 #voice-advanced {margin:12px 0 18px;font-size:12px}#voice-advanced summary {cursor:pointer}#voice-advanced p {margin:10px 0}
 
 .shared-panel>.share-toolbar,.shared-panel>.paste-composer {flex:0 0 auto;margin:9px 0 0}
+
+.call-display-controls {display:flex;justify-content:center;align-items:center;gap:14px;flex-wrap:wrap}
+.screen-awake {display:flex;align-items:center;gap:5px;font-size:11px;white-space:nowrap;color:var(--muted)}
+.screen-awake input {width:14px;height:14px;accent-color:var(--accent,#32685d)}
+.camera-progress {padding:10px 12px;border-left:3px solid #729267;background:#fff9;border-radius:4px;font-size:12px;line-height:1.5}
+#camera-guide {font-size:13px;line-height:1.5}
+@media(max-width:650px) {.call-display-controls {gap:10px}.screen-awake {font-size:10px}.screen-awake input {width:13px;height:13px}}
+
+.camera-heading button {padding:8px 10px;font-size:11px;white-space:nowrap;flex:none}
+.camera-panel .preview-badge {display:block;margin:5px 0}
+
+.screen-awake-warning {font-size:10px;line-height:1.5;color:var(--muted);margin-top:3px}
