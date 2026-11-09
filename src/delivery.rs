@@ -336,6 +336,16 @@ pub fn check_owner(state: &AppState, input: &Input) -> Result<()> {
 /// Credential references never leave this private table or enter ACP metadata.
 pub fn authorized(state: &AppState, message_id: &str, actor: &str) -> Result<bool> {
     let db = state.db.lock().unwrap();
+    authorized_in(state, &db, message_id, actor)
+}
+
+/// Use the same credential rules while the caller holds its mutation transaction.
+pub(crate) fn authorized_in(
+    state: &AppState,
+    db: &Connection,
+    message_id: &str,
+    actor: &str,
+) -> Result<bool> {
     let row: Option<(Option<String>, Option<String>)> = db
         .query_row(
             "SELECT browser_hash,token_hash FROM input_authority WHERE message_id=?1",

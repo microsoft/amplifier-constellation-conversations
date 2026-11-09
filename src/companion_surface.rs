@@ -301,21 +301,65 @@ fn source_authorized(
 /// lookup also permits read-only duplicate acknowledgment of a terminal operation;
 /// the atomic acceptance transition still rejects expiry and repeat execution.
 /// It cannot admit a new operation or revive failed/unknown source delivery.
-fn operation_source_authorized(
+fn operation_source_authorized_in(
     s: &AppState,
+    db: &Connection,
     id: &str,
     operation: &str,
     owner: &str,
     agent: &str,
     room: &str,
 ) -> Result<bool> {
-    let source: Option<String> = s.db.lock().unwrap().query_row(
+    let source: Option<String> = db.query_row(
         "SELECT d.message_id FROM companion_surface_commands o JOIN companion_delegations d ON d.call_id=o.call_id AND d.id=o.delegation_id JOIN messages m ON m.id=d.message_id JOIN input_deliveries i ON i.message_id=m.id AND i.agent_id=?4 AND i.conversation_id=?5 LEFT JOIN messages result ON result.id=i.target_turn AND result.conversation_id=?5 AND result.agent_id=?4 AND result.role='assistant' WHERE o.call_id=?1 AND o.operation_id=?2 AND m.role='user' AND m.actor=?3 AND m.conversation_id=?5 AND ((d.state='dispatched' AND i.state IN ('submitted','received_remote','incorporated')) OR (d.state='completed' AND i.state IN ('completed','incorporated') AND result.status='complete'))",
         params![id,operation,owner,agent,room], |r|r.get(0)).optional()?;
     match source {
-        Some(source) => crate::delivery::authorized(s, &source, owner),
+        Some(source) => crate::delivery::authorized_in(s, db, &source, owner),
         None => Ok(false),
     }
+}
+
+/// Revalidate the current call, browser consent and original source under the
+/// same transaction that changes queued to accepted. Earlier route/credential
+/// checks are not authority for this final transition.
+fn accept_operation_in(
+    s: &AppState,
+    db: &rusqlite::Transaction<'_>,
+    id: &str,
+    operation: &str,
+    owner: &str,
+    browser: &str,
+    session: &str,
+) -> ApiResult<bool> {
+    if !crate::companion_tools::enabled(s)? || !s.config.allows_user(owner) {
+        return Err(ApiError::forbidden());
+    }
+    let Some(identity) = crate::companion_history::private_identity(db, id)? else {
+        return Err(ApiError::forbidden());
+    };
+    if identity.owner != owner {
+        return Err(ApiError::forbidden());
+    }
+    let at = now_ms();
+    let current: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM companion_surface_commands o JOIN companion_calls c ON c.id=o.call_id JOIN companion_tool_grants g ON g.call_id=c.id JOIN companion_surfaces p ON p.call_id=o.call_id AND p.browser_id=o.browser_id AND p.session_hash=o.session_hash JOIN browser_sessions b ON b.hash=p.session_hash AND b.owner=c.owner WHERE o.call_id=?1 AND o.operation_id=?2 AND p.browser_id=?3 AND p.session_hash=?4 AND c.owner=?5 AND c.state IN ('connecting','connected') AND c.heartbeat_at>=?6 AND g.port>0 AND p.updated_at>=?6 AND b.expires_at>?7 AND (o.kind!='capture' OR (p.camera_enabled=1 AND p.capture_consent=1)))",
+        params![id,operation,browser,session,owner,at-FRESH_MS,at],
+        |r| r.get(0),
+    )?;
+    if !current
+        || !operation_source_authorized_in(
+            s,
+            db,
+            id,
+            operation,
+            owner,
+            &identity.agent,
+            &identity.room,
+        )?
+    {
+        return Err(ApiError::forbidden());
+    }
+    Ok(db.execute("UPDATE companion_surface_commands SET state='accepted',accepted_at=?3 WHERE call_id=?1 AND operation_id=?2 AND state='queued' AND expires_at>=?3",params![id,operation,at])?==1)
 }
 
 fn card_exists(s: &AppState, id: &str, card: &str) -> Result<bool> {
@@ -790,35 +834,24 @@ pub async fn ack(
     {
         return Err(ApiError::bad("Use one supported browser acknowledgment"));
     }
-    let current = {
-        let db = s.db.lock().unwrap();
-        row(&db, &id, &operation)?.ok_or_else(ApiError::missing)?
-    };
-    if current["browser_id"] != a.browser_id {
-        return Err(ApiError::forbidden());
-    }
-    if a.state == "accepted" {
-        let agent: String = s.db.lock().unwrap().query_row(
-            "SELECT agent_id FROM companion_calls WHERE id=?1",
-            [&id],
-            |r| r.get(0),
-        )?;
-        if surface(&s, &id, current["kind"] == "capture")?.as_deref() != Some(&a.browser_id)
-            || !operation_source_authorized(&s, &id, &operation, &p.actor, &agent, &room)?
-        {
-            return Err(ApiError::forbidden());
-        }
-    }
     let mut db = s.db.lock().unwrap();
     let tx = db.transaction()?;
+    let previous = row(&tx, &id, &operation)?.ok_or_else(ApiError::missing)?;
     let bound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_surfaces p JOIN companion_surface_commands c ON c.call_id=p.call_id AND c.browser_id=p.browser_id AND c.session_hash=p.session_hash WHERE p.call_id=?1 AND p.browser_id=?2 AND p.session_hash=?3 AND c.operation_id=?4)",params![id,a.browser_id,p.session_hash,operation],|r|r.get(0))?;
     if !bound {
         return Err(ApiError::forbidden());
     }
-    let previous = row(&tx, &id, &operation)?.ok_or_else(ApiError::missing)?;
     let mut execute = false;
     if a.state == "accepted" {
-        execute=tx.execute("UPDATE companion_surface_commands SET state='accepted',accepted_at=?3 WHERE call_id=?1 AND operation_id=?2 AND state='queued' AND expires_at>=?3",params![id,operation,now_ms()])?==1;
+        execute = accept_operation_in(
+            &s,
+            &tx,
+            &id,
+            &operation,
+            &p.actor,
+            &a.browser_id,
+            p.session_hash.as_deref().ok_or_else(ApiError::forbidden)?,
+        )?;
     } else {
         let accepted:bool=tx.query_row("SELECT accepted_at IS NOT NULL FROM companion_surface_commands WHERE call_id=?1 AND operation_id=?2",params![id,operation],|r|r.get(0))?;
         if !accepted {
@@ -1085,4 +1118,195 @@ pub async fn status(
         }
     }
     Ok(Json(receipt))
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::*;
+    use crate::config::{Agent, Config};
+    use std::collections::BTreeMap;
+
+    struct Fixture {
+        _home: tempfile::TempDir,
+        state: Arc<AppState>,
+        call: String,
+        room: String,
+        operation: String,
+        browser: String,
+        session: String,
+        message: String,
+    }
+
+    fn fixture() -> Fixture {
+        let home = tempfile::tempdir().unwrap();
+        Config {
+            id: uuid::Uuid::new_v4().to_string(),
+            label: "Surface acceptance fixture".into(),
+            owner: "owner".into(),
+            allowed_users: vec![],
+            embed_origins: vec![],
+            bind: "127.0.0.1".into(),
+            port: 0,
+            public_url: "https://example.test".into(),
+            pam_service: "fixture".into(),
+            tls_cert: home.path().join("cert"),
+            tls_key: home.path().join("key"),
+            tls_ca: None,
+            import_source: "fixture".into(),
+            import_surface: "fixture".into(),
+            agent: Agent {
+                label: "Coach".into(),
+                command: "/bin/true".into(),
+                args: vec![],
+                cwd: home.path().to_string_lossy().into_owned(),
+                session_cwd: None,
+                env: BTreeMap::new(),
+                mcp_servers: vec![],
+                timeout_seconds: 30,
+                client: Default::default(),
+            },
+        }
+        .save(home.path())
+        .unwrap();
+        std::fs::write(
+            home.path().join("companion-actions.json"),
+            r#"{"enabled":true,"agents":{}}"#,
+        )
+        .unwrap();
+        let state = AppState::open(home.path().into()).unwrap();
+        let room = state.create("Private call").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let call = uuid::Uuid::new_v4().to_string();
+        let operation = uuid::Uuid::new_v4().to_string();
+        let browser = uuid::Uuid::new_v4().to_string();
+        let message = uuid::Uuid::new_v4().to_string();
+        let session = auth::digest("browser");
+        let fingerprint = auth::digest(
+            &serde_json::to_string(&state.agent("default").unwrap().unwrap()).unwrap(),
+        );
+        let at = now_ms();
+        let control = std::fs::read_to_string(home.path().join("secrets/control-token")).unwrap();
+        {
+            let db = state.db.lock().unwrap();
+            db.execute("INSERT INTO browser_sessions(hash,owner,csrf,expires_at) VALUES(?1,'owner','csrf',?2)",params![session,at+60_000]).unwrap();
+            db.execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at,endpoint_hash) VALUES(?1,'owner',?1,'fixture','default',?2,'connected',?3,?3,?4)",params![call,room,at,fingerprint]).unwrap();
+            db.execute(
+                "INSERT INTO companion_tool_grants(call_id,token,port) VALUES(?1,'fixture',12345)",
+                [&call],
+            )
+            .unwrap();
+            db.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,updated_at) VALUES(?1,?2,?3,1,1,?4)",params![call,browser,session,at]).unwrap();
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user','Show me what the camera sees.','complete',?3,?3,'owner')",params![message,room,at]).unwrap();
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES('result',?1,'assistant','','streaming',?2,?2,'Coach','default')",params![room,at]).unwrap();
+            db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'delegation',100,'dispatched',?2,?3)",params![call,message,at]).unwrap();
+            db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES(?1,?1,?2,'default','direct','submitted','result',?3)",params![message,room,at]).unwrap();
+            db.execute(
+                "INSERT INTO input_authority(message_id,token_hash) VALUES(?1,?2)",
+                params![message, auth::digest(control.trim())],
+            )
+            .unwrap();
+            db.execute("INSERT INTO companion_surface_commands(call_id,operation_id,delegation_id,browser_id,session_hash,kind,command,state,created_at,expires_at) VALUES(?1,?2,'delegation',?3,?4,'capture','{}','queued',?5,?6)",params![call,operation,browser,session,at,at+TTL_MS]).unwrap();
+        }
+        Fixture {
+            _home: home,
+            state,
+            call,
+            room,
+            operation,
+            browser,
+            session,
+            message,
+        }
+    }
+
+    #[test]
+    fn stale_prechecks_cannot_authorize_surface_acceptance_after_revocation() {
+        for mutation in [
+            "DELETE FROM input_authority",
+            "UPDATE tokens SET scopes='[]'",
+            "UPDATE browser_sessions SET expires_at=0",
+            "UPDATE companion_surfaces SET camera_enabled=0",
+            "UPDATE companion_surfaces SET capture_consent=0",
+            "UPDATE companion_surfaces SET updated_at=0",
+            "UPDATE companion_surfaces SET browser_id='replacement'",
+            "UPDATE companion_calls SET state='closing'",
+            "UPDATE companion_calls SET heartbeat_at=0",
+            "UPDATE companion_calls SET endpoint_hash='changed'",
+            "UPDATE companion_tool_grants SET port=0",
+            "UPDATE conversations SET shared=1",
+            "UPDATE input_deliveries SET state='unknown'",
+        ] {
+            let f = fixture();
+            // Reproduce the old successful route/source precheck, then change
+            // the protected fact before entering the final acceptance boundary.
+            assert_eq!(
+                surface(&f.state, &f.call, true).unwrap().as_deref(),
+                Some(f.browser.as_str())
+            );
+            assert!(
+                source_authorized(&f.state, &f.call, "owner", "default", &f.room, "delegation")
+                    .unwrap()
+            );
+            assert!(crate::delivery::authorized(&f.state, &f.message, "owner").unwrap());
+            let mut db = f.state.db.lock().unwrap();
+            db.execute_batch(mutation).unwrap();
+            let tx = db.transaction().unwrap();
+            let before = tx.total_changes();
+            let error = accept_operation_in(
+                &f.state,
+                &tx,
+                &f.call,
+                &f.operation,
+                "owner",
+                &f.browser,
+                &f.session,
+            )
+            .unwrap_err();
+            assert_eq!(error.0, axum::http::StatusCode::FORBIDDEN, "{mutation}");
+            assert_eq!(tx.total_changes(), before, "{mutation}");
+            let status: (String, Option<i64>) = tx.query_row("SELECT state,accepted_at FROM companion_surface_commands WHERE operation_id=?1",[&f.operation],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(status, ("queued".into(), None), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn atomic_acceptance_preserves_completed_source_once_and_expired_nonexecution() {
+        for expired in [false, true] {
+            let f = fixture();
+            let mut db = f.state.db.lock().unwrap();
+            db.execute_batch("UPDATE companion_delegations SET state='completed'; UPDATE input_deliveries SET state='completed'; UPDATE messages SET status='complete' WHERE id='result';").unwrap();
+            if expired {
+                db.execute("UPDATE companion_surface_commands SET expires_at=0", [])
+                    .unwrap();
+            }
+            let tx = db.transaction().unwrap();
+            assert_eq!(
+                accept_operation_in(
+                    &f.state,
+                    &tx,
+                    &f.call,
+                    &f.operation,
+                    "owner",
+                    &f.browser,
+                    &f.session
+                )
+                .unwrap(),
+                !expired
+            );
+            assert!(
+                !accept_operation_in(
+                    &f.state,
+                    &tx,
+                    &f.call,
+                    &f.operation,
+                    "owner",
+                    &f.browser,
+                    &f.session
+                )
+                .unwrap()
+            );
+        }
+    }
 }
