@@ -26,6 +26,7 @@ _source_spec.loader.exec_module(source_contract)
 MAX_INPUT = 65536
 MAX_OUTPUT = 131072
 MAX_EVENTS = 32
+LIMIT_STATE_MEANING = "Current assignment limits only; not the recorded reason for status, proof of completion, or permission for other activity."
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -71,11 +72,17 @@ def validate_input(value):
         raise ValueError("input_limit")
     cursor = value.get("cursor")
     if cursor is not None:
-        if (not isinstance(cursor, dict) or "seen" not in cursor or set(cursor) - {"seen", "presence"}
+        if (not isinstance(cursor, dict) or "seen" not in cursor or set(cursor) - {"seen", "presence", "task"}
                 or not isinstance(cursor["seen"], list) or len(cursor["seen"]) > 64):
             raise ValueError("invalid_cursor")
         for row in cursor["seen"]:
             if not isinstance(row, dict) or set(row) != {"id", "revision"} or not valid_id(row["id"]) or not re.fullmatch(r"[a-f0-9]{64}", str(row["revision"])):
+                raise ValueError("invalid_cursor")
+        if "task" in cursor:
+            task = cursor["task"]
+            if (not isinstance(task, dict) or set(task) != {"id", "semantic_revision"}
+                    or not valid_id(task["id"])
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(task["semantic_revision"]))):
                 raise ValueError("invalid_cursor")
         if "presence" in cursor:
             present = cursor["presence"]
@@ -117,6 +124,42 @@ def task_projection(task):
             "authority_revision": task.get("authority_revision"), "progress_revision": task.get("progress_revision"),
             "turns": task.get("turns"), "started_at": task.get("started_at"),
             "progress": {"at": latest.get("at"), "summary": text(latest.get("summary"))}, "omitted_fields": omitted}
+
+
+def current_limit_state(status, current):
+    """Copy only the domain's current, same-task observation; never derive a stop cause."""
+    if (not isinstance(status, dict) or not isinstance(current, dict)
+            or not valid_id(current.get("id")) or not valid_time(status.get("observed_at"))):
+        return None
+    task = status.get("task")
+    if not isinstance(task, dict) or task.get("id") != current["id"]:
+        return None
+    value = task.get("limit_state")
+    if (not isinstance(value, dict) or set(value) != {"observed_at", "deadline", "turns", "meaning"}
+            or value.get("observed_at") != status["observed_at"] or value.get("meaning") != LIMIT_STATE_MEANING):
+        return None
+    result = {"observed_at": value["observed_at"], "meaning": LIMIT_STATE_MEANING}
+    for name, flag, remaining in [("deadline", "elapsed", "remaining_ms"), ("turns", "reached", "remaining")]:
+        axis = value[name]
+        if not isinstance(axis, dict) or set(axis) != {"kind", flag, remaining}:
+            return None
+        kind, limit_reached, amount = axis["kind"], axis[flag], axis[remaining]
+        if kind == "finite":
+            if (type(limit_reached) is not bool or type(amount) not in (int, float)
+                    or (name == "turns" and type(amount) is not int)
+                    or not 0 <= amount <= 9007199254740991 or not math.isfinite(amount)
+                    or limit_reached != (amount == 0)):
+                return None
+        elif kind == "no_configured_bound":
+            if limit_reached is not False or amount is not None:
+                return None
+        elif kind == "unknown":
+            if limit_reached is not None or amount is not None:
+                return None
+        else:
+            return None
+        result[name] = {"kind": kind, flag: limit_reached, remaining: amount}
+    return result
 
 
 def private_source(source, queued):
@@ -475,6 +518,10 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
     cursor = None
     actions = []
     try:
+        # A malformed bounded cursor is an unavailable read, not permission to
+        # reset its history and emit everything again on the next poll.
+        if isinstance(value, dict) and len(encoded(value)) <= MAX_INPUT:
+            cursor = value.get("cursor")
         cursor, actions = validate_input(value)
         if not config_path.is_absolute():
             raise ValueError("absolute_config_required")
@@ -559,6 +606,8 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
         omitted_events = 0
         private_messages_withheld = 0
         presence_cursor = (cursor or {}).get("presence")
+        previous_task_cursor = (cursor or {}).get("task")
+        task_cursor = None
         for snapshot, is_private in [(public, False), (private, True)]:
             messages = snapshot.get("messages")
             if not isinstance(messages, list) or len(messages) > (16 if is_private else 20):
@@ -596,6 +645,11 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
         if (isinstance(current, dict) and valid_id(current.get("id")) and valid_id("minecraft:task:" + current["id"])
                 and not private_task_withheld):
             projection = task_projection(current)
+            # The public MCP summary is a separate observation, not saved task
+            # history. Only attach it after this call's task audience is checked.
+            limits = current_limit_state(presence, current)
+            if limits is not None:
+                projection["limit_state"] = limits
             source = current.get("authority", {}).get("source", {})
             event = {"id": "minecraft:task:" + current["id"], "connection_id": connection,
                      "occurred_at": projection["progress"]["at"] or projection["started_at"], "observed_at": observed_at, "kind": "task_observation",
@@ -604,7 +658,26 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
                      "text": text(json.dumps(projection, ensure_ascii=False))}
             if (len(json.dumps(projection, ensure_ascii=False).encode()) <= 4000 and not projection["omitted_fields"]
                     and len(encoded(event)) <= 7800 and valid_time(event["occurred_at"])):
-                events.append({**event, "revision": revision({key: val for key, val in event.items() if key != "observed_at"})})
+                # Re-observation and an ordinary countdown are not new ambient
+                # facts. Retain a separate semantic cursor: cursorless direct
+                # reads still get exact values under a full immutable revision.
+                semantic_projection = dict(projection)
+                if limits is not None:
+                    semantic_projection["limit_state"] = {
+                        key: val for key, val in limits.items() if key != "observed_at"}
+                    semantic_projection["limit_state"]["deadline"] = {
+                        key: val for key, val in limits["deadline"].items() if key != "remaining_ms"}
+                semantic = {key: val for key, val in event.items() if key not in ("observed_at", "text")}
+                semantic["task"] = semantic_projection
+                # A new/restricted assignment is meaningful even if both old
+                # and new deadlines are still future. These raw bounds are
+                # fingerprint inputs only, never additional public metadata.
+                semantic["assignment_bounds"] = {key: current.get(key) for key in ["bounds", "deadline", "max_turns"]}
+                task_cursor = {"id": current["id"], "semantic_revision": revision(semantic)}
+                if task_cursor != previous_task_cursor:
+                    immutable = {key: val for key, val in event.items() if key != "observed_at"}
+                    immutable["assignment_bounds"] = semantic["assignment_bounds"]
+                    events.append({**event, "revision": revision(immutable)})
             else:
                 omitted_events += 1
         seen = {row["id"]: row["revision"] for row in (cursor or {}).get("seen", [])}
@@ -625,8 +698,10 @@ def observe(config_path, value, opener=None, now=None, presence_reader=None):
             for event in emitted:
                 delivered.pop(event["id"], None)
                 delivered[event["id"]] = event["revision"]
+            delivered_task = task_cursor if any(event["kind"] == "task_observation" for event in emitted) else previous_task_cursor
             return {"seen": [{"id": key, "revision": val} for key, val in list(delivered.items())[-64:]],
-                    **({"presence": presence_cursor} if presence_cursor else {})}
+                    **({"presence": presence_cursor} if presence_cursor else {}),
+                    **({"task": delivered_task} if delivered_task else {})}
 
         gap = bool(cursor and any(row["id"].startswith("minecraft:message:") for row in cursor["seen"]) and
                    not any(event["id"] in {r["id"] for r in cursor["seen"]} for event in events if event["kind"] == "message"))
