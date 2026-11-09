@@ -530,9 +530,22 @@ no lifetime event quota that silently stops a long call receiving new facts;
 per-query and per-transport bounds remain. Known action receipts rotate through
 bounded polls so newer requests cannot permanently hide older unresolved ones.
 
+An outcome for an already requested action is a result, not optional ambient
+news. A validated saved observation bound to its original caller, request and
+connection enters quiet context without a relevance-model decision. It still
+waits for the conversational floor and passes the same private-audience, source,
+revision and call checks. Arbitrary observer text cannot claim this route by
+labeling itself an action result. A result receipt does not establish fulfillment
+or require a spoken interruption. Waiting behind a long human explanation does
+not erase a bound result; its original timestamp remains explicit.
+
 Full relevant facts are retained as shared cards and supplied with their actor,
 connection, scope and original time. Long facts use numbered source-data parts,
-not clipped summaries or opaque retrieval pointers. Each provider append stays
+not clipped summaries or opaque retrieval pointers. For a shared connection ID,
+use the same user-facing label in action and awareness configuration so the caller's
+selected name also identifies background observations. Labels are presentation
+metadata; the stable connection ID and caller/source binding establish identity.
+Each provider append stays
 below its transport bound; all matching receipts are needed to mark the whole
 observation accepted. A missing part means the source must not be summarized.
 Both quiet context and spoken notices wait for the shared conversational floor:
