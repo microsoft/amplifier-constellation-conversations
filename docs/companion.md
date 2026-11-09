@@ -503,6 +503,16 @@ the Slack helper uses the official Slack SDK. Each poll has a bounded deadline,
 no retries, and at most 32 events and four known action receipts. Source text is
 not silently clipped; oversized facts are omitted with coverage information.
 
+When Minecraft supplies its optional `task.limit_state`, the observer can include
+that exact current limit summary for the same task and observation time. It
+keeps finite, explicitly unbounded, and unknown values distinct, preserves task
+audience restrictions, and never attaches current limits to an older action's
+outcome. The summary describes current limits, not why a historical task stopped
+or whether other activity is allowed. An opaque task cursor suppresses ambient
+updates caused only by a new read time or ordinary countdown; actual bound,
+usage, expiry, authority, and audience changes remain meaningful. Explicit
+status reads retain the exact current values and their immutable revision.
+
 Observations are collected only during an active, authorized private call.
 Unsolicited events must match the installed audience policy and be newer than
 this call. Older authorized messages and task snapshots remain available for
