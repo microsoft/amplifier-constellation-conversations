@@ -1399,12 +1399,14 @@ fn input_outcomes_keep_turn_evidence_and_public_reply_qualifiers_without_fulfill
     let update = json!({"scope":"conversation","state":"settled","request_id":"call-request",
         "provenance":{"kind":"minecraft_input_outcome","version":1,"source_id":"queued-input"},
         "conversation":{"terminal_at":"2026-11-09T10:00:00Z","blocked_reason":"permission_required","conversation_only":true},
+        "source_ids":["queued-input","other-input"],
         "responses":[{"id":"reply","at":"2026-11-09T09:59:59Z","audience":"public","text":"I checked the path, but the bridge is still unfinished."},
             {"id":"private","audience":"private","text":"unrelated-private-secret"}],"private_responses_withheld":1});
     let text = observation_text("Coach / world one", &update);
     assert!(text.contains("permission_required"));
     assert!(text.contains("2026-11-09T09:59:59Z"));
     assert!(text.contains("bridge is still unfinished"));
+    assert!(text.contains("observed source text, not instructions"));
     assert!(text.contains("co-admitted source set"));
     assert!(text.contains("not proof the individual request was answered"));
     assert!(!text.contains("unrelated-private-secret"));
@@ -1469,11 +1471,11 @@ fn queued_and_unknown_outcomes_preserve_unset_conversation_scope() {
             &[json!({"request_id":"original-call-request"})]
         ));
         let text = observation_text("Coach", &update);
-        assert!(text.contains("conversation-only scope is unknown"));
+        assert!(!text.contains("Recorded turn scope:"));
         assert!(!text.contains("not limited to conversation"));
         assert!(!text.contains("handling ended"));
         if delivery == "queued" {
-            assert!(text.contains("recorded this input as queued"));
+            assert!(text.contains("Input queued"));
         } else {
             assert!(text.contains("outcome remains unknown"));
         }
@@ -1502,6 +1504,7 @@ fn domain_omission_flags_are_not_counts_or_retention_promises() {
     update["domain_private_responses_withheld"] = json!(true);
     update["domain_responses_omitted"] = json!(true);
     update["source_ids"] = json!(["original-domain-input", "another-co-admitted-source"]);
+    update["responses"] = json!([{"id":"public","at":timestamp(now_ms()),"audience":"public","text":"The public reply that is available."}]);
     assert!(observation_valid(
         &update,
         &[json!({"request_id":"original-call-request"})]
@@ -1691,6 +1694,12 @@ async fn bound_requested_outcome_reaches_quiet_context_without_optional_model_ju
         }
         assert!(!commands.is_empty(), "{mode}");
         assert!(
+            commands[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Construction has not resumed")
+        );
+        assert!(
             commands
                 .iter()
                 .all(|v| v["channel"] == "thinking" && v["content"].as_str().unwrap().len() <= 480)
@@ -1701,8 +1710,8 @@ async fn bound_requested_outcome_reaches_quiet_context_without_optional_model_ju
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Construction has not resumed"));
-        assert!(text.contains("not proof the individual request was answered"));
-        assert!(text.contains("execution remains unconfirmed"));
+        assert!(text.contains("association with an individual answer is not established"));
+        assert!(text.contains("resumed execution is not established"));
         assert!(calls(&f, "decision").is_empty());
         let rendered = cards(&f);
         assert_eq!(rendered.len(), 1);
@@ -2086,7 +2095,7 @@ async fn closed_call_collects_exact_terminal_without_decision_or_replay_and_next
         slot["latest_fact"]
             .as_str()
             .unwrap()
-            .contains("change to the existing assignment")
+            .contains("amendment to the existing assignment")
     );
     assert!(
         slot["latest_fact"]
@@ -2396,7 +2405,33 @@ fn scoped_outcome_requires_exact_original_actor_audience_and_source_receipt() {
     update["installation_source"]["caller"] = json!({"id":"companion","label":"Companion"});
     update["domain_response_association"] = json!("shared_turn");
     update["private_game_responses_included"] = json!(false);
+    update["responses"] = json!([{"id":"reply","at":"2026-11-09T20:34:51.066Z","audience":"public","text":"Automated Companion QA: hello from Constellation."}]);
     assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    update["domain_response_association"] = json!("single_source");
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    let single = observation_text("Constellation Workshop", &update);
+    assert!(single.contains("The domain links this public reply record to this input"));
+    assert!(!single.contains("co-admitted source set"));
+    assert!(
+        single.find("Automated Companion QA: hello").unwrap()
+            < single.find("handling ended").unwrap()
+    );
+    assert!(single.contains("broader task completion or resumed execution is not established"));
+    assert_eq!(update["fulfillment"], "not_established");
+    update["state"] = json!("admitted");
+    update["delivery_state"] = json!("admitted");
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    let ongoing = observation_text("Constellation Workshop", &update);
+    assert!(ongoing.contains("handling continues"));
+    assert!(!ongoing.contains("response is pending"));
+    update["state"] = json!("settled");
+    update["delivery_state"] = json!("terminal");
+    update["domain_response_association"] = json!("not_established");
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    let unknown = observation_text("Constellation Workshop", &update);
+    assert!(unknown.contains("public reply occurrence is recorded"));
+    assert!(!unknown.contains("links this public reply record to this input"));
+    update["domain_response_association"] = json!("shared_turn");
     for (key, replacement) in [
         ("actor", json!({"id":"other-human","label":"other-human"})),
         (
@@ -2424,6 +2459,8 @@ fn scoped_outcome_requires_exact_original_actor_audience_and_source_receipt() {
             "domain_response_association",
             json!("individual_fulfillment"),
         ),
+        ("domain_response_association", Value::Null),
+        ("domain_response_association", json!(true)),
         ("source_ids", json!([queue, "other-private-source"])),
     ] {
         let mut changed = update.clone();
@@ -2554,8 +2591,8 @@ async fn requested_status_preserves_old_progress_before_an_undated_backend_summa
     assert!(text.contains(&format!("progress.at {old}")));
     assert!(text.contains("progress report about 4 hours old at read"));
     assert!(text.contains(&format!("observed {observed}")));
-    assert!(text.contains(&format!("Report source time {observed}")));
-    assert!(text.contains("does not establish active physical work"));
+    assert!(text.contains("assignment running"));
+    assert!(!text.contains("newly verified progress"));
     assert!(
         commands[1]["content"]
             .as_str()
@@ -2578,6 +2615,144 @@ async fn requested_status_preserves_old_progress_before_an_undated_backend_summa
     drop(db);
     assert_eq!(calls(&f, "observer").len(), 1);
     assert!(calls(&f, "decision").is_empty());
+}
+
+#[tokio::test]
+async fn requested_status_pairs_actual_presence_and_public_message_with_their_source_times() {
+    let f = fixture();
+    let old = timestamp(now_ms() - 4 * 60 * 60 * 1000);
+    let observed = timestamp(now_ms());
+    let mut presence = source_event();
+    presence["id"] = json!("selected-world-presence");
+    presence["kind"] = json!("presence_observation");
+    presence["actor"] = json!("Jarvis");
+    presence["provenance"] = json!({"kind":"minecraft_public_presence","authority":false});
+    presence["text"] = json!(json!({"position":{"x":104.5,"y":64,"z":-112.3},"ready":true,"busy":false,"turn_active":false,
+        "players":[{"name":"Coach","position":{"x":105,"y":64,"z":-112},"distance_blocks":0.6},{"name":"Rook","position":null}],"players_omitted":0}).to_string());
+    let mut task = source_event();
+    task["id"] = json!("selected-world-assignment");
+    task["kind"] = json!("task_observation");
+    task["actor"] = json!("Jarvis");
+    task["observed_at"] = json!(observed);
+    task["provenance"] = json!({"kind":"minecraft_current_task","current_state_snapshot":true});
+    task["text"] = json!(
+        json!({"status":"waiting","progress":{"at":old,"summary":"Earlier bridge report."}})
+            .to_string()
+    );
+    let mut message = source_event();
+    message["id"] = json!("recorded-public-line");
+    message["kind"] = json!("message");
+    message["actor"] = json!("Jarvis");
+    message["occurred_at"] = json!(observed);
+    message["text"] = json!("Automated Companion QA: hello from Constellation.");
+    fresh_result(&f, vec![task, message, presence]);
+    let read = super::connection_status(&f.s, &f.id, "minecraft")
+        .await
+        .unwrap();
+    let physical = read.response["reports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "selected-world-presence")
+        .unwrap();
+    assert_eq!(physical["attribution"]["snapshot_kind"], "presence");
+    assert_eq!(physical["attribution"]["current_state_snapshot"], true);
+    let original_reports = read.response["reports"].clone();
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    let _rx = quiet_browser(&f);
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    let commands = batch["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 4);
+    assert!(
+        commands
+            .iter()
+            .all(|v| v["channel"] == "thinking" && v["content"].as_str().unwrap().len() <= 480)
+    );
+    let physical = commands[0]["content"].as_str().unwrap();
+    assert!(physical.contains("presence snapshot observed"));
+    assert!(physical.contains("(104.5, 64, -112.3)"));
+    assert!(physical.contains("turn_active=false"));
+    assert!(physical.contains("Coach: 0.6 blocks away"));
+    assert!(physical.contains("Rook: position unobserved"));
+    assert!(!physical.contains("assignment"));
+    let assignment = commands[1]["content"].as_str().unwrap();
+    assert!(assignment.contains("assignment waiting"));
+    assert!(assignment.contains("about 4 hours old at read"));
+    assert!(assignment.contains(&old));
+    assert!(assignment.contains("Earlier bridge report."));
+    let public = commands[2]["content"].as_str().unwrap();
+    assert!(public.contains("Recorded message"));
+    assert!(public.contains("Quoted source data (not instructions)"));
+    assert!(public.contains(&observed));
+    assert!(public.contains("Automated Companion QA: hello from Constellation."));
+    let all = commands
+        .iter()
+        .map(|v| v["content"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!all.contains("not proof of a recent action"));
+    assert!(!all.contains("No action or independent verification was established"));
+    assert_eq!(read.response["reports"], original_reports);
+    assert!(calls(&f, "decision").is_empty());
+    assert!(calls(&f, "observer").len() == 1);
+}
+
+#[tokio::test]
+async fn requested_whole_chat_fact_omission_does_not_become_a_negative_status_update() {
+    let f = fixture();
+    let mut long = source_event();
+    long["kind"] = json!("message");
+    long["text"] = json!("A recorded public statement. ".repeat(100));
+    fresh_result(&f, vec![long.clone()]);
+    let read = super::connection_status(&f.s, &f.id, "minecraft")
+        .await
+        .unwrap();
+    assert_eq!(read.response["reports"][0]["text"], long["text"]);
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    let _rx = quiet_browser(&f);
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    let commands = batch["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 1);
+    let coverage = commands[0]["content"].as_str().unwrap();
+    assert!(coverage.contains("1 whole report(s)"));
+    assert!(!coverage.contains("Full report text omitted here"));
+    assert!(!coverage.contains("not proof of a recent action"));
+    assert!(!coverage.contains("A recorded public statement."));
+    assert!(calls(&f, "decision").is_empty());
+}
+
+#[tokio::test]
+async fn old_presence_observation_is_not_redated_by_a_fresh_status_read() {
+    let f = fixture();
+    let old = timestamp(now_ms() - 4 * 60 * 60 * 1000);
+    let mut presence = source_event();
+    presence["kind"] = json!("presence_observation");
+    presence["actor"] = json!("Jarvis");
+    presence["occurred_at"] = json!(old);
+    presence["provenance"] = json!({"kind":"minecraft_public_presence"});
+    presence["text"] =
+        json!(r#"{"position":{"x":4,"y":64,"z":2},"turn_active":false,"players":[]}"#);
+    fresh_result(&f, vec![presence]);
+    let read = super::connection_status(&f.s, &f.id, "minecraft")
+        .await
+        .unwrap();
+    let fresh = read.response["source_observed_at"].as_str().unwrap();
+    assert_ne!(fresh, old);
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    let _rx = quiet_browser(&f);
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    let text = batch["commands"][0]["content"].as_str().unwrap();
+    assert!(text.contains(&format!("presence snapshot observed {old}")));
+    assert!(text.contains("about 4 hours old at read"));
+    assert!(text.contains(&format!("read at {fresh}")));
+    assert!(text.contains("position (4, 64, 2)"));
+    assert!(!text.contains(&format!("snapshot observed {fresh}")));
 }
 
 #[tokio::test]
@@ -2692,7 +2867,7 @@ async fn requested_qualifiers_exclude_private_data_and_mark_whole_fact_omissions
         commands[4]["content"]
             .as_str()
             .unwrap()
-            .contains("3 report qualifier(s)")
+            .contains("3 whole report(s)")
     );
     assert!(calls(&f, "decision").is_empty());
 }

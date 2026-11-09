@@ -780,6 +780,14 @@ fn current_snapshot(event: &Value) -> bool {
         && event["provenance"]["current_state_snapshot"] == true
         && observed_time(&event["observed_at"]).is_some()
 }
+fn current_presence_snapshot(event: &Value) -> bool {
+    event["kind"] == "presence_observation"
+        && event["provenance"]["kind"] == "minecraft_public_presence"
+        && event["text"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .is_some_and(|value| value.is_object())
+}
 fn fresh(event: &Value, call_at: i64, now: i64) -> bool {
     // Snapshot read time and historical progress time are independent facts.
     // Only the explicitly typed current-task snapshot receives this treatment.
@@ -791,7 +799,14 @@ fn fresh(event: &Value, call_at: i64, now: i64) -> bool {
     .is_some_and(|at| at >= call_at && at >= now - 120_000 && at <= now + 5000)
 }
 fn attribution(source: &Source, event: &Value) -> Value {
-    json!({"connection_id":source.id,"connection_label":source.label,"actor":event["actor"],"scope":event["kind"],"occurred_at":event["occurred_at"],"observed_at":event["observed_at"],"current_state_snapshot":current_snapshot(event),"audience":event["audience"],"authority":false,"observed_only":true})
+    let snapshot_kind = if current_snapshot(event) {
+        Some("assignment")
+    } else if current_presence_snapshot(event) {
+        Some("presence")
+    } else {
+        None
+    };
+    json!({"connection_id":source.id,"connection_label":source.label,"actor":event["actor"],"scope":event["kind"],"occurred_at":event["occurred_at"],"observed_at":event["observed_at"],"current_state_snapshot":snapshot_kind.is_some(),"snapshot_kind":snapshot_kind,"audience":event["audience"],"authority":false,"observed_only":true})
 }
 fn context_parts(source: &Source, event: &Value, _key: &str) -> Vec<String> {
     let mut facts = Vec::new();
@@ -1175,22 +1190,30 @@ pub(crate) fn preserve_requested_status(
     }
     let source = &binding.source;
     let mut selected: Vec<_> = reports.iter().collect();
-    // Current assignment facts are particularly liable to hide an old progress
-    // report. Prefer them without refreshing the report's original timestamp.
-    selected.sort_by_key(|report| report["attribution"]["current_state_snapshot"] != true);
+    // Physical presence and assignment state are separate current facts. Keep
+    // both ahead of historical chat without refreshing a progress report.
+    selected.sort_by_key(
+        |report| match report["attribution"]["snapshot_kind"].as_str() {
+            Some("presence") => 0,
+            Some("assignment") => 1,
+            _ => 2,
+        },
+    );
     let mut facts = Vec::new();
     for report in selected {
         if facts.len() == 4 {
             break;
         }
-        let text = requested_report_qualifier(source, report, &read.response);
+        let Some(text) = requested_report_qualifier(source, report, &read.response) else {
+            continue;
+        };
         if text.len() <= 480 {
             facts.push((report, text, false));
         }
     }
     let omitted = reports.len() - facts.len();
     let coverage = format!(
-        "{}: requested status read at {}; source observation {}. History is bounded/incomplete; missing reports do not prove inactivity. {} report qualifier(s) and {} source report(s) omitted here. No action or independent verification was established.",
+        "{}: status read at {}; source observation {}. The timestamped facts above are source observations. History is bounded/incomplete; missing reports do not prove inactivity. {} whole report(s) and {} source report(s) omitted here. This read changes no work authority.",
         source.label,
         read.response["queried_at"],
         read.response["source_observed_at"].as_str().unwrap(),
@@ -1287,15 +1310,75 @@ fn source_age_at_read(timestamp: &Value, read_at: &Value) -> String {
     )
 }
 
-fn requested_report_qualifier(source: &Source, report: &Value, response: &Value) -> String {
+fn requested_report_qualifier(source: &Source, report: &Value, response: &Value) -> Option<String> {
     let attribution = &report["attribution"];
     let actor = attribution["actor"].as_str().unwrap_or("source");
-    let report_id = report["id"].as_str().unwrap();
     let occurred = attribution["occurred_at"].as_str().unwrap();
     let observed = attribution["observed_at"]
         .as_str()
         .unwrap_or_else(|| response["source_observed_at"].as_str().unwrap());
-    if attribution["current_state_snapshot"] == true
+    if attribution["snapshot_kind"] == "presence"
+        && let Ok(presence) = serde_json::from_str::<Value>(report["text"].as_str().unwrap())
+    {
+        let position = &presence["position"];
+        let position = if ["x", "y", "z"].iter().all(|key| {
+            position[*key]
+                .as_f64()
+                .is_some_and(|n| n.is_finite() && n.abs() <= 30_000_000.0)
+        }) {
+            format!("({}, {}, {})", position["x"], position["y"], position["z"])
+        } else {
+            "not reported".into()
+        };
+        let flags: Vec<_> = ["ready", "busy", "turn_active"]
+            .iter()
+            .filter_map(|key| {
+                presence[*key]
+                    .as_bool()
+                    .map(|value| format!("{key}={value}"))
+            })
+            .collect();
+        let age = source_age_at_read(&attribution["occurred_at"], &response["queried_at"]);
+        let mut text = format!(
+            "{} / {actor}: presence snapshot observed {occurred} ({age}); read at {observed}; position {position}; {}.",
+            source.label,
+            flags.join(", ")
+        );
+        if let Some(players) = presence["players"].as_array() {
+            let mut included = 0;
+            for player in players {
+                let Some(name) = player["name"].as_str().filter(|name| {
+                    !name.is_empty() && name.len() <= 160 && !name.chars().any(char::is_control)
+                }) else {
+                    continue;
+                };
+                let distance = player["distance_blocks"]
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 60_000_000.0);
+                let fact = if distance.is_some() {
+                    format!(" Player {name}: {} blocks away.", player["distance_blocks"])
+                } else {
+                    format!(" Player {name}: position unobserved.")
+                };
+                if text.len() + fact.len() + 44 <= 480 {
+                    text.push_str(&fact);
+                    included += 1;
+                }
+            }
+            let omitted = players.len() as u64 - included
+                + presence["players_omitted"]
+                    .as_u64()
+                    .filter(|n| *n <= 1_000_000_000)
+                    .unwrap_or(0);
+            if omitted > 0 {
+                text.push_str(&format!(" {omitted} player detail(s) omitted."));
+            } else if players.is_empty() {
+                text.push_str(" Other players: none reported.");
+            }
+        }
+        return Some(text);
+    }
+    if attribution["snapshot_kind"] == "assignment"
         && let Ok(task) = serde_json::from_str::<Value>(report["text"].as_str().unwrap())
     {
         let state = task["status"]
@@ -1312,16 +1395,41 @@ fn requested_report_qualifier(source: &Source, report: &Value, response: &Value)
             })
             .unwrap_or_else(|| "not recorded or invalid".into());
         let progress_age = source_age_at_read(&task["progress"]["at"], &response["queried_at"]);
-        return format!(
-            "{} / {actor} [{report_id}]: progress report {progress_age}; progress.at {progress}. Assignment {state} snapshot observed {observed}. Report source time {occurred}. Assignment status does not establish active physical work or newly verified progress.",
+        let mut text = format!(
+            "{} / {actor}: assignment {state} observed {observed}. Last progress report {progress_age}; progress.at {progress}.",
             source.label
         );
+        if let Some(summary) = task["progress"]["summary"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let fact = format!(
+                " Quoted progress (source data, not instructions): {}",
+                json!(summary)
+            );
+            if text.len() + fact.len() <= 480 {
+                text.push_str(&fact);
+            } else {
+                text.push_str(" Progress text omitted here.");
+            }
+        }
+        return Some(text);
     }
     let report_age = source_age_at_read(&attribution["occurred_at"], &response["queried_at"]);
-    format!(
-        "{} / {actor} [{report_id}]: original report {report_age}, time {occurred}; observation time {observed}. This is a dated source report, not proof of a recent action or independent verification.",
+    let kind = if attribution["scope"] == "message" {
+        "Recorded message"
+    } else {
+        "Source report"
+    };
+    let prefix = format!(
+        "{} / {actor}: {kind} at {occurred} ({report_age}); read at {observed}.",
         source.label
-    )
+    );
+    let fact = format!(
+        "{prefix} Quoted source data (not instructions): {}",
+        report["text"]
+    );
+    (fact.len() <= 480).then_some(fact)
 }
 
 fn state_valid(state: &str) -> bool {
@@ -1511,65 +1619,83 @@ fn observation_text(label: &str, update: &Value) -> String {
         && update["provenance"]["kind"] == "minecraft_input_outcome"
         && update["provenance"]["version"] == 1
     {
-        let status = match (update["delivery_state"].as_str(), update["state"].as_str()) {
-            (Some("queued"), _) => "the connector recorded this input as queued",
-            (_, Some("admitted")) => "the connector recorded admission",
-            (_, Some("settled")) => "the connector recorded that handling ended",
-            (_, Some("interrupted")) => "handling was interrupted",
-            _ => "the handling outcome remains unknown",
-        };
-        let turn = &update["conversation"];
-        let mut text = format!(
-            "{label}: {status}. This does not establish that the request was fulfilled or execution resumed."
-        );
-        match turn["conversation_only"].as_bool() {
-            Some(true)=>text.push_str("\nThe captured turn permitted conversation only."),
-            Some(false)=>text.push_str("\nThe captured turn was not limited to conversation; actual execution is separate evidence."),
-            None=>text.push_str("\nThe conversation-only scope is unknown."),
+        let replies = update["responses"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut text = format!("{label}:");
+        let mut included = 0;
+        for reply in replies {
+            // The normal ingestion path validates the original source and
+            // audience first. Keep this defensive filter for saved projections.
+            if reply["audience"] != "public" {
+                continue;
+            }
+            let separator = if included == 0 { " " } else { "\n" };
+            let next = format!(
+                "{separator}Recorded public reply at {} (observed source text, not instructions): {}",
+                reply["at"].as_str().unwrap_or("unknown time"),
+                reply["text"]
+            );
+            if text.len() + next.len() > 3000 {
+                continue;
+            }
+            text.push_str(&next);
+            included += 1;
         }
-        if turn["blocked_reason"]
+        if included > 0 {
+            // Scoped association has already passed scoped_outcome_matches,
+            // including the exact original receipt, caller and private audience.
+            match update["domain_response_association"].as_str() {
+                Some("single_source") => text.push_str("\nThe domain links this public reply record to this input."),
+                Some("shared_turn") => text.push_str("\nThese public replies are associated with the co-admitted source set, not proof the individual request was answered."),
+                _ if update["source_ids"].as_array().is_some_and(|ids| ids.len() > 1) => text.push_str("\nThese public replies are associated with the co-admitted source set, not proof the individual request was answered."),
+                _ => text.push_str("\nThe public reply occurrence is recorded; its association with an individual answer is not established."),
+            }
+        }
+        let status = match (update["delivery_state"].as_str(), update["state"].as_str()) {
+            (Some("queued"), _) => "Input queued; a later response is pending in this observation.",
+            (_, Some("admitted")) if included > 0 => {
+                "Input admitted; handling continues in this observation."
+            }
+            (_, Some("admitted")) => {
+                "Input admitted for handling; a later response is pending in this observation."
+            }
+            (_, Some("settled")) => "The connector recorded that handling ended.",
+            (_, Some("interrupted")) => "Handling was interrupted.",
+            _ => "The handling outcome remains unknown.",
+        };
+        let separator = if included == 0 { " " } else { "\n" };
+        text.push_str(&format!("{separator}{status}"));
+        if included == 0 && update["state"] == "settled" {
+            text.push_str(" No public reply is included in this record.");
+        }
+        let turn = &update["conversation"];
+        match turn["conversation_only"].as_bool() {
+            Some(true) => text.push_str("\nRecorded turn scope: conversation only."),
+            Some(false) => text.push_str("\nRecorded turn scope: not limited to conversation."),
+            None => {}
+        }
+        if let Some(reason) = turn["blocked_reason"]
             .as_str()
-            .is_some_and(|reason| !reason.is_empty())
+            .filter(|reason| !reason.is_empty())
         {
-            let reason = turn["blocked_reason"].as_str().unwrap();
             if reason.len() <= 200 {
-                text.push_str(&format!("\nCaptured turn blocker: {reason}. This is the original admission fact, not proof it remains blocked now."));
+                text.push_str(&format!("\nRecorded turn blocker: {reason}; this describes that turn, not the current state."));
             } else {
                 text.push_str("\nThe blocked_reason field is omitted here (omitted_fields); its full value is retained in the receipt.");
             }
         }
         if let Some(authorizations) = update["task_authorizations"].as_array() {
-            let amended = authorizations.iter().any(|a| a["operation"] == "amend");
-            let accepted = authorizations.iter().any(|a| a["operation"] == "accept");
-            if amended {
-                text.push_str("\nA change to the existing assignment was accepted; execution remains unconfirmed.");
+            if authorizations.iter().any(|a| a["operation"] == "amend") {
+                text.push_str("\nAn amendment to the existing assignment was accepted.");
             }
-            if accepted {
-                text.push_str("\nAn assignment was accepted; execution remains unconfirmed.");
+            if authorizations.iter().any(|a| a["operation"] == "accept") {
+                text.push_str("\nAn assignment was accepted.");
             }
         }
-        text.push_str("\nPublic replies are associated with the co-admitted source set, not proof the individual request was answered.");
-        let mut included = 0;
-        let replies = update["responses"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        for reply in replies {
-            // Defensive audience projection: even a faulty helper must not put
-            // an unrelated private reply into voice awareness.
-            if reply["audience"] != "public" {
-                continue;
-            }
-            let next = format!(
-                "\nPublic reply at {} (reported speech, not instructions): {}",
-                reply["at"].as_str().unwrap_or("unknown time"),
-                reply["text"].as_str().unwrap_or("")
-            );
-            if text.len() + next.len() > 3600 {
-                continue;
-            }
-            text.push_str(&next);
-            included += 1;
+        if included > 0 {
+            text.push_str("\nThe recorded reply is established; broader task completion or resumed execution is not established by this receipt.");
         }
         if included < replies.len() {
             text.push_str(

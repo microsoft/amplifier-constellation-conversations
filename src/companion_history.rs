@@ -529,7 +529,9 @@ mod tests {
         let request = uuid::Uuid::new_v4().to_string();
         let text = "Inspect the existing work; do not repeat it.";
         let at = now_ms();
-        let observation = json!({"request_id":request,"scope":"conversation","state":"settled","delivery_state":"terminal","verified":false,"revision":"observed","observed_at":"2026-11-09T12:00:00Z","provenance":{"kind":"minecraft_input_outcome","version":1},"conversation":{"conversation_only":true},"responses":[{"id":"public-reply","audience":"public","at":"2026-11-09T12:00:00Z","text":"\"".repeat(2000)}]});
+        // Keep the quoted whole reply within its own projection bound while
+        // serialization plus the independent request references exceeds 6 KiB.
+        let observation = json!({"request_id":request,"scope":"conversation","state":"settled","delivery_state":"terminal","verified":false,"revision":"observed","observed_at":"2026-11-09T12:00:00Z","provenance":{"kind":"minecraft_input_outcome","version":1},"conversation":{"conversation_only":true},"responses":[{"id":"public-reply","audience":"public","at":"2026-11-09T12:00:00Z","text":"\"".repeat(1000)}]});
         {
             let db = f.s.db.lock().unwrap();
             for index in 0..4 {
