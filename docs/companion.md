@@ -311,7 +311,10 @@ a changed payload is rejected. A timeout, lost response, or restart during
 submission leaves an unknown outcome that must not be retried automatically.
 Hanging up closes new call-tool actions. The original call grant can still read
 saved operation receipts while already accepted backend work settles; it cannot
-create a new effect, capture, or live observation. Already submitted connector
+create a new effect, capture, or live observation. Once that call's tool transport
+is disposed, a recognized late Companion tool permission is cancelled rather than
+opening an approval for the closed browser. Saved receipts remain stored; this
+does not replay work or turn an uncertain delivery into success. Already submitted connector
 work retains its original authority and must be inspected through its owning
 connector's controls when no retained receipt establishes the outcome.
 

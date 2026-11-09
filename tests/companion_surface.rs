@@ -1481,6 +1481,33 @@ async fn closed_call_receipts_preserve_terminal_evidence_without_reopening_autho
             "once"
         );
     }
+    // Saved terminal receipts may be queried while this exact listener exists.
+    // Once the bridge has closed it, retain the receipt but cancel the MCP
+    // request; do not ask the departed browser to approve an impossible call.
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_tool_grants SET port=NULL WHERE call_id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    for args in [json!({}), json!({"operation_id":operation})] {
+        assert_eq!(
+            companion_tools::permission_once(
+                &f.s,
+                &c.room,
+                "owner",
+                "default",
+                true,
+                &permission("companion_surface_status", args)
+            )
+            .unwrap(),
+            Some(agent_conversations::permissions::cancelled())
+        );
+    }
+    assert_eq!(surface_status(&f, &c, &operation).await, receipt);
+    assert!(f.s.permissions.list(&c.room, "owner").is_empty());
     assert_eq!(
         companion_tools::permission_once(
             &f.s,

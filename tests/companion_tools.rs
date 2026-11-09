@@ -994,6 +994,123 @@ async fn late_exact_own_tools_are_denied_after_call_end_without_a_hidden_human_p
 }
 
 #[tokio::test]
+async fn lost_own_transport_cancels_recognized_permissions_without_human_approval() {
+    let f = fixture();
+    let c = call(&f);
+    companion_tools::record_mcp_port(&f.s, &c.id, 34567).unwrap();
+    let check = |request: &Value, injected| {
+        companion_tools::permission_once(&f.s, &c.room, "owner", "default", injected, request)
+            .unwrap()
+    };
+    let observation = native_permission("companion_observations", json!({}));
+    assert_eq!(
+        check(&observation, true).unwrap()["outcome"]["optionId"],
+        "single"
+    );
+    // A grant is retained after the bridge tears down its listener. Exact own
+    // requests still belong to that call, but can no longer be forwarded.
+    for state in ["connected", "closed"] {
+        for port in [None, Some(0_i64), Some(-1_i64)] {
+            {
+                let db = f.s.db.lock().unwrap();
+                db.execute(
+                    "UPDATE companion_calls SET state=?2 WHERE id=?1",
+                    params![c.id, state],
+                )
+                .unwrap();
+                db.execute(
+                    "UPDATE companion_tool_grants SET port=?2 WHERE call_id=?1",
+                    params![c.id, port],
+                )
+                .unwrap();
+            }
+            for permission in [
+                observation.clone(),
+                native_permission("companion_surface_status", json!({})),
+                native_permission(
+                    "companion_surface_status",
+                    json!({"operation_id":uuid::Uuid::new_v4().to_string()}),
+                ),
+                native_permission(
+                    "companion_request_action",
+                    action(&uuid::Uuid::new_v4().to_string()),
+                ),
+            ] {
+                assert_eq!(
+                    check(&permission, true),
+                    Some(agent_conversations::permissions::cancelled()),
+                    "{state}, port={port:?}"
+                );
+                assert!(check(&permission, false).is_none());
+            }
+        }
+    }
+    assert!(f.s.permissions.list(&c.room, "owner").is_empty());
+    assert!(effects(&f).is_empty());
+    let db = f.s.db.lock().unwrap();
+    let denied: i64 = db.query_row("SELECT COUNT(*) FROM audit WHERE kind='permission.companion.denied' AND json_extract(data,'$.reason')='transport_unavailable' AND json_extract(data,'$.kind')='cancelled' AND json_extract(data,'$.human_decision')=0", [], |r|r.get(0)).unwrap();
+    assert_eq!(denied, 24);
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn unavailable_transport_does_not_claim_unrelated_or_static_collision_permissions() {
+    let f = fixture();
+    let c = call(&f); // no listener was recorded
+    let valid = native_permission("companion_observations", json!({}));
+    let mut wrong_server = valid.clone();
+    wrong_server["toolCall"]["rawInput"]["server"] = json!("other");
+    let mut forged_title = valid.clone();
+    forged_title["toolCall"]["title"] = json!("workspace run");
+    let mut duplicate_options = valid.clone();
+    duplicate_options["options"][1]["optionId"] = json!("persistent");
+    for permission in [
+        wrong_server,
+        forged_title,
+        duplicate_options,
+        native_permission("unrelated_tool", json!({})),
+        native_permission("companion_observations", json!({"command":"unrelated"})),
+    ] {
+        assert!(
+            companion_tools::permission_once(&f.s, &c.room, "owner", "default", true, &permission)
+                .unwrap()
+                .is_none()
+        );
+    }
+    for (actor, agent) in [("other", "default"), ("owner", "other-agent")] {
+        assert!(
+            companion_tools::permission_once(&f.s, &c.room, actor, agent, true, &valid)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut agent = f.s.agent("default").unwrap().unwrap();
+    agent
+        .mcp_servers
+        .push(json!({"type":"http","name":"companion","url":"https://other.test/mcp"}));
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+            [serde_json::to_string(&agent).unwrap()],
+        )
+        .unwrap();
+    assert!(
+        companion_tools::permission_once(&f.s, &c.room, "owner", "default", true, &valid)
+            .unwrap()
+            .is_none()
+    );
+    assert!(f.s.permissions.list(&c.room, "owner").is_empty());
+    assert!(effects(&f).is_empty());
+}
+
+#[tokio::test]
 async fn fresh_connection_status_stays_on_the_authenticated_private_call_without_action_effects() {
     let f = fixture();
     let c = call(&f);

@@ -154,8 +154,10 @@ pub fn permission_once(
         return Ok(None);
     }
     let cfg = config(s).ok();
-    let call:Option<(String,String)>=s.db.lock().unwrap().query_row("SELECT c.id,c.state FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.owner=?2 AND c.agent_id=?3 AND g.port>0",params![room,actor,agent],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    let Some((call, state)) = call else {
+    // A disconnected listener does not erase this injected server's ownership.
+    // Recognize its retained grant before deciding whether it can still run.
+    let call:Option<(String,String,Option<i64>)>=s.db.lock().unwrap().query_row("SELECT c.id,c.state,g.port FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.owner=?2 AND c.agent_id=?3",params![room,actor,agent],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((call, state, port)) = call else {
         return Ok(None);
     };
     if !crate::companion::room_identity_valid(s, room)?
@@ -222,7 +224,7 @@ pub fn permission_once(
             .iter()
             .filter(|o| o["kind"] == "reject_once")
             .collect::<Vec<_>>();
-        let automatic_end = reason == "call_inactive";
+        let automatic_end = matches!(reason, "call_inactive" | "transport_unavailable");
         let outcome = if rejects.len() == 1 && !automatic_end {
             json!({"outcome":{"outcome":"selected","optionId":rejects[0]["optionId"]}})
         } else {
@@ -231,6 +233,9 @@ pub fn permission_once(
         s.audit("permission.companion.denied", Some(room), json!({"agent_id":agent,"actor":actor,"call_id":call,"tool":raw.tool,"reason":reason,"kind":if rejects.len() == 1 && !automatic_end {"reject_once"} else {"cancelled"},"human_decision":false}))?;
         Ok(Some(outcome))
     };
+    if port.is_none_or(|port| port <= 0) {
+        return deny("transport_unavailable");
+    }
     let inactive = !matches!(state.as_str(), "connecting" | "connected");
     let saved_receipt = raw.tool == "companion_surface_status"
         && crate::companion_surface::terminal_status_shape_valid(&raw.arguments);
