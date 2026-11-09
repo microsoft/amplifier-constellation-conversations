@@ -519,9 +519,11 @@ pub async fn status(
     h: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authorize(&s, &id, &h)?;
-    Ok(Json(
-        action_row(&s, &id, &rid)?.ok_or_else(ApiError::missing)?,
-    ))
+    Ok(Json(match action_row(&s, &id, &rid)? {
+        Some(value) => value,
+        None => crate::companion_awareness::action_observation_for_call(&s, &id, &rid)?
+            .ok_or_else(ApiError::missing)?,
+    }))
 }
 pub async fn action(
     State(s): State<Arc<AppState>>,
@@ -582,8 +584,30 @@ pub async fn action(
             drop(db);
             return Ok(Json(action_row(&s, &id, &rid)?.unwrap()));
         }
-        let source = json!({"call_id":id,"conversation_id":room,"actor":owner,"audience":"private","delegation_id":did,"message_id":mid,"occurred_at":at,"original_text":text,"source_revision":auth::digest(&text)});
+        let original_text: Option<String> = tx.query_row(
+            "SELECT request_text FROM companion_delegations WHERE call_id=?1 AND id=?2",
+            params![id, did],
+            |r| r.get(0),
+        )?;
+        let original_text = original_text
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| text.clone());
+        let original_at = crate::companion_awareness::original_human_source_time(&tx, &id, &did)
+            .map_err(|_| ApiError::bad("The original human source cannot be verified"))?;
+        let time_basis = if original_at.is_some() {
+            "retained_human_transcript"
+        } else {
+            "delegation_created_at"
+        };
+        let source = json!({"call_id":id,"conversation_id":room,"actor":owner,"audience":"private","delegation_id":did,"intent_id":did,"message_id":mid,"occurred_at":original_at.unwrap_or(at),"time_basis":time_basis,"original_text":original_text,"source_revision":auth::digest(&original_text),"evidence_revision":auth::digest(&text)});
         tx.execute("INSERT INTO companion_actions(call_id,request_id,delegation_id,connection_id,instruction,source,state,result,created_at) VALUES(?1,?2,?3,?4,?5,?6,'submitting','{}',?7)",params![id,a.request_id,did,a.connection_id,a.instruction,source.to_string(),now_ms()])?;
+        crate::companion_awareness::bind_action_observer(
+            &s,
+            &tx,
+            &id,
+            &a.request_id,
+            &a.connection_id,
+        )?;
         tx.commit()?;
         source
     };

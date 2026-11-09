@@ -57,6 +57,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
         ("board_card_ids", "TEXT NOT NULL DEFAULT '[]'"),
         ("pinned_card_ids", "TEXT NOT NULL DEFAULT '[]'"),
         ("focused_card_id", "TEXT"),
+        ("playback", "TEXT"),
     ] {
         if !surface_columns.iter().any(|c| c == name) {
             db.execute(
@@ -102,6 +103,52 @@ pub struct Presence {
     #[serde(default)]
     pinned_card_ids: Vec<String>,
     focused_card_id: Option<String>,
+    playback: Option<Playback>,
+    interruption: Option<Interruption>,
+}
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Playback {
+    state: String,
+    interruption_id: Option<String>,
+    output_active: Option<bool>,
+    floor: String,
+}
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Interruption {
+    id: String,
+    reason: String,
+    phase: String,
+}
+fn valid_playback(p: &Presence) -> bool {
+    let Some(playback) = &p.playback else {
+        return p.interruption.is_none();
+    };
+    if !["ready", "suppressed", "unknown"].contains(&playback.state.as_str())
+        || !["user", "open", "unknown"].contains(&playback.floor.as_str())
+        || playback
+            .interruption_id
+            .as_ref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+        || (playback.state == "suppressed"
+            && (playback.interruption_id.is_none() || playback.floor == "open"))
+        || (playback.floor == "open" && p.user_speaking != Some(false))
+    {
+        return false;
+    }
+    p.interruption.as_ref().is_none_or(|i| {
+        uuid::Uuid::parse_str(&i.id).is_ok()
+            && playback.interruption_id.as_deref() == Some(i.id.as_str())
+            && [
+                "sustained_speech",
+                "explicit_interrupt",
+                "continued_explanation",
+            ]
+            .contains(&i.reason.as_str())
+            && ((i.phase == "suppressed" && playback.state == "suppressed")
+                || (i.phase == "released" && playback.state == "ready"))
+    })
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -249,6 +296,28 @@ fn source_authorized(
         None => Ok(false),
     }
 }
+/// An already queued browser operation retains its original authorization until
+/// its own expiry. A fast successful backend return is not revocation. This
+/// lookup also permits read-only duplicate acknowledgment of a terminal operation;
+/// the atomic acceptance transition still rejects expiry and repeat execution.
+/// It cannot admit a new operation or revive failed/unknown source delivery.
+fn operation_source_authorized(
+    s: &AppState,
+    id: &str,
+    operation: &str,
+    owner: &str,
+    agent: &str,
+    room: &str,
+) -> Result<bool> {
+    let source: Option<String> = s.db.lock().unwrap().query_row(
+        "SELECT d.message_id FROM companion_surface_commands o JOIN companion_delegations d ON d.call_id=o.call_id AND d.id=o.delegation_id JOIN messages m ON m.id=d.message_id JOIN input_deliveries i ON i.message_id=m.id AND i.agent_id=?4 AND i.conversation_id=?5 LEFT JOIN messages result ON result.id=i.target_turn AND result.conversation_id=?5 AND result.agent_id=?4 AND result.role='assistant' WHERE o.call_id=?1 AND o.operation_id=?2 AND m.role='user' AND m.actor=?3 AND m.conversation_id=?5 AND ((d.state='dispatched' AND i.state IN ('submitted','received_remote','incorporated')) OR (d.state='completed' AND i.state IN ('completed','incorporated') AND result.status='complete'))",
+        params![id,operation,owner,agent,room], |r|r.get(0)).optional()?;
+    match source {
+        Some(source) => crate::delivery::authorized(s, &source, owner),
+        None => Ok(false),
+    }
+}
+
 fn card_exists(s: &AppState, id: &str, card: &str) -> Result<bool> {
     if let Some(upload) = card.strip_prefix("upload:") {
         return Ok(s.db.lock().unwrap().query_row(
@@ -383,6 +452,7 @@ pub async fn presence(
 ) -> ApiResult<Json<Value>> {
     let (p, _) = browser(&s, &id, &h, true)?;
     if uuid::Uuid::parse_str(&presence.browser_id).is_err()
+        || !valid_playback(&presence)
         || (presence.capture_consent && !presence.camera_enabled)
         || presence.board_card_ids.len() > 3
         || presence.board_card_ids.iter().any(|id| !valid_card_id(id))
@@ -411,7 +481,10 @@ pub async fn presence(
             "Use an enabled camera for capture consent and at most three owned board cards",
         ));
     }
-    if !active(&s, &id)? {
+    // Playback telemetry belongs to the call, including plain ACP calls without
+    // optional Companion MCP tools. It grants no camera or connector authority.
+    let live: bool = s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND state IN ('connecting','connected') AND heartbeat_at>=?2)",params![id,now_ms()-FRESH_MS],|r|r.get(0))?;
+    if !live || crate::companion_history::private_identity(&s.db.lock().unwrap(), &id)?.is_none() {
         return Err(ApiError::forbidden());
     }
     for card in &presence.board_card_ids {
@@ -435,6 +508,29 @@ pub async fn presence(
         return Err(ApiError::busy());
     }
     db.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,user_speaking,agent_speaking,updated_at,board_card_ids,pinned_card_ids,focused_card_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(call_id) DO UPDATE SET browser_id=excluded.browser_id,session_hash=excluded.session_hash,camera_enabled=excluded.camera_enabled,capture_consent=excluded.capture_consent,user_speaking=excluded.user_speaking,agent_speaking=excluded.agent_speaking,updated_at=excluded.updated_at,board_card_ids=excluded.board_card_ids,pinned_card_ids=excluded.pinned_card_ids,focused_card_id=excluded.focused_card_id",params![id,presence.browser_id,p.session_hash,presence.camera_enabled,presence.capture_consent,presence.user_speaking,presence.agent_speaking,now_ms(),serde_json::to_string(&presence.board_card_ids).unwrap(),serde_json::to_string(&presence.pinned_card_ids).unwrap(),presence.focused_card_id])?;
+    db.execute(
+        "UPDATE companion_surfaces SET playback=?2 WHERE call_id=?1",
+        params![id, presence.playback.as_ref().map(|p| json!(p).to_string())],
+    )?;
+    let interruption_control = if let Some(interruption) = &presence.interruption {
+        let key = format!("playback:{}:{}", interruption.id, interruption.phase);
+        let data = json!({"browser_id":presence.browser_id,"interruption":interruption,"playback":presence.playback,"work_cancelled":false,"generated_speech_is_not_playback":true});
+        let inserted = db.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'playback',?3,?4)",params![id,key,data.to_string(),now_ms()])?;
+        (inserted > 0).then(|| (key, if interruption.phase == "suppressed" {
+            "The caller has taken the floor. Stop speaking and listen through their explanation. Do not acknowledge this control message. Do not resume the interrupted wording or narrate task routing. This stops speech only; accepted work is unchanged."
+        } else {
+            "Playback is available after an interruption. Continue listening; when appropriate answer the caller's latest point naturally. Do not resume the unheard middle or tail of earlier speech, acknowledge this control message, or infer that work completed."
+        }))
+    } else {
+        None
+    };
+    drop(db);
+    if let Some((event_id, content)) = interruption_control {
+        // Application-authored controls only. Browser text is never promoted to
+        // model instructions; authorization and world effects are unchanged.
+        crate::companion::instruction(&s, &id, &event_id, content)?;
+        s.changed();
+    }
     Ok(Json(
         json!({"browser_id":presence.browser_id,"camera_enabled":presence.camera_enabled,"capture_consent":presence.capture_consent,"expires_at":now_ms()+FRESH_MS}),
     ))
@@ -708,14 +804,7 @@ pub async fn ack(
             |r| r.get(0),
         )?;
         if surface(&s, &id, current["kind"] == "capture")?.as_deref() != Some(&a.browser_id)
-            || !source_authorized(
-                &s,
-                &id,
-                &p.actor,
-                &agent,
-                &room,
-                current["delegation_id"].as_str().unwrap_or(""),
-            )?
+            || !operation_source_authorized(&s, &id, &operation, &p.actor, &agent, &room)?
         {
             return Err(ApiError::forbidden());
         }

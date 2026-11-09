@@ -1110,3 +1110,104 @@ async fn short_plain_note_cards_share_the_existing_board_and_permission_boundary
     );
     assert!(effects(&f).is_empty());
 }
+
+#[tokio::test]
+async fn connector_source_preserves_human_words_separate_from_backend_context() {
+    let f = fixture();
+    let c = call(&f);
+    let (did, mid, _) = delegation(&f, &c, "user");
+    let words = "Actually, check the blue door first; leave the roof alone.";
+    let wrapper = format!(
+        "The live voice conversation delegated help at 100ms. Backend instructions and old context. Current human source: {words}"
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET text=?2 WHERE id=?1",
+            params![mid, wrapper],
+        )
+        .unwrap();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_delegations SET request_text=?3 WHERE call_id=?1 AND id=?2",
+            params![c.id, did, words],
+        )
+        .unwrap();
+    let rid = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        request(
+            &f,
+            &c,
+            "POST",
+            "actions",
+            Some(action(&rid)),
+            &c.token,
+            false
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let submitted = effects(&f);
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(submitted[0]["source"]["original_text"], words);
+    assert_eq!(
+        submitted[0]["source"]["source_revision"],
+        auth::digest(words)
+    );
+    assert_eq!(
+        submitted[0]["source"]["evidence_revision"],
+        auth::digest(&wrapper)
+    );
+    assert_eq!(submitted[0]["source"]["intent_id"], did);
+}
+
+#[tokio::test]
+async fn action_preserves_original_human_time_and_refuses_changed_transcript() {
+    for invalid in [false, true] {
+        let f = fixture();
+        let c = call(&f);
+        let (did, _, _) = delegation(&f, &c, "user");
+        let old = now_ms() - 7_000_000;
+        let words = "Keep the blue door; explain what remains.";
+        {
+            let db = f.s.db.lock().unwrap();
+            let event = json!({"role":"user","text":words,"start_ms":10,"end_ms":20,"event_id":"original-human-fragment"});
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'original-human-fragment','transcript',?2,?3)",params![c.id,event.to_string(),old]).unwrap();
+            let seq = db.last_insert_rowid();
+            let source = json!({"version":1,"previous_anchor_ms":0,"offset_ms":100,"fragments":[{"seq":seq,"role":"user","text":words,"start_ms":10,"end_ms":20,"event_id":"original-human-fragment"}]});
+            db.execute("UPDATE companion_delegations SET source=?3,request_text=?4 WHERE call_id=?1 AND id=?2",params![c.id,did,source.to_string(),words]).unwrap();
+            if invalid {
+                db.execute("UPDATE companion_events SET data=json_set(data,'$.text','Different words') WHERE seq=?1",[seq]).unwrap();
+            }
+        }
+        let rid = uuid::Uuid::new_v4().to_string();
+        let (status, _) = request(
+            &f,
+            &c,
+            "POST",
+            "actions",
+            Some(action(&rid)),
+            &c.token,
+            false,
+        )
+        .await;
+        if invalid {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(effects(&f).is_empty());
+        } else {
+            assert_eq!(status, StatusCode::OK);
+            let submitted = effects(&f);
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0]["source"]["occurred_at"], old);
+            assert_eq!(
+                submitted[0]["source"]["time_basis"],
+                "retained_human_transcript"
+            );
+            assert_eq!(submitted[0]["source"]["original_text"], words);
+        }
+    }
+}

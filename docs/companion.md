@@ -374,6 +374,10 @@ leaving the call, or losing the browser's live presence closes that permission.
 A capture receipt progresses through queued, accepted, executed (one frame), and
 uploaded (saved bytes). The browser executes only after its first confirmed
 atomic acceptance; uncertain acknowledgments never recapture or resend a photo.
+An already queued browser operation can survive successful completion of its
+originating reasoning turn until its own expiry. That completion does not grant
+a new operation; revoked/unknown sources, expired commands and duplicate
+acceptances cannot create another effect.
 The status tool can return the actual owned JPEG/PNG as MCP image content for a
 reasoning engine only when this call's actual ACP initialization advertises image input. Unsupported or unconfirmed support retains the saved artifact and omits image bytes. Uploaded does not mean inspected. Camera images
 from this path are capped at 512 KiB. A local-only engine remains local-only; the
@@ -544,6 +548,33 @@ time does not generate repeated waiting speech. After hang-up, accepted work can
 finish and retain its result, but cannot dispatch another voice request or append
 more voice context.
 
+Results are durably queued separately from the voice transport. Fresh authenticated
+browser observations decide when a result may enter the speaking context: both
+parties must be quiet and playback available. Unknown or stale observations defer
+presentation; a transcript pause is not a semantic turn-completion signal. A newer
+unsent revision replaces only the same fact, never a distinct unanswered question.
+The final dispatch rechecks private-room membership, endpoint identity and source
+policy. A process interruption during dispatch leaves delivery unknown rather
+than replaying it. Queue pressure keeps the canonical result available without
+disconnecting the call. Provider append acknowledgment does not prove playback.
+
+The browser preserves short listening cues but suppresses sustained overlapping
+agent speech when the caller takes the floor. Muted audio is consumed and discarded,
+not paused for later playback. Fixed application instructions ask GPT-Live to yield;
+the browser guard does not rely on the model obeying them. Playback resumes only
+after fresh observed quiet, never from buffering, a hidden page, or an instruction
+acknowledgment. These acoustic boundaries remain heuristics, not sentence or intent
+recognition. Stopping speech does not cancel accepted work.
+
+Current task observations distinguish snapshot time from the original progress
+report time. Prior-call context carries human goals and exact result references;
+old assistant prose is not automatically reused as current status. Newly submitted
+connection actions freeze their observer and original source binding. After hang-up,
+read-only polling can collect the exact outcome for up to an hour; a later private
+call can continue that lookup after revalidating owner, agent, endpoint, observer
+policy and original audience. No new action, model call or retry is performed by
+this observer. Older actions without the binding are not retroactively adopted.
+
 Native permissions outside the narrowly validated Companion tool policy appear
 as single-request choices on the call screen. They are still actor- and
 conversation-bound; the voice model does not approve arbitrary native tools.
@@ -686,8 +717,9 @@ by default; existing projects do not gain a new provider prerequisite silently.
 No failed creation is retried with a different configuration.
 
 The official GPT-Live input-transcript Decisions trigger evaluates only whether
-the human explicitly requests ending the current call. It runs independently of
-the reasoning queue. Its sole effect is existing call closure; it cannot cancel
+the human expresses a complete current intention to end the call, including a
+polite indirect request or a clear closing farewell. A bare “thanks” or ending a
+work step is insufficient. It runs independently of the reasoning queue. Its sole effect is existing call closure; it cannot cancel
 agent work, resolve unknown delivery or affect another call. Quoted, hypothetical,
 incomplete, negated and revoked requests, and requests to stop other work, are
 excluded. The host requires the exact current session and source event/times,
@@ -698,7 +730,8 @@ A matching provider terminal event still confirms closure separately.
 This native decision may incur provider usage and requires the project's
 Decisions access. Automated signal/ordering tests do not establish semantic
 accuracy for real speech. Qualify with explicit, quoted, corrected and negative
-utterances before treating it as dependable hands-free control; the on-screen
+utterances, natural farewells, incomplete phrases, and stop-work requests before
+treating it as dependable hands-free control; the on-screen
 End call button remains available independently. See OpenAI's
 [voice Decisions guidance](https://developers.openai.com/api/docs/guides/decisions-voice).
 
@@ -734,3 +767,20 @@ already accepted backend work settles. Only authenticated saved receipt reads
 remain available; ending a call does not reopen actions or another call's context.
 Native hang-up diagnostics retain bounded decision status and source identities,
 not private reasoning or raw provider configuration.
+
+### Reproducible duplex evaluation
+
+`tests/companion-duplex-eval.mjs` provides deterministic self-checks, a real browser
+audio-graph check, and opt-in `--run-live CONFIG` evaluation. Live evaluation requires
+an explicitly marked disposable loopback installation and synthetic caller identity;
+it refuses the production preview address. The actual Companion UI/API/official
+GPT-Live bridge is paired with an independent synthetic caller. Both audio channels
+share one browser clock, and the caller hears the application's post-playback-gate
+output. Hidden expected outcomes are not sent to the caller model. Domain tools
+remain disposable fixtures; record their effects and receipts separately.
+
+Retain scenario, binary/configuration hashes, application events, source-to-result
+links, PCM audio and final state. Review coherent answers, corrections, honest
+blockers, silence and overlap in context; overlap counts alone are not a naturalness
+score. Headless audio and simulated callers do not establish physical phone speaker,
+echo cancellation, background operation, or human usability.

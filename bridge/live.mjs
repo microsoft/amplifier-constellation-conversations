@@ -20,10 +20,10 @@ export const BROWSER_EVENTS = Object.freeze(/** @satisfies {Array<ServerEvent['t
 // It has no game/work authority; its only effect is closing this call.
 export const END_CALL_QUESTION = Object.freeze({
   type:'predicate',name:'end_current_call',
-  instructions:'Is there a COMPLETE unambiguous instruction in the CURRENT human utterance to hang up this voice call now? Use the cumulative words of this current utterance through the triggering fragment, not a fragment in isolation. True requires either the complete idiom hang up/disconnect, or an instruction explicitly naming the call or voice connection as the thing to end. IMPORTANT: bare incomplete phrases such as please end, please stop, can you, or I want you to end are FALSE even if earlier conversation discussed ending calls; never fill in their missing object. Examples: Please hang up = true. End this call now = true. Please end = false. Do not hang up = false. If I asked you to end the call later = false. The phrase I am quoting is please hang up = false. Stop working on Minecraft = false. After an explicit complete request, trailing words this call and now retain its meaning; an assistant acknowledgment does not revoke it. A human correction such as actually do not hang up or keep talking revokes it. Quoted/reported/example/hypothetical/future requests, negative/revoked requests, questions about hangup, and assistant speech alone are false. Do not carry an old request into a different human utterance.',
+  instructions:'Does the caller\'s CURRENT human utterance express a COMPLETE intention to end this voice conversation now? Judge natural conversational meaning, using the cumulative words through the triggering fragment and recent context to identify what is ending. An indirect polite request or a clear closing farewell can end a call without the literal word call. Examples: Please hang up = true. End this call now = true. Thanks, that is everything I needed; can we end here? = true. Okay, goodbye = true when addressed to this conversation. Can you hang up now? = true. Distinguish a request to do it from a question about how it works. How do I hang up? = false. Bare incomplete requests remain false: Please end = false; Please stop = false; Can you = false. Never fill in a missing object from an earlier request. Stopping an explanation, task, game activity, or work step is not ending the conversation. Stop working on Minecraft = false. Stop explaining but keep this call open = false. Thanks alone = false. We are done with that step, what next? = false. Quoted, reported, hypothetical, future, negative or revoked requests are false. A human correction such as actually do not hang up or keep talking revokes the request. Assistant speech alone never supplies ending intent. Do not carry an old request into a different human utterance.',
 });
 const PUBLIC_EVENTS = new Set([...BROWSER_EVENTS, 'session.delegation.created',
-  'session.thinking.appended', 'session.commentary.appended']);
+  'session.thinking.appended', 'session.commentary.appended', 'session.instructions.appended']);
 // Parameter names are protocol identifiers, never provider-supplied values.
 const ERROR_PARAMS = new Set(['type','event_id','delegation_id','content','session',
   'session.model','session.instructions','session.input','session.voice','session.audio',
@@ -119,7 +119,7 @@ export function publicEvent(event,knownCommands=new Set()) {
     if (typeof event.delta!=='string' || !Number.isFinite(event.start_ms) || !Number.isFinite(event.end_ms)) return null;
     return {...base,delta:event.delta,start_ms:event.start_ms,end_ms:event.end_ms};
   }
-  if (event.type==='session.thinking.appended' || event.type==='session.commentary.appended') {
+  if (event.type==='session.thinking.appended' || event.type==='session.commentary.appended' || event.type==='session.instructions.appended') {
     if (!Number.isFinite(event.start_ms) || !Number.isFinite(event.end_ms)) return null;
     return {...base,start_ms:event.start_ms,end_ms:event.end_ms};
   }
@@ -224,7 +224,8 @@ export class LiveBridge {
     if (command.op==='create') return this.create(command);
     if (command.op==='close') return this.close();
     if (command.op!=='append' || this.state!=='active') throw new Error('call_not_active');
-    if ((command.channel!=='thinking' && command.channel!=='commentary') ||
+    if ((command.channel!=='thinking' && command.channel!=='commentary' && command.channel!=='instructions') ||
+        (command.channel==='instructions' && command.delegation_id!==null) ||
         typeof command.event_id!=='string' || !/^[a-zA-Z0-9_.:-]{1,160}$/.test(command.event_id) ||
         !(command.delegation_id===null || (typeof command.delegation_id==='string' && command.delegation_id.length>0 && command.delegation_id.length<=160))) throw new Error('invalid_append');
     /** @type {ClientEvent} */

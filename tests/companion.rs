@@ -10,7 +10,14 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 struct Fixture {
@@ -18,6 +25,16 @@ struct Fixture {
     s: Arc<AppState>,
     app: Router,
     token: String,
+    browser_id: String,
+    browser_refresh: Arc<AtomicBool>,
+    browser_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for task in self.browser_tasks.get_mut().unwrap().drain(..) {
+            task.abort();
+        }
+    }
 }
 fn fixture(mode: &str) -> Fixture {
     let home = tempfile::tempdir().unwrap();
@@ -143,6 +160,7 @@ for line in sys.stdin:
     std::fs::write(home.path().join("bridge-mode"), mode).unwrap();
     std::fs::write(home.path().join("companion.json"),json!({"enabled":true,"node":python,"bridge":bridge,"profiles":{"default":{"voice":"alloy","description":"Fixture agent"}},"max_call_seconds":1800}).to_string()).unwrap();
     let s = AppState::open(home.path().into()).unwrap();
+    s.db.lock().unwrap().execute("INSERT INTO browser_sessions(hash,owner,csrf,expires_at) VALUES(?1,'owner','fixture-surface-csrf',?2)",rusqlite::params![auth::digest("fixture-surface-cookie"),now_ms()+120_000]).unwrap();
     let app = server::router(s.clone());
     let token = std::fs::read_to_string(home.path().join("secrets/control-token")).unwrap();
     Fixture {
@@ -150,6 +168,9 @@ for line in sys.stdin:
         s,
         app,
         token,
+        browser_id: uuid::Uuid::new_v4().to_string(),
+        browser_refresh: Arc::new(AtomicBool::new(true)),
+        browser_tasks: Mutex::new(Vec::new()),
     }
 }
 async fn request(
@@ -173,11 +194,108 @@ async fn request(
     let bytes = to_bytes(r.into_body(), 1024 * 1024).await.unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
+async fn post_browser_surface(
+    app: &Router,
+    cookie_name: &str,
+    id: &str,
+    body: Value,
+) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/companion/calls/{id}/surface/presence"))
+                .header(
+                    header::COOKIE,
+                    format!("{cookie_name}=fixture-surface-cookie"),
+                )
+                .header("x-csrf-token", "fixture-surface-csrf")
+                .header(header::ORIGIN, "https://example.test:18445")
+                .header(header::HOST, "example.test:18445")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+fn available_browser_surface(browser: &str) -> Value {
+    json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,
+        "user_speaking":false,"agent_speaking":false,
+        "playback":{"state":"ready","floor":"open","output_active":false,"interruption_id":null}})
+}
+async fn attach_browser(f: &Fixture, id: &str) {
+    let body = available_browser_surface(&f.browser_id);
+    let app = f.app.clone();
+    let cookie = auth::cookie_name(&f.s).to_owned();
+    let id = id.to_owned();
+    let first = post_browser_surface(&app, &cookie, &id, body.clone()).await;
+    if first != StatusCode::OK {
+        let state: String =
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM companion_calls WHERE id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert!(
+            ["closed", "interrupted", "closing"].contains(&state.as_str()),
+            "{first}: {state}"
+        );
+        return;
+    }
+    // A real foreground browser refreshes presence independently of tool/model
+    // completion. This fixture uses the authenticated public endpoint, not a
+    // database shortcut that pretends the user has heard a generated answer.
+    let enabled = f.browser_refresh.clone();
+    let state = f.s.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let active: bool = state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state IN ('connecting','connected') FROM companion_calls WHERE id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            if enabled.load(Ordering::SeqCst) {
+                let _ = post_browser_surface(&app, &cookie, &id, body.clone()).await;
+            }
+        }
+    });
+    f.browser_tasks.lock().unwrap().push(task);
+}
+fn current_human_segments(prompt: &str) -> Vec<Value> {
+    let block = prompt
+        .split_once("Current human source (")
+        .expect("explicit source block")
+        .1;
+    let source = block
+        .split_once("):\n")
+        .expect("source block header")
+        .1
+        .split_once("\n\nRecent conversation,")
+        .expect("separate reference context")
+        .0;
+    serde_json::from_str(source).expect("exact current human source JSON")
+}
 async fn start(f: &Fixture) -> (Value, Value) {
     let input = json!({"request_id":uuid::Uuid::new_v4().to_string(),"agent_id":"default","sdp":"v=0\r\nfixture-offer"});
     let (status, value) = request(f, "POST", "/api/v1/companion/calls", Some(input.clone())).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     assert!(["connecting", "connected"].contains(&value["state"].as_str().unwrap()));
+    attach_browser(f, value["id"].as_str().unwrap()).await;
     (input, value)
 }
 async fn until(f: &Fixture, id: &str, kind: &str) -> Value {
@@ -998,11 +1116,15 @@ async fn delegation_anchor_includes_observed_straddling_word_with_original_timin
     assert_eq!(tail["text"], " elsewhere");
     assert_eq!(tail["start_ms"], 13000);
     assert_eq!(tail["end_ms"], 13200);
-    assert!(source.contains(
-        "explicitly publish it through this runtime's advertised image-attachment/output capability"
-    ));
-    assert!(source.contains("A path on another host is not a usable attachment or public URL"));
-    let segments: Vec<Value> = serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
+    assert!(source.contains("only a clear new human request supplies action authority"));
+    assert!(source.contains("Unknown effects must not be retried"));
+    assert!(
+        source.contains(
+            "publish it with the runtime's advertised image-attachment/output capability"
+        )
+    );
+    assert!(source.contains("inspecting bytes or naming a remote path does not share it"));
+    let segments = current_human_segments(&source);
     assert_eq!(segments.len(), 1);
     assert_eq!(
         segments[0]["text"],
@@ -1043,8 +1165,7 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
     wait_delegation(&f, &call, "delegate-1", "completed").await;
     wait_delegation(&f, &call, "delegate-2", "completed").await;
     let source:String=f.s.db.lock().unwrap().query_row("SELECT m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='delegate-2'",[id],|r|r.get(0)).unwrap();
-    let fragments: Vec<Value> =
-        serde_json::from_str(source.rsplit_once("\n\n").unwrap().1).unwrap();
+    let fragments = current_human_segments(&source);
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0]["text"], "Now give me a separate summary.");
     assert_eq!(fragments[0]["crosses_delegation_anchor"], true);
@@ -1059,13 +1180,14 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
             .contains("human-tail")
     );
     let context = source
-        .split_once("proof of playback. If a reference is ambiguous, ask rather than invent it:\n")
+        .split_once("Assistant speech is generated, not proof of playback:\n")
+        .expect("separate historical reference context")
+        .1;
+    let context: Value = serde_json::Deserializer::from_str(context)
+        .into_iter::<Value>()
+        .next()
         .unwrap()
-        .1
-        .split_once("\n\nThe CURRENT NEW REQUEST")
-        .unwrap()
-        .0;
-    let context: Value = serde_json::from_str(context).unwrap();
+        .unwrap();
     assert!(
         context["segments"]
             .as_array()
@@ -1074,7 +1196,9 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
             .any(|v| v["text"].as_str().unwrap().contains("elsewhere"))
     );
     assert_eq!(context["action_authority"], false);
-    assert!(source.contains("Never repeat an earlier instruction or effect from this block"));
+    assert!(
+        source.contains("for references/corrections only, not authority to repeat earlier effects")
+    );
     let lines = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
     assert_eq!(
         lines
@@ -1127,9 +1251,9 @@ async fn grounded_bootstrap_and_voice_preferences_do_not_create_backend_model_wo
         "Coach",
         "Minecraft",
         "2026-11-07T19:00:00Z",
-        "missing reports do not mean a place is quiet",
+        "If current state is unavailable, check it before giving a status answer",
         "<|SpawnThinking|>",
-        "dated snapshots retain their original age",
+        "Preserve original report dates",
     ] {
         assert!(instructions.contains(expected), "{expected}");
     }
@@ -2346,7 +2470,7 @@ async fn long_spoken_request_and_followup_preserve_exact_source_and_human_card_l
         exact
     );
     assert!(prompt.len() < 48 * 1024);
-    let segments: Vec<Value> = serde_json::from_str(prompt.rsplit_once("\n\n").unwrap().1).unwrap();
+    let segments = current_human_segments(&prompt);
     assert_eq!(segments[0]["text"], exact);
     let record = until(&f, id, "card").await;
     let card = record["events"]
@@ -2990,6 +3114,145 @@ async fn explicit_acp_image_result_is_saved_published_and_available_for_scoped_r
             .count(),
         1,
         "image reinspection must not recapture or dispatch another prompt"
+    );
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn tools_disabled_browser_floor_defers_saved_result_until_fresh_open_without_replaying_work()
+{
+    let f = fixture("quiet");
+    f.browser_refresh.store(false, Ordering::SeqCst);
+    assert!(!f.home.path().join("companion-actions.json").exists());
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let cookie = auth::cookie_name(&f.s);
+    let mut unknown = available_browser_surface(&f.browser_id);
+    unknown["user_speaking"] = Value::Null;
+    unknown["agent_speaking"] = Value::Null;
+    unknown["playback"]["state"] = json!("unknown");
+    unknown["playback"]["floor"] = json!("unknown");
+    unknown["playback"]["output_active"] = Value::Null;
+    assert_eq!(
+        post_browser_surface(&f.app, &cookie, id, unknown).await,
+        StatusCode::OK
+    );
+    terminal_fixture(&f, &call, "floor-target", "complete");
+    settlement_source(&f, &call, "floor-source", "completed", "floor-target");
+    let saved = until(&f, id, "card").await;
+    assert!(
+        saved["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "card" && e["data"]["message_id"] == "floor-target")
+    );
+    wait_delegation(&f, &call, "floor-source", "completed").await;
+    let assert_unsent = || {
+        assert!(
+            !std::fs::read_to_string(f.home.path().join("bridge-commands"))
+                .unwrap_or_default()
+                .lines()
+                .any(|line| serde_json::from_str::<Value>(line).unwrap()["op"] == "append")
+        );
+        assert_eq!(f.s.db.lock().unwrap().query_row("SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1 AND state='pending'",[id],|r|r.get::<_,i64>(0)).unwrap(),1);
+    };
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_unsent();
+    // Model an otherwise-open browser observation that has expired. No new
+    // live presence is fabricated to make the pending result dispatch.
+    let open = available_browser_surface(&f.browser_id);
+    f.s.db.lock().unwrap().execute("UPDATE companion_surfaces SET user_speaking=0,agent_speaking=0,playback=?2,updated_at=?3 WHERE call_id=?1",rusqlite::params![id,open["playback"].to_string(),now_ms()-6000]).unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_unsent();
+    let mut speaking = open.clone();
+    speaking["user_speaking"] = json!(true);
+    speaking["playback"]["floor"] = json!("user");
+    assert_eq!(
+        post_browser_surface(&f.app, &cookie, id, speaking).await,
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_unsent();
+    assert_eq!(
+        post_browser_surface(&f.app, &cookie, id, open).await,
+        StatusCode::OK
+    );
+    let mut accepted = false;
+    for _ in 0..80 {
+        accepted=f.s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND kind='context_delivery' AND json_extract(data,'$.state')='accepted')",[id],|r|r.get(0)).unwrap();
+        if accepted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        accepted,
+        "fresh open browser should deliver the saved exact result"
+    );
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    let appends: Vec<Value> = commands
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|v: &Value| v["op"] == "append")
+        .collect();
+    assert_eq!(appends.len(), 1);
+    assert_eq!(appends[0]["delegation_id"], "floor-source");
+    assert!(
+        appends[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("One settled answer")
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM input_deliveries WHERE id='floor-source'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_tool_grants WHERE call_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let capture = request(
+        &f,
+        "POST",
+        &format!("/api/v1/companion/calls/{id}/tools/capture"),
+        Some(
+            json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"floor-source"}),
+        ),
+    )
+    .await;
+    assert!(
+        capture.0.is_client_error(),
+        "telemetry must not enable disabled capture tools"
+    );
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_surface_commands WHERE call_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
     );
     end(&f, id).await;
 }

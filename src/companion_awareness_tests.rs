@@ -304,7 +304,15 @@ async fn entered(f: &Fixture, name: &str) {
     .unwrap();
 }
 async fn run(f: &Fixture) -> Result<()> {
-    tick(&f.s, &f.id, &f.headers).await
+    tick(&f.s, &f.id, &f.headers).await?;
+    while let Some(batch) = crate::companion_delivery::take_ready(&f.s, &f.id)? {
+        if let Some(sender) = f.s.companion.controls.lock().unwrap().get(&f.id).cloned() {
+            for command in batch["commands"].as_array().unwrap() {
+                let _ = sender.try_send(command.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -377,7 +385,7 @@ async fn ready_source_removed_from_policy_never_appends_or_reevaluates() {
     for removed in ["audience", "source", "owner"] {
         let f = fixture();
         run(&f).await.unwrap();
-        assert_eq!(states(&f), vec!["ready"]);
+        assert_eq!(states(&f), vec!["context_queued"]);
         observations(&f, vec![]);
         rewrite_policy(&f, |v| match removed {
             "audience" => v["agents"]["default"][0]["audiences"] = json!([]),
@@ -388,12 +396,7 @@ async fn ready_source_removed_from_policy_never_appends_or_reevaluates() {
         run(&f).await.unwrap();
         assert!(rx.try_recv().is_err(), "{removed}");
         assert_eq!(calls(&f, "decision").len(), 1);
-        assert!(
-            !states(&f)
-                .iter()
-                .any(|v| v == "ready" || v == "context_queued"),
-            "{removed}"
-        );
+        assert!(!states(&f).iter().any(|v| v == "ready"), "{removed}");
     }
 }
 
@@ -501,7 +504,7 @@ async fn crash_after_paid_intent_is_unknown_and_never_replayed() {
 }
 
 #[tokio::test]
-async fn full_source_reaches_voice_without_backend_lookup_or_lost_qualifiers() {
+async fn oversized_whole_report_stays_saved_without_partial_voice_claim() {
     let f = fixture();
     let mut event = source_event();
     event["text"] = json!(format!(
@@ -512,37 +515,21 @@ async fn full_source_reaches_voice_without_backend_lookup_or_lost_qualifiers() {
     let mut rx = quiet_browser(&f);
     run(&f).await.unwrap();
     assert_eq!(cards(&f)[0]["text"], event["text"]);
-    let mut commands = Vec::new();
-    while let Ok(command) = rx.try_recv() {
-        commands.push(command);
-    }
-    assert!(commands.len() > 2);
-    let mut body = String::new();
-    for command in &commands {
-        assert_eq!(command["channel"], "thinking");
-        let content = command["content"].as_str().unwrap();
-        assert!(content.len() <= 480);
-        if let Some((_, part)) = content.split_once(":\n") {
-            body.push_str(part);
-        }
-    }
-    assert!(body.ends_with(event["text"].as_str().unwrap()));
-    assert!(body.contains("The final check FAILED; do not claim completion."));
-    assert!(!body.contains("Retrieve with companion_shared"));
-    assert_eq!(states(&f), vec!["context_queued"]);
-    for command in commands.iter().take(commands.len() - 1) {
-        provider_event(
-            &f.s,
-            &f.id,
-            &json!({"type":"session.thinking.appended","client_event_id":command["event_id"]}),
-        )
-        .unwrap();
-        assert_eq!(states(&f), vec!["context_queued"]);
-    }
-    provider_event(&f.s,&f.id,&json!({"type":"session.thinking.appended","client_event_id":commands.last().unwrap()["event_id"]})).unwrap();
+    let command = rx.try_recv().unwrap();
+    let text = command["content"].as_str().unwrap();
+    assert!(text.len() <= 480);
+    assert!(text.contains("complete text does not fit"));
+    assert!(text.contains("do not infer an answer or completion"));
+    assert!(!text.contains("Detailed source observation"));
+    assert!(rx.try_recv().is_err());
+    provider_event(
+        &f.s,
+        &f.id,
+        &json!({"type":"session.thinking.appended","client_event_id":command["event_id"]}),
+    )
+    .unwrap();
     assert_eq!(states(&f), vec!["context_accepted"]);
     run(&f).await.unwrap();
-    assert!(rx.try_recv().is_err());
     assert_eq!(calls(&f, "decision").len(), 1);
 }
 
@@ -627,8 +614,8 @@ async fn official_nested_append_error_requires_unambiguous_identity_and_never_re
 }
 
 #[tokio::test]
-async fn speaking_recent_transcript_or_new_delegation_defers_even_high_confidence_notice() {
-    for blocked in ["speaking", "transcript", "delegation", "stale-browser"] {
+async fn speaking_recent_transcript_or_unknown_floor_defers_even_high_confidence_notice() {
+    for blocked in ["speaking", "transcript", "stale-browser"] {
         let f = fixture();
         std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
         let mut rx = quiet_browser(&f);
@@ -659,7 +646,7 @@ async fn speaking_recent_transcript_or_new_delegation_defers_even_high_confidenc
         }
         run(&f).await.unwrap();
         assert!(rx.try_recv().is_err(), "{blocked}");
-        assert_eq!(states(&f), vec!["ready"], "{blocked}");
+        assert_eq!(states(&f), vec!["context_queued"], "{blocked}");
         assert_eq!(cards(&f).len(), 1);
     }
 }
@@ -723,7 +710,7 @@ async fn peer_source_attribution_reaches_decisions_cards_and_voice_without_actor
     assert_eq!(card["source"], event);
     let append = rx.try_recv().unwrap();
     let content = append["content"].as_str().unwrap();
-    for required in ["Rook", "minecraft", "message", "not verified"] {
+    for required in ["Rook", "Workshop", "not verified"] {
         assert!(content.contains(required), "{content}");
     }
     assert!(!content.contains("Coach"));
@@ -1442,8 +1429,8 @@ fn queued_and_unknown_outcomes_preserve_unset_conversation_scope() {
             &[json!({"request_id":"original-call-request"})]
         ));
         let text = observation_text("Coach", &update);
-        assert!(text.contains("\"conversation_only\":null"));
-        assert!(!text.contains("\"conversation_only\":false"));
+        assert!(text.contains("conversation-only scope is unknown"));
+        assert!(!text.contains("not limited to conversation"));
         assert!(!text.contains("handling ended"));
         if delivery == "queued" {
             assert!(text.contains("recorded this input as queued"));
@@ -1557,4 +1544,554 @@ fn outcome_raw_validation_rejects_mismatched_delivery_and_malformed_public_reply
         wrong["responses"] = json!([reply]);
         assert!(!observation_valid(&wrong, &known), "{wrong}");
     }
+}
+
+fn retained_action(f: &Fixture) -> (String, String) {
+    let request = uuid::Uuid::new_v4().to_string();
+    let queue = uuid::Uuid::new_v4().to_string();
+    let input = uuid::Uuid::new_v4().to_string();
+    let delegation = uuid::Uuid::new_v4().to_string();
+    let at = now_ms();
+    let text = "Find why this stopped; preserve the existing request.";
+    let source = json!({"call_id":f.id,"conversation_id":f.room,"actor":"owner","audience":"private","delegation_id":delegation,"message_id":input,"occurred_at":at,"original_text":text,"source_revision":auth::digest(text)});
+    let receipt = json!({"request_id":request,"state":"queued","scope":"private_operator_instruction","receipt":{"request_id":queue,"queued":true}});
+    let db = f.s.db.lock().unwrap();
+    db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user',?3,'complete',?4,?4,'owner')",params![input,f.room,text,at]).unwrap();
+    db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,?2,100,'completed',?3,?4)",params![f.id,delegation,input,at]).unwrap();
+    db.execute(
+        "INSERT INTO companion_actions VALUES(?1,?2,?3,'minecraft',?4,?5,'queued',?6,?7)",
+        params![
+            f.id,
+            request,
+            delegation,
+            text,
+            source.to_string(),
+            receipt.to_string(),
+            at
+        ],
+    )
+    .unwrap();
+    bind_action_observer(&f.s, &db, &f.id, &request, "minecraft").unwrap();
+    (request, queue)
+}
+fn another_call(f: &Fixture, owner: &str) -> String {
+    let room =
+        f.s.create_room("Next call", owner, &["default".into()])
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let id = uuid::Uuid::new_v4().to_string();
+    let hash =
+        auth::digest(&serde_json::to_string(&f.s.agent("default").unwrap().unwrap()).unwrap());
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at,endpoint_hash) VALUES(?1,?2,?3,'test','default',?4,'connected',?5,?5,?6)",params![id,owner,uuid::Uuid::new_v4().to_string(),room,now_ms(),hash]).unwrap();
+    id
+}
+fn returned_outcome(f: &Fixture, request: &str, queue: &str, terminal: bool) -> Value {
+    let mut outcome = outcome_update(
+        if terminal { "terminal" } else { "admitted" },
+        if terminal { "settled" } else { "admitted" },
+        json!(true),
+    );
+    outcome["request_id"] = json!(request);
+    outcome["connection_id"] = json!("minecraft");
+    outcome["revision"] = json!(if terminal {
+        "terminal-v2"
+    } else {
+        "admitted-v1"
+    });
+    outcome["provenance"]["source_id"] = json!(queue);
+    outcome["source_ids"] = json!([queue]);
+    outcome["conversation"]["blocked_reason"] = json!("unresolved_activity_effects");
+    outcome["conversation"]["admitted_at"] = json!(timestamp(now_ms() - 1000));
+    outcome["conversation"]["terminal_at"] = if terminal {
+        json!(timestamp(now_ms()))
+    } else {
+        Value::Null
+    };
+    outcome["task_authorizations"] =
+        json!([{"operation":"amend","task_id":"original-task","authority_revision":2}]);
+    outcome["responses"] = if terminal {
+        json!([{"id":"public-report","audience":"public","at":timestamp(now_ms()),"text":"Construction has not resumed; the existing action receipt needs review."}])
+    } else {
+        json!([])
+    };
+    let mut response = fresh_result(f, vec![]);
+    response["actions"] = json!([outcome.clone()]);
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        response.to_string(),
+    )
+    .unwrap();
+    outcome
+}
+
+#[tokio::test]
+async fn closed_call_collects_exact_terminal_without_decision_or_replay_and_next_call_reads_it() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&f.id],
+        )
+        .unwrap();
+    let expected = returned_outcome(&f, &request, &queue, true);
+    assert!(
+        followthrough_tick(&f.s, &f.id, &f.headers, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        action_observation(&f.s, &f.id, &request).unwrap(),
+        Some(expected)
+    );
+    assert!(
+        !followthrough_tick(&f.s, &f.id, &f.headers, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(calls(&f, "observer").len(), 1);
+    assert_eq!(
+        calls(&f, "observer")[0]["actions"][0]["receipt"]["receipt"]["request_id"],
+        queue
+    );
+    assert!(calls(&f, "decision").is_empty());
+    let new = another_call(&f, "owner");
+    let slot = action_observation_for_call(&f.s, &new, &request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(slot["source_call_id"], f.id);
+    assert_eq!(slot["observation"]["delivery_state"], "terminal");
+    assert_eq!(slot["fulfillment"], "not_established");
+    assert_eq!(slot["automatic_replay_allowed"], false);
+    assert!(
+        slot["latest_fact"]
+            .as_str()
+            .unwrap()
+            .contains("change to the existing assignment")
+    );
+    assert!(
+        slot["latest_fact"]
+            .as_str()
+            .unwrap()
+            .contains("Construction has not resumed")
+    );
+    let history = crate::companion_history::snapshot(&f.s, &new)
+        .unwrap()
+        .unwrap();
+    assert_eq!(history["action_outcomes"][0]["request_id"], request);
+    assert!(history["action_outcomes"][0].get("observation").is_none());
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(cards(&f).is_empty());
+}
+
+#[tokio::test]
+async fn later_call_refreshes_original_pending_receipt_without_copying_action_authority() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    returned_outcome(&f, &request, &queue, false);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&f.id],
+        )
+        .unwrap();
+    followthrough_tick(&f.s, &f.id, &f.headers, false)
+        .await
+        .unwrap();
+    let new = another_call(&f, "owner");
+    returned_outcome(&f, &request, &queue, true);
+    followthrough_tick(&f.s, &new, &f.headers, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        action_observation(&f.s, &f.id, &request).unwrap().unwrap()["state"],
+        "settled"
+    );
+    assert!(action_observation(&f.s, &new, &request).unwrap().is_none());
+    let facts = current_observations(&f.s, &new).unwrap();
+    assert!(facts.to_string().contains("Construction has not resumed"));
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_actions WHERE call_id=?1",
+                [&new],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn cross_call_outcomes_refuse_changed_actor_endpoint_policy_and_duplicate_queue() {
+    for change in [
+        "owner",
+        "endpoint",
+        "source",
+        "message",
+        "audience",
+        "duplicate",
+    ] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE companion_calls SET state='closed' WHERE id=?1",
+                [&f.id],
+            )
+            .unwrap();
+        let destination = another_call(&f, if change == "owner" { "other" } else { "owner" });
+        match change {
+            "endpoint" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_calls SET endpoint_hash='different' WHERE id=?1",
+                        [&destination],
+                    )
+                    .unwrap();
+            }
+            "source" => rewrite_policy(&f, |value| {
+                value["agents"]["default"][0]["audiences"] = json!([])
+            }),
+            "message" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE messages SET text='Changed original source' WHERE role='user'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "audience" => {
+                f.s.db.lock().unwrap().execute("UPDATE companion_actions SET source=json_set(source,'$.audience','public')",[]).unwrap();
+            }
+            "duplicate" => {
+                f.s.db.lock().unwrap().execute("INSERT INTO companion_actions SELECT call_id,'duplicate','another-delegation',connection_id,instruction,source,state,result,created_at FROM companion_actions",[]).unwrap();
+            }
+            _ => (),
+        }
+        returned_outcome(&f, &request, &queue, true);
+        assert!(
+            !followthrough_tick(&f.s, &destination, &f.headers, true)
+                .await
+                .unwrap(),
+            "{change}"
+        );
+        assert!(
+            action_observation_for_call(&f.s, &destination, &request)
+                .unwrap()
+                .is_none(),
+            "{change}"
+        );
+        assert!(calls(&f, "observer").is_empty(), "{change}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_receipt_remains_unknown_and_missing_enrollment_is_not_recreated() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&f.id],
+        )
+        .unwrap();
+    let mut update = returned_outcome(&f, &request, &queue, false);
+    update["delivery_state"] = json!("unknown");
+    update["state"] = json!("unknown");
+    update["conversation"]["conversation_only"] = Value::Null;
+    update["revision"] = json!("unknown-v1");
+    let mut response = fresh_result(&f, vec![]);
+    response["actions"] = json!([update]);
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        response.to_string(),
+    )
+    .unwrap();
+    followthrough_tick(&f.s, &f.id, &f.headers, false)
+        .await
+        .unwrap();
+    let new = another_call(&f, "owner");
+    assert_eq!(
+        action_observation_for_call(&f.s, &new, &request)
+            .unwrap()
+            .unwrap()["observation"]["state"],
+        "unknown"
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM companion_action_observers", [])
+        .unwrap();
+    assert!(
+        !followthrough_tick(&f.s, &new, &f.headers, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        action_observation_for_call(&f.s, &new, &request)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn current_snapshot_is_presented_without_forging_old_progress_time() {
+    let f = fixture();
+    let old = timestamp(now_ms() - 14 * 3600 * 1000);
+    let mut event = source_event();
+    event["kind"] = json!("task_observation");
+    event["occurred_at"] = json!(old);
+    event["observed_at"] = json!(timestamp(now_ms()));
+    event["provenance"] = json!({"kind":"minecraft_current_task","current_state_snapshot":true});
+    event["text"] = json!(json!({"status":"running","progress":{"at":old}}).to_string());
+    observations(&f, vec![event.clone()]);
+    let mut rx = quiet_browser(&f);
+    run(&f).await.unwrap();
+    assert_eq!(calls(&f, "decision").len(), 1);
+    let command = rx.try_recv().unwrap();
+    let text = command["content"].as_str().unwrap();
+    assert!(text.contains("status running"));
+    assert!(text.contains(&old));
+    assert!(text.contains("does not prove a game action"));
+    let facts = current_observations(&f.s, &f.id).unwrap();
+    assert_eq!(facts["observations"][0]["source"]["occurred_at"], old);
+    event["observed_at"] = json!(timestamp(now_ms() + 1000));
+    observations(&f, vec![event]);
+    run(&f).await.unwrap();
+    assert_eq!(calls(&f, "decision").len(), 1);
+}
+
+#[test]
+fn retained_request_binds_human_text_and_wrapper_evidence_separately() {
+    let f = fixture();
+    let (request, _) = retained_action(&f);
+    let human = "Please diagnose and resume the same work.";
+    let wrapper = "Private prior context, instructions, current source, and tool references.";
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("UPDATE messages SET text=?1 WHERE role='user'", [wrapper])
+            .unwrap();
+        db.execute(
+            "UPDATE companion_delegations SET request_text=?1 WHERE call_id=?2",
+            params![human, f.id],
+        )
+        .unwrap();
+        db.execute("UPDATE companion_actions SET source=json_set(source,'$.original_text',?1,'$.source_revision',?2,'$.evidence_revision',?3) WHERE request_id=?4",params![human,auth::digest(human),auth::digest(wrapper),request]).unwrap();
+        assert!(original_source_valid(&db, &f.id, &request).unwrap());
+        db.execute("UPDATE companion_delegations SET request_text='Changed human instruction' WHERE call_id=?1",[&f.id]).unwrap();
+        assert!(!original_source_valid(&db, &f.id, &request).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn revoked_read_in_flight_retains_no_domain_response() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&f.id],
+        )
+        .unwrap();
+    returned_outcome(&f, &request, &queue, true);
+    std::fs::write(f.home.path().join("observer-block"), "").unwrap();
+    let (state, id, headers) = (f.s.clone(), f.id.clone(), f.headers.clone());
+    let pending =
+        tokio::spawn(async move { followthrough_tick(&state, &id, &headers, false).await });
+    entered(&f, "observer").await;
+    rewrite_policy(&f, |value| {
+        value["agents"]["default"][0]["owners"] = json!(["other"])
+    });
+    std::fs::remove_file(f.home.path().join("observer-block")).unwrap();
+    assert!(!pending.await.unwrap().unwrap());
+    assert!(action_observation(&f.s, &f.id, &request).unwrap().is_none());
+    assert!(cards(&f).is_empty());
+    assert!(calls(&f, "decision").is_empty());
+}
+
+#[test]
+fn mismatched_domain_queue_and_malformed_amendment_cannot_become_facts() {
+    let known = [
+        json!({"request_id":"original-call-request","receipt":{"receipt":{"request_id":"expected-domain-input"}}}),
+    ];
+    let mut update = outcome_update("terminal", "settled", json!(true));
+    assert!(!observation_valid(&update, &known));
+    update["provenance"]["source_id"] = json!("expected-domain-input");
+    assert!(observation_valid(&update, &known));
+    for wrong in [
+        json!({"operation":"amend","task_id":"task","authority_revision":false}),
+        json!({"operation":"execute","task_id":"task","authority_revision":1}),
+    ] {
+        update["task_authorizations"] = json!([wrong]);
+        assert!(!observation_valid(&update, &known));
+    }
+}
+
+#[test]
+fn scoped_outcome_requires_exact_original_actor_audience_and_source_receipt() {
+    let request = uuid::Uuid::new_v4().to_string();
+    let queue = uuid::Uuid::new_v4().to_string();
+    let source = json!({"version":1,"request_id":request,"call_id":"original-call","intent_id":"original-intent",
+        "revision":"original-human-text-revision","occurred_at":timestamp(now_ms()),
+        "actor":{"id":"authenticated-human","label":"authenticated-human"},
+        "audience":{"kind":"private","experience":"companion","id":"original-room"}});
+    let action = json!({"request_id":request,"receipt":{"request_id":request,"state":"queued","scope":"private_installation_input",
+        "protocol":"installation_inputs.v1","caller_id":"companion","source":source,
+        "receipt":{"queued":true,"request_id":queue,"source_request_id":request}}});
+    let mut update = outcome_update("terminal", "settled", json!(true));
+    update["request_id"] = json!(request);
+    update["provenance"]["source_id"] = json!(queue);
+    update["installation_source"] = source;
+    update["installation_source"]["caller"] = json!({"id":"companion","label":"Companion"});
+    update["domain_response_association"] = json!("shared_turn");
+    update["private_game_responses_included"] = json!(false);
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    for (key, replacement) in [
+        ("actor", json!({"id":"other-human","label":"other-human"})),
+        (
+            "audience",
+            json!({"kind":"private","experience":"companion","id":"other-room"}),
+        ),
+        ("caller", json!({"id":"other-caller","label":"Other"})),
+        ("call_id", json!("other-call")),
+        ("intent_id", json!("other-intent")),
+        ("revision", json!("other-revision")),
+        ("occurred_at", json!(timestamp(now_ms() - 1000))),
+        ("request_id", json!(uuid::Uuid::new_v4().to_string())),
+    ] {
+        let mut changed = update.clone();
+        changed["installation_source"][key] = replacement;
+        assert!(
+            !observation_valid(&changed, std::slice::from_ref(&action)),
+            "{key}"
+        );
+    }
+    for (key, replacement) in [
+        ("private_game_responses_included", json!(true)),
+        ("private_game_responses_included", json!(0)),
+        (
+            "domain_response_association",
+            json!("individual_fulfillment"),
+        ),
+        ("source_ids", json!([queue, "other-private-source"])),
+    ] {
+        let mut changed = update.clone();
+        changed[key] = replacement;
+        assert!(
+            !observation_valid(&changed, std::slice::from_ref(&action)),
+            "{key}"
+        );
+    }
+    let text = observation_text("Coach", &update);
+    assert!(text.contains("not proof the individual request was answered"));
+    assert!(!text.contains("authenticated-human"));
+    assert!(!text.contains("original-room"));
+    let mut legacy = action.clone();
+    legacy["receipt"]["scope"] = json!("private_operator_instruction");
+    legacy["receipt"]
+        .as_object_mut()
+        .unwrap()
+        .remove("protocol");
+    assert!(!observation_valid(&update, &[legacy]));
+    update["provenance"]["kind"] = json!("minecraft_observation");
+    update["state"] = json!("unknown");
+    for key in [
+        "installation_source",
+        "domain_response_association",
+        "private_game_responses_included",
+    ] {
+        update.as_object_mut().unwrap().remove(key);
+    }
+    assert!(observation_valid(&update, &[action]));
+}
+
+#[test]
+fn retained_action_time_uses_exact_original_fragments_not_later_delegation() {
+    let f = fixture();
+    let (request, _) = retained_action(&f);
+    let db = f.s.db.lock().unwrap();
+    let raw: String = db
+        .query_row(
+            "SELECT source FROM companion_actions WHERE request_id=?1",
+            [&request],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut action: Value = serde_json::from_str(&raw).unwrap();
+    let did = action["delegation_id"].as_str().unwrap().to_owned();
+    let words = action["original_text"].as_str().unwrap();
+    assert_eq!(original_human_source_time(&db, &f.id, &did).unwrap(), None);
+    let old = now_ms() - 7_000_000;
+    let event =
+        json!({"role":"user","event_id":"old-human-event","text":words,"start_ms":10,"end_ms":20});
+    db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'old-human-event','transcript',?2,?3)",params![f.id,event.to_string(),old]).unwrap();
+    let seq = db.last_insert_rowid();
+    let source = json!({"version":1,"fragments":[{"seq":seq,"role":"user","event_id":"old-human-event","text":words,"start_ms":10,"end_ms":20}]});
+    db.execute(
+        "UPDATE companion_delegations SET source=?3 WHERE call_id=?1 AND id=?2",
+        params![f.id, did, source.to_string()],
+    )
+    .unwrap();
+    action["time_basis"] = json!("retained_human_transcript");
+    action["occurred_at"] = json!(old);
+    db.execute(
+        "UPDATE companion_actions SET source=?2 WHERE request_id=?1",
+        params![request, action.to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        original_human_source_time(&db, &f.id, &did).unwrap(),
+        Some(old)
+    );
+    assert!(original_source_valid(&db, &f.id, &request).unwrap());
+    db.execute(
+        "UPDATE companion_events SET data=json_set(data,'$.text','Changed fragment') WHERE seq=?1",
+        [seq],
+    )
+    .unwrap();
+    assert!(original_human_source_time(&db, &f.id, &did).is_err());
+    assert!(!original_source_valid(&db, &f.id, &request).unwrap());
+    db.execute(
+        "UPDATE companion_delegations SET source='broken' WHERE call_id=?1 AND id=?2",
+        params![f.id, did],
+    )
+    .unwrap();
+    assert!(original_human_source_time(&db, &f.id, &did).is_err());
+    assert!(!original_source_valid(&db, &f.id, &request).unwrap());
 }

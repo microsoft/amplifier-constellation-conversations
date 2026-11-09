@@ -167,6 +167,26 @@ class MinecraftObserveTests(unittest.TestCase):
             self.assertFalse(action["verified"])
             self.assertNotEqual(action["state"], "completed")
 
+    def test_current_status_snapshot_preserves_old_progress_time_and_stable_revision(self):
+        old = "2026-11-06T20:00:00+00:00"
+        self.task.update(status="running", progress_revision=2,
+                         progress=[{"at": old, "summary": "Old progress, not current activity"}])
+        first = self.observe()
+        event = next(e for e in first["events"] if e["kind"] == "task_observation")
+        self.assertEqual(event["occurred_at"], old)
+        self.assertEqual(event["observed_at"], NOW)
+        self.assertTrue(event["provenance"]["current_state_snapshot"])
+        self.assertEqual(json.loads(event["text"])["status"], "running")
+        self.assertEqual(json.loads(event["text"])["progress"]["at"], old)
+        second = helper.observe(self.config, {**self.input, "cursor": first["cursor"]},
+                                opener=self, now="2026-11-07T20:10:00+00:00", presence_reader=self.read_presence)
+        self.assertFalse(any(e["kind"] == "task_observation" for e in second["events"]))
+        self.task["status"] = "waiting"
+        changed = self.observe({**self.input, "cursor": first["cursor"]})
+        current = next(e for e in changed["events"] if e["kind"] == "task_observation")
+        self.assertNotEqual(current["revision"], event["revision"])
+        self.assertEqual(current["occurred_at"], old)
+
     def test_different_current_task_cannot_complete_old_action_but_retained_binding_can_be_superseded(self):
         old = self.task.copy()
         self.task = {**self.task, "id": str(uuid.uuid4()), "request_id": "unrelated", "authority": {}}

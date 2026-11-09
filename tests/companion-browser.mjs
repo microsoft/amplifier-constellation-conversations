@@ -5,7 +5,7 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const files = new Map(await Promise.all(['companion.html','companion.js','companion.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
+const files = new Map(await Promise.all(['companion.html','companion.js','companion.css','companion-floor.mjs'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
 const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
 const surfaces = new Map(), surfaceCommands = new Map(), permissions = new Map();
 let holdNextSurfaceAck = false, heldSurfaceAck = null;
@@ -18,7 +18,7 @@ const csrf = 'fixture-csrf';
 const server = createServer(async (request,response) => {
   const url = new URL(request.url,'http://fixture');
   const send = (status,value) => { response.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'}); response.end(JSON.stringify(value)); };
-  if (['/companion','/companion.html','/companion.js','/companion.css'].includes(url.pathname)) {
+  if (['/companion','/companion.html','/companion.js','/companion.css','/companion-floor.mjs'].includes(url.pathname)) {
     const name = url.pathname === '/companion' ? 'companion.html' : url.pathname.slice(1);
     response.writeHead(200,{'Content-Type':name.endsWith('.html')?'text/html':name.endsWith('.css')?'text/css':'text/javascript'}); response.end(files.get(name)); return;
   }
@@ -119,7 +119,7 @@ const browser = await chromium.launch({headless:true,executablePath:process.env.
 const context = await browser.newContext({viewport:{width:1280,height:900}});
 const page = await context.newPage(), errors=[]; page.on('pageerror', error => errors.push(error.message));
 await page.addInitScript(() => {
-  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,delayCamera:false,draws:0,shutters:0,enumerations:0,wakeRequests:0,delayWake:false,denyWake:false,wakeGrants:[],cameras:[{kind:'videoinput',deviceId:'rear-camera',label:'Back camera'},{kind:'videoinput',deviceId:'front-camera',label:'Front camera'}]};
+  const fixture = window.fixture = {media:[],tracks:[],peers:[],channels:[],level:0,micLevel:0,wakeLocks:[],audioContexts:[],delayMic:false,denyCamera:false,delayCamera:false,draws:0,shutters:0,enumerations:0,wakeRequests:0,delayWake:false,denyWake:false,wakeGrants:[],cameras:[{kind:'videoinput',deviceId:'rear-camera',label:'Back camera'},{kind:'videoinput',deviceId:'front-camera',label:'Front camera'}]};
   const actualNow=Date.now;fixture.clockOffset=0;Date.now=()=>actualNow()+fixture.clockOffset;
   const actualInterval=window.setInterval;window.setInterval=(fn,ms,...args)=>{if(ms===500)fixture.controlTick=fn;return actualInterval(fn,ms,...args);};
   const makeStream = (kind,deviceId) => {
@@ -155,8 +155,8 @@ await page.addInitScript(() => {
   window.AudioContext=class {
     constructor(){this.closed=false;this.state='running';this.sampleRate=48000;this.destination={};fixture.audioContexts.push(this);}
     async resume(){this.state='running';} async suspend(){this.state='suspended';} async close(){this.closed=true;this.state='closed';}
-    createMediaStreamSource(){return {connect(){},disconnect(){}};}
-    createAnalyser(){return {fftSize:256,getByteTimeDomainData(values){values.fill(128+fixture.level);}};}
+    createMediaStreamSource(stream){return {connect(node){node.fixtureKind=stream.getAudioTracks().length?'mic':'output';},disconnect(){}};}
+    createAnalyser(){return {fftSize:256,getByteTimeDomainData(values){values.fill(128+(this.fixtureKind==='mic'?fixture.micLevel:fixture.level));}};}
     createBuffer(channels,length,rate){const samples=new Float32Array(length);return {getChannelData:()=>samples};}
     createBufferSource(){return {connect(){},disconnect(){},start(){if(this.buffer.getChannelData(0).some(x=>x!==0))fixture.shutters++;}};}
   };
@@ -251,6 +251,33 @@ try {
   assert.doesNotMatch(await page.locator('#transcript').innerText(),/DUPLICATE/);
   await page.evaluate(()=>{fixture.level=20;}); await page.locator('.presence.speaking').waitFor();
   await page.evaluate(()=>{fixture.level=0;}); await wait(async()=>await page.locator('.presence.speaking').count()===0,'speaker meter did not settle');
+  // Browser media routing, not generated captions, owns suppression. The
+  // microphone and output energies are independent fixtures in this test.
+  await page.evaluate(()=>{fixture.level=20;fixture.micLevel=0;});
+  await page.waitForTimeout(150);
+  await page.evaluate(()=>{fixture.micLevel=20;}); await page.waitForTimeout(250);
+  await page.evaluate(()=>{fixture.micLevel=0;});
+  assert.equal(await page.locator('#remote-audio').evaluate(node=>node.muted),false,'brief listener response must preserve duplex');
+  await page.waitForTimeout(350);await page.evaluate(()=>{fixture.micLevel=20;});
+  await wait(async()=>page.locator('#remote-audio').evaluate(node=>node.muted),'sustained human speech did not suppress playback');
+  const floorReceipt=()=>[...surfaces.values()].find(value=>value.playback?.state==='suppressed');
+  await wait(async()=>Boolean(floorReceipt()?.interruption),'interruption was not reported');
+  const interruptionId=floorReceipt().interruption.id;
+  assert.match(interruptionId,/^[0-9a-f-]{36}$/);assert.equal(floorReceipt().interruption.phase,'suppressed');
+  assert.equal(await page.locator('#remote-audio').evaluate(node=>node.paused),false,'suppression must consume and drop, never pause queued live audio');
+  await page.evaluate(()=>{fixture.micLevel=0;});await page.waitForTimeout(2100);
+  assert.equal(await page.locator('#remote-audio').evaluate(node=>node.muted),true,'mic silence must not resume the middle of continuing output');
+  await page.evaluate(()=>{fixture.level=0;document.getElementById('remote-audio').dispatchEvent(new Event('waiting'));});
+  await page.waitForTimeout(1500);
+  assert.equal(await page.locator('#remote-audio').evaluate(node=>node.muted),true,'buffering must not count as observed quiet');
+  await wait(async()=>[...surfaces.values()].some(value=>value.playback?.floor==='unknown'),'buffering must report an unknown floor');
+  await page.evaluate(()=>document.getElementById('remote-audio').dispatchEvent(new Event('playing')));
+  await wait(async()=>page.locator('#remote-audio').evaluate(node=>!node.muted),'quiet-boundary recovery did not release playback');
+  await wait(async()=>[...surfaces.values()].some(value=>value.interruption?.id===interruptionId&&value.interruption.phase==='released'),'stable release receipt missing');
+  const released=[...surfaces.values()].find(value=>value.interruption?.id===interruptionId);
+  assert.equal(released.playback.floor,'open');assert.equal(released.playback.output_active,false);
+  assert.equal(requests.filter(r=>r.path==='/api/v1/companion/calls').length,1,'interruption must preserve the same call');
+  checks.push('short backchannel stays duplex; sustained overlap drops output without pausing, stable interruption telemetry and quiet-boundary recovery preserve call');
   const captionBeforeProgress=await page.locator('#caption-text').innerText();
   emit('progress',{delegation_id:'d1',request_id:'request-1',state:'submitted',elapsed_seconds:65});
   await wait(async()=>/65 seconds/.test(await page.locator('#work-status').innerText()),'quiet pending receipt missing');
@@ -993,12 +1020,14 @@ try {
   assert(await page.evaluate(()=>fixture.peers.every(peer=>peer.closed)),'terminal observation must release any retained old transport');
   await page.getByRole('button',{name:'Call Coach',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','new explicit call did not connect');
-  const latestCall=[...calls.values()].at(-1),writesBeforeLate=requests.filter(r=>r.method!=='GET').length;
+  // A newer active call legitimately reports fresh browser media state.
+  const substantiveWrites=()=>requests.filter(r=>r.method!=='GET'&&!r.path.endsWith('/surface/presence')&&!r.path.endsWith('/heartbeat')).length;
+  const latestCall=[...calls.values()].at(-1),writesBeforeLate=substantiveWrites();
   heldClose();heldClose=null;await deliverOldCatalog();await page.waitForTimeout(200);
   await page.unroute('**/api/v1/companion');
   assert(await page.locator('#call-recovery').isHidden());assert(await page.locator('#call-screen').isVisible());
   assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
-  assert.equal(requests.filter(r=>r.method!=='GET').length,writesBeforeLate);
+  assert.equal(substantiveWrites(),writesBeforeLate);
   assert.equal(await page.evaluate(()=>fixture.peers.at(-1).closed||fixture.tracks.at(-1).stopped),false);
   assert.equal([...calls.values()].at(-1).id,latestCall.id);
   await page.locator('#hangup').click();await wait(async()=>await page.locator('#call-recovery').isHidden(),'last call did not settle');

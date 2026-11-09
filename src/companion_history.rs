@@ -6,13 +6,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 const MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
-const MAX_BYTES: usize = 10 * 1024;
-const SPEECH_BYTES: usize = 4500;
+const MAX_BYTES: usize = 6 * 1024;
+const SPEECH_BYTES: usize = 2000;
 
-struct Call {
-    owner: String,
-    agent: String,
-    room: String,
+pub(crate) struct Call {
+    pub(crate) owner: String,
+    pub(crate) agent: String,
+    pub(crate) room: String,
     state: String,
     created_at: i64,
     endpoint_hash: String,
@@ -20,7 +20,7 @@ struct Call {
 
 /// Revalidate source and destination under one read transaction. In particular,
 /// a formerly shared room stays excluded even after its extra members leave.
-fn private_call(db: &Connection, id: &str) -> Result<Option<Call>> {
+pub(crate) fn private_identity(db: &Connection, id: &str) -> Result<Option<Call>> {
     let row = db.query_row(
         "SELECT c.owner,c.agent_id,c.conversation_id,c.state,c.created_at,c.endpoint_hash,e.config FROM companion_calls c JOIN conversations r ON r.id=c.conversation_id AND r.owner=c.owner AND r.shared=0 JOIN agent_endpoints e ON e.id=c.agent_id WHERE c.id=?1 AND (SELECT COUNT(*) FROM room_members WHERE conversation_id=c.conversation_id)=1 AND EXISTS(SELECT 1 FROM room_members WHERE conversation_id=c.conversation_id AND username=c.owner AND role='owner') AND (SELECT COUNT(*) FROM room_agents WHERE conversation_id=c.conversation_id)=1 AND EXISTS(SELECT 1 FROM room_agents WHERE conversation_id=c.conversation_id AND agent_id=c.agent_id)",
         [id],
@@ -38,19 +38,81 @@ fn private_call(db: &Connection, id: &str) -> Result<Option<Call>> {
     Ok(Some(call))
 }
 
+pub(crate) fn same_private_identity(
+    db: &Connection,
+    destination: &str,
+    origin: &str,
+) -> Result<bool> {
+    let (Some(current), Some(prior)) = (
+        private_identity(db, destination)?,
+        private_identity(db, origin)?,
+    ) else {
+        return Ok(false);
+    };
+    Ok(current.owner == prior.owner
+        && current.agent == prior.agent
+        && current.endpoint_hash == prior.endpoint_hash)
+}
+
 /// Saved context for the latest terminal call to this same owner and endpoint.
 /// No transcripts, cards, uploads or results from another audience are searched.
 /// The caller supplies this as historical source data, never system instructions.
 pub(crate) fn snapshot(s: &AppState, current_call_id: &str) -> Result<Option<Value>> {
-    let db = s.db.lock().unwrap();
-    let tx = db.unchecked_transaction()?;
-    let value = read_snapshot(&tx, current_call_id)?;
-    tx.commit()?;
+    let mut value = {
+        let db = s.db.lock().unwrap();
+        let tx = db.unchecked_transaction()?;
+        let value = read_snapshot(&tx, current_call_id)?;
+        tx.commit()?;
+        value
+    };
+    let mut outcomes = crate::companion_awareness::retained_action_outcomes(s, current_call_id)?;
+    if !outcomes.is_empty() {
+        let context=value.get_or_insert_with(||json!({"kind":"private_prior_call_context","action_authority":false,"automatic_resume_authorized":false,"recent_speech":[],"requests":[],"omitted":false}));
+        // Keep whole outcome slots; the detailed original-call receipt remains
+        // available through exact authorized lookup, never silently summarized.
+        for outcome in &mut outcomes {
+            outcome.as_object_mut().unwrap().remove("observation");
+        }
+        context["action_outcomes"] = json!(outcomes);
+        while context.to_string().len() > MAX_BYTES {
+            context["omitted"] = json!(true);
+            if context["recent_speech"]
+                .as_array_mut()
+                .is_some_and(|rows| !rows.is_empty())
+            {
+                context["recent_speech"].as_array_mut().unwrap().remove(0);
+            } else if context["action_outcomes"].as_array().unwrap().len() > 1 {
+                context["action_outcomes"].as_array_mut().unwrap().pop();
+            } else if context["requests"]
+                .as_array_mut()
+                .is_some_and(|rows| !rows.is_empty())
+            {
+                // Adding a retained outcome can exceed the bound even after
+                // read_snapshot bounded the earlier requests on their own.
+                // Omit whole context references, never their canonical rows.
+                context["requests"].as_array_mut().unwrap().pop();
+            } else if context["action_outcomes"]
+                .as_array_mut()
+                .and_then(|rows| rows.first_mut())
+                .and_then(Value::as_object_mut)
+                .is_some_and(|slot| slot.remove("latest_fact").is_some())
+            {
+                context["action_outcomes"][0]["latest_fact_omitted"] = json!(true);
+            } else if !context["action_outcomes"].as_array().unwrap().is_empty() {
+                context["action_outcomes"].as_array_mut().unwrap().pop();
+            } else {
+                // Future metadata additions must not turn a context budget
+                // into an unbounded prompt or disconnect the new call.
+                *context = json!({"kind":"private_prior_call_context","action_authority":false,"automatic_resume_authorized":false,"recent_speech":[],"requests":[],"action_outcomes":[],"omitted":true});
+                break;
+            }
+        }
+    }
     Ok(value)
 }
 
 fn read_snapshot(db: &Connection, current_call_id: &str) -> Result<Option<Value>> {
-    let Some(current) = private_call(db, current_call_id)? else {
+    let Some(current) = private_identity(db, current_call_id)? else {
         return Ok(None);
     };
     if !["starting", "connecting", "connected"].contains(&current.state.as_str()) {
@@ -66,7 +128,7 @@ fn read_snapshot(db: &Connection, current_call_id: &str) -> Result<Option<Value>
     };
     // Do not skip an invalid recent call and silently present an older one as
     // the conversation the person just left.
-    let Some(prior) = private_call(db, &prior_id)? else {
+    let Some(prior) = private_identity(db, &prior_id)? else {
         return Ok(None);
     };
     let (speech, speech_omitted) = recent_speech(db, &prior_id)?;
@@ -85,7 +147,9 @@ fn read_snapshot(db: &Connection, current_call_id: &str) -> Result<Option<Value>
         "automatic_resume_authorized":false,
         "assistant_playback":"unconfirmed",
         "result_delivery_to_caller":"unconfirmed",
-        "coverage":"bounded saved source fragments and exact input/result receipts; not a complete conversation or proof of current external activity",
+        "coverage":"Earlier human goals/questions and exact delivery/outcome references. This is not current status or proof every question was answered. Fresh direct observations supersede historical assistant claims; preserve the original progress/report times.",
+        "current_status":"requires_current_evidence",
+        "prior_assistant_prose_included":false,
         "fragment_fields":["event_seq","start_ms","end_ms","text"],
         "recent_speech":speech,
         "requests":requests,
@@ -141,7 +205,7 @@ fn recent_speech(db: &Connection, call: &str) -> Result<(Vec<Value>, bool)> {
             omitted = true;
             continue;
         };
-        if !["user", "assistant"].contains(&role) || text.is_empty() || start < 0 || end < start {
+        if role != "user" || text.is_empty() || start < 0 || end < start {
             omitted = true;
             continue;
         }
@@ -179,11 +243,11 @@ fn recent_requests(db: &Connection, call: &str, prior: &Call) -> Result<(Vec<Val
         Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?))
     })?.map(|row| {
         let (request,state,updated,result,status,text,original_bytes,delegation,delegation_state)=row?;
-        let mut value=json!({"request_id":request,"delivery_state":state,"observed_at":updated,"delegation_id":delegation,"delegation_state":delegation_state,"result_message_id":result,"result_status":status,"saved_result_available":text.is_some()});
+        let mut value=json!({"request_id":request,"delivery_state":state,"observed_at":updated,"delegation_id":delegation,"delegation_state":delegation_state,"result_message_id":result,"result_status":status,"saved_result_available":text.is_some(),"fulfillment":"not_established"});
         if let Some(text)=text {
             let mut end=text.len().min(900);
             while !text.is_char_boundary(end) {end-=1;}
-            value["result_excerpt"]=json!(&text[..end]);
+            value["answer_coverage"]=json!("not_established");
             value["result_excerpt_omitted"]=json!(original_bytes.unwrap_or(text.len() as i64)>end as i64);
             value["result_url"]=json!(format!("/api/v1/companion/calls/{call}/results/{}",result.unwrap()));
         }
@@ -210,7 +274,7 @@ mod tests {
         _home: tempfile::TempDir,
         s: Arc<AppState>,
         old: String,
-        room: String,
+        pub(crate) room: String,
         new: String,
     }
 
@@ -417,6 +481,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn history_keeps_human_goal_and_exact_result_reference_not_stale_assistant_prose() {
+        let f = fixture();
+        request(&f, "completed", Some("result"));
+        result(
+            &f,
+            &f.room,
+            "default",
+            "complete",
+            "Needs review; last progress was fourteen hours ago.",
+        );
+        speech(
+            &f.s,
+            &f.old,
+            "assistant",
+            300,
+            400,
+            "Needs review; last progress was fourteen hours ago.",
+        );
+        let value = snapshot(&f.s, &f.new).unwrap().unwrap();
+        assert!(!value.to_string().contains("fourteen hours"));
+        assert!(
+            value["recent_speech"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["role"] == "user")
+        );
+        assert_eq!(value["requests"][0]["saved_result_available"], true);
+        assert_eq!(value["requests"][0]["fulfillment"], "not_established");
+        assert!(
+            value["requests"][0]["result_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/results/result")
+        );
+        assert_eq!(value["current_status"], "requires_current_evidence");
+    }
+
+    #[test]
+    fn mixed_request_references_and_outcome_respect_serialized_bound_without_erasing_evidence() {
+        let f = fixture();
+        std::fs::write(f._home.path().join("companion-awareness.json"),json!({"enabled":true,"decision_command":["/bin/true"],"agents":{"default":[{"id":"minecraft","label":"Workshop","command":["/bin/true"],"owners":["owner"],"audiences":[]}]}}).to_string()).unwrap();
+        let request = uuid::Uuid::new_v4().to_string();
+        let text = "Inspect the existing work; do not repeat it.";
+        let at = now_ms();
+        let observation = json!({"request_id":request,"scope":"conversation","state":"settled","delivery_state":"terminal","verified":false,"revision":"observed","observed_at":"2026-11-09T12:00:00Z","provenance":{"kind":"minecraft_input_outcome","version":1},"conversation":{"conversation_only":true},"responses":[{"id":"public-reply","audience":"public","at":"2026-11-09T12:00:00Z","text":"\"".repeat(2000)}]});
+        {
+            let db = f.s.db.lock().unwrap();
+            for index in 0..4 {
+                let input = uuid::Uuid::new_v4().to_string();
+                let result = uuid::Uuid::new_v4().to_string();
+                let delegation = format!("{index}{}", "d".repeat(159));
+                db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user',?3,'complete',?4,?4,'owner')",params![input,f.room,text,at]).unwrap();
+                db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES(?1,?2,'assistant','Saved qualified result.','complete',?3,?3,'Coach','default')",params![result,f.room,at]).unwrap();
+                db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES(?1,?2,?3,'default','direct','completed',?4,?5)",params![uuid::Uuid::new_v4().to_string(),input,f.room,result,at]).unwrap();
+                db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,?2,100,'completed',?3,?4)",params![f.old,delegation,input,at]).unwrap();
+                if index == 0 {
+                    let source = json!({"call_id":f.old,"conversation_id":f.room,"actor":"owner","audience":"private","delegation_id":delegation,"message_id":input,"occurred_at":at,"original_text":text,"source_revision":auth::digest(text)});
+                    let receipt = json!({"request_id":request,"state":"queued","receipt":{"request_id":uuid::Uuid::new_v4().to_string(),"queued":true}});
+                    db.execute("INSERT INTO companion_actions VALUES(?1,?2,?3,'minecraft',?4,?5,'queued',?6,?7)",params![f.old,request,delegation,text,source.to_string(),receipt.to_string(),at]).unwrap();
+                    crate::companion_awareness::bind_action_observer(
+                        &f.s,
+                        &db,
+                        &f.old,
+                        &request,
+                        "minecraft",
+                    )
+                    .unwrap();
+                    db.execute(
+                        "INSERT INTO companion_observations VALUES(?1,?2,'observed',?3,?4)",
+                        params![f.old, request, observation.to_string(), at],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let before = f.s.db.lock().unwrap().total_changes();
+        let mut independently_bounded = read_snapshot(&f.s.db.lock().unwrap(), &f.new)
+            .unwrap()
+            .unwrap();
+        let mut outcomes =
+            crate::companion_awareness::retained_action_outcomes(&f.s, &f.new).unwrap();
+        for outcome in &mut outcomes {
+            outcome.as_object_mut().unwrap().remove("observation");
+        }
+        independently_bounded["action_outcomes"] = json!(outcomes);
+        independently_bounded["recent_speech"] = json!([]);
+        assert!(independently_bounded.to_string().len() > MAX_BYTES);
+        let value = snapshot(&f.s, &f.new).unwrap().unwrap();
+        assert!(value.to_string().len() <= MAX_BYTES);
+        assert_eq!(value["omitted"], true);
+        assert!(value["requests"].as_array().unwrap().len() < 4);
+        assert_eq!(value["action_outcomes"][0]["request_id"], request);
+        let exact = crate::companion_awareness::action_observation_for_call(&f.s, &f.new, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact["observation"], observation);
+        let db = f.s.db.lock().unwrap();
+        assert_eq!(db.total_changes(), before);
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM input_deliveries WHERE conversation_id=?1",
+                [&f.room],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            4
+        );
     }
 
     #[test]

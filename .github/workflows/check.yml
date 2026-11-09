@@ -26,8 +26,14 @@ jobs:
       - run: npm test --prefix bridge
       - run: python3 -m unittest discover -s bridge/test -p 'test_*.py'
       - run: node tests/voice.mjs
+      - run: node --test tests/companion-floor.test.mjs
+      - run: node tests/companion-duplex-eval.mjs --self-test
       - run: cargo build --locked
       - run: npm ci && npx playwright install --with-deps chromium
+        if: matrix.os == 'ubuntu-24.04'
+      - run: node tests/companion-floor-browser.mjs
+        if: matrix.os == 'ubuntu-24.04'
+      - run: node tests/companion-duplex-eval.mjs --self-test-browser
         if: matrix.os == 'ubuntu-24.04'
       - run: node tests/companion-browser.mjs
         if: matrix.os == 'ubuntu-24.04'

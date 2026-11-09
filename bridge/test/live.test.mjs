@@ -205,7 +205,7 @@ test('native call control is input-only and independent of client reasoning dele
  assert.equal(trigger.event_type,'session.input_transcript.delta');assert.equal(trigger.type,'decisions');
  assert.equal(trigger.decisions.questions.length,1);assert.equal(trigger.decisions.questions[0].name,'end_current_call');
  const instructions=trigger.decisions.questions[0].instructions;
- for(const term of ['COMPLETE','Quoted','hypothetical','negative','revokes','Stop working on Minecraft = false','Please end = false','assistant speech'])assert.ok(instructions.includes(term));
+ for(const term of ['COMPLETE','Quoted','hypothetical','negative','revokes','Stop working on Minecraft = false','Please end = false','assistant speech','indirect polite request','can we end here?','How do I hang up? = false'])assert.ok(instructions.toLowerCase().includes(term.toLowerCase()));
  assert.equal(options.session.client.data_channel.allowed_server_events.some(v=>v.type==='decision.event'),false);
 });
 
@@ -352,5 +352,19 @@ test('native control diagnostics distinguish no-close decisions and stale source
  for(let i=0;i<1100;i++)bridge.diagnostic('no_close_decision');
  assert.equal(events.filter(e=>e.event?.type==='companion.native_call_control.diagnostic').length,1025);
  assert.equal(events.at(-1).event.reason,'diagnostic_limit');
+ await bridge.close();
+});
+
+test('session-wide interruption instructions use the supported SDK event and correlated receipt',async()=>{
+ const {bridge,sideband,events}=fixture();await bridge.command(create);
+ const append={op:'append',channel:'instructions',event_id:'floor-123-suppressed',delegation_id:null,content:'The caller has taken the floor. Stop speaking and listen. Accepted work is unchanged.'};
+ await bridge.command(append);await bridge.command(append);
+ assert.deepEqual(sideband.sent.filter(e=>e.type==='session.instructions.append'),[{type:'session.instructions.append',event_id:append.event_id,delegation_id:null,content:append.content}]);
+ await assert.rejects(bridge.command({...append,event_id:'wrong-delegation',delegation_id:'d1'}),/invalid_append/);
+ await assert.rejects(bridge.command({...append,content:'Changed instruction'}),/changed_command/);
+ await assert.rejects(bridge.command({...append,event_id:'empty',content:''}),/invalid_content/);
+ sideband.emit('event',{type:'session.instructions.appended',event_id:'ack-1',client_event_id:append.event_id,start_ms:100,end_ms:250});
+ assert.deepEqual(events.find(e=>e.event?.type==='session.instructions.appended').event,{type:'session.instructions.appended',event_id:'ack-1',client_event_id:append.event_id,start_ms:100,end_ms:250});
+ assert.equal(sideband.sent.some(e=>e.type==='response.cancel'||e.type==='session.input_audio.mute'),false);
  await bridge.close();
 });

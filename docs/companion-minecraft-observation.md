@@ -107,3 +107,62 @@ withholds it and reports only its local count. Possession of the installation's
 control token cannot authorize disclosure into a different call.
 This consumer support does not establish that a particular installed Minecraft
 version advertises the capability; coverage records the actual negotiation.
+
+## Optional installation-scoped human source
+
+Install `minecraft-instruction.py` beside `minecraft-observe.py`; the observer
+uses the same strict source-contract validator. This is an installation policy,
+not a tool argument or a new ACP field. Configure a dedicated Minecraft caller
+credential, distinct from the body, context and presence tokens:
+
+```json
+{"version":1,"caller_id":"companion","token_file":"/absolute/private/companion-caller-token"}
+```
+
+Pass that fixed file as `minecraft-instruction.py --source-config FILE`; set
+`source_config` to the same absolute file in the observer configuration. The
+endpoint remains the installed Minecraft home. Both helpers require the exact
+v1 contract from `GET /source-capabilities` before using `POST /task` with a
+source envelope or `POST /source-outcomes`. The advertised identity and
+idempotency semantics, fixed routes, 16-item bound and exclusion of private game
+responses must all match. A missing or incompatible capability
+is a refusal, not permission to downgrade the request to a broad owner route.
+
+The submitted text is the original retained human wording. Actor, original call,
+intent, time, revision and private conversation audience are preserved separately
+from the authenticated installation caller. The model's action description and
+backend instruction/context wrapper are not substituted for human speech. The
+source time is the earliest retained human transcript event in the exact selected
+source, with local `time_basis: retained_human_transcript`; a later delegation
+does not refresh old speech. Missing historical source mappings retain explicit
+legacy timing for legacy connections only. Scoped submission refuses that legacy
+time basis, and malformed or changed transcript evidence blocks submission.
+The receipt must match the action UUID in `source_request_id` and retains the
+distinct Minecraft queue ID. The actor label is the authenticated identifier,
+not a model assertion of a Minecraft player identity.
+Uncertain submission is not retried automatically, even though the domain offers
+idempotency for an explicit identical request.
+
+Follow-through sends the exact original source object with its original queue ID,
+including when a later private call requests the outcome. It never replaces the
+audience with the later call. Foreign or changed source identity produces no
+content. The projection preserves whether a public response belongs to one input
+or a shared turn; neither is independently established task fulfillment. Private
+game responses and unrelated whispers remain excluded. Legacy receipts retain
+their legacy observation path and are never silently promoted to scoped sources.
+
+Validation includes the actual Minecraft body HTTP handler with a disposable bot
+and workshop, both helpers, multiple callers, grouped public replies, private
+whispers, mismatched original source fields, read-only history preservation and
+exact queue/terminal distinctions. This is not proof of a live world action or
+that a caller heard a response.
+
+Scoped receipts use `scope: private_installation_input` and
+`protocol: installation_inputs.v1`. Their validated outcomes retain
+`installation_source`, `domain_response_association` (`shared_turn`,
+`single_source`, or `not_established`), and
+`private_game_responses_included: false`. These fields remain separate from
+local omission counts and domain omission flags. No co-admitted private source
+IDs are disclosed. Changed or unauthorized bindings produce an unconfirmed
+outcome with no invented actor/audience, admission, or reply. Private response
+payloads violate this capability and invalidate the scoped lookup.
