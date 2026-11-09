@@ -36,9 +36,20 @@ history. A saved presentation request is not confirmation that it is on screen.
 
 An image explicitly attached by the agent to a completed answer in the current
 call also requests whiteboard space. This requires an exact link to the caller's
-request and the same agent, connection, and private audience. Late or unlinked
-images remain in history. The request still respects pinned items, the item being
-read, and the three-item limit; receipt of an image does not prove it was visible.
+request and the same agent, connection, and private audience. A newer distinct
+request can supersede that presentation; a listening acknowledgment or slow
+response alone does not. Unlinked or superseded images remain in history. The
+request still respects pinned items, the item being read, and the three-item
+limit; receipt of an image does not prove it was visible. Native image attachments
+are published with the completed answer. An empty board before that answer is
+not evidence that attachment publication is unavailable.
+
+Changes to the authenticated browser's current board are also supplied as concise
+application context. Repeated presence heartbeats do not create repeated notices;
+pending membership updates coalesce to the latest board and wait for the same
+conversational floor as other context. Card identities link this observation to
+the saved answer. Browser-reported membership does not establish that the person
+looked at, decoded, or understood an image.
 
 An explicit **Paste** control opens a text composer; pasted images use the saved
 upload path. A receipt says when material is available. New content follows the
@@ -497,12 +508,24 @@ Durable prior receipts remain available in the installation's call history.
 
 ### Decision models and presentation
 
-The official OpenAI SDK's Decisions endpoint with `gpt-6-luna` advises ignore,
-quiet, later, or notify from the intact event, bounded recent transcript fragments,
-and owner guidance. Decisions receive no credentials and grant no action
-permission. The host records intent before the single provider request, deduplicates
+The official OpenAI SDK's Decisions endpoint with `gpt-6-luna` answers two
+independent predicates in one request: whether the event is relevant to the
+caller's current topic and whether a proactive spoken mention would be useful.
+Both use the intact event, bounded recent transcript fragments, and owner guidance.
+Independently bounded human fragments and retained request
+IDs/text preserve an explicit selection when a long agent answer fills the recent
+transcript; omission counts remain explicit. Decisions receive no credentials and grant no action
+permission. The host records intent before each event/context decision, deduplicates
 immutable revisions, disables retries, and keeps uncertain outcomes uncertain.
-Provider failure/refusal/invalid output retains a quiet card. At most two new facts are evaluated per worker cycle. Durable source history has
+Raw provider probabilities remain in the receipt. The declared pilot policy admits
+quiet context at relevance probability 0.85 or above; a proactive notice also
+requires proactive probability 0.90 or above. Relevance at or below 0.20 is ignored;
+intermediate estimates retain evidence without adding voice context. The host
+validates the assessment and its derived disposition independently. Older
+configured choice helpers retain their conservative confidence checks.
+Provider failure, refusal, and invalid output also retain evidence without adding
+it to the speaking model's context. At most two facts are evaluated
+per worker cycle. Durable source history has
 no lifetime event quota that silently stops a long call receiving new facts;
 per-query and per-transport bounds remain. Known action receipts rotate through
 bounded polls so newer requests cannot permanently hide older unresolved ones.
@@ -512,10 +535,13 @@ connection, scope and original time. Long facts use numbered source-data parts,
 not clipped summaries or opaque retrieval pointers. Each provider append stays
 below its transport bound; all matching receipts are needed to mark the whole
 observation accepted. A missing part means the source must not be summarized.
-Quiet context can arrive while the caller speaks or other work runs. Deliberately
-spoken notices wait for fresh browser quiet hints and six seconds without a
-transcript fragment or a newly created delegation; this is a presentation
-heuristic, not proof that speech played or a human turn ended. An unavailable
+Both quiet context and spoken notices wait for the shared conversational floor:
+fresh authenticated browser activity, available playback, and a gap after the
+latest human transcript. Ambient relevance is evaluated against that current
+context and checked again before dispatch. A newer human context withdraws an
+unsent ambient batch; a known completed decision can be reconsidered for the new
+context, but an uncertain decision or append is never replayed. These checks are
+presentation heuristics, not proof that speech played or a human turn ended. An unavailable
 observer does not block the others. Model scores are pilot thresholds, not
 calibrated accuracy or a delivery guarantee.
 
@@ -688,6 +714,9 @@ times remain separate from query time. Missing facts or a failed read do not mea
 inactivity. This avoids a redundant native approval for an already-enrolled read;
 it does not allow arbitrary external tools. Expired call-scoped native requests
 are rejected directly instead of creating approvals on a closed call screen.
+Current task and physical-state snapshots take priority over historical chatter
+in the bounded result. Deferred source records remain available through their
+unchanged cursor identity; prioritization does not change their original time.
 
 Before returning that explicit read, the host also queues a bounded set of source
 qualifiers directly as thinking context. Up to four whole report facts preserve
@@ -779,12 +808,14 @@ not an invitation to invent status or plausible work details. Both are recorded
 once per delegation. Dispatch remains visible without injecting waiting narration. It is not a guarantee of silence: already-generated
 speech and independent model speech remain separate.
 
-Useful attributed observations are supplied directly to voice. A long observation
+Relevant attributed observations are supplied directly to voice. Facts from one
+connection must not answer a question about another connection, even when the
+agent identity is shared. A long observation
 is delivered as numbered source-data parts, preserving its full qualifiers; it no
 longer requires a second reasoning turn merely to retrieve its text. All matching
 part acknowledgments are required before the recorded observation becomes
-`context_accepted`. Quiet context can arrive while another request is active;
-deliberately spoken notifications still wait for a conversational gap.
+`context_accepted`. Quiet context can inform speech, so it follows the same
+current-context and conversational-floor checks as spoken notifications.
 
 See [Minecraft observations](companion-minecraft-observation.md) for the official
 MCP SDK presence client. It reads own and other players' public chat, current
