@@ -167,6 +167,14 @@ an artifact never licenses a claim that it has been seen or read.
 For the native Constellation runtime, `provider.native.image_input` controls the
 enabled image path. An omitted or disabled setting can make an image-capable model
 advertise `image: false`; that flag alone does not establish the model's abilities.
+The voice starts with image inspection support **unknown**. Its current-call
+capability is learned from the actual selected backend's ACP initialization and
+sent as a quiet capability update. A previous call's settings, static profile,
+camera permission, or installed tools do not establish support for this call.
+An explicit `image: false` means the voice must not promise photo inspection;
+files can still be saved or displayed. `image: true` enables the inspection path,
+but does not prove that any particular image was delivered or understood.
+
 The optional `image_input` in `companion.json` is informational, not an override of
 ACP capabilities. Enable a supported path in the agent installation, reconnect,
 then verify fresh initialization and an actual image prompt. Preserve the selected
@@ -671,6 +679,17 @@ times remain separate from query time. Missing facts or a failed read do not mea
 inactivity. This avoids a redundant native approval for an already-enrolled read;
 it does not allow arbitrary external tools. Expired call-scoped native requests
 are rejected directly instead of creating approvals on a closed call screen.
+
+Before returning that explicit read, the host also queues a bounded set of source
+qualifiers directly as thinking context. Up to four whole report facts preserve
+original report time and observation time; current assignment snapshots also keep
+`progress.at` separate from assignment status. A coverage note states omissions
+and that missing reports do not establish inactivity or independent verification.
+This protects the original qualifications if a reasoning model omits them while
+summarizing. The same private caller, configured source, audience and current
+policy are revalidated before delivery, and the normal conversational floor still
+applies. These facts grant no speech or action authority, invoke no decision model,
+and never convert a queued input or running assignment into completed work.
 
 ### Coherent speech and bounded presentation
 

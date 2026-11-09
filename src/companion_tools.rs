@@ -478,10 +478,12 @@ pub async fn connection_status(
     if !valid_connection_id(&query.connection_id) {
         return Err(ApiError::bad("Choose a configured observation source"));
     }
-    let response =
-        crate::companion_awareness::connection_status(&s, &id, &query.connection_id).await?;
+    let read = crate::companion_awareness::connection_status(&s, &id, &query.connection_id).await?;
     authorize(&s, &id, &h)?;
-    Ok(Json(response))
+    // Preserve original source qualifiers before a backend can paraphrase them.
+    // This queues context only; the ordinary floor and policy checks still apply.
+    crate::companion_awareness::preserve_requested_status(&s, &id, &read)?;
+    Ok(Json(read.response))
 }
 
 #[derive(Deserialize)]

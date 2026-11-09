@@ -37,6 +37,7 @@ export function validateConfig(c) {
   assert(typeof c.caller_voice==='string'&&c.caller_voice!==c.target_voice,'Caller and target need distinct voices');
   assert.equal(c.caller_model,'gpt-live-1');
   assert(typeof c.caller_backend==='string');
+  if(c.scenario.expected?.published_image_sha256)assert(/^[a-f0-9]{64}$/.test(c.scenario.expected.published_image_sha256));
   assert(!JSON.stringify(c).includes('sk-proj-'),'Keep credentials out of evaluation configuration');
   return c;
 }
@@ -189,6 +190,19 @@ for key,q,args in [
 print(json.dumps(result))
 `;
 
+export function ownedAttachmentUrl(value,origin,room){
+  try{const url=new URL(value,origin),prefix=`/api/v1/conversations/${encodeURIComponent(room)}/attachments/`;
+    if(!room||url.origin!==new URL(origin).origin||url.username||url.password||url.search||url.hash||!url.pathname.startsWith(prefix)||!/^[-A-Za-z0-9_]+$/.test(url.pathname.slice(prefix.length)))return null;
+    return url.href;
+  }catch{return null;}
+}
+export function exactImagePermission(permission,room,paths){
+  const tool=permission?.tool_call,options=permission?.options;
+  if(permission?.conversation_id!==room||typeof tool?.toolCallId!=='string'||tool.title!=='workspace attach image'||!paths?.includes(tool.rawInput?.path)||!Array.isArray(options))return null;
+  const allowed=options.filter(option=>option.kind==='allow_once'&&typeof option.optionId==='string'&&typeof option.name==='string');
+  return allowed.length===1?allowed[0]:null;
+}
+
 async function waitFor(check,seconds,label){const stop=Date.now()+seconds*1000;while(Date.now()<stop){const result=await check();if(result)return result;await sleep(250);}throw Error('Timed out: '+label);}
 function safeError(error,secrets=[]){let text=String(error?.message||error);for(const secret of secrets)if(secret)text=text.replaceAll(secret,'[redacted]');return text.replace(/Bearer\s+[^\s"']+/gi,'Bearer [redacted]').replace(/sk-[A-Za-z0-9_-]+/g,'[redacted]');}
 function parseChunks(chunks){return chunks.map(c=>{const b=Buffer.from(c.pcm16,'base64'),pcm=new Int16Array(b.length/2);for(let i=0;i<pcm.length;i++)pcm[i]=b.readInt16LE(i*2);return {...c,pcm,pcm16:undefined};});}
@@ -214,6 +228,30 @@ export async function runLive(configFile) {
   const chunks=[];let recordingBytes=0;
   const api=async(path,method='GET',body)=>{const res=await context.request.fetch(c.origin.replace(/\/$/,'')+path,{method,timeout:15000,maxRedirects:0,headers:{Authorization:'Bearer '+token},...(body===undefined?{}:{data:body})});if(!res.ok())fail(`HTTP ${res.status()} ${path}`);return res.json();};
   const snapshot=()=>callId?JSON.parse(execFileSync('python3',['-c',snapshotScript,join(c.home,'state.sqlite3'),callId],{encoding:'utf8',timeout:8000,maxBuffer:20*1024*1024})):null;
+  const approveExactImagePublication=async()=>{
+    const paths=c.scenario.expected?.single_image_permission_paths;
+    if(!Array.isArray(paths)||evidence.image_publication_permission||!evidence.conversation_id)return;
+    const room=await page.evaluate(async id=>{const response=await fetch('/api/v1/conversations/'+encodeURIComponent(id));if(!response.ok())throw Error('Cannot read current room permission');return response.json();},evidence.conversation_id);
+    for(const permission of room.permissions||[]){const option=exactImagePermission(permission,evidence.conversation_id,paths);if(!option)continue;
+      const record=evidence.image_publication_permission={id:permission.id,tool_call_id:permission.tool_call.toolCallId,path:permission.tool_call.rawInput.path,option_id:option.optionId,kind:'allow_once',source:'Explicitly authorized synthetic operator approval using normal authenticated Companion UI; not hands-free publication proof',at:Date.now(),outcome:'unknown'};
+      const card=page.locator(`.call-permission[data-permission-id="${permission.id}"]`);await page.locator('#permission-alert:not([hidden])').click();await card.waitFor({state:'visible',timeout:5000});
+      const response=page.waitForResponse(r=>r.request().method()==='POST'&&new URL(r.url()).pathname===`/api/v1/conversations/${evidence.conversation_id}/permissions/${permission.id}`,{timeout:10000});
+      await card.getByRole('button',{name:option.name+' (this request only)',exact:true}).click();const settled=await response;record.http_status=settled.status();record.outcome=settled.ok()?'accepted':'rejected';
+      assert(settled.ok(),'Exact saved-image permission did not settle successfully; never retry unknown approval');return;
+    }
+  };
+  const capturePublishedImages=async()=>{
+    if(!c.scenario.expected?.published_image_sha256||!page||!evidence.conversation_id)return;
+    const images=await page.locator('.output-card img.shared-media').evaluateAll(nodes=>nodes.slice(0,8).map(img=>({url:img.currentSrc||img.src,name:img.alt,decoded:img.complete&&img.naturalWidth>0,width:img.naturalWidth,height:img.naturalHeight,visible:!!(img.getBoundingClientRect().width&&img.getBoundingClientRect().height),card_text:img.closest('.output-card')?.innerText?.slice(0,4000)||''})));
+    evidence.published_images||=[];
+    for(const image of images){const url=ownedAttachmentUrl(image.url,c.origin,evidence.conversation_id);if(!url)continue;
+      let record=evidence.published_images.find(item=>item.url===url);
+      if(record){Object.assign(record,image);continue;}
+      record={...image,url,first_seen_at:Date.now()};evidence.published_images.push(record);
+      const response=await context.request.get(url,{timeout:15000,maxRedirects:0});record.http_status=response.status();
+      if(!response.ok())continue;const bytes=await response.body();assert(bytes.length<=10*1024*1024,'Published evaluation image exceeds byte bound');record.bytes=bytes.length;record.sha256=sha(bytes);record.content_type=response.headers()['content-type'];
+    }
+  };
   const recoverOwnCall=()=>{
     if(callId||!requestId)return;
     const code="import json,sqlite3,sys,urllib.parse;d=sqlite3.connect('file:'+urllib.parse.quote(sys.argv[1])+'?mode=ro',uri=True,timeout=3);r=d.execute('SELECT id FROM companion_calls WHERE request_id=? AND owner=? AND agent_id=?',sys.argv[2:]).fetchone();print(json.dumps(r[0] if r else None))";
@@ -272,10 +310,10 @@ export async function runLive(configFile) {
     while(Date.now()<deadline){await collect();if(['closed','interrupted'].includes(evidence.target_state)){evidence.end_reason='target_terminal';break;}
       if(evidence.errors.length)throw Error('Evaluation infrastructure error; inspect retained diagnostics without automatic retry');
       if(evidence.target_state==='connected'&&Date.now()-lastPresenceOk>12000)throw Error('Ongoing connected call lost authenticated browser presence');
-      if(Date.now()-lastSnapshot>2000){evidence.last_media=await page.evaluate(()=>__duplex.sample());lastSnapshot=Date.now();}
+      if(Date.now()-lastSnapshot>2000){evidence.last_media=await page.evaluate(()=>__duplex.sample());await approveExactImagePublication();await capturePublishedImages();lastSnapshot=Date.now();}
       await sleep(500);
     }
-    evidence.end_reason||='evaluation_duration_bound';evidence.browser_presence_failures=presenceFailures;evidence.receipts=snapshot();await page.screenshot({path:join(out,'final.png'),fullPage:true});
+    evidence.end_reason||='evaluation_duration_bound';evidence.browser_presence_failures=presenceFailures;evidence.receipts=snapshot();await capturePublishedImages();await page.screenshot({path:join(out,'final.png'),fullPage:true});
     // A presence request racing native hangup can correctly receive403 after
     // the call loses surface authority. Preserve it; only an ongoing live call
     // with no successful presence for>12s is a liveness failure, not this race.
@@ -325,6 +363,8 @@ export async function runLive(configFile) {
     if(c.scenario.verify_next_call)evidence.assertions.push({name:'natural_hangup_then_fresh_call_connect_and_close',passed:evidence.end_reason==='target_terminal'&&evidence.next_call?.passed===true});
     if(c.scenario.expect_natural_hangup)evidence.assertions.push({name:'spoken_hangup_reached_terminal_without_harness_close',passed:evidence.end_reason==='target_terminal'&&!evidence.cleanup.target_close_requested});
     if(c.scenario.camera){const uploads=evidence.receipts?.uploads||[],captures=(evidence.receipts?.surface_commands||[]).filter(x=>x.kind==='capture');evidence.assertions.push({name:'one_consented_camera_capture_uploaded',passed:captures.length===1&&captures[0].state==='uploaded'&&uploads.filter(x=>x.state==='available').length===1,captures:captures.length,uploaded:uploads.filter(x=>x.state==='available').length});}
+    if(c.scenario.expected?.published_image_sha256){const expected=c.scenario.expected.published_image_sha256,images=evidence.published_images||[],captures=(evidence.receipts?.surface_commands||[]).filter(x=>x.kind==='capture');evidence.assertions.push({name:'actual_backend_published_saved_image_visible_and_byte_exact',passed:images.some(image=>image.sha256===expected&&image.decoded&&image.visible&&image.http_status===200),expected_sha256:expected,observed:images.map(({sha256,decoded,visible,http_status})=>({sha256,decoded,visible,http_status}))});evidence.assertions.push({name:'saved_image_did_not_activate_camera_capture',passed:captures.length===0});}
+    if(c.scenario.expected?.single_image_permission_paths)evidence.assertions.push({name:'exact_saved_image_single_use_permission_approved_via_ui',passed:evidence.image_publication_permission?.outcome==='accepted'});
     try{evidence.final_input_hashes=await fingerprint();evidence.assertions.push({name:'frozen_evaluation_inputs',passed:JSON.stringify(evidence.input_hashes)===JSON.stringify(evidence.final_input_hashes)});}catch(error){evidence.errors.push('Could not reverify evaluation input files');}
     const actions=Array.isArray(evidence.receipts?.actions)?evidence.receipts.actions:[];
     if(Number.isInteger(c.scenario.expected?.action_count))evidence.assertions.push({name:'exact_disposable_action_count',expected:c.scenario.expected.action_count,actual:actions.length,passed:actions.length===c.scenario.expected.action_count});
@@ -349,7 +389,10 @@ export function selfTest(){
   assert.equal(validateConfig(config),config);
   for(const change of [{origin:'https://example.com:18896'},{origin:'https://127.0.0.1:18795'},{owner:'Brian'},{world_effects:'live'},{origin:'https://test.tailnet.ts.net:18896'}])assert.throws(()=>validateConfig({...config,...change}));
   assert(validateConfig({...config,origin:'https://test.tailnet.ts.net:18896',private_network_fixture:true}));
-  return {passed:true,checks:6,scope:'Offline harness math/hidden-expectations/config guard; no model or browser claim'};
+  assert.equal(ownedAttachmentUrl('/api/v1/conversations/room/attachments/image-id',config.origin,'room'),config.origin+'/api/v1/conversations/room/attachments/image-id');
+  for(const url of ['https://elsewhere.example/api/v1/conversations/room/attachments/image-id','/api/v1/conversations/other/attachments/image-id','/api/v1/conversations/room/attachments/image-id?token=secret','/api/v1/conversations/room/attachments/../private'])assert.equal(ownedAttachmentUrl(url,config.origin,'room'),null);
+  const permission={conversation_id:'room',tool_call:{toolCallId:'tool',title:'workspace attach image',rawInput:{path:'saved/view.png'}},options:[{optionId:'once',name:'Allow once',kind:'allow_once'}]};assert(exactImagePermission(permission,'room',['saved/view.png']));assert.equal(exactImagePermission(permission,'other',['saved/view.png']),null);assert.equal(exactImagePermission(permission,'room',['another.png']),null);assert.equal(exactImagePermission({...permission,options:[{optionId:'always',name:'Always',kind:'allow_always'}]},'room',['saved/view.png']),null);assert.equal(exactImagePermission({...permission,tool_call:{...permission.tool_call,title:'execute'}},'room',['saved/view.png']),null);
+  return {passed:true,checks:8,scope:'Offline harness math/hidden-expectations/config, authenticated-image and exact single-use publication permission guards; no model or browser claim'};
 }
 
 export async function selfTestBrowser(){

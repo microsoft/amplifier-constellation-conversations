@@ -1211,3 +1211,77 @@ async fn action_preserves_original_human_time_and_refuses_changed_transcript() {
         }
     }
 }
+
+#[tokio::test]
+async fn explicit_status_response_queues_qualified_context_before_backend_paraphrase() {
+    let f = fixture();
+    let c = call(&f);
+    let current = time::OffsetDateTime::now_utc();
+    let stamp = |at: time::OffsetDateTime| {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            at.year(),
+            u8::from(at.month()),
+            at.day(),
+            at.hour(),
+            at.minute(),
+            at.second()
+        )
+    };
+    let old = stamp(current - time::Duration::hours(4));
+    let now = stamp(current);
+    let event = json!({"id":"current-assignment","revision":"r1","kind":"task_observation","text":json!({"status":"running","progress":{"at":old,"text":"The linkage was unfinished."}}).to_string(),"occurred_at":now,"observed_at":now,"actor":"Jarvis","audience":{"kind":"public"},"provenance":{"kind":"minecraft_current_task","current_state_snapshot":true}});
+    let report = json!({"version":1,"connection_id":"minecraft","availability":"available","observed_at":now,"events":[event],"actions":[],"coverage":{"bounded":true,"gap":true},"presence":{}});
+    std::fs::write(f.home.path().join("status-result.json"), report.to_string()).unwrap();
+    std::fs::write(f.home.path().join("status-read.py"),"import pathlib,sys,json\njson.load(sys.stdin)\nprint((pathlib.Path(__file__).parent/'status-result.json').read_text())\n").unwrap();
+    std::fs::write(f.home.path().join("companion-awareness.json"),json!({"enabled":true,"decision_command":["/bin/false"],"agents":{"default":[{"id":"minecraft","label":"Workshop","command":["/usr/bin/python3",f.home.path().join("status-read.py")],"owners":["owner"],"audiences":[{"kind":"public"}]}]}}).to_string()).unwrap();
+    let (code, value) = request(
+        &f,
+        &c,
+        "GET",
+        "connection-status?connection_id=minecraft",
+        None,
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(value["reports"][0]["text"], report["events"][0]["text"]);
+    assert!(value.get("binding").is_none());
+    let db = f.s.db.lock().unwrap();
+    let (raw, state): (String, String) = db
+        .query_row(
+            "SELECT updates,state FROM companion_voice_batches WHERE call_id=?1",
+            [&c.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+    let commands: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(commands.as_array().unwrap().len(), 2);
+    assert!(
+        commands
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["channel"] == "thinking")
+    );
+    assert!(raw.contains(&old) && raw.contains(&now));
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM companion_awareness WHERE decision IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    drop(db);
+    assert!(effects(&f).is_empty());
+}

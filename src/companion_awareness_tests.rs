@@ -13,6 +13,12 @@ struct Fixture {
     headers: HeaderMap,
 }
 
+// Existing reader tests inspect the same public filtered tool response. The
+// separate host binding never crosses the MCP response boundary.
+async fn connection_status(s: &AppState, id: &str, connection: &str) -> Result<Value> {
+    Ok(super::connection_status(s, id, connection).await?.response)
+}
+
 fn timestamp(at: i64) -> String {
     let t = time::OffsetDateTime::from_unix_timestamp(at / 1000).unwrap();
     format!(
@@ -2094,4 +2100,267 @@ fn retained_action_time_uses_exact_original_fragments_not_later_delegation() {
     .unwrap();
     assert!(original_human_source_time(&db, &f.id, &did).is_err());
     assert!(!original_source_valid(&db, &f.id, &request).unwrap());
+}
+
+#[tokio::test]
+async fn requested_status_preserves_old_progress_before_an_undated_backend_summary() {
+    let f = fixture();
+    let old = timestamp(now_ms() - 4 * 60 * 60 * 1000);
+    let observed = timestamp(now_ms());
+    let mut task = source_event();
+    task["id"] = json!("current-assignment");
+    task["kind"] = json!("task_observation");
+    // Even a fresh event timestamp must not refresh the nested progress report.
+    task["occurred_at"] = json!(observed);
+    task["observed_at"] = json!(observed);
+    task["actor"] = json!("Jarvis");
+    task["provenance"] = json!({"kind":"minecraft_current_task","current_state_snapshot":true});
+    task["text"] = json!(json!({"status":"running","progress":{"at":old,"text":"The blue door linkage was unfinished."}}).to_string());
+    fresh_result(&f, vec![task]);
+    let read = super::connection_status(&f.s, &f.id, "minecraft")
+        .await
+        .unwrap();
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    let summary = "The assignment is running and the blue door linkage is unfinished.";
+    crate::companion_delivery::enqueue_batch(&f.s, &f.id, "result:undated", vec![json!({"op":"append","channel":"commentary","event_id":"undated-result","delegation_id":null,"content":summary})]).unwrap();
+    // No authenticated quiet surface yet: neither qualification nor answer bypasses it.
+    assert!(
+        crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    let _rx = quiet_browser(&f);
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    let commands = batch["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert!(commands.iter().all(|v| v["channel"] == "thinking"));
+    let text = commands[0]["content"].as_str().unwrap();
+    assert!(text.contains(&format!("progress.at {old}")));
+    assert!(text.contains(&format!("observed {observed}")));
+    assert!(text.contains(&format!("Report source time {observed}")));
+    assert!(text.contains("does not establish active physical work"));
+    assert!(
+        commands[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("missing reports do not prove inactivity")
+    );
+    let next = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(next["commands"][0]["content"], summary);
+    let db = f.s.db.lock().unwrap();
+    let provenance: String = db.query_row("SELECT json_extract(data,'$.provenance.kind') FROM companion_awareness WHERE call_id=?1 LIMIT 1",[&f.id],|r|r.get(0)).unwrap();
+    assert_eq!(provenance, "companion_requested_connection_status");
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(db);
+    assert_eq!(calls(&f, "observer").len(), 1);
+    assert!(calls(&f, "decision").is_empty());
+}
+
+#[tokio::test]
+async fn requested_qualifiers_revalidate_private_identity_and_policy_before_dispatch() {
+    for revoke in ["policy", "audience", "private", "endpoint", "closed"] {
+        let f = fixture();
+        fresh_result(&f, vec![source_event()]);
+        let read = super::connection_status(&f.s, &f.id, "minecraft")
+            .await
+            .unwrap();
+        preserve_requested_status(&f.s, &f.id, &read).unwrap();
+        let _rx = quiet_browser(&f);
+        match revoke {
+            "policy" => rewrite_policy(&f, |v| {
+                v["agents"]["default"][0]["owners"] = json!(["other"])
+            }),
+            "audience" => {
+                rewrite_policy(&f, |v| v["agents"]["default"][0]["audiences"] = json!([]))
+            }
+            "private" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE conversations SET shared=1 WHERE id=?1", [&f.room])
+                    .unwrap();
+            }
+            "endpoint" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_calls SET endpoint_hash='changed' WHERE id=?1",
+                        [&f.id],
+                    )
+                    .unwrap();
+            }
+            "closed" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_calls SET state='closed' WHERE id=?1",
+                        [&f.id],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            crate::companion_delivery::take_ready(&f.s, &f.id)
+                .unwrap()
+                .is_none(),
+            "{revoke}"
+        );
+        let state: String =
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM companion_voice_batches WHERE call_id=?1",
+                    [&f.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(state, "withdrawn", "{revoke}");
+    }
+}
+
+#[tokio::test]
+async fn requested_qualifiers_exclude_private_data_and_mark_whole_fact_omissions() {
+    let f = fixture();
+    let mut events = Vec::new();
+    for i in 0..7 {
+        let mut event = source_event();
+        event["id"] = json!(format!("report-{i}"));
+        event["actor"] = json!("Jarvis");
+        if i == 0 {
+            event["actor"] = json!("a".repeat(160));
+            event["id"] = json!("i".repeat(160));
+        }
+        events.push(event);
+    }
+    let mut private = source_event();
+    private["id"] = json!("private-other-user");
+    private["text"] = json!("Secret private activity");
+    private["audience"] = json!({"kind":"private","owner":"other"});
+    events.push(private);
+    fresh_result(&f, events);
+    let read = super::connection_status(&f.s, &f.id, "minecraft")
+        .await
+        .unwrap();
+    assert_eq!(read.response["reports"].as_array().unwrap().len(), 7);
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    let _rx = quiet_browser(&f);
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    let commands = batch["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 5);
+    assert!(
+        commands
+            .iter()
+            .all(|c| c["content"].as_str().unwrap().len() <= 480 && c["channel"] == "thinking")
+    );
+    let all = batch.to_string();
+    assert!(
+        !all.contains("private-other-user")
+            && !all.contains("Secret private activity")
+            && !all.contains(&"i".repeat(160))
+    );
+    assert!(
+        commands[4]["content"]
+            .as_str()
+            .unwrap()
+            .contains("3 report qualifier(s)")
+    );
+    assert!(calls(&f, "decision").is_empty());
+}
+
+#[tokio::test]
+async fn requested_status_binding_cannot_move_to_a_different_call_or_changed_policy() {
+    for changed in ["call", "policy"] {
+        let f = fixture();
+        fresh_result(&f, vec![source_event()]);
+        let read = super::connection_status(&f.s, &f.id, "minecraft")
+            .await
+            .unwrap();
+        if changed == "policy" {
+            rewrite_policy(&f, |v| v["guidance"] = json!("Updated policy"));
+        }
+        let destination = if changed == "call" {
+            "another-call"
+        } else {
+            f.id.as_str()
+        };
+        assert!(preserve_requested_status(&f.s, destination, &read).is_err());
+        assert!(states(&f).is_empty());
+        assert_eq!(
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM companion_voice_batches", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn requested_qualifier_revisions_replace_only_unsent_same_source_context() {
+    let f = fixture();
+    let mut first = source_event();
+    first["actor"] = json!("Jarvis");
+    fresh_result(&f, vec![first.clone()]);
+    let read = super::connection_status(&f.s, &f.id, "minecraft")
+        .await
+        .unwrap();
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1",
+                [&f.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    let newer = timestamp(now_ms() - 60_000);
+    first["revision"] = json!("second-revision");
+    first["occurred_at"] = json!(newer);
+    fresh_result(&f, vec![first]);
+    let second = super::connection_status(&f.s, &f.id, "minecraft")
+        .await
+        .unwrap();
+    preserve_requested_status(&f.s, &f.id, &second).unwrap();
+    let counts: (i64,i64)=f.s.db.lock().unwrap().query_row("SELECT SUM(state='pending'),SUM(state='superseded') FROM companion_voice_batches WHERE call_id=?1",[&f.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(counts, (1, 1));
+    let _rx = quiet_browser(&f);
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        batch["commands"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&newer)
+    );
+    crate::companion_delivery::sent(&f.s, &f.id, batch["batch_id"].as_str().unwrap()).unwrap();
+    preserve_requested_status(&f.s, &f.id, &second).unwrap();
+    assert!(
+        crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(calls(&f, "decision").is_empty());
 }

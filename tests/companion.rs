@@ -783,7 +783,7 @@ for line in sys.stdin:
         .iter()
         .filter(|v| v["op"] == "append")
         .collect::<Vec<_>>();
-    assert_eq!(appends.len(), 2);
+    assert_eq!(appends.len(), 3);
     assert_eq!(appends[0]["channel"], "thinking");
     assert!(appends[0]["content"].as_str().unwrap().is_empty());
     assert_eq!(appends[1]["channel"], "instructions");
@@ -792,6 +792,13 @@ for line in sys.stdin:
             .as_str()
             .unwrap()
             .contains("still awaits checked information")
+    );
+    assert_eq!(appends[2]["channel"], "instructions");
+    assert!(
+        appends[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("remains unknown after its handshake")
     );
     assert_eq!(
         std::fs::read_to_string(f.home.path().join("bridge-starts")).unwrap(),
@@ -1821,9 +1828,11 @@ async fn static_companion_name_collision_is_rejected_before_session_setup() {
 
 #[tokio::test]
 async fn capture_image_delivery_uses_actual_initialized_acp_capability_not_static_profile() {
-    for image in [false, true] {
+    for (image, tools) in [(false, false), (true, false), (false, true), (true, true)] {
         let f = fixture("delegate");
-        configure_call_permission_fixture(&f, "none", false);
+        if tools {
+            configure_call_permission_fixture(&f, "none", false);
+        }
         let mut agent = f.s.agent("default").unwrap().unwrap();
         if image {
             agent.env.insert("FIXTURE_IMAGES".into(), "1".into());
@@ -1843,6 +1852,38 @@ async fn capture_image_delivery_uses_actual_initialized_acp_capability_not_stati
         let (_, call) = start(&f).await;
         let id = call["id"].as_str().unwrap();
         until(&f, id, "card").await;
+        let initial: Value = serde_json::from_slice(
+            &std::fs::read(f.home.path().join("bridge-initial.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            initial["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("\"image_input\":null")
+        );
+        let controls = std::fs::read_to_string(f.home.path().join("bridge-commands"))
+            .unwrap()
+            .lines()
+            .map(|v| serde_json::from_str::<Value>(v).unwrap())
+            .filter(|v| {
+                v["event_id"]
+                    .as_str()
+                    .is_some_and(|v| v.starts_with("image-capability-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            controls.len(),
+            1,
+            "one actual capability control, independent of tool installation"
+        );
+        assert_eq!(controls[0]["channel"], "instructions");
+        assert!(controls[0]["content"].as_str().unwrap().contains(if image {
+            "advertised image input support"
+        } else {
+            "image input is unsupported"
+        }));
+
         let (actual,at):(bool,i64)=f.s.db.lock().unwrap().query_row("SELECT image_input,observed_at FROM companion_surface_capabilities WHERE call_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(actual, image);
         assert!(at > 0);

@@ -21,7 +21,7 @@ struct Config {
     guidance: String,
     agents: BTreeMap<String, Vec<Source>>,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Source {
     id: String,
@@ -882,10 +882,32 @@ pub(crate) fn status_sources(s: &AppState, id: &str) -> Result<Vec<Value>> {
         .collect())
 }
 
+/// The binding stays inside the host; it is not helper-provided metadata or an
+/// extra wire capability. Tool authorization is checked again before presentation.
+pub(crate) struct ConnectionStatusRead {
+    pub(crate) response: Value,
+    binding: Option<StatusReadBinding>,
+}
+struct StatusReadBinding {
+    call_id: String,
+    source: Source,
+    policy: String,
+    owner: String,
+    agent: String,
+    room: String,
+}
+
 /// Fresh bounded read through one already-configured observation helper. Never
 /// run a decision/action helper, advance background cursors, or present context.
-pub(crate) async fn connection_status(s: &AppState, id: &str, connection: &str) -> Result<Value> {
-    let empty = |status: &str| json!({"connection_id":connection,"status":status,"reports":[],"presence":{},"coverage":{"bounded":true,"gap":true},"queried_at":now_ms(),"read_only":true,"authority":false,"note":"This read established no current facts. Missing reports do not establish inactivity; no action was submitted."});
+pub(crate) async fn connection_status(
+    s: &AppState,
+    id: &str,
+    connection: &str,
+) -> Result<ConnectionStatusRead> {
+    let empty = |status: &str| ConnectionStatusRead {
+        response: json!({"connection_id":connection,"status":status,"reports":[],"presence":{},"coverage":{"bounded":true,"gap":true},"queried_at":now_ms(),"read_only":true,"authority":false,"note":"This read established no current facts. Missing reports do not establish inactivity; no action was submitted."}),
+        binding: None,
+    };
     let Some((owner, agent, room, _)) = active(s, id)? else {
         anyhow::bail!("Active private call required")
     };
@@ -987,10 +1009,159 @@ pub(crate) async fn connection_status(s: &AppState, id: &str, connection: &str) 
             presence[key] = json!(value);
         }
     }
-    Ok(
-        json!({"connection_id":source.id,"label":source.label,"status":"available","reports":reports,"presence":presence,"coverage":coverage,"omitted":omitted,"queried_at":now,"source_observed_at":result["observed_at"],"read_only":true,"authority":false,"note":"Fresh bounded source query; report timestamps describe the original events, which may be older. Attribute reports to their actor and connection. Plans, requests, work in progress and reported completion remain distinct. Coverage is incomplete even when omitted is zero. Missing reports do not establish inactivity. This grants no action authority or independent verification."}),
+    Ok(ConnectionStatusRead {
+        response: json!({"connection_id":source.id,"label":source.label,"status":"available","reports":reports,"presence":presence,"coverage":coverage,"omitted":omitted,"queried_at":now,"source_observed_at":result["observed_at"],"read_only":true,"authority":false,"note":"Fresh bounded source query; report timestamps describe the original events, which may be older. Attribute reports to their actor and connection. Plans, requests, work in progress and reported completion remain distinct. Coverage is incomplete even when omitted is zero. Missing reports do not establish inactivity. This grants no action authority or independent verification."}),
+        binding: Some(StatusReadBinding {
+            call_id: id.to_owned(),
+            source: source.clone(),
+            policy: fingerprint,
+            owner,
+            agent,
+            room,
+        }),
+    })
+}
+
+/// Preserve essential source qualifications independently of the reasoning
+/// model's summary. A requested read is context, never a request to speak or act.
+pub(crate) fn preserve_requested_status(
+    s: &AppState,
+    id: &str,
+    read: &ConnectionStatusRead,
+) -> Result<()> {
+    let Some(binding) = &read.binding else {
+        return Ok(());
+    };
+    ensure!(
+        binding.call_id == id
+            && active(s, id)?.is_some_and(|(owner, agent, room, _)| {
+                owner == binding.owner && agent == binding.agent && room == binding.room
+            })
+            && config(s)?.is_some_and(|(_, policy)| policy == binding.policy),
+        "Requested observation access changed"
+    );
+    let reports = read.response["reports"].as_array().unwrap();
+    if reports.is_empty() {
+        return Ok(());
+    }
+    let source = &binding.source;
+    let mut selected: Vec<_> = reports.iter().collect();
+    // Current assignment facts are particularly liable to hide an old progress
+    // report. Prefer them without refreshing the report's original timestamp.
+    selected.sort_by_key(|report| report["attribution"]["current_state_snapshot"] != true);
+    let mut facts = Vec::new();
+    for report in selected {
+        if facts.len() == 4 {
+            break;
+        }
+        let text = requested_report_qualifier(source, report, &read.response);
+        if text.len() <= 480 {
+            facts.push((report, text, false));
+        }
+    }
+    let omitted = reports.len() - facts.len();
+    let coverage = format!(
+        "{}: requested status read at {}; source observation {}. History is bounded/incomplete; missing reports do not prove inactivity. {} report qualifier(s) and {} source report(s) omitted here. No action or independent verification was established.",
+        source.label,
+        read.response["queried_at"],
+        read.response["source_observed_at"].as_str().unwrap(),
+        omitted,
+        read.response["omitted"],
+    );
+    // The bounded note is mandatory: never silently cut a timestamp or qualifier.
+    ensure!(
+        coverage.len() <= 480,
+        "Requested status qualifications exceed context bound"
+    );
+    facts.push((&reports[0], coverage, true));
+    let mut commands = Vec::new();
+    for (report, content, summary) in facts {
+        let event_id = format!(
+            "requested-status:{}",
+            auth::digest(&json!([source.id, report["id"], summary]).to_string())
+        );
+        let revision = auth::digest(
+            &json!([
+                report,
+                read.response["queried_at"],
+                read.response["source_observed_at"],
+                content
+            ])
+            .to_string(),
+        );
+        // Retain the exact authorized audience and source-time association. The
+        // application constructs these fields from the filtered read, not from
+        // arbitrary helper provenance or the backend's eventual prose.
+        let event = json!({
+            "id":event_id,"revision":revision,"kind":"requested_status_qualifier",
+            "text":content,"occurred_at":report["attribution"]["occurred_at"],
+            "observed_at":read.response["source_observed_at"],
+            "actor":report["attribution"]["actor"],"audience":report["attribution"]["audience"],
+            "provenance":{"kind":"companion_requested_connection_status","read_only":true,
+                "report_id":report["id"],"report_revision":report["revision"],
+                "attribution":report["attribution"],"queried_at":read.response["queried_at"],
+                "coverage_note":summary,"authority":false}
+        });
+        ensure!(
+            event_valid(&event) && source.audiences.contains(&event["audience"]),
+            "Invalid requested status qualification"
+        );
+        record_source_event(s, id, source, &event, &binding.policy, false)?;
+        let key = event_key(&source.id, &event);
+        let append_id = format!("awareness-{key}");
+        {
+            let db = s.db.lock().unwrap();
+            db.execute("INSERT OR IGNORE INTO companion_awareness_appends VALUES(?1,?2,?3,'thinking','queued')", params![id,key,append_id])?;
+            db.execute("UPDATE companion_awareness SET state='context_queued',append_channel='thinking' WHERE call_id=?1 AND event_key=?2 AND state='observed'",params![id,key])?;
+        }
+        commands.push(json!({"op":"append","channel":"thinking","event_id":append_id,"delegation_id":null,"content":content}));
+    }
+    // Later reads replace only an unsent qualifier batch for this same source.
+    // Independent backend answers and action outcomes keep their own identities.
+    crate::companion_delivery::enqueue_batch(
+        s,
+        id,
+        &format!("requested-status:{}", source.id),
+        commands,
+    )?;
+    Ok(())
+}
+
+fn requested_report_qualifier(source: &Source, report: &Value, response: &Value) -> String {
+    let attribution = &report["attribution"];
+    let actor = attribution["actor"].as_str().unwrap_or("source");
+    let report_id = report["id"].as_str().unwrap();
+    let occurred = attribution["occurred_at"].as_str().unwrap();
+    let observed = attribution["observed_at"]
+        .as_str()
+        .unwrap_or_else(|| response["source_observed_at"].as_str().unwrap());
+    if attribution["current_state_snapshot"] == true
+        && let Ok(task) = serde_json::from_str::<Value>(report["text"].as_str().unwrap())
+    {
+        let state = task["status"]
+            .as_str()
+            .filter(|s| state_valid(s))
+            .unwrap_or("unknown");
+        let progress = task["progress"]
+            .get("at")
+            .filter(|at| observed_time(at).is_some() || at.as_i64().is_some_and(|n| n > 0))
+            .map(|at| {
+                at.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| at.to_string())
+            })
+            .unwrap_or_else(|| "not recorded or invalid".into());
+        return format!(
+            "{} / {actor} [{report_id}]: assignment {state} observed {observed}. Report source time {occurred}; progress.at {progress}. Current assignment state does not establish active physical work or newly verified progress.",
+            source.label
+        );
+    }
+    format!(
+        "{} / {actor} [{report_id}]: original report time {occurred}; observation time {observed}. This is a dated source report, not proof of a recent action or independent verification.",
+        source.label
     )
 }
+
 fn state_valid(state: &str) -> bool {
     matches!(
         state,

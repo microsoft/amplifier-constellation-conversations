@@ -62,7 +62,22 @@ pub(crate) fn project(initialize: &Value, setup: &Value) -> Value {
             model = json!({"id":current,"name":selected});
         }
     }
-    json!({"agent":agent,"model":model,"options":options,"source":"acp_session_setup","observed_at":now_ms()})
+    json!({"agent":agent,"model":model,"options":options,"source":"acp_session_setup","observed_at":now_ms(),"capabilities":{"image_input":initialize["agentCapabilities"]["promptCapabilities"]["image"].as_bool(),"source":"acp_initialize","scope":"observed_session_snapshot"}})
+}
+
+/// Application-owned capability correction; no provider/user text is inserted.
+pub(crate) fn image_capability_instruction(image: Option<bool>) -> &'static str {
+    match image {
+        Some(true) => {
+            "This call's selected backend has now advertised image input support. Deliberately shared image bytes can be inspected through the backend. This does not mean any image has already been seen; use actual inspected findings for visual claims. This is a quiet capability update, not a request to speak."
+        }
+        Some(false) => {
+            "This call's selected backend has now advertised that image input is unsupported. Do not promise to inspect photos or describe their pixels in this call. A file may still be saved or shown, which is not visual understanding. Offer help from the caller's description instead. This is a quiet capability update, not a request to speak."
+        }
+        None => {
+            "Image input support for this call's selected backend remains unknown after its handshake. Do not infer support from installed tools, profile hints or another call. Do not promise image inspection until current capability and actual image delivery establish it. This is a quiet capability update, not a request to speak."
+        }
+    }
 }
 
 pub(crate) fn record(s: &AppState, room: &str, initialize: &Value, setup: &Value) -> Result<()> {
@@ -100,6 +115,28 @@ pub(crate) fn latest(s: &AppState, owner: &str, agent: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_projection_is_typed_and_explicitly_a_session_snapshot() {
+        for value in [json!(true), json!(false), Value::Null, json!("true")] {
+            let projected = project(
+                &json!({"agentCapabilities":{"promptCapabilities":{"image":value},"private":"not exposed"}}),
+                &json!({}),
+            );
+            assert_eq!(
+                projected["capabilities"]["image_input"],
+                json!(value.as_bool())
+            );
+            assert_eq!(
+                projected["capabilities"]["scope"],
+                "observed_session_snapshot"
+            );
+            assert!(!projected.to_string().contains("not exposed"));
+        }
+        for supported in [None, Some(false), Some(true)] {
+            assert!(image_capability_instruction(supported).len() <= 480);
+        }
+    }
 
     #[test]
     fn only_advertised_public_current_settings_are_reported() {
