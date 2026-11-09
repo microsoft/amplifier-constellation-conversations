@@ -1291,6 +1291,12 @@ fn provider_event(s: &AppState, id: &str, room: &str, owner: &str, v: &Value) ->
         let already: bool = s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND kind='context_delivery' AND json_extract(data,'$.event_id')=?2)", params![id,ack], |r|r.get(0))?;
         if !already {
             queue_append(s, id, "thinking", Some(did), "", &ack)?;
+            instruction(
+                s,
+                id,
+                &format!("delegation-facts-{}", auth::digest(did)),
+                crate::companion_prompt::AWAITING_FACTS,
+            )?;
         }
         s.changed();
     } else {
@@ -1799,12 +1805,12 @@ pub fn notify(s: &AppState, id: &str, channel: &str, content: &str) -> Result<bo
         &uuid::Uuid::new_v4().to_string(),
     )
 }
-/// Fixed application controls for local playback interruption. This is not a
+/// Fixed application controls for playback and pending factual checks. This is not a
 /// public tool and accepts no user-authored instruction text from the browser.
 pub(crate) fn instruction(s: &AppState, id: &str, event_id: &str, content: &str) -> Result<bool> {
     ensure!(
         content.len() <= 480 && !content.is_empty(),
-        "Invalid interruption control"
+        "Invalid voice instruction control"
     );
     if !active_call(s, id)? {
         return Ok(false);

@@ -745,8 +745,10 @@ was played. Historical content without a retained receipt remains unknown.
 `companion_view` can open this tab with `action: "show_context"`.
 
 At delegation receipt the host sends the documented empty thinking append to
-cancel a pending automatic acknowledgment. Dispatch remains visible without
-injecting waiting narration. It is not a guarantee of silence: already-generated
+cancel a pending automatic acknowledgment. A separate fixed instruction marks
+the delegated question as still awaiting checked facts, so a waiting interval is
+not an invitation to invent status or plausible work details. Both are recorded
+once per delegation. Dispatch remains visible without injecting waiting narration. It is not a guarantee of silence: already-generated
 speech and independent model speech remain separate.
 
 Useful attributed observations are supplied directly to voice. A long observation

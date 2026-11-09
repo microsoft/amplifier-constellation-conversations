@@ -101,7 +101,7 @@ for line in sys.stdin:
   emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});break
  if c['op']=='append':
   if not c['content'].strip() and c['channel']!='thinking':emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
-  if voice=='append_error' and c['content']:
+  if voice=='append_error' and c['content'] and c['channel']!='instructions':
    if second_sent:continue
    second_sent=True
    for suffix,client,outer in [('unrelated','never-queued',None),('conflict',c['event_id'],'another-command'),('matched',c['event_id'],None)]:
@@ -783,9 +783,16 @@ for line in sys.stdin:
         .iter()
         .filter(|v| v["op"] == "append")
         .collect::<Vec<_>>();
-    assert_eq!(appends.len(), 1);
+    assert_eq!(appends.len(), 2);
     assert_eq!(appends[0]["channel"], "thinking");
     assert!(appends[0]["content"].as_str().unwrap().is_empty());
+    assert_eq!(appends[1]["channel"], "instructions");
+    assert!(
+        appends[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("still awaits checked information")
+    );
     assert_eq!(
         std::fs::read_to_string(f.home.path().join("bridge-starts")).unwrap(),
         "start\n"
@@ -1221,6 +1228,24 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
         .filter(|v| v["content"].as_str().unwrap_or("").is_empty())
         .collect::<Vec<_>>();
     assert_eq!(intake.len(), 2);
+    let fact_controls = commands
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| {
+            v["channel"] == "instructions"
+                && v["event_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("delegation-facts-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fact_controls.len(), 2);
+    assert_ne!(fact_controls[0]["event_id"], fact_controls[1]["event_id"]);
+    assert!(fact_controls.iter().all(|v| {
+        v["content"]
+            .as_str()
+            .unwrap()
+            .contains("still awaits checked information")
+    }));
     for delegation in ["delegate-1", "delegate-2"] {
         let receipt = intake
             .iter()
