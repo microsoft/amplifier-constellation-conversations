@@ -223,13 +223,24 @@ def validate_outcome(row):
     if (not isinstance(row, dict) or not valid_id(row.get("request_id"))
             or row.get("delivery") not in ["queued", "admitted", "terminal", "interrupted", "unknown"]
             or row.get("completion") != "not_established"
-            or type(row.get("conversation_only")) is not bool
+            or "conversation_only" not in row
+            or (type(row.get("conversation_only")) is not bool
+                and not (row.get("delivery") in ["queued", "unknown"] and row.get("conversation_only") is None))
             or row.get("turn_task_id") is not None and not valid_id(row["turn_task_id"])
             or any(row.get(key) is not None and not valid_time(row[key]) for key in ["admitted_at", "terminal_at"])
             or row.get("blocked_reason") is not None and not text(row["blocked_reason"], 1000)
             or not isinstance(row.get("responses"), list) or len(row["responses"]) > 64
             or not isinstance(row.get("task_authorizations"), list) or len(row["task_authorizations"]) > 16):
         raise ValueError("invalid_input_outcome")
+    for flag in ["private_responses_withheld", "responses_omitted"]:
+        if flag in row and type(row[flag]) is not bool:
+            raise ValueError("invalid_outcome_coverage")
+    if "source_ids" in row:
+        sources = row["source_ids"]
+        if (not isinstance(sources, list) or not 1 <= len(sources) <= 64
+                or any(not valid_id(source) for source in sources)
+                or len(set(sources)) != len(sources) or row["request_id"] not in sources):
+            raise ValueError("invalid_outcome_source_set")
     response_ids = set()
     for response in row["responses"]:
         if (not isinstance(response, dict) or not valid_id(response.get("id"))
@@ -308,6 +319,13 @@ def outcome_observation(action, connection, observed_at, outcomes, availability)
         response_bytes += size
     state = {"queued": "unknown", "admitted": "admitted", "terminal": "settled",
              "interrupted": "interrupted", "unknown": "unknown"}[row["delivery"]]
+    # Domain omissions are booleans, not counts. Keep them separate from the
+    # records this observer itself withheld and never invent a retained total.
+    domain_evidence = {"domain_" + flag: row[flag] for flag in ["private_responses_withheld", "responses_omitted"] if flag in row}
+    if "source_ids" in row:
+        domain_evidence["source_ids"] = row["source_ids"]
+    if row.get("reason") in ["not_retained", "terminal_not_retained"]:
+        domain_evidence["outcome_reason"] = row["reason"]
     return action_observation(action, connection, observed_at, state, scope="conversation", fulfillment="not_established",
                               reason="source_bound_input_outcome", receipt={"request_id": queued}, delivery_state=row["delivery"],
                               conversation={"admitted_at": row.get("admitted_at"), "terminal_at": row.get("terminal_at"),
@@ -321,7 +339,7 @@ def outcome_observation(action, connection, observed_at, outcomes, availability)
                               task_authorizations=[{key: item[key] for key in ["operation", "task_id", "authority_revision"]}
                                                    for item in row["task_authorizations"]],
                               provenance={"kind": "minecraft_input_outcome", "source_id": queued, "version": 1,
-                                          "completion": "not_established", "authority": False})
+                                          "completion": "not_established", "authority": False}, **domain_evidence)
 
 
 def read_presence(port, token, username, timeout, node_executable):
