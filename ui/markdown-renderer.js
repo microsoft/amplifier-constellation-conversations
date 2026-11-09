@@ -10,7 +10,7 @@
       image({href, text}) { return `<a href="${escape(href)}">${escape(text || 'Image')}</a>`; },
     },
   });
-  globalThis.renderMarkdown = text => {
+  globalThis.renderMarkdown = (text, {resolveLink} = {}) => {
     const fragment = DOMPurify.sanitize(parser.parse(String(text ?? '')), {
       RETURN_DOM_FRAGMENT: true,
       ALLOWED_TAGS: ['p','br','strong','em','del','code','pre','blockquote','ul','ol','li','h1','h2','h3','h4','h5','h6','hr','a','table','thead','tbody','tr','th','td','input'],
@@ -19,10 +19,16 @@
       ALLOW_ARIA_ATTR: false,
     });
     for (const link of fragment.querySelectorAll('a')) {
-      const href = link.getAttribute('href') || '';
+      let href = link.getAttribute('href') || '';
       let safe = false;
-      try { safe = /^(https?:|mailto:)/i.test(href) && ['https:','http:','mailto:'].includes(new URL(href).protocol); } catch {}
+      try {
+        // Experiences may narrow the common policy (for example to attachments
+        // in the current conversation). A resolver cannot admit executable URLs.
+        if (resolveLink) href = resolveLink(href);
+        safe = typeof href === 'string' && /^(https?:|mailto:)/i.test(href) && ['https:','http:','mailto:'].includes(new URL(href).protocol);
+      } catch {}
       if (!safe) { link.replaceWith(...link.childNodes); continue; }
+      link.setAttribute('href', href);
       link.target = '_blank';
       link.rel = 'noopener noreferrer';
     }

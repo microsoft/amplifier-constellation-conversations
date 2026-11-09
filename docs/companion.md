@@ -617,16 +617,6 @@ references; it is explicitly context, not a replay of earlier instructions.
 The current delegated source remains separate. Runtime identity comes from the
 installation profile, distinct from the cloud voice interface.
 
-The delegated agent's final public answer is also the caller's saved result card.
-Its response guidance asks for a direct, concise plain-text answer, with source,
-time and uncertainty kept when they affect the meaning. It distinguishes transport
-submission from acknowledgment or recipient delivery, and equivalent spoken and
-written timestamps from genuine conflicts. Adequate evidence can answer a
-clarification about an established historical event; a fresh-state question or
-missing, changed or conflicting evidence still needs a check. There is no extra
-rewrite model, automatic removal of caveats or alteration of the canonical answer.
-These are generation instructions, not a guarantee of model compliance or latency.
-
 Multiple inputs can be incorporated into one backend turn. The host settles each
 exact source only when its linked target has completed successfully and publishes
 that answer once. Source incorporation alone is not completion. Repeated elapsed

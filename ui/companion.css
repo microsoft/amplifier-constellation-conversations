@@ -684,7 +684,7 @@ input,textarea {
   background:#fafbf5;
   overflow-wrap:anywhere
 }
-.output-card h2 {
+.output-card > h2 {
   font-size:14px;
   letter-spacing:0;
   font-weight:650;
@@ -1240,8 +1240,13 @@ body.call-active {
 .share-toolbar button {flex:0 0 auto;padding:10px 14px;font-size:12px}
 #share-capability {font-size:11px!important;line-height:1.5;margin-bottom:16px}
 .cards {padding-bottom:5px}
-.output-card h2 {gap:10px}
+.output-card > h2 {gap:10px}
 .output-card p a {font-size:inherit;display:inline;margin:0}
+.output-card .card-text {font-size:15px}
+.output-card .card-text p {white-space:normal;margin:.8em 0}
+.output-card .card-text > :first-child {margin-top:0}
+.output-card .card-text > :last-child {margin-bottom:0}
+.output-card .card-text a {font-size:inherit;display:inline;margin:0}
 .output-card .upload-status {font-size:13px}
 .upload-card[data-state="failed"],.upload-card[data-state="unconfirmed"] {border-color:#c9a293}
 .upload-card[data-state="available"] {border-color:#adc2a5}
