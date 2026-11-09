@@ -1,7 +1,8 @@
 /** Fixed installation-owned Slack delivery. No model-selected destination or token. */
 import {readFile} from 'node:fs/promises';
 import {isAbsolute,join} from 'node:path';
-import {pathToFileURL} from 'node:url';
+import {fileURLToPath} from 'node:url';
+import {realpathSync} from 'node:fs';
 import {WebClient,LogLevel} from '@slack/web-api';
 import {z} from 'zod/v4';
 
@@ -85,4 +86,9 @@ async function main() {
     process.stdout.write(JSON.stringify({request_id:z.string().uuid().safeParse(candidate).success?candidate:null,state:'failed',error:'invalid_request'})+'\n');
   }
 }
-if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)await main();
+// Match Node's canonical module URL even through a versioned install symlink.
+let invokedAsEntry=false;
+if(process.argv[1]){
+  try{invokedAsEntry=realpathSync(fileURLToPath(import.meta.url))===realpathSync(process.argv[1]);}catch{}
+}
+if(invokedAsEntry) await main();

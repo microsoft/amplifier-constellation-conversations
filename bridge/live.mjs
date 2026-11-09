@@ -3,7 +3,8 @@
  */
 import OpenAI from 'openai';
 import {SidebandWS} from 'openai/resources/live/sideband/ws';
-import {pathToFileURL} from 'node:url';
+import {fileURLToPath} from 'node:url';
+import {realpathSync} from 'node:fs';
 import {startCompanionMcp} from './companion-mcp.mjs';
 
 /** @typedef {import('openai/resources/live/live').LiveCreateParams} LiveCreateParams */
@@ -380,4 +381,11 @@ async function main() {
   await bridge.transportDone;
   process.stdin.destroy();
 }
-if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) await main();
+// Node resolves imported module URLs through versioned installation symlinks,
+// while argv keeps the invoked path. Canonicalize only that entrypoint check;
+// importing this module must never start a bridge or require credentials.
+let invokedAsEntry=false;
+if(process.argv[1]){
+  try{invokedAsEntry=realpathSync(fileURLToPath(import.meta.url))===realpathSync(process.argv[1]);}catch{}
+}
+if(invokedAsEntry) await main();

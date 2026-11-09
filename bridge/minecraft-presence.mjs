@@ -1,7 +1,8 @@
 // Fixed read-only Minecraft presence client. The official SDK owns MCP transport.
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import {pathToFileURL} from 'node:url';
+import {fileURLToPath} from 'node:url';
+import {realpathSync} from 'node:fs';
 import {z} from 'zod/v4';
 
 const MAX_BYTES = 524288;
@@ -70,7 +71,12 @@ export async function observePresence(value) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Match Node's canonical module URL even through a versioned install symlink.
+let invokedAsEntry=false;
+if(process.argv[1]){
+  try{invokedAsEntry=realpathSync(fileURLToPath(import.meta.url))===realpathSync(process.argv[1]);}catch{}
+}
+if(invokedAsEntry) {
   try {
     let raw = '';
     for await (const chunk of process.stdin) {

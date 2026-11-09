@@ -9,7 +9,8 @@
  * conservative pilot thresholds below require evaluation on labeled real calls.
  */
 import OpenAI from 'openai';
-import {pathToFileURL} from 'node:url';
+import {fileURLToPath} from 'node:url';
+import {realpathSync} from 'node:fs';
 
 export const MODEL = 'gpt-6-luna';
 export const MAX_INPUT_BYTES = 32 * 1024;
@@ -191,4 +192,9 @@ export async function main(input=process.stdin,output=process.stdout) {
   output.write(`${JSON.stringify(await evaluateAwareness(value))}\n`);
 }
 
-if (process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) await main();
+// Match Node's canonical module URL even through a versioned install symlink.
+let invokedAsEntry=false;
+if(process.argv[1]){
+  try{invokedAsEntry=realpathSync(fileURLToPath(import.meta.url))===realpathSync(process.argv[1]);}catch{}
+}
+if(invokedAsEntry) await main();
