@@ -554,6 +554,41 @@ fn state_valid(state: &str) -> bool {
             | "interrupted"
     )
 }
+fn input_outcome_valid(v: &Value) -> bool {
+    let expected_state = match v["delivery_state"].as_str() {
+        Some("queued" | "unknown") => "unknown",
+        Some("admitted") => "admitted",
+        Some("terminal") => "settled",
+        Some("interrupted") => "interrupted",
+        _ => return false,
+    };
+    v["provenance"]["version"] == 1
+        && v["scope"] == "conversation"
+        && v["state"] == expected_state
+        && v["fulfillment"] == "not_established"
+        && v["conversation"].is_object()
+        && (v["conversation"]["conversation_only"].is_boolean()
+            || (v["conversation"]["conversation_only"].is_null()
+                && matches!(v["delivery_state"].as_str(), Some("queued" | "unknown"))))
+        // Domain omissions are facts about the source's bounded projection.
+        // They are not counts, nor proof this client retained the missing rows.
+        && ["domain_private_responses_withheld", "domain_responses_omitted"]
+            .iter()
+            .all(|key| v.get(key).is_none_or(Value::is_boolean))
+        && ["private_responses_withheld", "responses_omitted"]
+            .iter()
+            .all(|key| v.get(key).is_none_or(|count| count.as_u64().is_some()))
+        && v["responses"].as_array().is_some_and(|replies| {
+            replies.len() <= 8
+                && replies.iter().all(|reply| {
+                    reply["audience"] == "public"
+                        && reply["id"].as_str().is_some_and(|id| !id.is_empty() && id.len() <= 160)
+                        && observed_time(&reply["at"]).is_some()
+                        && reply["text"].as_str().is_some_and(|text| !text.trim().is_empty() && text.len() <= 4000)
+                })
+        })
+}
+
 fn observation_valid(v: &Value, known: &[Value]) -> bool {
     known.iter().any(|a| a["request_id"] == v["request_id"])
         && v["revision"]
@@ -563,13 +598,7 @@ fn observation_valid(v: &Value, known: &[Value]) -> bool {
         && ["task", "message_delivery", "conversation"].contains(&v["scope"].as_str().unwrap_or(""))
         && observed_time(&v["observed_at"]).is_some()
         && v["provenance"].is_object()
-        && (v["provenance"]["kind"] != "minecraft_input_outcome"
-            || (v["provenance"]["version"] == 1
-                && v["scope"] == "conversation"
-                && v["fulfillment"] == "not_established"
-                && v["responses"].as_array().is_some_and(|replies| {
-                    replies.iter().all(|reply| reply["audience"] == "public")
-                })))
+        && (v["provenance"]["kind"] != "minecraft_input_outcome" || input_outcome_valid(v))
         && v.to_string().len() <= 16000
         && (v["state"] != "completed" || v["scope"] == "message_delivery")
         && (!["task", "conversation"].contains(&v["scope"].as_str().unwrap_or(""))
@@ -580,10 +609,11 @@ fn observation_text(label: &str, update: &Value) -> String {
         && update["provenance"]["kind"] == "minecraft_input_outcome"
         && update["provenance"]["version"] == 1
     {
-        let status = match update["state"].as_str() {
-            Some("admitted") => "the connector recorded admission",
-            Some("settled") => "the connector recorded that handling ended",
-            Some("interrupted") => "handling was interrupted",
+        let status = match (update["delivery_state"].as_str(), update["state"].as_str()) {
+            (Some("queued"), _) => "the connector recorded this input as queued",
+            (_, Some("admitted")) => "the connector recorded admission",
+            (_, Some("settled")) => "the connector recorded that handling ended",
+            (_, Some("interrupted")) => "handling was interrupted",
             _ => "the handling outcome remains unknown",
         };
         let turn = &update["conversation"];
@@ -626,11 +656,22 @@ fn observation_text(label: &str, update: &Value) -> String {
             text.push_str(&next);
             included += 1;
         }
-        if included < replies.len() || update["responses_omitted"].as_u64().unwrap_or(0) > 0 {
-            text.push_str("\nAdditional reply records are retained in the action status; no partial reply was summarized here.");
+        if included < replies.len() {
+            text.push_str(
+                "\nSome returned replies are not included here; no partial reply was summarized.",
+            );
         }
-        if update["private_responses_withheld"].as_u64().unwrap_or(0) > 0 {
-            text.push_str("\nPrivate response content was withheld because its recipient binding is not established.");
+        if update["responses_omitted"].as_u64().unwrap_or(0) > 0
+            || update["domain_responses_omitted"] == true
+        {
+            text.push_str(
+                "\nThe available reply record is incomplete; omitted replies may not be retained.",
+            );
+        }
+        if update["private_responses_withheld"].as_u64().unwrap_or(0) > 0
+            || update["domain_private_responses_withheld"] == true
+        {
+            text.push_str("\nPrivate response content was withheld; it is not evidence available to this call.");
         }
         return text;
     }

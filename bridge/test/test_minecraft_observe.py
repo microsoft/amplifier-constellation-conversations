@@ -19,6 +19,70 @@ TOKEN = "fixture-control-secret-never-output"
 PRESENCE_TOKEN = "fixture-presence-secret-never-output"
 NOW = "2026-11-07T20:00:00+00:00"
 
+# Exact owner v1 fixture from Minecraft 6babae4; no service/model calls.
+OWNER_STATUS_FIXTURE = json.loads(r'''{
+  "input_outcomes": {
+    "version": 1,
+    "method": "GET",
+    "path": "/input-outcomes",
+    "max_ids": 16
+  }
+}''')
+OWNER_OUTCOMES_FIXTURE = json.loads(r'''{
+  "version": 1,
+  "observed_at": "2026-11-09T11:00:03.000Z",
+  "outcomes": [
+    {
+      "request_id": "6df50b1b-edc6-4c57-88b2-a2f9f39eb1d4",
+      "delivery": "terminal",
+      "admitted_at": "2026-11-09T11:00:00.000Z",
+      "terminal_at": "2026-11-09T11:00:02.000Z",
+      "conversation_only": true,
+      "turn_task_id": null,
+      "blocked_reason": null,
+      "responses": [
+        {
+          "id": "754b14e4-cc67-4b85-bc8e-c4dfd0391b49",
+          "at": "2026-11-09T11:00:01.000Z",
+          "text": "I inspected the entrance; the path is clear.",
+          "audience": "public"
+        }
+      ],
+      "task_authorizations": [],
+      "completion": "not_established",
+      "source_ids": [
+        "6df50b1b-edc6-4c57-88b2-a2f9f39eb1d4"
+      ],
+      "private_responses_withheld": true
+    },
+    {
+      "request_id": "c06398ab-364d-4a87-b291-e36bb62c3739",
+      "delivery": "queued",
+      "admitted_at": null,
+      "terminal_at": null,
+      "conversation_only": null,
+      "turn_task_id": null,
+      "blocked_reason": null,
+      "responses": [],
+      "task_authorizations": [],
+      "completion": "not_established"
+    },
+    {
+      "request_id": "c2e38a2d-dbbd-4145-b164-e3741b7a09c1",
+      "delivery": "unknown",
+      "admitted_at": null,
+      "terminal_at": null,
+      "conversation_only": null,
+      "turn_task_id": null,
+      "blocked_reason": null,
+      "responses": [],
+      "task_authorizations": [],
+      "completion": "not_established",
+      "reason": "not_retained"
+    }
+  ]
+}''')
+
 
 class MinecraftObserveTests(unittest.TestCase):
     def setUp(self):
@@ -553,6 +617,107 @@ class MinecraftObserveTests(unittest.TestCase):
             self.assertNotIn("Private instruction", json.dumps(result))
             self.assertNotIn("Build the tower", json.dumps(result))
             self.assertFalse(any("/operator-inputs" in call.full_url for call in self.calls))
+
+    def test_exact_owner_fixture_keeps_mixed_terminal_queued_unknown_and_domain_withholding(self):
+        # This exact batch was previously rejected because queued/unknown use
+        # null when no turn exists; that is not conversation_only=false.
+        self.snapshots["/status"] = OWNER_STATUS_FIXTURE
+        actions = []
+        for row in OWNER_OUTCOMES_FIXTURE["outcomes"]:
+            request = str(uuid.uuid4())
+            actions.append({"request_id": request, "receipt": {"request_id": request, "state": "queued",
+                "scope": "private_operator_instruction", "receipt": {"request_id": row["request_id"], "queued": True}}})
+        queues = [row["request_id"] for row in OWNER_OUTCOMES_FIXTURE["outcomes"]]
+        path = "/input-outcomes?" + urllib.parse.urlencode({"ids": ",".join(queues)})
+        self.snapshots[path] = OWNER_OUTCOMES_FIXTURE
+        result = self.observe({"version": 1, "actions": actions})
+        self.assertEqual(result["coverage"]["input_outcomes"], "available")
+        self.assertEqual([row["state"] for row in result["actions"]], ["settled", "unknown", "unknown"])
+        self.assertEqual([row["delivery_state"] for row in result["actions"]], ["terminal", "queued", "unknown"])
+        first, queued, unknown = result["actions"]
+        self.assertTrue(first["domain_private_responses_withheld"])
+        self.assertEqual(first["private_responses_withheld"], 0, "The domain disclosed no count and no private reply text")
+        self.assertEqual(first["source_ids"], [queues[0]])
+        self.assertIsNone(queued["conversation"]["conversation_only"])
+        self.assertIsNone(unknown["conversation"]["conversation_only"])
+        self.assertEqual(unknown["outcome_reason"], "not_retained")
+        self.assertNotIn("domain_private_responses_withheld", queued, "Absent coverage is not false")
+        for row in result["actions"]:
+            self.assertFalse(row["verified"])
+            self.assertEqual(row["fulfillment"], "not_established")
+
+    def test_null_turn_mode_is_only_valid_before_admission_or_for_unknown(self):
+        for delivery in ["queued", "unknown"]:
+            self.advertise_outcome(delivery, conversation_only=None)
+            result = self.observe()
+            self.assertEqual(result["coverage"]["input_outcomes"], "available")
+            self.assertIsNone(result["actions"][0]["conversation"]["conversation_only"])
+        for delivery in ["admitted", "terminal", "interrupted"]:
+            with self.subTest(delivery=delivery):
+                self.advertise_outcome(delivery, conversation_only=None)
+                result = self.observe()
+                self.assertEqual(result["coverage"]["input_outcomes"], "unavailable")
+                self.assertEqual(result["actions"][0]["state"], "unknown")
+        row, _ = self.advertise_outcome("unknown")
+        del row["conversation_only"]
+        self.assertEqual(self.observe()["coverage"]["input_outcomes"], "unavailable")
+        for invalid in [0, 1, "false", "unknown", []]:
+            self.advertise_outcome("unknown", conversation_only=invalid)
+            self.assertEqual(self.observe()["coverage"]["input_outcomes"], "unavailable")
+
+    def test_domain_omission_booleans_remain_separate_from_local_numeric_counts(self):
+        for flag in [False, True]:
+            row, _ = self.advertise_outcome(private_responses_withheld=flag, responses_omitted=flag)
+            row["responses"].append({"id": "private", "at": NOW, "text": "withhold this text", "audience": "private"})
+            action = self.observe()["actions"][0]
+            self.assertIs(action["domain_private_responses_withheld"], flag)
+            self.assertIs(action["domain_responses_omitted"], flag)
+            self.assertEqual(action["private_responses_withheld"], 1)
+            self.assertEqual(action["responses_omitted"], 0)
+            self.assertNotIn("withhold this text", json.dumps(action))
+        self.advertise_outcome()
+        action = self.observe()["actions"][0]
+        self.assertNotIn("domain_private_responses_withheld", action)
+        self.assertNotIn("domain_responses_omitted", action)
+
+    def test_malformed_domain_omission_flags_fail_closed(self):
+        for name in ["private_responses_withheld", "responses_omitted"]:
+            for value in [0, 1, None, "true", {}, []]:
+                with self.subTest(name=name, value=value):
+                    self.advertise_outcome(**{name: value})
+                    result = self.observe()
+                    self.assertEqual(result["coverage"]["input_outcomes"], "unavailable")
+                    self.assertEqual(result["actions"][0]["state"], "unknown")
+
+    def test_coadmitted_source_set_is_preserved_without_individual_fulfillment(self):
+        other = str(uuid.uuid4())
+        self.advertise_outcome(source_ids=[self.queued, other])
+        action = self.observe()["actions"][0]
+        self.assertEqual(action["source_ids"], [self.queued, other])
+        self.assertEqual(action["response_association"], "same_turn_source_set_not_individual_fulfillment")
+        self.assertEqual(action["fulfillment"], "not_established")
+        self.assertFalse(action["conversation"]["reply_verified"])
+        self.assertFalse(action["verified"])
+
+    def test_malformed_or_unrelated_coadmitted_source_set_fails_closed(self):
+        for sources in [None, "source", [], [str(uuid.uuid4())], [self.queued, self.queued],
+                        [self.queued, None], [self.queued, {}], [self.queued, ""],
+                        [self.queued, "bad\nidentity"], [self.queued, "x" * 161],
+                        [self.queued, *[str(uuid.uuid4()) for _ in range(64)]]]:
+            with self.subTest(sources=sources):
+                self.advertise_outcome(source_ids=sources)
+                result = self.observe()
+                self.assertEqual(result["coverage"]["input_outcomes"], "unavailable")
+                self.assertEqual(result["actions"][0]["state"], "unknown")
+
+    def test_known_retention_reason_is_preserved_without_arbitrary_private_text(self):
+        for reason in ["not_retained", "terminal_not_retained"]:
+            self.advertise_outcome("unknown", conversation_only=None, reason=reason)
+            self.assertEqual(self.observe()["actions"][0]["outcome_reason"], reason)
+        self.advertise_outcome("unknown", conversation_only=None, reason="private arbitrary reason " + TOKEN)
+        result = self.observe()
+        self.assertNotIn("outcome_reason", result["actions"][0])
+        self.assertNotIn(TOKEN, json.dumps(result))
 
     def test_cli_invalid_json_is_sanitized(self):
         result = subprocess.run([sys.executable, str(HELPER), "--config", str(self.config)], input="bad " + TOKEN,

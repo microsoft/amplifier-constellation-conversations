@@ -84,13 +84,26 @@ input maps to `settled`, never task completion. Captured admission time, termina
 time, task identity and blockage remain the original turn's facts. Source-bound
 accept/amend authorization receipts are separate from delivery and fulfillment.
 Every projection retains `verified: false` and `fulfillment: "not_established"`.
+For queued or unknown inputs, `conversation_only` may be `null`: no turn mode was
+established. It is not converted to `false`. Admitted, terminal and interrupted
+records require an explicit boolean. If supplied, `source_ids` must be a bounded,
+unique source set containing the queried ID; it is retained as association
+evidence, never permission to look up or act on those other inputs.
 
 Public replies are associated with the turn's input set, not proof that each
 co-admitted request was answered. At most eight whole replies and 8,000 serialized
 bytes are returned; additional replies are counted as omitted instead of
-truncating a qualification mid-sentence. The v1 proposal does not identify the
-recipient and complete co-admitted source set for private replies, so **private
-reply content is withheld**, with only a count returned. Possession of the
-installation's control token cannot authorize disclosure into a different call.
+truncating a qualification mid-sentence. Those observer-local counts remain
+separate from the domain's optional omission booleans. A domain
+`private_responses_withheld` or `responses_omitted` flag is preserved as
+`domain_private_responses_withheld` or `domain_responses_omitted`; it supplies no
+count and does not promise that omitted text remains retrievable. An absent flag
+stays absent. Malformed flag types invalidate the lookup.
+
+The v1 source set does not establish individual private-response recipients, so
+**private reply content remains withheld**. Domain-filtered private text never
+arrives at this observer; if a response does arrive marked private, the observer
+withholds it and reports only its local count. Possession of the installation's
+control token cannot authorize disclosure into a different call.
 This consumer support does not establish that a particular installed Minecraft
 version advertises the capability; coverage records the actual negotiation.

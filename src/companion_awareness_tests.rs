@@ -1408,9 +1408,9 @@ fn input_outcome_awareness_omits_oversized_whole_reply_instead_of_dropping_its_q
 fn input_outcomes_reject_private_response_payload_before_retention_and_bound_escaped_blocker() {
     let request = "req";
     let mut update = json!({"request_id":request,"revision":"revision","observed_at":timestamp(now_ms()),
-        "scope":"conversation","state":"settled","verified":false,"fulfillment":"not_established",
+        "scope":"conversation","state":"settled","delivery_state":"terminal","verified":false,"fulfillment":"not_established",
         "provenance":{"kind":"minecraft_input_outcome","version":1},
-        "conversation":{"blocked_reason":"\u{0001}".repeat(1000)},
+        "conversation":{"conversation_only":true,"blocked_reason":"\u{0001}".repeat(1000)},
         "responses":[{"id":"secret","audience":"private","text":"private-secret"}]});
     assert!(!observation_valid(
         &update,
@@ -1423,4 +1423,138 @@ fn input_outcomes_reject_private_response_payload_before_retention_and_bound_esc
     assert!(text.contains("omitted_fields"));
     assert!(text.contains("blocked_reason"));
     assert!(!text.contains("\\u0001"));
+}
+
+fn outcome_update(delivery: &str, state: &str, conversation_only: Value) -> Value {
+    json!({"request_id":"original-call-request","revision":"outcome-revision","observed_at":timestamp(now_ms()),
+        "scope":"conversation","state":state,"delivery_state":delivery,"verified":false,"fulfillment":"not_established",
+        "provenance":{"kind":"minecraft_input_outcome","version":1,"source_id":"original-domain-input"},
+        "conversation":{"conversation_only":conversation_only,"admitted_at":null,"terminal_at":null,"blocked_reason":null},
+        "responses":[],"responses_omitted":0,"private_responses_withheld":0})
+}
+
+#[test]
+fn queued_and_unknown_outcomes_preserve_unset_conversation_scope() {
+    for delivery in ["queued", "unknown"] {
+        let update = outcome_update(delivery, "unknown", Value::Null);
+        assert!(observation_valid(
+            &update,
+            &[json!({"request_id":"original-call-request"})]
+        ));
+        let text = observation_text("Coach", &update);
+        assert!(text.contains("\"conversation_only\":null"));
+        assert!(!text.contains("\"conversation_only\":false"));
+        assert!(!text.contains("handling ended"));
+        if delivery == "queued" {
+            assert!(text.contains("recorded this input as queued"));
+        } else {
+            assert!(text.contains("outcome remains unknown"));
+        }
+    }
+    for (delivery, state) in [
+        ("admitted", "admitted"),
+        ("terminal", "settled"),
+        ("interrupted", "interrupted"),
+    ] {
+        let mut update = outcome_update(delivery, state, Value::Null);
+        assert!(!observation_valid(
+            &update,
+            &[json!({"request_id":"original-call-request"})]
+        ));
+        update["conversation"]["conversation_only"] = json!(false);
+        assert!(observation_valid(
+            &update,
+            &[json!({"request_id":"original-call-request"})]
+        ));
+    }
+}
+
+#[test]
+fn domain_omission_flags_are_not_counts_or_retention_promises() {
+    let mut update = outcome_update("terminal", "settled", json!(true));
+    update["domain_private_responses_withheld"] = json!(true);
+    update["domain_responses_omitted"] = json!(true);
+    update["source_ids"] = json!(["original-domain-input", "another-co-admitted-source"]);
+    assert!(observation_valid(
+        &update,
+        &[json!({"request_id":"original-call-request"})]
+    ));
+    let text = observation_text("Coach", &update);
+    assert!(text.contains("Private response content was withheld"));
+    assert!(text.contains("available reply record is incomplete"));
+    assert!(text.contains("omitted replies may not be retained"));
+    assert!(!text.contains("Additional reply records are retained"));
+    assert!(text.contains("not proof the individual request was answered"));
+    assert!(text.contains("co-admitted source set"));
+    assert!(!text.contains("another-co-admitted-source"));
+    assert_eq!(update["private_responses_withheld"], 0);
+    assert_eq!(update["responses_omitted"], 0);
+    for key in [
+        "domain_private_responses_withheld",
+        "domain_responses_omitted",
+    ] {
+        for invalid in [json!(1), json!("true"), Value::Null, json!([])] {
+            let mut wrong = update.clone();
+            wrong[key] = invalid;
+            assert!(
+                !observation_valid(&wrong, &[json!({"request_id":"original-call-request"})]),
+                "{key}: {wrong}"
+            );
+        }
+    }
+    for key in ["private_responses_withheld", "responses_omitted"] {
+        for invalid in [json!(true), json!("1"), json!(-1), json!(1.5)] {
+            let mut wrong = update.clone();
+            wrong[key] = invalid;
+            assert!(
+                !observation_valid(&wrong, &[json!({"request_id":"original-call-request"})]),
+                "{key}: {wrong}"
+            );
+        }
+    }
+    update["domain_private_responses_withheld"] = json!(false);
+    update["domain_responses_omitted"] = json!(false);
+    let text = observation_text("Coach", &update);
+    assert!(!text.contains("Private response content was withheld"));
+    assert!(!text.contains("available reply record is incomplete"));
+}
+
+#[test]
+fn outcome_raw_validation_rejects_mismatched_delivery_and_malformed_public_reply() {
+    let known = [json!({"request_id":"original-call-request"})];
+    let update = outcome_update("terminal", "settled", json!(true));
+    for change in [
+        json!({"state":"completed"}),
+        json!({"state":"admitted"}),
+        json!({"delivery_state":"queued"}),
+        json!({"delivery_state":"invented"}),
+        json!({"conversation":{"conversation_only":"false"}}),
+    ] {
+        let mut wrong = update.clone();
+        wrong
+            .as_object_mut()
+            .unwrap()
+            .extend(change.as_object().unwrap().clone());
+        assert!(!observation_valid(&wrong, &known), "{wrong}");
+    }
+    let public = json!({"id":"public-reply","at":timestamp(now_ms()),"text":"The path is clear, but the shop is unfinished.","audience":"public"});
+    let mut valid = update.clone();
+    valid["responses"] = json!([public.clone()]);
+    assert!(observation_valid(&valid, &known));
+    for change in [
+        json!({"id":null}),
+        json!({"text":null}),
+        json!({"text":""}),
+        json!({"at":"not-a-time"}),
+        json!({"audience":"private"}),
+    ] {
+        let mut reply = public.clone();
+        reply
+            .as_object_mut()
+            .unwrap()
+            .extend(change.as_object().unwrap().clone());
+        let mut wrong = update.clone();
+        wrong["responses"] = json!([reply]);
+        assert!(!observation_valid(&wrong, &known), "{wrong}");
+    }
 }

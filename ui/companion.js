@@ -464,7 +464,8 @@ function connectionObservationText(data) {
   if (observation.scope === 'conversation') {
     const outcome = inputOutcomeDetails(observation);
     if (outcome) {
-      const wording = ({admitted:'The game connector admitted this request.',settled:'The game turn ended.',interrupted:'The game turn was interrupted.'})[state] || 'Game handling remains unconfirmed.';
+      const wording = ({admitted:'The game connector admitted this request.',settled:'The game turn ended.',interrupted:'The game turn was interrupted.'})[state]
+        || (observation.outcome_reason === 'not_retained' ? 'A retained handling record is not available for this request.' : 'Game handling remains unconfirmed.');
       return `${label}: ${wording}${outcome.blocker ? ' A blocker was reported; details are in Context.' : ''}${outcome.responses.length ? ' Public replies from the same turn are in Context.' : ''} The result of this request is not confirmed.`;
     }
     const wording = ({admitted:'The game connector admitted your request; forwarding to the agent is not confirmed.',settled:'The conversation turn ended; a reply and work outcome are not confirmed.',interrupted:'Conversation handling was interrupted; the outcome is unconfirmed.'})[state]
@@ -497,8 +498,11 @@ function connectionObservationContent(data) {
       content += `\n\n${at ? at.toLocaleString() : 'Time not recorded'} — ${response.text.slice(0,4000)}`;
     }
   }
-  if (Number.isSafeInteger(observation.private_responses_withheld) && observation.private_responses_withheld > 0) content += '\n\nPrivate response text was withheld from this call.';
-  if (Number.isSafeInteger(observation.responses_omitted) && observation.responses_omitted > 0) content += '\n\nAdditional public replies were omitted from this bounded report.';
+  if (observation.domain_private_responses_withheld === true || (Number.isSafeInteger(observation.private_responses_withheld) && observation.private_responses_withheld > 0)) content += '\n\nPrivate response text was withheld from this report.';
+  // The domain reports omission as a flag, not a count or a promise that the
+  // missing content remains retrievable. Local filtering has separate counts.
+  if (observation.domain_responses_omitted === true) content += '\n\nSome replies are not included in this report.';
+  else if (Number.isSafeInteger(observation.responses_omitted) && observation.responses_omitted > 0) content += '\n\nAdditional public replies were omitted from this bounded report.';
   return content;
 }
 function contextTime(value) {
