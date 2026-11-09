@@ -9,6 +9,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -1138,6 +1139,11 @@ async fn delegation_anchor_includes_observed_straddling_word_with_original_timin
         )
     );
     assert!(source.contains("inspecting bytes or naming a remote path does not share it"));
+    assert!(source.contains("published to Companion when this response settles"));
+    assert!(
+        source
+            .contains("board-status query before settlement cannot establish publication failure")
+    );
     let segments = current_human_segments(&source);
     assert_eq!(segments.len(), 1);
     assert_eq!(
@@ -1428,7 +1434,7 @@ async fn upload_awareness_is_owned_durable_idempotent_and_does_not_auto_prompt()
 }
 
 #[tokio::test]
-async fn delayed_result_preserves_qualifiers_full_lookup_and_delegation_without_interrupting() {
+async fn superseded_result_preserves_qualifiers_full_lookup_and_delegation_without_interrupting() {
     let f = fixture("quiet");
     let (_, call) = start(&f).await;
     let id = call["id"].as_str().unwrap();
@@ -1444,6 +1450,10 @@ async fn delayed_result_preserves_qualifiers_full_lookup_and_delegation_without_
         db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES('late-result',?1,'assistant',?2,'complete',?3,?3,'Coach','default')",rusqlite::params![room,text,now_ms()]).unwrap();
         db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES('late-delivery','late-source',?1,'default','direct','completed','late-result',?2)",rusqlite::params![room,now_ms()]).unwrap();
         db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'late-delegation',100,'dispatched','late-source',?2)",rusqlite::params![id,now_ms()-190_000]).unwrap();
+        // The result is earlier context because a distinct request replaced it,
+        // not simply because useful work took longer than thirty seconds.
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('new-question',?1,'user','Now check the other issue','sent',?2,?2,'owner')",rusqlite::params![room,now_ms()]).unwrap();
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('new-question','new-question',?1,'default','direct','queued',?2)",rusqlite::params![room,now_ms()]).unwrap();
     }
     let v = until(&f, id, "card").await;
     let card = &v["events"]
@@ -3187,10 +3197,13 @@ async fn explicit_acp_image_result_is_saved_published_and_available_for_scoped_r
 }
 
 #[tokio::test]
-async fn output_images_do_not_present_stale_closed_unlinked_or_nonterminal_results() {
+async fn output_images_follow_current_request_identity_and_preserve_private_scope() {
     for case in [
-        "late",
+        "delayed",
+        "acknowledged",
         "corrected",
+        "manual-request",
+        "incorporated-followup",
         "closed",
         "old-call-source",
         "other-owner",
@@ -3217,18 +3230,46 @@ async fn output_images_do_not_present_stale_closed_unlinked_or_nonterminal_resul
             ).unwrap();
         }
         settlement_source(&f, &call, "image-source", "incorporated", "image-target");
+        if case == "corrected" || case == "incorporated-followup" {
+            settlement_source(
+                &f,
+                &call,
+                "newer-source",
+                if case == "corrected" {
+                    "submitted"
+                } else {
+                    "incorporated"
+                },
+                if case == "corrected" {
+                    "different-target"
+                } else {
+                    "image-target"
+                },
+            );
+        }
         {
             let db = f.s.db.lock().unwrap();
             match case {
-                "late" => {
+                "delayed" => {
+                    // Keep the exact source inside this call while simulating
+                    // slow publication; age alone cannot revoke the request.
+                    db.execute(
+                        "UPDATE companion_calls SET created_at=?2 WHERE id=?1",
+                        rusqlite::params![id, now_ms() - 40_000],
+                    )
+                    .unwrap();
                     db.execute(
                         "UPDATE messages SET created_at=?1 WHERE id='image-source'",
                         [now_ms() - 31_000],
                     )
                     .unwrap();
                 }
-                "corrected" => {
-                    db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'later-human','transcript',?2,?3)", rusqlite::params![id,json!({"role":"user","text":"Actually, leave that for later."}).to_string(),now_ms()+1]).unwrap();
+                "acknowledged" => {
+                    db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'later-human','transcript',?2,?3)", rusqlite::params![id,json!({"role":"user","text":"Okay, I'm still here."}).to_string(),now_ms()+1]).unwrap();
+                }
+                "manual-request" => {
+                    db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('manual-new',?1,'user','Switch to the other question','sent',?2,?2,'owner')",rusqlite::params![room,now_ms()]).unwrap();
+                    db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('manual-new','manual-new',?1,'default','direct','queued',?2)",rusqlite::params![room,now_ms()]).unwrap();
                 }
                 "old-call-source" => {
                     db.execute("UPDATE messages SET created_at=(SELECT created_at-1 FROM companion_calls WHERE id=?1) WHERE id='image-source'", [id]).unwrap();
@@ -3296,7 +3337,18 @@ async fn output_images_do_not_present_stale_closed_unlinked_or_nonterminal_resul
             );
         } else {
             assert_eq!(cards.len(), 1, "{case}");
-            assert_eq!(cards[0]["data"]["presentation"], "later", "{case}");
+            let current = ["delayed", "acknowledged", "incorporated-followup"].contains(&case);
+            assert_eq!(
+                cards[0]["data"]["presentation"],
+                if current { "current" } else { "later" },
+                "{case}"
+            );
+            if current {
+                assert_eq!(cards[0]["data"]["late"], false, "{case}");
+            }
+            if case == "delayed" {
+                assert!(cards[0]["data"]["elapsed_seconds"].as_i64().unwrap() >= 31);
+            }
         }
         assert!(
             !f.home.path().join("acp.jsonl").exists(),
@@ -3306,6 +3358,89 @@ async fn output_images_do_not_present_stale_closed_unlinked_or_nonterminal_resul
             end(&f, id).await;
         }
     }
+}
+
+#[tokio::test]
+async fn settled_image_publication_receipt_accompanies_unmodified_backend_answer() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    terminal_fixture(&f, &call, "image-receipt-target", "streaming");
+    let answer = "Attached the screenshot. I could not upload it to the board because no local upload tool exists.";
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET text=?1 WHERE id='image-receipt-target'",
+            [answer],
+        )
+        .unwrap();
+    agent_conversations::attachments::receive(&f.s,room,"image-receipt-target","Coach",&json!({"type":"image","mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="})).unwrap();
+    settlement_source(
+        &f,
+        &call,
+        "image-receipt-source",
+        "incorporated",
+        "image-receipt-target",
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET status='complete' WHERE id='image-receipt-target'",
+            [],
+        )
+        .unwrap();
+    let mut batch = None;
+    for _ in 0..100 {
+        batch = f.s.db.lock().unwrap().query_row("SELECT updates FROM companion_voice_batches WHERE call_id=?1 AND semantic_key='result:image-receipt-target'",[id],|r|r.get::<_,String>(0)).optional().unwrap();
+        if batch.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let updates: Value =
+        serde_json::from_str(&batch.expect("publication facts must travel with answer")).unwrap();
+    let updates = updates.as_array().unwrap();
+    assert!(
+        updates.len() >= 3,
+        "Header, complete answer and receipt stay together"
+    );
+    let answer_parts = &updates[1..updates.len() - 1];
+    assert!(answer_parts.iter().all(|v| v["channel"] == "thinking"));
+    let sentences: Vec<_> = answer_parts
+        .iter()
+        .flat_map(|v| v["content"].as_str().unwrap().lines())
+        .collect();
+    assert_eq!(
+        sentences,
+        vec![
+            "Attached the screenshot.",
+            "I could not upload it to the board because no local upload tool exists."
+        ],
+        "All source sentences remain complete and ordered before the authoritative publication receipt"
+    );
+    let receipt = updates.last().unwrap();
+    assert_eq!(receipt["channel"], "commentary");
+    let content = receipt["content"].as_str().unwrap();
+    assert!(content.contains("1 output image(s) are saved in this call"));
+    assert!(content.contains("Offered to the current whiteboard"));
+    assert!(content.contains("Actual display is unconfirmed"));
+    assert!(content.contains("supersedes any answer claim"));
+    assert!(content.len() <= 480);
+    let card: String = f.s.db.lock().unwrap().query_row("SELECT data FROM companion_events WHERE call_id=?1 AND event_key='result:image-receipt-target'",[id],|r|r.get(0)).unwrap();
+    let card: Value = serde_json::from_str(&card).unwrap();
+    assert_eq!(
+        card["text"], answer,
+        "Canonical model answer is evidence, not rewritten"
+    );
+    assert_eq!(card["presentation"], "current");
+    assert!(
+        !f.home.path().join("acp.jsonl").exists(),
+        "Publication must not recapture or reprompt"
+    );
+    end(&f, id).await;
 }
 
 #[tokio::test]

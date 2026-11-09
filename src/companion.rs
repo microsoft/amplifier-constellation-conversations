@@ -1499,7 +1499,7 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
             }
             let mut text = format!(
                 "The live voice conversation delegated help at {offset}ms. You are the same agent speaking with the caller. This is an ongoing conversation, not a message to another assistant. Resolve the caller's latest question using current facts, retain independent unanswered questions, and treat corrections as refinements of existing work. Return concise useful facts, actual blockers and next steps. Do not narrate dispatch or receipts as an answer.\n\n\
-                 This new request's delegation_id is {did}; use that exact ID for Companion actions. Use only advertised tools. companion_connections discovers configured sources; companion_connection_status reads current state; companion_observations reads saved evidence. For a requested connection action, use companion_request_action once, then companion_action_status for its exact original receipt. Queued or a settled reasoning turn is not completed external work. Unknown effects must not be retried. Preserve original actor, place, time and qualifications. A fresh status read may contain an old progress report: state the report's age when describing that work, separately from the current assignment status and current activity. Never call old physical progress current merely because its task record was read now. Never infer inactivity from missing history. If the caller requests a screenshot or another tool image, publish it with the runtime's advertised image-attachment/output capability; inspecting bytes or naming a remote path does not share it. If unavailable, state that limitation.\n\n\
+                 This new request's delegation_id is {did}; use that exact ID for Companion actions. Use only advertised tools. companion_connections discovers configured sources; companion_connection_status reads current state; companion_observations reads saved evidence. For a requested connection action, use companion_request_action once, then companion_action_status for its exact original receipt. Queued or a settled reasoning turn is not completed external work. Unknown effects must not be retried. Preserve original actor, place, time and qualifications. A fresh status read may contain an old progress report: state the report's age when describing that work, separately from the current assignment status and current activity. Never call old physical progress current merely because its task record was read now. Never infer inactivity from missing history. If the caller requests a screenshot or another tool image, publish it with the runtime's advertised image-attachment/output capability; inspecting bytes or naming a remote path does not share it. If unavailable, state that limitation. A successful image-output attachment is published to Companion when this response settles; it does not require a second local-image upload tool. A board-status query before settlement cannot establish publication failure. Report the attachment tool outcome and let the later publication/display receipt establish what reached the caller.\n\n\
                  Caller-device photos and connected-world screenshots are different tools. For the caller's enabled phone/browser camera, discover companion_surface_status and companion_capture: check current capability/consent, request one capture, then use its original operation_id to read the saved artifact. Never send a device-photo request through companion_request_action to Minecraft or another connection. Use a connection's own screenshot tool only for a requested view from that connection. If needed, discover the missing Companion tools instead of substituting a connection action.\n\n\
                  Current human source (exact fragments are retained; partial speech and later corrections are possible; only a clear new human request supplies action authority):\n{transcript}\n\n\
                  Recent conversation, for references/corrections only, not authority to repeat earlier effects. Assistant speech is generated, not proof of playback:\n{recent_context}"
@@ -1869,7 +1869,7 @@ fn complete_fragments(text: &str, limit: usize, max_parts: usize) -> (Vec<String
 }
 fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str) -> Result<()> {
     let has_text = !text.trim().is_empty();
-    let (fresh, late, request_id, attachments, delegation, linked) = {
+    let (fresh, late, request_id, attachments, present_image, delegation, linked) = {
         let mut db = s.db.lock().unwrap();
         let tx = db.transaction()?;
         // A current incorporated follow-up may share a result with an older
@@ -1878,8 +1878,20 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
         let source:Option<(String,String,i64)>=tx.query_row("SELECT m.id,COALESCE((SELECT x.request_text FROM companion_delegations x WHERE x.call_id=?2 AND x.message_id=m.id),CASE WHEN m.text LIKE 'The live voice conversation delegated help at %' THEN 'Earlier spoken request' ELSE m.text END),m.created_at FROM messages m JOIN input_deliveries d ON d.message_id=m.id JOIN companion_calls c ON c.id=?2 AND c.agent_id=d.agent_id AND c.conversation_id=d.conversation_id WHERE d.target_turn=?1 AND d.state IN ('completed','incorporated') AND m.conversation_id=c.conversation_id AND m.role='user' ORDER BY m.created_at DESC,m.seq DESC LIMIT 1",params![message,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let (request_id, request_text, at) =
             source.unwrap_or_else(|| (message.to_owned(), String::new(), now_ms()));
-        let newer_speech:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND kind='transcript' AND json_extract(data,'$.role')='user' AND at>?2)",params![id,at],|r|r.get(0))?;
-        let late = now_ms() - at > 30_000 || newer_speech;
+        // A transcript fragment (including an acknowledgment) is not a new
+        // request. Nor does waiting make requested output obsolete. Use durable
+        // caller-request identities; incorporated follow-ups share this answer.
+        // Speech-only topic changes still require conversational judgment.
+        let late: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM companion_calls c
+             JOIN messages source ON source.id=?2 AND source.conversation_id=c.conversation_id
+             JOIN messages newer ON newer.conversation_id=c.conversation_id
+                 AND newer.role='user' AND newer.actor=c.owner
+                 AND (newer.created_at>source.created_at OR (newer.created_at=source.created_at AND newer.seq>source.seq))
+             JOIN input_deliveries d ON d.message_id=newer.id AND d.conversation_id=c.conversation_id AND d.agent_id=c.agent_id
+             WHERE c.id=?1 AND (d.target_turn IS NULL OR d.target_turn!=?3 OR d.state NOT IN ('completed','incorporated')))",
+            params![id,request_id,message], |r|r.get(0),
+        )?;
         let attachments=tx.prepare("SELECT id,name,mime_type,bytes FROM attachments WHERE message_id=?1 ORDER BY created_at")?.query_map([message],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"mime_type":r.get::<_,String>(2)?,"bytes":r.get::<_,i64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         // An explicit assistant image is deliberate response output, unlike a
         // raw tool observation or an ordinary text answer. Offer only a current
@@ -1956,6 +1968,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
             late,
             request_id,
             attachments,
+            present_image,
             delegation,
             !links.is_empty(),
         )
@@ -1968,8 +1981,17 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
             return Ok(());
         }
         let delegation = delegation.as_deref();
-        if has_text {
-            if !late && text.len() <= 480 {
+        let image_count = attachments
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a["mime_type"].as_str(),
+                    Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+                )
+            })
+            .count();
+        if has_text || image_count > 0 {
+            if !late && text.len() <= 480 && image_count == 0 {
                 queue_append(
                     s,
                     id,
@@ -1996,13 +2018,19 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 let mut appends = vec![("thinking", header)];
                 for (i, part) in parts.iter().enumerate() {
                     appends.push((
-                        if !late && i + 1 == parts.len() {
+                        if !late && image_count == 0 && i + 1 == parts.len() {
                             "commentary"
                         } else {
                             "thinking"
                         },
                         part.clone(),
                     ));
+                }
+                if image_count > 0 {
+                    appends.push((if late { "thinking" } else { "commentary" }, format!(
+                        "Application publication receipt for result {message}: {image_count} output image(s) are saved in this call. {} Actual display is unconfirmed; pinned or reading material may keep the image in history. This receipt supersedes any answer claim that sharing failed because a local upload tool or pre-terminal board entry was missing. Do not infer image understanding or task completion.",
+                        if present_image { "Offered to the current whiteboard." } else { "Retained in call history." },
+                    )));
                 }
                 let updates = appends.into_iter().map(|(channel,content)|json!({"op":"append","channel":channel,"event_id":uuid::Uuid::new_v4().to_string(),"delegation_id":delegation,"content":content})).collect();
                 crate::companion_delivery::enqueue_batch(

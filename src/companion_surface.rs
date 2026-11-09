@@ -555,6 +555,37 @@ fn record_event(
     db.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,?3,?4,?5)",params![id,format!("surface:{operation}:{state}"),kind,data.to_string(),now_ms()])?;
     Ok(())
 }
+/// Do not send obsolete browser membership after it waited for the caller's
+/// floor. Ownership/private identity is checked by the common delivery gate.
+pub(crate) fn board_presentation_allowed(
+    db: &rusqlite::Connection,
+    call: &str,
+    commands: &[Value],
+) -> Result<bool> {
+    for command in commands {
+        let Some(event) = command["event_id"]
+            .as_str()
+            .filter(|v| v.starts_with("board:"))
+        else {
+            continue;
+        };
+        let latest: Option<(String,String,String)> = db.query_row(
+            "SELECT e.event_key,e.data,p.board_card_ids FROM companion_events e JOIN companion_surfaces p ON p.call_id=e.call_id WHERE e.call_id=?1 AND e.kind='surface_observation' ORDER BY e.seq DESC LIMIT 1",
+            [call],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        let Some((key, data, raw)) = latest else {
+            return Ok(false);
+        };
+        let mut current: Vec<String> = serde_json::from_str(&raw)?;
+        current.sort();
+        let saved: Value = serde_json::from_str(&data)?;
+        if key != event || saved["card_ids"] != json!(current) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub async fn presence(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -603,30 +634,64 @@ pub async fn presence(
             return Err(ApiError::missing());
         }
     }
-    let db = s.db.lock().unwrap();
+    let mut db = s.db.lock().unwrap();
+    let tx = db.transaction()?;
     // A fresh different browser cannot silently take over this call surface.
-    let current: Option<(String, String, i64)> = db
+    let current: Option<(String, String, i64, String)> = tx
         .query_row(
-            "SELECT browser_id,session_hash,updated_at FROM companion_surfaces WHERE call_id=?1",
+            "SELECT browser_id,session_hash,updated_at,board_card_ids FROM companion_surfaces WHERE call_id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    if current.is_some_and(|(browser, session, at)| {
-        at >= now_ms() - FRESH_MS
-            && (browser != presence.browser_id || Some(session) != p.session_hash)
+    if current.as_ref().is_some_and(|(browser, session, at, _)| {
+        *at >= now_ms() - FRESH_MS
+            && (browser != &presence.browser_id || Some(session) != p.session_hash.as_ref())
     }) {
         return Err(ApiError::busy());
     }
-    db.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,user_speaking,agent_speaking,updated_at,board_card_ids,pinned_card_ids,focused_card_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(call_id) DO UPDATE SET browser_id=excluded.browser_id,session_hash=excluded.session_hash,camera_enabled=excluded.camera_enabled,capture_consent=excluded.capture_consent,user_speaking=excluded.user_speaking,agent_speaking=excluded.agent_speaking,updated_at=excluded.updated_at,board_card_ids=excluded.board_card_ids,pinned_card_ids=excluded.pinned_card_ids,focused_card_id=excluded.focused_card_id",params![id,presence.browser_id,p.session_hash,presence.camera_enabled,presence.capture_consent,presence.user_speaking,presence.agent_speaking,now_ms(),serde_json::to_string(&presence.board_card_ids).unwrap(),serde_json::to_string(&presence.pinned_card_ids).unwrap(),presence.focused_card_id])?;
-    db.execute(
+    let mut old_board: Vec<String> = current
+        .as_ref()
+        .map(|(_, _, _, raw)| serde_json::from_str(raw))
+        .transpose()
+        .map_err(anyhow::Error::from)?
+        .unwrap_or_default();
+    let mut board = presence.board_card_ids.clone();
+    old_board.sort();
+    board.sort();
+    let board_changed = old_board != board;
+    tx.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,user_speaking,agent_speaking,updated_at,board_card_ids,pinned_card_ids,focused_card_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(call_id) DO UPDATE SET browser_id=excluded.browser_id,session_hash=excluded.session_hash,camera_enabled=excluded.camera_enabled,capture_consent=excluded.capture_consent,user_speaking=excluded.user_speaking,agent_speaking=excluded.agent_speaking,updated_at=excluded.updated_at,board_card_ids=excluded.board_card_ids,pinned_card_ids=excluded.pinned_card_ids,focused_card_id=excluded.focused_card_id",params![id,presence.browser_id,p.session_hash,presence.camera_enabled,presence.capture_consent,presence.user_speaking,presence.agent_speaking,now_ms(),serde_json::to_string(&presence.board_card_ids).unwrap(),serde_json::to_string(&presence.pinned_card_ids).unwrap(),presence.focused_card_id])?;
+    tx.execute(
         "UPDATE companion_surfaces SET playback=?2 WHERE call_id=?1",
         params![id, presence.playback.as_ref().map(|p| json!(p).to_string())],
     )?;
+    let board_control = if board_changed {
+        let mut identities = Vec::new();
+        for card in &board {
+            let result: Option<String> = if card.starts_with("upload:") {
+                None
+            } else {
+                tx.query_row("SELECT json_extract(data,'$.message_id') FROM companion_events WHERE call_id=?1 AND seq=?2 AND kind='card'",params![id,card],|r|r.get(0)).optional()?.flatten()
+            };
+            identities.push(json!({"card":card,"result":result}));
+        }
+        let event_id = format!("board:{}", uuid::Uuid::new_v4());
+        let content = format!(
+            "Browser reports current board: {}. Result IDs match publication receipts. Membership does not prove image decoding or that the caller saw or understood it. Empty means no current items, not deleted history. Use quietly.",
+            json!(identities)
+        );
+        if content.len() > 480 {
+            return Err(anyhow::anyhow!("Board observation exceeds context bound").into());
+        }
+        tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'surface_observation',?3,?4)",params![id,event_id,json!({"card_ids":board,"identities":identities,"source":"authenticated_browser_membership","human_viewed":null,"image_decoded":null}).to_string(),now_ms()])?;
+        Some((event_id, content))
+    } else {
+        None
+    };
     let interruption_control = if let Some(interruption) = &presence.interruption {
         let key = format!("playback:{}:{}", interruption.id, interruption.phase);
         let data = json!({"browser_id":presence.browser_id,"interruption":interruption,"playback":presence.playback,"work_cancelled":false,"generated_speech_is_not_playback":true});
-        let inserted = db.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'playback',?3,?4)",params![id,key,data.to_string(),now_ms()])?;
+        let inserted = tx.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'playback',?3,?4)",params![id,key,data.to_string(),now_ms()])?;
         (inserted > 0).then(|| (key, if interruption.phase == "suppressed" {
             "The caller has taken the floor. Stop speaking and listen through their explanation. Do not acknowledge this control message. Do not resume the interrupted wording or narrate task routing. This stops speech only; accepted work is unchanged."
         } else {
@@ -635,7 +700,19 @@ pub async fn presence(
     } else {
         None
     };
+    tx.commit()?;
     drop(db);
+    if let Some((event_id, content)) = board_control {
+        crate::companion_delivery::enqueue_batch(
+            &s,
+            &id,
+            "surface:board",
+            vec![
+                json!({"op":"append","channel":"thinking","event_id":event_id,"delegation_id":null,"content":content}),
+            ],
+        )?;
+        s.changed();
+    }
     if let Some((event_id, content)) = interruption_control {
         // Application-authored controls only. Browser text is never promoted to
         // model instructions; authorization and world effects are unchanged.
@@ -1286,6 +1363,52 @@ mod acceptance_tests {
             session,
             message,
         }
+    }
+
+    #[test]
+    fn queued_board_observation_waits_for_floor_and_rejects_superseded_membership() {
+        let f = fixture();
+        let append = |id: &str| json!({"op":"append","channel":"thinking","event_id":id,"delegation_id":null,"content":"Browser membership observation only"});
+        {
+            let db = f.state.db.lock().unwrap();
+            db.execute("UPDATE companion_surfaces SET user_speaking=1,agent_speaking=0,board_card_ids='[\"1\"]' WHERE call_id=?1",[&f.call]).unwrap();
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'board:first','surface_observation','{\"card_ids\":[\"1\"]}',?2)",params![f.call,now_ms()]).unwrap();
+        }
+        crate::companion_delivery::enqueue_batch(
+            &f.state,
+            &f.call,
+            "surface:board",
+            vec![append("board:first")],
+        )
+        .unwrap();
+        assert!(
+            crate::companion_delivery::take_ready(&f.state, &f.call)
+                .unwrap()
+                .is_none()
+        );
+        {
+            let db = f.state.db.lock().unwrap();
+            db.execute("UPDATE companion_surfaces SET user_speaking=0,board_card_ids='[]' WHERE call_id=?1",[&f.call]).unwrap();
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'board:empty','surface_observation','{\"card_ids\":[]}',?2)",params![f.call,now_ms()]).unwrap();
+            assert!(!board_presentation_allowed(&db, &f.call, &[append("board:first")]).unwrap());
+        }
+        // The older pending item cannot leak after the browser changed it.
+        assert!(
+            crate::companion_delivery::take_ready(&f.state, &f.call)
+                .unwrap()
+                .is_none()
+        );
+        crate::companion_delivery::enqueue_batch(
+            &f.state,
+            &f.call,
+            "surface:board",
+            vec![append("board:empty")],
+        )
+        .unwrap();
+        let ready = crate::companion_delivery::take_ready(&f.state, &f.call)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready["commands"][0]["event_id"], "board:empty");
     }
 
     #[test]

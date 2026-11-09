@@ -2368,3 +2368,123 @@ async fn queued_surface_acceptance_still_rejects_revoked_or_uncertain_original_s
         assert_eq!(surface_status(&f, &c, &op).await["state"], "queued");
     }
 }
+
+#[tokio::test]
+async fn browser_board_membership_is_scoped_deduplicated_and_tracks_return_to_image() {
+    let f = fixture();
+    let c = call(&f);
+    let other = call(&f);
+    let (_, _, result) = published_agent_image(&f, &c);
+    let (_, _, foreign_result) = published_agent_image(&f, &other);
+    let card_for = |call: &Call, message: &str| {
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT seq FROM companion_events WHERE call_id=?1 AND event_key=?2",
+                params![call.id, format!("result:{message}")],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            .to_string()
+    };
+    let card = card_for(&c, &result);
+    let foreign = card_for(&other, &foreign_result);
+    let browser = uuid::Uuid::new_v4().to_string();
+    let path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
+    let before = protected_playback_state(&f);
+    for ids in [
+        vec![card.clone()],
+        vec![card.clone()],
+        vec![],
+        vec![],
+        vec![card.clone()],
+    ] {
+        let body = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"user_speaking":true,"agent_speaking":false,"board_card_ids":ids});
+        let response = browser_request(&f, "POST", &path, Some(body), "browser", true).await;
+        assert_eq!(response.0, StatusCode::OK, "{response:?}");
+    }
+    let bad = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"board_card_ids":[foreign]});
+    assert_eq!(
+        browser_request(&f, "POST", &path, Some(bad), "browser", true)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let db = f.s.db.lock().unwrap();
+    let events:Vec<(String,String)>=db.prepare("SELECT event_key,data FROM companion_events WHERE call_id=?1 AND kind='surface_observation' ORDER BY seq").unwrap().query_map([&c.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        events.len(),
+        3,
+        "Only actual membership changes create observations"
+    );
+    assert_ne!(
+        events[0].0, events[2].0,
+        "Returning to an image is a new transition"
+    );
+    for (_, raw) in &events {
+        let observation: Value = serde_json::from_str(raw).unwrap();
+        assert!(observation.get("human_viewed").unwrap().is_null());
+        assert!(observation.get("image_decoded").unwrap().is_null());
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(&events[1].1).unwrap()["card_ids"],
+        json!([])
+    );
+    let batches:Vec<(String,String)>=db.prepare("SELECT state,updates FROM companion_voice_batches WHERE call_id=?1 AND semantic_key='surface:board' ORDER BY rowid").unwrap().query_map([&c.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        batches.iter().map(|v| v.0.as_str()).collect::<Vec<_>>(),
+        vec!["superseded", "superseded", "pending"]
+    );
+    let latest: Value = serde_json::from_str(&batches[2].1).unwrap();
+    assert_eq!(latest[0]["channel"], "thinking");
+    assert_eq!(latest[0]["event_id"], events[2].0);
+    let text = latest[0]["content"].as_str().unwrap();
+    assert!(text.contains(&result) && text.contains(&card));
+    assert!(text.contains("does not prove image decoding"));
+    assert!(
+        !text.contains("Here is the requested screenshot"),
+        "No model prose is promoted to UI evidence"
+    );
+    assert!(text.len() <= 480);
+    drop(db);
+    assert_eq!(
+        protected_playback_state(&f),
+        before,
+        "Presence does not create prompts, actions or authority"
+    );
+}
+
+#[tokio::test]
+async fn maximum_three_owned_board_items_fit_complete_voice_context() {
+    let f = fixture();
+    let c = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    let path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
+    let mut results = Vec::new();
+    let mut uploads = Vec::new();
+    {
+        let db = f.s.db.lock().unwrap();
+        for i in 0..3i64 {
+            let seq = 8_000_000_000_000_000_000 + i;
+            let message = uuid::Uuid::new_v4().to_string();
+            db.execute("INSERT INTO companion_events(seq,call_id,event_key,kind,data,at) VALUES(?1,?2,?3,'card',?4,?5)",params![seq,c.id,format!("result:{message}"),json!({"message_id":message}).to_string(),now_ms()]).unwrap();
+            results.push(seq.to_string());
+            let upload = uuid::Uuid::new_v4().to_string();
+            db.execute("INSERT INTO companion_uploads(call_id,upload_id,state,data,updated_at) VALUES(?1,?2,'available','{}',?3)",params![c.id,upload,now_ms()]).unwrap();
+            uploads.push(format!("upload:{upload}"));
+        }
+    }
+    for ids in [results, uploads] {
+        let body = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"board_card_ids":ids});
+        let response = browser_request(&f, "POST", &path, Some(body), "browser", true).await;
+        assert_eq!(response.0, StatusCode::OK, "{response:?}");
+    }
+    let db = f.s.db.lock().unwrap();
+    let batches:Vec<String>=db.prepare("SELECT updates FROM companion_voice_batches WHERE call_id=?1 AND semantic_key='surface:board'").unwrap().query_map([&c.id],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(batches.len(), 2);
+    for batch in batches {
+        let j: Value = serde_json::from_str(&batch).unwrap();
+        assert!(j[0]["content"].as_str().unwrap().len() <= 480);
+    }
+}
