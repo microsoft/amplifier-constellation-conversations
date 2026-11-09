@@ -34,6 +34,13 @@ not change an event's semantic revision and produce repeated voice updates.
 Player positions and activity flags describe observations, not proof of work or
 request fulfillment.
 
+Requested status context keeps each included fact with its connection, source
+time, and relevant limits. Presence, current assignment state, historical
+progress, and public messages remain separate kinds of evidence. A bounded
+history does not erase a message it actually contains. Oversized whole reports
+are omitted with an explicit count; timestamps and warnings alone must not
+become a substitute status answer while the reasoning response is pending.
+
 Private installation-control history is not a general context feed. The observer
 emits an operator instruction only when its original UUID is uniquely bound to a
 confirmed queue receipt in this call's supplied action batch. A private task
@@ -166,3 +173,11 @@ local omission counts and domain omission flags. No co-admitted private source
 IDs are disclosed. Changed or unauthorized bindings produce an unconfirmed
 outcome with no invented actor/audience, admission, or reply. Private response
 payloads violate this capability and invalidate the scoped lookup.
+
+Voice context presents recorded public replies before handling metadata. An
+explicit `single_source` association describes the domain's link to that input;
+`shared_turn` retains the weaker source-set association. Neither promotes the
+record to general task fulfillment or changes its `verified: false` value.
+Likewise, a confirmed message occurrence can be stated affirmatively without
+claiming that unrelated work finished, that the caller heard it, or that the
+world is continuously observed.
