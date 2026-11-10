@@ -37,6 +37,7 @@ fn rejected(error: &Value, method: &str) -> anyhow::Error {
         "initialize" => "initialize",
         "session/new" => "session/new",
         "session/load" => "session/load",
+        "session/resume" => "session/resume",
         "session/prompt" => "session/prompt",
         "authenticate" => "authenticate",
         _ => "request",
@@ -639,7 +640,13 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         &agent_id,
         &init["agentCapabilities"],
     )?;
-    let can_load = init["agentCapabilities"]["loadSession"] == true;
+    let restore_method = if init["agentCapabilities"]["sessionCapabilities"]["resume"].is_object() {
+        Some("session/resume")
+    } else if init["agentCapabilities"]["loadSession"] == true {
+        Some("session/load")
+    } else {
+        None
+    };
     let mut params = json!({"cwd":agent.session_cwd.as_ref().unwrap_or(&agent.cwd),"mcpServers":agent.mcp_servers});
     let mut companion_injected = false;
     if let Some(tool) = crate::companion_tools::descriptor(&state, &conversation)? {
@@ -660,24 +667,25 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     }
     let prior:Option<(String,i64)>=state.db.lock().unwrap().query_row("SELECT session_id,last_seq FROM room_agents WHERE conversation_id=?1 AND agent_id=?2 AND endpoint=?3 AND session_id IS NOT NULL",params![conversation,agent_id,endpoint],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let last_seq = prior.as_ref().map(|p| p.1).unwrap_or(0);
-    let prior = prior.map(|p| p.0).filter(|_| can_load);
+    let prior = prior.map(|p| p.0).zip(restore_method);
     let acknowledgments = crate::delivery::pending_ack(&state, &conversation, &agent_id)?;
     for ack in &acknowledgments {
         if ack.mode.as_deref() == Some("steering") {
             ensure!(
-                ack.endpoint.as_deref() == Some(&endpoint) && ack.session == prior,
-                "The saved update requires its original endpoint and loaded session; restore that connection before continuing"
+                ack.endpoint.as_deref() == Some(&endpoint)
+                    && ack.session.as_deref() == prior.as_ref().map(|(sid, _)| sid.as_str()),
+                "The saved update requires its original endpoint and restored session; restore that connection before continuing"
             );
         }
     }
     let mut loaded = false;
     let setup;
-    let sid = if let Some(old) = prior {
+    let sid = if let Some((old, method)) = prior {
         params["sessionId"] = json!(old);
         let restore = c
             .peer
             .session_request(
-                "session/load",
+                method,
                 params.clone(),
                 SetupInteraction {
                     state: &state,
@@ -692,7 +700,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 &mut cancel_rx,
             )
             .await;
-        // A failed load is not evidence that the previous work never happened.
+        // A failed restore is not evidence that the previous work never happened.
         // Keep its binding instead of silently rebuilding and replaying context.
         setup = restore?;
         loaded = true;
