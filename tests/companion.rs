@@ -4039,29 +4039,18 @@ async fn active_steering_never_admits_an_empty_or_assistant_only_source_before_g
 async fn cancelling_prompt_has_no_early_continuation_window(timeout: bool) {
     let f = fixture("quiet");
     companion_steering_peer(&f, "held-cancel");
-    if timeout {
-        let db = f.s.db.lock().unwrap();
-        let mut config: Value = serde_json::from_str(
-            &db.query_row(
-                "SELECT config FROM agent_endpoints WHERE id='default'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        config["timeout_seconds"] = json!(1);
-        db.execute(
-            "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
-            [config.to_string()],
-        )
-        .unwrap();
-    }
     let (_, call) = start(&f).await;
     speech_fixture(&f, &call, "initial", "user", 100, "Read the saved result.");
     pending_voice_fixture(&f, &call, "initial-request", 200);
     companion_frame(&f, "session/prompt", 1).await;
-    if !timeout {
+    if timeout {
+        // Exercise the active-prompt deadline only after real ACP setup. A
+        // one-second wall timeout could expire during slow CI initialization
+        // and never reach the cancellation window this regression checks.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::resume();
+    } else {
         assert_eq!(
             request(
                 &f,
