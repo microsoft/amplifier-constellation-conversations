@@ -46,7 +46,7 @@ try{
   await page.getByRole('textbox',{name:'Message the huddle'}).fill('Please keep the entrance clear.');
   await page.getByText('To: Everyone here',{exact:true}).click();
   await page.getByRole('checkbox',{name:'Coach',exact:true}).check();
-  await page.getByRole('button',{name:'Send message',exact:true}).click();
+  await page.locator('.huddles-composer').getByRole('button',{name:'Send message',exact:true}).click();
   await until(async()=> (await api(`/api/v1/huddles/${room.id}/messages`)).items.length===3,'Human join was not saved');
   const joined=(await api(`/api/v1/huddles/${room.id}/messages`)).items.at(-1);
   assert.equal(joined.role,'user');assert.equal(joined.actor,'fixture-owner');
@@ -72,7 +72,7 @@ try{
     await route.abort('connectionfailed');
   });
   await page.getByRole('textbox',{name:'Message the huddle'}).fill('Use the rear approach in the review.');
-  await page.getByRole('button',{name:'Send message',exact:true}).click();
+  await page.locator('.huddles-composer').getByRole('button',{name:'Send message',exact:true}).click();
   await page.getByRole('button',{name:'Check message status',exact:true}).waitFor();
   await page.reload();
   await page.locator('#conversation-huddles:not([hidden])').waitFor();
