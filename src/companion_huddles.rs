@@ -315,31 +315,9 @@ pub(crate) fn reconcile(s: &AppState, call: &str) -> Result<()> {
         if !live {
             return Ok(());
         }
-        // Normal post intake records the return atomically. Recovery only
-        // examines actual linked outcome posts with no saved return, not every
-        // former call or its complete result history on each voice poll.
-        let recovery = {
-            let mut query=tx.prepare("SELECT c.id,c.conversation_id,p.message_id FROM huddle_posts p JOIN huddles h ON h.room_id=p.room_id JOIN companion_calls c ON c.conversation_id=json_extract(h.origin,'$.conversation_id') WHERE c.owner=?1 AND c.agent_id=?2 AND c.endpoint_hash=(SELECT endpoint_hash FROM companion_calls WHERE id=?3) AND json_extract(h.origin,'$.kind')='conversation' AND json_extract(h.origin,'$.actor.id')=?1 AND json_extract(p.payload,'$.kind')='outcome' AND COALESCE(json_extract(p.receipt,'$.return.state'),'') IN ('','available') AND EXISTS(SELECT 1 FROM room_members WHERE conversation_id=h.room_id AND username=?1) AND NOT EXISTS(SELECT 1 FROM companion_events e WHERE e.call_id=c.id AND e.kind='huddle_return' AND json_extract(e.data,'$.origin_call_id')=c.id AND json_extract(e.data,'$.row.message.id')=p.message_id) ORDER BY p.rowid")?;
-            query
-                .query_map(params![identity.owner, identity.agent, call], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (origin, parent, message) in recovery {
-            if !crate::companion_history::same_private_identity(&tx, call, &origin)? {
-                continue;
-            }
-            if let Some(row) =
-                crate::huddles::outcome_for_parent(&tx, &parent, &identity.owner, &message)?
-            {
-                record_return(s, &tx, &row)?;
-            }
-        }
+        // Shared intake saves the canonical post and original return in one
+        // transaction. Only those durable return events authorize observation;
+        // a bare post is never reconstructed into a missing request receipt.
         let records = {
             // Only the original return is a candidate. Later-call copies are
             // presentation receipts, not additional work. Exclude prior
@@ -648,7 +626,7 @@ mod tests {
         );
     }
     #[test]
-    fn intake_rollback_removes_parent_and_card_together_then_reconciliation_repairs_once() {
+    fn intake_rollback_has_no_partial_presentation_or_observer_reconstruction() {
         let f = fixture();
         let row = post(&f, "A durable result", "outcome");
         {
@@ -675,6 +653,41 @@ mod tests {
                 0
             );
         }
+        reconcile(&f.s, &f.call).unwrap();
+        reconcile(&f.s, &f.call).unwrap();
+        {
+            let db = f.s.db.lock().unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM companion_events WHERE kind='huddle_return'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE conversation_id=?1 AND role='assistant'",
+                    [&f.room],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1",
+                    [&f.call],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+        // Only the actual intake writer can establish this return. Subsequent
+        // observer passes use its persisted identity without reconstructing it.
+        assert_eq!(record(&f, &row)["state"], "stored");
         reconcile(&f.s, &f.call).unwrap();
         reconcile(&f.s, &f.call).unwrap();
         let db = f.s.db.lock().unwrap();
@@ -850,6 +863,66 @@ mod tests {
                     state
                 }
             );
+        }
+    }
+    #[test]
+    fn reopened_store_keeps_atomic_return_and_transfers_only_never_dispatched_result() {
+        for prior in ["pending", "dispatching"] {
+            let f = fixture();
+            let row = post(&f, "A retained requested result.", "outcome");
+            {
+                let mut db = f.s.db.lock().unwrap();
+                let tx = db.transaction().unwrap();
+                let returned = record_return(&f.s, &tx, &row).unwrap();
+                save_shared_return(&tx, &row, &returned);
+                tx.commit().unwrap();
+            }
+            reconcile(&f.s, &f.call).unwrap();
+            f.s.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE companion_voice_batches SET state=?2 WHERE call_id=?1",
+                    params![f.call, prior],
+                )
+                .unwrap();
+            let reopened = AppState::open(f._home.path().into()).unwrap();
+            let (later, _) = call(&reopened, "After process restart");
+            reconcile(&reopened, &later).unwrap();
+            reconcile(&reopened, &later).unwrap();
+            let db = reopened.db.lock().unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1",
+                    [&later],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                i64::from(prior == "pending")
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT state FROM companion_voice_batches WHERE call_id=?1",
+                    [&f.call],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                if prior == "pending" {
+                    "withdrawn"
+                } else {
+                    "unknown"
+                }
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE conversation_id=?1 AND role='assistant'",
+                    [&f.room],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(db.query_row("SELECT json_extract(receipt,'$.return.state') FROM huddle_posts WHERE message_id=?1",[row["message"]["id"].as_str().unwrap()],|r|r.get::<_,String>(0)).unwrap(),"stored");
         }
     }
     #[test]
