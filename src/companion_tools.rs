@@ -112,9 +112,9 @@ fn own_tool_shape_valid(tool: &str, args: &Value) -> bool {
         | "companion_surface_status"
         | "companion_hangup"
         | "companion_feedback" => crate::companion_surface::permission_shape_valid(tool, args),
-        "companion_connections" | "companion_observations" => {
-            args.as_object().is_some_and(|a| a.is_empty())
-        }
+        "companion_connections" => args.as_object().is_some_and(|a| a.is_empty()),
+        "companion_observations" => serde_json::from_value::<Observations>(args.clone())
+            .is_ok_and(|v| v.connection_id.as_deref().is_none_or(valid_connection_id)),
         "companion_connection_status" => serde_json::from_value::<ConnectionStatus>(args.clone())
             .is_ok_and(|v| valid_connection_id(&v.connection_id)),
         "companion_shared" => args.as_object().is_some_and(|a| {
@@ -458,17 +458,44 @@ pub async fn observations(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
     h: HeaderMap,
+    Query(query): Query<Observations>,
 ) -> ApiResult<Json<Value>> {
     authorize(&s, &id, &h)?;
+    if !query
+        .connection_id
+        .as_deref()
+        .is_none_or(valid_connection_id)
+    {
+        return Err(ApiError::bad("Choose a configured observation source"));
+    }
     Ok(Json(crate::companion_awareness::current_observations(
-        &s, &id,
+        &s,
+        &id,
+        query.connection_id.as_deref(),
     )?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observations {
+    #[serde(default, deserialize_with = "optional_connection_id")]
+    connection_id: Option<String>,
+}
+// An omitted selector means all authorized sources. Explicit null is not a
+// selector and must not silently broaden a scoped read through native permission.
+fn optional_connection_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionStatus {
     connection_id: String,
+    #[serde(default)]
+    view: crate::companion_awareness::StatusView,
 }
 fn valid_connection_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 120 && !id.chars().any(char::is_control)
@@ -483,7 +510,9 @@ pub async fn connection_status(
     if !valid_connection_id(&query.connection_id) {
         return Err(ApiError::bad("Choose a configured observation source"));
     }
-    let read = crate::companion_awareness::connection_status(&s, &id, &query.connection_id).await?;
+    let read =
+        crate::companion_awareness::connection_status(&s, &id, &query.connection_id, query.view)
+            .await?;
     authorize(&s, &id, &h)?;
     // Preserve original source qualifiers before a backend can paraphrase them.
     // This queues context only; the ordinary floor and policy checks still apply.

@@ -85,6 +85,21 @@ pub(crate) fn enqueue_batch(
     Ok(true)
 }
 
+/// Withdraw only unsent context for this exact semantic key. A newer read can
+/// intentionally select no facts; that is not delivery, source deletion or a
+/// reason to withdraw unrelated answers. Already dispatched/unknown batches stay.
+pub(crate) fn supersede_pending(s: &AppState, call: &str, semantic_key: &str) -> Result<()> {
+    ensure!(
+        !semantic_key.is_empty() && semantic_key.len() <= 512,
+        "Invalid voice update key"
+    );
+    let db = s.db.lock().unwrap();
+    db.execute("UPDATE companion_voice_batches SET state='superseded',updated_at=?3 WHERE call_id=?1 AND semantic_key=?2 AND state='pending'", params![call,semantic_key,now_ms()])?;
+    drop(db);
+    s.changed();
+    Ok(())
+}
+
 /// Recheck at the final transport boundary. Neither a quiet microphone nor a
 /// transcript gap claims that the person finished their thought.
 pub(crate) fn floor_open_in(db: &Connection, call: &str) -> Result<bool> {

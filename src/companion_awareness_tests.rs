@@ -16,7 +16,11 @@ struct Fixture {
 // Existing reader tests inspect the same public filtered tool response. The
 // separate host binding never crosses the MCP response boundary.
 async fn connection_status(s: &AppState, id: &str, connection: &str) -> Result<Value> {
-    Ok(super::connection_status(s, id, connection).await?.response)
+    Ok(
+        super::connection_status(s, id, connection, StatusView::Reports)
+            .await?
+            .response,
+    )
 }
 
 fn timestamp(at: i64) -> String {
@@ -203,14 +207,19 @@ async fn fresh_status_reads_only_fixed_source_and_projects_current_access_withou
 
 #[tokio::test]
 async fn fresh_status_withholds_inflight_results_after_policy_identity_or_call_revocation() {
-    for mode in ["policy", "identity", "closed"] {
+    for (mode, view) in ["policy", "identity", "closed"]
+        .into_iter()
+        .flat_map(|mode| [StatusView::Reports, StatusView::Current].map(|view| (mode, view)))
+    {
         let f = fixture();
         fresh_result(&f, vec![source_event()]);
         std::fs::write(f.home.path().join("observer-block"), "hold").unwrap();
         let state = f.s.clone();
         let id = f.id.clone();
         let pending =
-            tokio::spawn(async move { connection_status(&state, &id, "minecraft").await });
+            tokio::spawn(
+                async move { super::connection_status(&state, &id, "minecraft", view).await },
+            );
         entered(&f, "observer").await;
         match mode {
             "policy" => rewrite_policy(&f, |v| v["agents"]["default"][0]["audiences"] = json!([])),
@@ -735,7 +744,7 @@ async fn peer_source_attribution_reaches_decisions_cards_and_voice_without_actor
         assert!(content.contains(required), "{content}");
     }
     assert!(!content.contains("Coach"));
-    let current = current_observations(&f.s, &f.id).unwrap();
+    let current = current_observations(&f.s, &f.id, None).unwrap();
     assert_eq!(current["observations"][0]["source"], event);
     assert_eq!(current["observations"][0]["attribution"]["actor"], "Rook");
     assert_eq!(calls(&f, "decision").len(), 1);
@@ -745,7 +754,7 @@ async fn peer_source_attribution_reaches_decisions_cards_and_voice_without_actor
 #[test]
 fn observation_read_is_cached_bounded_current_policy_and_honest_about_coverage() {
     let f = fixture();
-    let empty = current_observations(&f.s, &f.id).unwrap();
+    let empty = current_observations(&f.s, &f.id, None).unwrap();
     assert_eq!(empty["status"], "no_saved_facts");
     assert_eq!(empty["sources"][0]["status"], "no_observation");
     assert!(
@@ -754,7 +763,7 @@ fn observation_read_is_cached_bounded_current_policy_and_honest_about_coverage()
             .unwrap()
             .contains("do not establish inactivity")
     );
-    assert!(current_observations(&f.s, "another-call").is_err());
+    assert!(current_observations(&f.s, "another-call", None).is_err());
     let (cfg, fingerprint) = config(&f.s).unwrap().unwrap();
     let source = &cfg.agents["default"][0];
     for index in 0..20 {
@@ -780,7 +789,7 @@ fn observation_read_is_cached_bounded_current_policy_and_honest_about_coverage()
             [&f.id],
         )
         .unwrap();
-    let current = current_observations(&f.s, &f.id).unwrap();
+    let current = current_observations(&f.s, &f.id, None).unwrap();
     assert_eq!(current["observations"].as_array().unwrap().len(), 16);
     assert_eq!(current["omitted"], 4);
     assert_eq!(current["observations"][0]["source"], updated);
@@ -802,7 +811,7 @@ fn observation_read_is_cached_bounded_current_policy_and_honest_about_coverage()
     );
     rewrite_policy(&f, |c| c["agents"]["default"][0]["audiences"] = json!([]));
     assert!(
-        current_observations(&f.s, &f.id).unwrap()["observations"]
+        current_observations(&f.s, &f.id, None).unwrap()["observations"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -856,7 +865,7 @@ fn observation_read_balances_connections_and_prioritizes_current_tasks_and_recen
         "UPDATE companion_awareness SET last_observed_at=?2 WHERE call_id=?1 AND connection_id='slack'",
         params![f.id, now + 1000],
     ).unwrap();
-    let reply = current_observations(&f.s, &f.id).unwrap();
+    let reply = current_observations(&f.s, &f.id, None).unwrap();
     let facts = reply["observations"].as_array().unwrap();
     assert_eq!(facts.len(), 16);
     assert_eq!(reply["omitted"], 25);
@@ -894,7 +903,7 @@ fn observation_read_balances_connections_and_prioritizes_current_tasks_and_recen
     );
     assert!(serde_json::to_vec(&reply).unwrap().len() <= 256 * 1024);
     rewrite_policy(&f, |c| c["agents"]["default"][0]["audiences"] = json!([]));
-    let revoked = current_observations(&f.s, &f.id).unwrap();
+    let revoked = current_observations(&f.s, &f.id, None).unwrap();
     assert!(revoked["observations"].as_array().unwrap().is_empty());
     assert!(calls(&f, "decision").is_empty());
     assert!(calls(&f, "observer").is_empty());
@@ -935,7 +944,7 @@ fn observation_read_bounds_serialized_bytes_without_clipping_any_included_fact()
             params![f.id,source.id,coverage,now_ms(),fingerprint],
         ).unwrap();
     }
-    let reply = current_observations(&f.s, &f.id).unwrap();
+    let reply = current_observations(&f.s, &f.id, None).unwrap();
     assert!(serde_json::to_vec(&reply).unwrap().len() <= 256 * 1024);
     let facts = reply["observations"].as_array().unwrap();
     assert!(!facts.is_empty());
@@ -973,7 +982,7 @@ fn observation_read_preserves_stale_time_and_revokes_closed_or_changed_call_iden
     let mut event = source_event();
     event["occurred_at"] = json!(timestamp(now_ms() - 180000));
     record_event(&f.s, &f.id, &cfg.agents["default"][0], &event, &fingerprint).unwrap();
-    let saved = current_observations(&f.s, &f.id).unwrap();
+    let saved = current_observations(&f.s, &f.id, None).unwrap();
     assert_eq!(saved["observations"][0]["fresh"], true);
     assert_eq!(saved["observations"][0]["source_fresh"], false);
     assert_eq!(
@@ -990,7 +999,7 @@ fn observation_read_preserves_stale_time_and_revokes_closed_or_changed_call_iden
         )
         .unwrap();
     assert_eq!(
-        current_observations(&f.s, &f.id).unwrap()["observations"][0]["fresh"],
+        current_observations(&f.s, &f.id, None).unwrap()["observations"][0]["fresh"],
         false
     );
     f.s.db
@@ -1001,7 +1010,7 @@ fn observation_read_preserves_stale_time_and_revokes_closed_or_changed_call_iden
             [&f.id],
         )
         .unwrap();
-    assert!(current_observations(&f.s, &f.id).is_err());
+    assert!(current_observations(&f.s, &f.id, None).is_err());
     f.s.db
         .lock()
         .unwrap()
@@ -1010,7 +1019,7 @@ fn observation_read_preserves_stale_time_and_revokes_closed_or_changed_call_iden
             [&f.id],
         )
         .unwrap();
-    assert!(current_observations(&f.s, &f.id).is_err());
+    assert!(current_observations(&f.s, &f.id, None).is_err());
     assert!(calls(&f, "decision").is_empty());
     assert!(calls(&f, "observer").is_empty());
 }
@@ -1035,7 +1044,7 @@ async fn baseline_old_tasks_and_chat_are_available_only_to_explicit_reads_withou
     assert!(cards(&f).is_empty());
     assert!(calls(&f, "decision").is_empty());
     assert!(rx.try_recv().is_err());
-    let saved = current_observations(&f.s, &f.id).unwrap();
+    let saved = current_observations(&f.s, &f.id, None).unwrap();
     assert_eq!(saved["observations"].as_array().unwrap().len(), 2);
     for fact in saved["observations"].as_array().unwrap() {
         assert_eq!(fact["source"]["occurred_at"], task["occurred_at"]);
@@ -1054,7 +1063,7 @@ async fn baseline_old_tasks_and_chat_are_available_only_to_explicit_reads_withou
         .unwrap();
     run(&f).await.unwrap();
     assert!(
-        current_observations(&f.s, &f.id).unwrap()["observations"]
+        current_observations(&f.s, &f.id, None).unwrap()["observations"]
             .as_array()
             .unwrap()
             .iter()
@@ -1063,13 +1072,13 @@ async fn baseline_old_tasks_and_chat_are_available_only_to_explicit_reads_withou
     assert!(calls(&f, "decision").is_empty());
     assert!(rx.try_recv().is_err());
     rewrite_policy(&f, |c| c["agents"]["default"][0]["audiences"] = json!([]));
-    let revoked = current_observations(&f.s, &f.id).unwrap();
+    let revoked = current_observations(&f.s, &f.id, None).unwrap();
     assert!(revoked["observations"].as_array().unwrap().is_empty());
     assert_eq!(revoked["sources"][0]["status"], "no_observation");
     run(&f).await.unwrap();
     assert_eq!(calls(&f, "observer").last().unwrap()["cursor"], Value::Null);
     assert!(
-        current_observations(&f.s, &f.id).unwrap()["observations"]
+        current_observations(&f.s, &f.id, None).unwrap()["observations"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -2146,7 +2155,7 @@ async fn later_call_refreshes_original_pending_receipt_without_copying_action_au
         "settled"
     );
     assert!(action_observation(&f.s, &new, &request).unwrap().is_none());
-    let facts = current_observations(&f.s, &new).unwrap();
+    let facts = current_observations(&f.s, &new, None).unwrap();
     assert!(facts.to_string().contains("Construction has not resumed"));
     assert_eq!(
         f.s.db
@@ -2311,7 +2320,7 @@ async fn current_snapshot_is_presented_without_forging_old_progress_time() {
     assert!(text.contains("status running"));
     assert!(text.contains(&old));
     assert!(text.contains("does not prove a game action"));
-    let facts = current_observations(&f.s, &f.id).unwrap();
+    let facts = current_observations(&f.s, &f.id, None).unwrap();
     assert_eq!(facts["observations"][0]["source"]["occurred_at"], old);
     event["observed_at"] = json!(timestamp(now_ms() + 1000));
     observations(&f, vec![event]);
@@ -2563,7 +2572,7 @@ async fn requested_status_preserves_old_progress_before_an_undated_backend_summa
     task["provenance"] = json!({"kind":"minecraft_current_task","current_state_snapshot":true});
     task["text"] = json!(json!({"status":"running","progress":{"at":old,"text":"The blue door linkage was unfinished."}}).to_string());
     fresh_result(&f, vec![task]);
-    let read = super::connection_status(&f.s, &f.id, "minecraft")
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
         .await
         .unwrap();
     preserve_requested_status(&f.s, &f.id, &read).unwrap();
@@ -2646,7 +2655,7 @@ async fn requested_status_pairs_actual_presence_and_public_message_with_their_so
     message["occurred_at"] = json!(observed);
     message["text"] = json!("Automated Companion QA: hello from Constellation.");
     fresh_result(&f, vec![task, message, presence]);
-    let read = super::connection_status(&f.s, &f.id, "minecraft")
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
         .await
         .unwrap();
     let physical = read.response["reports"]
@@ -2706,7 +2715,7 @@ async fn requested_whole_chat_fact_omission_does_not_become_a_negative_status_up
     long["kind"] = json!("message");
     long["text"] = json!("A recorded public statement. ".repeat(100));
     fresh_result(&f, vec![long.clone()]);
-    let read = super::connection_status(&f.s, &f.id, "minecraft")
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
         .await
         .unwrap();
     assert_eq!(read.response["reports"][0]["text"], long["text"]);
@@ -2737,7 +2746,7 @@ async fn old_presence_observation_is_not_redated_by_a_fresh_status_read() {
     presence["text"] =
         json!(r#"{"position":{"x":4,"y":64,"z":2},"turn_active":false,"players":[]}"#);
     fresh_result(&f, vec![presence]);
-    let read = super::connection_status(&f.s, &f.id, "minecraft")
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
         .await
         .unwrap();
     let fresh = read.response["source_observed_at"].as_str().unwrap();
@@ -2760,7 +2769,7 @@ async fn requested_qualifiers_revalidate_private_identity_and_policy_before_disp
     for revoke in ["policy", "audience", "private", "endpoint", "closed"] {
         let f = fixture();
         fresh_result(&f, vec![source_event()]);
-        let read = super::connection_status(&f.s, &f.id, "minecraft")
+        let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
             .await
             .unwrap();
         preserve_requested_status(&f.s, &f.id, &read).unwrap();
@@ -2841,7 +2850,7 @@ async fn requested_qualifiers_exclude_private_data_and_mark_whole_fact_omissions
     private["audience"] = json!({"kind":"private","owner":"other"});
     events.push(private);
     fresh_result(&f, events);
-    let read = super::connection_status(&f.s, &f.id, "minecraft")
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
         .await
         .unwrap();
     assert_eq!(read.response["reports"].as_array().unwrap().len(), 7);
@@ -2877,7 +2886,7 @@ async fn requested_status_binding_cannot_move_to_a_different_call_or_changed_pol
     for changed in ["call", "policy"] {
         let f = fixture();
         fresh_result(&f, vec![source_event()]);
-        let read = super::connection_status(&f.s, &f.id, "minecraft")
+        let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
             .await
             .unwrap();
         if changed == "policy" {
@@ -2908,7 +2917,7 @@ async fn requested_qualifier_revisions_replace_only_unsent_same_source_context()
     let mut first = source_event();
     first["actor"] = json!("Jarvis");
     fresh_result(&f, vec![first.clone()]);
-    let read = super::connection_status(&f.s, &f.id, "minecraft")
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
         .await
         .unwrap();
     preserve_requested_status(&f.s, &f.id, &read).unwrap();
@@ -2929,7 +2938,7 @@ async fn requested_qualifier_revisions_replace_only_unsent_same_source_context()
     first["revision"] = json!("second-revision");
     first["occurred_at"] = json!(newer);
     fresh_result(&f, vec![first]);
-    let second = super::connection_status(&f.s, &f.id, "minecraft")
+    let second = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
         .await
         .unwrap();
     preserve_requested_status(&f.s, &f.id, &second).unwrap();
@@ -3321,4 +3330,437 @@ fn predicate_policy_keeps_raw_probabilities_and_legacy_confidence_distinct() {
     legacy["decision"] = json!("quiet");
     legacy["reason"] = json!("provider_decision");
     assert_eq!(decision_policy(&legacy), Some(("ready", false)));
+}
+
+#[test]
+fn scoped_saved_observations_select_before_bounds_and_never_fall_back_across_owners() {
+    let f = fixture();
+    rewrite_policy(&f, |c| {
+        let mut home = c["agents"]["default"][0].clone();
+        home["id"] = json!("home-server");
+        home["label"] = json!("Home");
+        let mut private = home.clone();
+        private["id"] = json!("other-owner");
+        private["owners"] = json!(["someone-else"]);
+        c["agents"]["default"]
+            .as_array_mut()
+            .unwrap()
+            .extend([home, private]);
+    });
+    let (cfg, fingerprint) = config(&f.s).unwrap().unwrap();
+    for source in &cfg.agents["default"] {
+        for index in 0..if source.id == "minecraft" { 1 } else { 20 } {
+            let mut event = source_event();
+            event["id"] = json!(format!("{}-{index}", source.id));
+            event["text"] = json!(format!("{} report {index}", source.id));
+            record_source_event(&f.s, &f.id, source, &event, &fingerprint, false).unwrap();
+        }
+    }
+    let overview = current_observations(&f.s, &f.id, None).unwrap();
+    assert_eq!(overview["observations"].as_array().unwrap().len(), 16);
+    assert_eq!(overview["sources"].as_array().unwrap().len(), 2);
+    assert!(!overview.to_string().contains("other-owner"));
+    let selected = current_observations(&f.s, &f.id, Some("minecraft")).unwrap();
+    assert_eq!(selected["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["observations"][0]["source"]["id"], "minecraft-0");
+    assert_eq!(selected["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["sources"][0]["connection_id"], "minecraft");
+    assert_eq!(selected["omitted"], 0);
+    assert!(!selected.to_string().contains("home-server"));
+    for scope in ["unknown", "other-owner", "MINECRAFT"] {
+        let result = current_observations(&f.s, &f.id, Some(scope)).unwrap();
+        assert_eq!(result["status"], "not_configured");
+        assert_eq!(result["observations"], json!([]));
+        assert_eq!(result["sources"], json!([]));
+    }
+    rewrite_policy(&f, |c| {
+        c["agents"]["default"][0]["owners"] = json!(["other"])
+    });
+    assert_eq!(
+        current_observations(&f.s, &f.id, Some("minecraft")).unwrap()["status"],
+        "not_configured"
+    );
+    assert!(calls(&f, "observer").is_empty());
+    assert!(calls(&f, "decision").is_empty());
+    assert!(cards(&f).is_empty());
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn current_status_and_preserved_voice_context_exclude_history_without_redating_progress() {
+    let f = fixture();
+    let old = timestamp(now_ms() - 4 * 60 * 60 * 1000);
+    let observed = timestamp(now_ms());
+    let mut task = source_event();
+    task["id"] = json!("current-task");
+    task["kind"] = json!("task_observation");
+    task["observed_at"] = json!(observed);
+    task["actor"] = json!("Jarvis");
+    task["provenance"] = json!({"kind":"minecraft_current_task","current_state_snapshot":true,"token":"not-for-model"});
+    task["text"] = json!(json!({"status":"running","progress":{"at":old,"text":"The blue door linkage was unfinished."}}).to_string());
+    let mut presence = source_event();
+    presence["id"] = json!("current-presence");
+    presence["kind"] = json!("presence_observation");
+    presence["occurred_at"] = json!(observed);
+    presence["provenance"] = json!({"kind":"minecraft_public_presence"});
+    presence["text"] = json!(
+        json!({"position":{"x":10,"y":64,"z":-20},"ready":true,"busy":false,"turn_active":false})
+            .to_string()
+    );
+    let mut history = source_event();
+    history["text"] = json!("Historical peer audit unrelated to the current question.");
+    let mut private = history.clone();
+    private["id"] = json!("private");
+    private["audience"] = json!({"kind":"private","owner":"someone-else"});
+    let mut source = fresh_result(&f, vec![history, private, task.clone(), presence.clone()]);
+    source["coverage"]["omitted_events"] = json!(7);
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        source.to_string(),
+    )
+    .unwrap();
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Current)
+        .await
+        .unwrap();
+    let response = &read.response;
+    assert_eq!(response["reports"].as_array().unwrap().len(), 2);
+    assert_eq!(response["reports"][0]["id"], "current-task");
+    assert_eq!(response["reports"][0]["text"], task["text"]);
+    assert_eq!(response["reports"][0]["revision"], task["revision"]);
+    assert_eq!(
+        response["reports"][0]["attribution"]["observed_at"],
+        observed
+    );
+    assert_eq!(
+        response["reports"][0]["provenance"],
+        json!({"kind":"minecraft_current_task"})
+    );
+    assert_eq!(response["reports"][1]["text"], presence["text"]);
+    assert_eq!(
+        response["reports"][1]["attribution"]["occurred_at"],
+        observed
+    );
+    assert!(response["reports"][1]["attribution"]["observed_at"].is_null());
+    assert_eq!(response["source_observed_at"], source["observed_at"]);
+    assert_eq!(
+        response["selection"],
+        json!({"view":"current","status":"typed_current_snapshots","excluded_reports":1})
+    );
+    assert_eq!(response["omitted"], 0);
+    assert_eq!(response["coverage"]["omitted_events"], 7);
+    assert_eq!(response["presence"], json!({}));
+    assert!(!response.to_string().contains("not-for-model"));
+    assert!(!response.to_string().contains("Historical peer audit"));
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    let _rx = quiet_browser(&f);
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    let commands = batch["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 3);
+    assert!(commands.iter().all(|v| v["channel"] == "thinking"));
+    let text = batch.to_string();
+    assert!(text.contains(&format!("progress.at {old}")));
+    assert!(text.contains("progress report about 4 hours old at read"));
+    assert!(text.contains("1 report(s) excluded by selection"));
+    assert!(!text.contains("Historical peer audit"));
+    assert_eq!(
+        calls(&f, "observer"),
+        vec![json!({"version":1,"cursor":null,"actions":[]})]
+    );
+    assert!(calls(&f, "decision").is_empty());
+    assert!(cards(&f).is_empty());
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn current_status_without_typed_snapshots_is_unknown_and_reports_view_remains_available() {
+    let f = fixture();
+    let history = source_event();
+    let mut generic = history.clone();
+    generic["id"] = json!("generic-presence");
+    generic["kind"] = json!("presence_observation");
+    generic["text"] = json!("idle");
+    let mut malformed = history.clone();
+    malformed["id"] = json!("malformed-task");
+    malformed["kind"] = json!("task_observation");
+    malformed["observed_at"] = json!(timestamp(now_ms()));
+    malformed["provenance"] =
+        json!({"kind":"minecraft_current_task","current_state_snapshot":true});
+    fresh_result(&f, vec![history, generic, malformed]);
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Current)
+        .await
+        .unwrap();
+    assert_eq!(read.response["status"], "available");
+    assert_eq!(
+        read.response["selection"]["status"],
+        "no_typed_current_facts"
+    );
+    assert_eq!(read.response["selection"]["excluded_reports"], 3);
+    assert_eq!(read.response["reports"], json!([]));
+    assert_eq!(read.response["presence"], json!({}));
+    assert_eq!(read.response["omitted"], 0);
+    assert_eq!(read.response["coverage"]["gap"], false);
+    assert!(
+        read.response["note"]
+            .as_str()
+            .unwrap()
+            .contains("unknown, not inactivity")
+    );
+    preserve_requested_status(&f.s, &f.id, &read).unwrap();
+    assert!(states(&f).is_empty());
+    assert!(
+        crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    let reports = connection_status(&f.s, &f.id, "minecraft").await.unwrap();
+    assert_eq!(reports["reports"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        reports["presence"],
+        json!({"ready":true,"busy":false,"turn_active":false})
+    );
+    assert!(reports.get("selection").is_none());
+    for scope in ["unknown", "MINECRAFT"] {
+        assert_eq!(
+            super::connection_status(&f.s, &f.id, scope, StatusView::Current)
+                .await
+                .unwrap()
+                .response["status"],
+            "not_configured"
+        );
+    }
+    rewrite_policy(&f, |c| {
+        c["agents"]["default"][0]["owners"] = json!(["other"])
+    });
+    assert_eq!(
+        super::connection_status(&f.s, &f.id, "minecraft", StatusView::Current)
+            .await
+            .unwrap()
+            .response["status"],
+        "not_configured"
+    );
+    assert_eq!(calls(&f, "observer").len(), 2);
+    assert!(calls(&f, "decision").is_empty());
+    assert!(cards(&f).is_empty());
+}
+
+#[tokio::test]
+async fn current_status_counts_selection_response_bounds_and_source_omissions_separately() {
+    let f = fixture();
+    let mut events = vec![source_event()];
+    for index in 0..17 {
+        let mut event = source_event();
+        event["id"] = json!(format!("snapshot-{index}"));
+        event["kind"] = json!("presence_observation");
+        event["provenance"] = json!({"kind":"minecraft_public_presence"});
+        event["text"] =
+            json!(json!({"turn_active":true,"position":{"x":index,"y":64,"z":0}}).to_string());
+        events.push(event);
+    }
+    let mut source = fresh_result(&f, events);
+    source["coverage"]["omitted_events"] = json!(42);
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        source.to_string(),
+    )
+    .unwrap();
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Current)
+        .await
+        .unwrap();
+    assert_eq!(read.response["reports"].as_array().unwrap().len(), 16);
+    assert_eq!(read.response["selection"]["excluded_reports"], 1);
+    assert_eq!(read.response["omitted"], 1);
+    assert_eq!(read.response["coverage"]["omitted_events"], 42);
+    assert_eq!(read.response["coverage"]["gap"], true);
+    assert!(
+        read.response["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["attribution"]["snapshot_kind"] == "presence")
+    );
+}
+
+#[tokio::test]
+async fn current_status_requires_snapshot_time_not_just_a_fresh_source_envelope() {
+    let f = fixture();
+    let now = timestamp(now_ms());
+    let old = timestamp(now_ms() - 3_600_000);
+    let mut presence = source_event();
+    presence["kind"] = json!("presence_observation");
+    presence["provenance"] = json!({"kind":"minecraft_public_presence"});
+    presence["text"] = json!(json!({"turn_active":false,"position":null}).to_string());
+    let mut fallback = presence.clone();
+    fallback["id"] = json!("fresh-occurrence");
+    let mut explicit = presence.clone();
+    explicit["id"] = json!("fresh-observation-old-semantic-time");
+    explicit["occurred_at"] = json!(old);
+    explicit["observed_at"] = json!(now);
+    let mut stale_explicit = presence.clone();
+    stale_explicit["id"] = json!("stale-explicit");
+    stale_explicit["observed_at"] = json!(old);
+    let mut stale_fallback = presence.clone();
+    stale_fallback["id"] = json!("stale-occurrence");
+    stale_fallback["occurred_at"] = json!(old);
+    let mut task = source_event();
+    task["id"] = json!("fresh-task-old-progress");
+    task["kind"] = json!("task_observation");
+    task["provenance"] = json!({"kind":"minecraft_current_task","current_state_snapshot":true});
+    task["observed_at"] = json!(now);
+    task["text"] = json!(json!({"status":"running","progress":{"at":old}}).to_string());
+    let mut missing = task.clone();
+    missing["id"] = json!("missing-task-time");
+    missing.as_object_mut().unwrap().remove("observed_at");
+    let mut stale_task = task.clone();
+    stale_task["id"] = json!("stale-task");
+    stale_task["observed_at"] = json!(old);
+    let mut future = task.clone();
+    future["id"] = json!("future-task");
+    future["observed_at"] = json!(timestamp(now_ms() + 60_000));
+    fresh_result(
+        &f,
+        vec![
+            fallback,
+            explicit,
+            stale_explicit,
+            stale_fallback,
+            task.clone(),
+            missing,
+            stale_task,
+            future,
+        ],
+    );
+    let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Current)
+        .await
+        .unwrap();
+    let ids: Vec<_> = read.response["reports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "fresh-task-old-progress",
+            "fresh-occurrence",
+            "fresh-observation-old-semantic-time"
+        ]
+    );
+    assert_eq!(read.response["selection"]["excluded_reports"], 5);
+    assert_eq!(read.response["reports"][0]["text"], task["text"]);
+    let reports = connection_status(&f.s, &f.id, "minecraft").await.unwrap();
+    assert_eq!(reports["reports"].as_array().unwrap().len(), 8);
+    presence.as_object_mut().unwrap().remove("occurred_at");
+    fresh_result(&f, vec![presence]);
+    let missing_time = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Current)
+        .await
+        .unwrap();
+    assert_eq!(missing_time.response["status"], "unavailable");
+    assert_eq!(missing_time.response["reports"], json!([]));
+    assert!(calls(&f, "decision").is_empty());
+}
+
+#[tokio::test]
+async fn empty_current_read_withdraws_only_unsent_same_source_qualifiers() {
+    let f = fixture();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM companion_surfaces WHERE call_id=?1", [&f.id])
+        .unwrap();
+    let mut history = source_event();
+    history["text"] = json!("HISTORICAL-PEER-MARKER was reported complete yesterday.");
+    fresh_result(&f, vec![history]);
+    let earlier = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
+        .await
+        .unwrap();
+    preserve_requested_status(&f.s, &f.id, &earlier).unwrap();
+    for key in [
+        "result:independent-answer",
+        "requested-status:other-connection",
+    ] {
+        crate::companion_delivery::enqueue_batch(&f.s, &f.id, key, vec![json!({"op":"append","channel":"thinking","event_id":key,"delegation_id":null,"content":format!("Independent context {key}")})]).unwrap();
+    }
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO companion_voice_batches SELECT 'earlier-unknown',call_id,semantic_key,updates,'unknown',created_at,updated_at FROM companion_voice_batches WHERE call_id=?1 AND semantic_key='requested-status:minecraft' AND state='pending'", [&f.id]).unwrap();
+    }
+    let receipt_data = |f: &Fixture| -> Vec<String> {
+        let db = f.s.db.lock().unwrap();
+        let mut statement = db
+            .prepare("SELECT data FROM companion_awareness WHERE call_id=?1 ORDER BY event_key")
+            .unwrap();
+        statement
+            .query_map([&f.id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let before = receipt_data(&f);
+    assert!(!before.is_empty());
+    let current = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Current)
+        .await
+        .unwrap();
+    assert_eq!(
+        current.response["selection"]["status"],
+        "no_typed_current_facts"
+    );
+    preserve_requested_status(&f.s, &f.id, &current).unwrap();
+    assert_eq!(receipt_data(&f), before);
+    {
+        let db = f.s.db.lock().unwrap();
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1 AND semantic_key='requested-status:minecraft' AND state='pending'", [&f.id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            db.query_row(
+                "SELECT state FROM companion_voice_batches WHERE id='earlier-unknown'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "unknown"
+        );
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1 AND state='superseded'", [&f.id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1 AND state='pending'",
+                [&f.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+    }
+    let _rx = quiet_browser(&f);
+    for _ in 0..2 {
+        let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .unwrap();
+        assert!(!batch.to_string().contains("HISTORICAL-PEER-MARKER"));
+        assert!(batch.to_string().contains("Independent context"));
+    }
+    assert!(
+        crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(calls(&f, "decision").is_empty());
+    assert!(cards(&f).is_empty());
 }
