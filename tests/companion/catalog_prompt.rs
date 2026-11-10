@@ -107,6 +107,18 @@ async fn actual_delegation_contains_authorized_executable_read_catalog_and_exact
         1
     );
     assert!(!saved.contains("Return concise useful facts, actual blockers and next steps"));
+    assert_eq!(
+        text.matches("For routine questions, give the requested conclusion in one or two conversational sentences.").count(),
+        1,
+        "one response instruction must reach the actual prompt"
+    );
+    assert!(!text.contains(
+        "Answer the current question directly, usually with a short conversational reply."
+    ));
+    assert!(!text.contains(
+        "Compare each allowance or deadline with its usage and observation time separately"
+    ));
+
     end(&f, id).await;
 }
 
