@@ -1,5 +1,7 @@
 import {createVoice} from './voice.js';
 import {presentMessages,appendMessageDetails,voiceLabel} from './message-presentation.mjs';
+import {createHuddles} from './huddles.mjs';
+import {createHuddleApi} from './huddles-api.mjs';
 const $=id=>document.getElementById(id);
 const ui={meta:null,session:null,items:[],conversation:null,view:null,eventSource:null,refreshing:false,refreshAgain:false,sending:false,draftTimer:null,searchTimer:null,saveChain:Promise.resolve(),refreshTimer:null,titleTimer:null,actionId:null,agents:[],people:[],files:[],historyCursor:null,historyTimer:null,roomTimer:null};
 const viewId=localStorage.getItem('acv-view')||crypto.randomUUID();localStorage.setItem('acv-view',viewId);
@@ -7,6 +9,37 @@ const initials=name=>(name||'A').trim().split(/\s+/).map(p=>p[0]).slice(0,2).joi
 const shortTime=at=>new Date(at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
 const date=at=>new Date(at).toLocaleDateString([],{month:'short',day:'numeric'});
 const el=(tag,className,text)=>{const n=document.createElement(tag);if(className)n.className=className;if(text!==undefined)n.textContent=text;return n;};
+let huddleView=null,huddleContext=null,huddleRefresh=null,huddleRefreshAgain=false;
+function clearHuddles(){huddleContext=null;huddleRefreshAgain=false;huddleView?.destroy();huddleView=null;$('conversation-huddles').hidden=true;$('conversation-huddles').open=false;}
+async function refreshLinkedHuddles(){
+  const c=ui.conversation;
+  if(!c||!ui.session?.authenticated||$('app').hidden||c.id!==ui.view?.state.selected_conversation_id){clearHuddles();return;}
+  const key=JSON.stringify([ui.session.owner,c.id]);
+  if(huddleRefresh){huddleRefreshAgain=true;return;}
+  try{
+    if(huddleContext?.key!==key){
+      clearHuddles();
+      huddleContext=Object.freeze({key,owner:ui.session.owner,parentId:c.id});
+      const callbacks=createHuddleApi({api,getContext:()=>huddleContext});
+      huddleView=createHuddles({root:$('conversation-huddle-view'),...callbacks,list:async options=>{
+        try{
+          const result=await callbacks.list(options);
+          if(result.current)result.items=[result.current,...result.items.filter(item=>item.id!==result.current.id)];
+          if(huddleContext?.key===options.context.key){$('conversation-huddles').hidden=!result.items.length;$('conversation-huddle-count').textContent=result.items.length?`(${result.items.length})`:'';}
+          return result;
+        }catch(error){if(huddleContext?.key===options.context.key){$('conversation-huddles').hidden=false;$('conversation-huddle-count').textContent='';}throw error;}
+      }});
+      huddleRefresh=huddleView.setContext(huddleContext);
+    }else huddleRefresh=huddleView.refresh();
+    await huddleRefresh;
+  }catch{
+    if(huddleContext?.key===key){$('conversation-huddles').hidden=false;$('conversation-huddle-view').textContent='Huddles could not be opened. Your conversation is still available.';}
+  }finally{
+    huddleRefresh=null;
+    if(huddleRefreshAgain){huddleRefreshAgain=false;void refreshLinkedHuddles();}
+  }
+}
+$('conversation-huddles').ontoggle=()=>{if(!$('conversation-huddles').open)huddleView?.close();else void refreshLinkedHuddles();};
 function renderText(target,text){
   target.classList.add('markdown');
   target.innerHTML=renderMarkdown(text);
@@ -16,13 +49,13 @@ function applyAction(includeScroll=false){const a=ui.view?.state.action;if(!a||a
   else if(includeScroll&&a.kind==='scroll'&&['messages','permissions','elicitations'].includes(a.target)&&ui.view.state.panel==='conversation'){ui.actionId=a.id;requestAnimationFrame(()=>{$(a.target).scrollTop=a.position===-1?$(a.target).scrollHeight:Math.max(0,a.position||0);});}
 }
 function error(message){$('global-error').hidden=!message;$('global-error').querySelector('span').textContent=message||'';}
-async function api(path,method='GET',body){
+async function api(path,method='GET',body,options={}){
   const headers={};if(body!==undefined)headers['Content-Type']='application/json';if(method!=='GET'&&ui.session?.csrf)headers['X-CSRF-Token']=ui.session.csrf;
-  const r=await fetch(path,{method,headers,credentials:'same-origin',body:body===undefined?undefined:JSON.stringify(body)});
+  const r=await fetch(path,{method,headers,credentials:'same-origin',body:body===undefined?undefined:JSON.stringify(body),signal:options.signal});
   let v;try{v=await r.json();}catch{throw new Error('The service returned an unreadable response. Please refresh and try again.');}
   if(!r.ok){const e=new Error(v.error||'The request could not be completed.');e.status=r.status;if(r.status===401&&path!='/auth/login')showLogin();throw e;}return v;
 }
-function showLogin(){voice.close();ui.eventSource?.close();ui.eventSource=null;$('loading').hidden=true;$('app').hidden=true;$('login').hidden=false;$('username').value=ui.session?.owner||'';$('password').value='';}
+function showLogin(){clearHuddles();voice.close();ui.eventSource?.close();ui.eventSource=null;$('loading').hidden=true;$('app').hidden=true;$('login').hidden=false;$('username').value=ui.session?.owner||'';$('password').value='';}
 async function start(){
   try{ui.session=await api('/auth/session');if(!ui.session.authenticated){showLogin();return;}await openApp();}catch(e){$('loading').hidden=true;$('app').hidden=true;$('login').hidden=false;$('login-error').hidden=false;$('login-error').textContent=e.message;}
 }
@@ -56,7 +89,7 @@ async function refresh(){
       const history=await api(`/api/v1/conversations/${id}/messages?${params}`);ui.conversation.messages=history.items;ui.historyCursor=history.next_cursor;
       ui.files=(await api(`/api/v1/conversations/${id}/attachments`)).items;
     }else{ui.files=[];ui.historyCursor=null;}
-    renderList();renderChat();renderParticipants();if(ui.view.state.panel==='activity')await renderActivity();
+    renderList();renderChat();renderParticipants();void refreshLinkedHuddles();if(ui.view.state.panel==='activity')await renderActivity();
   }finally{ui.refreshing=false;if(ui.refreshAgain){ui.refreshAgain=false;queueRefresh();}}
 }
 function saveView(patch){
@@ -88,6 +121,7 @@ function applyView(){
   updateSend();renderList();
 }
 async function selectConversation(id){
+  clearHuddles();
   await flushDraft();await saveView({selected_conversation_id:id,panel:'conversation',draft:'',menu_open:false,attachment_ids:[],target_agent_ids:[],history_search:'',history_before:null,participants_open:false,share_history:false});await refresh();$('message').focus();
 }
 function renderList(){
@@ -122,9 +156,10 @@ function renderChat(){
   $('delivery-review').hidden=!older.length;$('delivery-review').replaceChildren(...older.map(d=>{const b=el('button','secondary',`Review earlier message for ${c.agents?.find(a=>a.id===d.agent_id)?.label||d.agent_id}`);b.type='button';b.onclick=()=>showDelivery(d.id).catch(e=>error(e.message));return b;}));
   if(nearBottom||previousId!==(c?.id||''))container.scrollTop=container.scrollHeight;
   voice.observe(c?.messages,previousId!==(c?.id||''));
-  const working=c?.status==='working';const failed=c?.status==='error';$('turn-status').hidden=!working&&!failed;$('turn-status').classList.toggle('failed',failed);$('turn-status-text').textContent=c?.note||(working?`${agent} is working…`:'');$('stop').hidden=!working;
+  const working=c?.status==='working',huddle=c?.huddle;const failed=c?.status==='error';$('turn-status').hidden=!working&&!failed&&!huddle;$('turn-status').classList.toggle('failed',failed);$('turn-status-text').textContent=huddle?(huddle.state==='stopped'?'This huddle is stopped. Its conversation remains available.':'This huddle is open. Inspecting it does not start or stop work.'):(c?.note||(working?`${agent} is working…`:''));$('stop').hidden=huddle?huddle.state!=='open':!working;$('stop').textContent=huddle?'Stop huddle':'Stop';
   $('composer').hidden=Boolean(c?.read_only);$('composer-hint').textContent=working?'You can add to the conversation while work continues.':'Enter to send · Shift + Enter for a new line';
-  $('composer-footnote').textContent=c?.read_only?`This transcript comes from ${c.surface}. Continue there, or start a new web conversation with the same agent.`:c?.shared?'Everyone here can read your message. A named recipient chooses which agent responds.':'A separate conversation with the same agent. Relevant context can follow through its authorized connections.';
+  $('composer-footnote').textContent=c?.read_only?`This transcript comes from ${c.surface}. Continue there, or start a new web conversation with the same agent.`:huddle?'Everyone in this huddle can read your message. Share links to evidence here; files stay in their original location.':c?.shared?'Everyone here can read your message. A named recipient chooses which agent responds.':'A separate conversation with the same agent. Relevant context can follow through its authorized connections.';
+  document.querySelector('label[for="file-upload"]').hidden=Boolean(huddle);$('message').maxLength=huddle?6000:60000;
   renderPermissions();renderElicitations();updateSend();
 }
 function renderPermissions(){
@@ -166,7 +201,7 @@ function renderElicitations(force=false){
  for(const p of forms){const form=[...container.children].find(f=>f.dataset.requestId===p.id);const draft=ui.view.state.elicitation_drafts?.[p.id]||{};for(const input of form.querySelectorAll('[data-field]')){if(!force&&document.activeElement===input)continue;const field=p.schema.properties[input.dataset.field];const value=Object.prototype.hasOwnProperty.call(draft,input.dataset.field)?draft[input.dataset.field]:field.default;if(input.type==='checkbox')input.checked=Boolean(value);else if(input.multiple){for(const o of input.options)o.selected=Array.isArray(value)&&value.includes(o.value);}else input.value=value===undefined?'':String(value);}}
  applyAction(true);
 }
-function updateSend(){$('file-upload').disabled=Boolean(ui.view?.state.selected_conversation_id&&ui.conversation?.id!==ui.view.state.selected_conversation_id);$('send').disabled=ui.sending||(ui.view?.state.selected_conversation_id&&ui.conversation?.id!==ui.view.state.selected_conversation_id)||(!$('message').value.trim()&&!ui.view?.state.attachment_ids?.length)||ui.conversation?.read_only;}
+function updateSend(){const stale=Boolean(ui.view?.state.selected_conversation_id&&ui.conversation?.id!==ui.view.state.selected_conversation_id);$('file-upload').disabled=stale||Boolean(ui.conversation?.huddle);$('send').disabled=ui.sending||stale||(!$('message').value.trim()&&!ui.view?.state.attachment_ids?.length)||ui.conversation?.read_only||Boolean(ui.conversation?.huddle&&ui.conversation.huddle.state!=='open');}
 async function flushDraft(){if(ui.draftTimer){clearTimeout(ui.draftTimer);ui.draftTimer=null;await saveView({draft:$('message').value});}}
 async function newConversation(){await flushDraft();const c=await api('/api/v1/conversations','POST',{title:'New conversation'});await selectConversation(c.id);}
 async function sendMessage(e){
@@ -176,6 +211,7 @@ async function sendMessage(e){
     if(!c){c=await api('/api/v1/conversations','POST',{title:text.split('\n')[0].slice(0,70)});await saveView({selected_conversation_id:c.id,panel:'conversation'});}
     if(c.title==='New conversation'&&c.owner===ui.session.owner)await api(`/api/v1/conversations/${c.id}`,'PATCH',{title:text.split('\n')[0].slice(0,70)});
     const target_agent_ids=[...(ui.view.state.target_agent_ids||[])],attachment_ids=[...(ui.view.state.attachment_ids||[])];
+    if(c.huddle&&(attachment_ids.length||new TextEncoder().encode(text).byteLength>6000))throw new Error('Use a shorter huddle message and links to evidence instead of attachments.');
     const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify({room:c.id,text,target_agent_ids,attachment_ids})));
     const digest=[...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');
     const request_id=ui.view.state.draft_request_sha256===digest&&ui.view.state.draft_request_id?ui.view.state.draft_request_id:crypto.randomUUID();
@@ -193,10 +229,11 @@ async function resolveDelivery(id){try{if(!ui.conversation)throw new Error('Open
 function renderParticipants(){
   const c=ui.conversation,v=ui.view.state,owner=c?.owner===ui.session.owner;
   $('participants-panel').hidden=!c||c.read_only||!v.participants_open;$('invite-controls').hidden=!owner;
+  $('agent-invite-controls').hidden=Boolean(c?.huddle);
   $('participants-toggle').setAttribute('aria-expanded',String(Boolean(v.participants_open)));
   const rows=[];
   for(const person of c?.members||[]){const row=el('div','participant-row');row.append(el('span',null,person.username+(person.role==='owner'?' · room owner':'')));if(owner&&person.role!=='owner'){const b=el('button','remove-participant','Remove');b.onclick=()=>api(`/api/v1/conversations/${c.id}/members/${encodeURIComponent(person.username)}`,'DELETE').then(refresh).catch(e=>error(e.message));row.append(b);}rows.push(row);}
-  for(const agent of c?.agents||[]){const row=el('div','participant-row');row.append(el('span',null,agent.label+' · agent'));if(owner){const b=el('button','remove-participant','Remove');b.onclick=()=>api(`/api/v1/conversations/${c.id}/agents/${encodeURIComponent(agent.id)}`,'DELETE').then(refresh).catch(e=>error(e.message));row.append(b);}rows.push(row);}
+  for(const agent of c?.agents||[]){const row=el('div','participant-row');row.append(el('span',null,agent.label+' · agent'));if(owner&&!c?.huddle){const b=el('button','remove-participant','Remove');b.onclick=()=>api(`/api/v1/conversations/${c.id}/agents/${encodeURIComponent(agent.id)}`,'DELETE').then(refresh).catch(e=>error(e.message));row.append(b);}rows.push(row);}
   $('participant-list').replaceChildren(...rows);
   const options=(node,items,key,label,prompt,selected)=>{node.replaceChildren(new Option(prompt,''),...items.map(a=>new Option(a[label]??a,a[key]??a)));node.value=selected||'';};
   options($('invite-username'),ui.people.filter(p=>!c?.members?.some(m=>m.username===p)),null,null,'Choose a person…',v.invite_username);

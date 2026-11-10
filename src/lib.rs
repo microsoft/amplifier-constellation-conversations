@@ -9,6 +9,7 @@ pub mod companion_awareness;
 mod companion_delivery;
 mod companion_diagnostics;
 mod companion_history;
+mod companion_huddles;
 mod companion_identity;
 mod companion_prompt;
 pub mod companion_surface;

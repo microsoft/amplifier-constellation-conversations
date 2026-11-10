@@ -1,5 +1,7 @@
 import {ConversationFloor} from './companion-floor.mjs';
 import {safeCardLink, renderCardText, savedCardTime} from './companion-cards.mjs';
+import {createHuddles} from './huddles.mjs';
+import {createHuddleApi} from './huddles-api.mjs';
 // The browser owns media and presentation only. Provider commands, delegation,
 // authorization and persisted call events belong to the Companion service.
 const $ = id => document.getElementById(id);
@@ -43,6 +45,38 @@ async function api(path, method = 'GET', body, options = {}) {
 function notice(message) { $('notice').hidden = !message; $('notice-text').textContent = message || ''; }
 function current(call) { return Boolean(call && state.call === call && call.generation === state.generation && !call.ended); }
 function conversationLink(id) { return '/?conversation=' + encodeURIComponent(id); }
+
+function startHuddleView(call) {
+  const context = Object.freeze({key:`${call.authGeneration}:${call.id}`,owner:state.session.owner,parentId:call.conversationId});
+  const callbacks = createHuddleApi({api,getContext:()=>current(call) ? context : null});
+  call.huddles = createHuddles({root:$('call-huddle-view'),...callbacks,list:async options=>{
+    try {
+      const result = await callbacks.list(options);
+      if (current(call)) {
+        $('call-huddle-count').textContent = result.items.length ? `(${result.items.length})` : '';
+        $('call-huddles').hidden = !result.items.length;
+      }
+      return result;
+    } catch (error) {
+      if (current(call)) { $('call-huddles').hidden=false; $('call-huddle-count').textContent=''; }
+      throw error;
+    }
+  }});
+  call.huddleRefreshAt=Date.now();
+  call.huddleRefresh=call.huddles.setContext(context).finally(()=>{call.huddleRefresh=null;});
+}
+function refreshHuddles(call) {
+  // Reuse the existing call poll. This only refreshes authorized presentation;
+  // it never creates input, a model turn, or voice context.
+  if (!current(call) || !call.huddles || call.huddleRefresh || Date.now()-call.huddleRefreshAt<5000) return;
+  call.huddleRefreshAt=Date.now();
+  call.huddleRefresh=call.huddles.refresh().finally(()=>{call.huddleRefresh=null;});
+}
+$('call-huddles').ontoggle=()=>{
+  const call=state.call;if(!current(call)||!call.huddles)return;
+  if(!$('call-huddles').open)call.huddles.close();
+  else {call.huddleRefreshAt=0;refreshHuddles(call);}
+};
 
 async function openContacts() {
   const authGeneration = state.authGeneration, generation = state.generation, recovery = state.recovery;
@@ -201,6 +235,7 @@ async function startCall(contact) {
   $('call-permissions').replaceChildren(); $('permission-alert').hidden = true; $('context-items').replaceChildren(); $('context-empty').hidden = false;
   $('transcript-empty').hidden = false; $('space-empty').hidden = false; $('work-status').hidden = true;
   $('connection-status').hidden = true; $('connection-status').textContent = '';
+  $('call-huddles').hidden = true; $('call-huddles').open = false; $('call-huddle-view').replaceChildren();
   updateBoard(call); resetFollowing();
   $('card-count').hidden = true; $('card-count').textContent = '0'; $('continue-work').hidden = true;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = 'Take your time. There’s room for a pause.';
@@ -247,6 +282,12 @@ async function startCall(contact) {
     if (!current(call)) { await closeKnownCall(call); return; }
     $('continue-work').href = conversationLink(call.conversationId); $('continue-work').hidden = false;
     await peer.setRemoteDescription({type:'answer',sdp:result.sdp});
+    try { startHuddleView(call); }
+    catch {
+      // Optional coordination presentation must not close a healthy voice call.
+      $('call-huddles').hidden=false;
+      $('call-huddle-view').textContent='Huddles are unavailable in this browser. Your call can continue.';
+    }
     call.lastControlAt = Date.now(); call.lastWatchdogAt = Date.now();
     call.durationTimer = setInterval(() => updateDuration(call), 1000);
     call.surfaceTimer = setInterval(() => surfacePresence(call), 2000); surfacePresence(call);
@@ -372,6 +413,7 @@ async function poll(call) {
       endCall(terminalMessage(result), false); showTerminal(result); return;
     }
     refreshStatus(call); refreshWorkStatus(call);
+    refreshHuddles(call);
   } catch (error) {
     if (!current(call) || call.pollRequest !== request) return;
     call.pollError = true; refreshStatus(call);
@@ -776,6 +818,21 @@ function addCard(call, title, text, conversationId, data = {}) {
   if (data.card_id) card.dataset.cardId = String(data.card_id);
   const heading = element('h2', null, title); heading.append(savedCardTime(data.event_at));
   card.append(heading);
+  if (typeof data.huddle_id === 'string' && data.huddle_id && data.source?.huddle_id === data.huddle_id) {
+    const attribution=data.attribution||{};
+    card.append(element('p','card-context',`${typeof attribution.actor==='string'?attribution.actor:'A participant'} reported this update.`));
+    for(const item of Array.isArray(data.evidence)?data.evidence:[]) {
+      if(typeof item?.label!=='string'||typeof item?.reference!=='string')continue;
+      const url=safeLink(item.reference,conversationId);
+      card.append(url?resultLink(item.label,url):element('p','small',`${item.label}: ${item.reference}`));
+    }
+    if(conversationId===call.conversationId&&call.huddles) {
+      const inspect=element('button','secondary','Inspect huddle');inspect.type='button';
+      inspect.onclick=()=>{if(!current(call))return;$('call-huddles').hidden=false;$('call-huddles').open=true;void call.huddles.inspect(data.huddle_id);};card.append(inspect);
+    }else{
+      const link=element('a','conversation-link','Inspect huddle ↗');link.href=conversationLink(data.huddle_id);link.target='constellation-work';card.append(link);
+    }
+  }
   if (data.late) card.append(element('p', 'card-context', 'Answer to your earlier request'));
   const answer = element('div', 'card-answer'), note = data.kind === 'note', explicitMedia = !note && safeLink(data.url, conversationId);
   if (note) answer.append(element('p',null,text)); else appendRichText(answer, text, conversationId, !explicitMedia); card.append(answer);
@@ -1100,6 +1157,7 @@ function releaseTransport(call) {
   call.channel?.close(); call.peer?.close(); call.audioSource?.disconnect(); call.audioContext?.close().catch(() => {});
 }
 function releaseMedia(call, retainTransport = false) {
+  call.huddles?.destroy(); call.huddles=null; $('call-huddles').hidden=true;
   call.floor?.close(); clearTimeout(call.surfaceRetryTimer);
   clearInterval(call.surfaceTimer); clearInterval(call.micMeterTimer); call.micSource?.disconnect();
   clearTimeout(call.pollTimer); clearInterval(call.heartbeatTimer); clearInterval(call.durationTimer); clearInterval(call.meterTimer); clearInterval(call.controlTimer);

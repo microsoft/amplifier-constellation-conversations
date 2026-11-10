@@ -8,6 +8,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/companion.css">
+  <link rel="stylesheet" href="/huddles.css">
   <script type="module" src="/companion.js"></script>
   <title>Companion · Constellation</title>
 </head>
@@ -60,6 +61,7 @@
           <p id="connection-status" class="small connection-status" hidden></p>
           <button id="permission-alert" class="secondary permission-alert" type="button" hidden>Review requested action</button>
           <div id="work-status" class="work-status" role="status" hidden></div>
+          <details id="call-huddles" class="linked-huddles" hidden><summary>Work huddles <span id="call-huddle-count"></span></summary><div id="call-huddle-view"></div></details>
             <div class="share-toolbar"><button id="show-paste" class="text-button" type="button" aria-label="Paste text or an image">Paste</button><button id="choose-files" class="secondary" type="button" disabled>Share files</button><input id="share-files" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,.md,.txt,.csv,.json" hidden></div>
             <form id="paste-composer" class="paste-composer" hidden><label class="sr-only" for="paste-input">Paste text or an image here</label><textarea id="paste-input" rows="1" placeholder="Paste text or an image here…"></textarea><button id="share-text" class="secondary" type="submit">Share</button></form>
           <section id="space-panel" role="tabpanel" aria-labelledby="space-tab" tabindex="0">

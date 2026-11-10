@@ -172,6 +172,7 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     if !active
         || crate::companion_history::private_identity(&tx, call)?.is_none()
         || !crate::companion_awareness::presentation_allowed(s, &tx, call, &commands)?
+        || !crate::companion_huddles::presentation_allowed(s, &tx, call, &commands)?
         || !crate::companion_surface::board_presentation_allowed(&tx, call, &commands)?
     {
         tx.execute(

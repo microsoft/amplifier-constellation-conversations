@@ -1808,6 +1808,9 @@ fn observe_results(s: &AppState, id: &str, room: &str, live: bool) -> Result<()>
     for (message, text) in results {
         publish_result(s, id, room, &message, &text)?;
     }
+    if live {
+        crate::companion_huddles::reconcile(s, id)?;
+    }
     Ok(())
 }
 /// Each append is below GPT-Live's 500-token ceiling using a conservative
