@@ -56,6 +56,35 @@ struct Config {
 fn duration_expired(limit: Option<u64>, elapsed: Duration) -> bool {
     limit.is_some_and(|seconds| elapsed >= Duration::from_secs(seconds))
 }
+const TRANSCRIPT_GRACE_MS: i64 = 2000;
+
+fn next_transcript_wake(db: &Connection, id: &str, now: i64) -> Result<Option<Duration>> {
+    let created_at: Option<i64> = db.query_row(
+        "SELECT MIN(d.created_at) FROM companion_delegations d JOIN companion_calls c ON c.id=d.call_id WHERE d.call_id=?1 AND d.state='waiting_transcript' AND c.state IN ('connecting','connected')",
+        [id],
+        |r| r.get(0),
+    )?;
+    // Held requests have already had their source examined. They remain on the
+    // maintenance poll so missing/unchanged speech cannot arm an overdue loop.
+    Ok(created_at.map(|at| {
+        Duration::from_millis(
+            at.saturating_add(TRANSCRIPT_GRACE_MS)
+                .saturating_sub(now)
+                .max(0) as u64,
+        )
+    }))
+}
+
+async fn wait_for_advance(timer: &mut tokio::time::Interval, transcript: Option<Duration>) {
+    if let Some(delay) = transcript {
+        tokio::select! {
+            _ = timer.tick() => {},
+            _ = tokio::time::sleep(delay) => {},
+        }
+    } else {
+        timer.tick().await;
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Profile {
@@ -986,6 +1015,7 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
         let started=tokio::time::Instant::now(); let mut closing:Option<Duration>=None;
         let mut early_events=Vec::new(); let mut early_bytes=0usize;
         loop {
+            let transcript_wake=if closing.is_none() { next_transcript_wake(&s.db.lock().unwrap(),&id,now_ms())? } else { None };
             let command=tokio::select! {
                 line=bridge_frame(&mut output,&mut partial)=>{
                     let Some(v)=line? else { return Ok(false); };
@@ -1041,7 +1071,7 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
                     }
                 },
                 command=rx.recv()=>command,
-                _=timer.tick()=>{
+                _=wait_for_advance(&mut timer,transcript_wake)=>{
                     let heartbeat:i64=s.db.lock().unwrap().query_row("SELECT heartbeat_at FROM companion_calls WHERE id=?1",[&id],|r|r.get(0))?;
                     if closing.is_some_and(|deadline|started.elapsed()>deadline) { child.start_kill()?; return Ok(false); }
                     let duration_expired=duration_expired(c.max_call_seconds,started.elapsed());
@@ -1395,7 +1425,7 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
             // The provider has no transcript-done event. Wait briefly for late
             // fragments, then delegate only the observed bounded source, clearly
             // labelled partial. No text is invented from delegation metadata.
-            if now_ms() - at < 2000 {
+            if now_ms().saturating_sub(at) < TRANSCRIPT_GRACE_MS {
                 continue;
             }
             let rows = {
@@ -2106,6 +2136,156 @@ fn settle(s: &AppState, id: &str, did: &str, state: &str, message: &str) -> Resu
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    fn transcript_schedule() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE companion_calls(id TEXT PRIMARY KEY,state TEXT);
+             CREATE TABLE companion_delegations(call_id TEXT,id TEXT,state TEXT,created_at INTEGER,PRIMARY KEY(call_id,id));
+             INSERT INTO companion_calls VALUES('call','connected'),('other','connected');",
+        )
+        .unwrap();
+        db
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delegation_deadline_wakes_between_maintenance_ticks_without_shortening_grace() {
+        let db = transcript_schedule();
+        db.execute(
+            "INSERT INTO companion_delegations VALUES('call','request','waiting_transcript',10037)",
+            [],
+        )
+        .unwrap();
+        let start = tokio::time::Instant::now();
+        let period = Duration::from_millis(500);
+        let mut timer = tokio::time::interval_at(start + period, period);
+        // The request arrives 37 ms after the maintenance clock's origin. It
+        // must be checked at 2037 ms, not the next 2500 ms maintenance tick.
+        for expected in [500, 1000, 1500, 2000, 2037] {
+            let wall_now = 10000 + start.elapsed().as_millis() as i64;
+            wait_for_advance(
+                &mut timer,
+                next_transcript_wake(&db, "call", wall_now).unwrap(),
+            )
+            .await;
+            assert_eq!(start.elapsed(), Duration::from_millis(expected));
+            let eligible =
+                10000 + start.elapsed().as_millis() as i64 - 10037 >= TRANSCRIPT_GRACE_MS;
+            assert_eq!(eligible, expected == 2037);
+        }
+        db.execute("UPDATE companion_delegations SET state='dispatched'", [])
+            .unwrap();
+        // Dispatch does not postpone result delivery, heartbeat or access checks.
+        wait_for_advance(
+            &mut timer,
+            next_transcript_wake(&db, "call", 12037).unwrap(),
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_millis(2500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bridge_activity_and_duplicate_do_not_restart_the_original_deadline() {
+        let db = transcript_schedule();
+        db.execute(
+            "INSERT INTO companion_delegations VALUES('call','request','waiting_transcript',10037)",
+            [],
+        )
+        .unwrap();
+        let start = tokio::time::Instant::now();
+        let period = Duration::from_millis(500);
+        let mut timer = tokio::time::interval_at(start + period, period);
+        for _ in 0..4 {
+            let wall_now = 10000 + start.elapsed().as_millis() as i64;
+            wait_for_advance(
+                &mut timer,
+                next_transcript_wake(&db, "call", wall_now).unwrap(),
+            )
+            .await;
+        }
+        // Model a transcript/bridge event interrupting the select's wait. The
+        // next iteration rebuilds its sleep from durable creation time.
+        tokio::select! {
+            _ = wait_for_advance(&mut timer, next_transcript_wake(&db, "call", 12000).unwrap()) => panic!("delegation ran early"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+        }
+        db.execute("INSERT OR IGNORE INTO companion_delegations VALUES('call','request','waiting_transcript',12020)", []).unwrap();
+        wait_for_advance(
+            &mut timer,
+            next_transcript_wake(&db, "call", 12020).unwrap(),
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_millis(2037));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_and_settled_rows_do_not_spin_or_hide_the_next_waiting_deadline() {
+        let db = transcript_schedule();
+        db.execute_batch(
+            "INSERT INTO companion_delegations VALUES
+             ('call','held','held',1),('call','running','dispatched',2),
+             ('call','done','completed',3),('call','unknown','unknown',4),
+             ('other','unrelated','waiting_transcript',5),
+             ('call','next','waiting_transcript',10037),
+             ('call','later','waiting_transcript',11000);",
+        )
+        .unwrap();
+        assert_eq!(
+            next_transcript_wake(&db, "call", 12000).unwrap(),
+            Some(Duration::from_millis(37))
+        );
+        let start = tokio::time::Instant::now();
+        let period = Duration::from_millis(500);
+        let mut timer = tokio::time::interval_at(start + period, period);
+        wait_for_advance(
+            &mut timer,
+            next_transcript_wake(&db, "call", 12000).unwrap(),
+        )
+        .await;
+        db.execute(
+            "UPDATE companion_delegations SET state='held' WHERE id='next'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            next_transcript_wake(&db, "call", 12037).unwrap(),
+            Some(Duration::from_millis(963))
+        );
+        // The later request does not starve regular observation of held work.
+        wait_for_advance(
+            &mut timer,
+            next_transcript_wake(&db, "call", 12037).unwrap(),
+        )
+        .await;
+        assert_eq!(start.elapsed(), period);
+        db.execute(
+            "UPDATE companion_delegations SET state='held' WHERE call_id='call'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(next_transcript_wake(&db, "call", 12500).unwrap(), None);
+        wait_for_advance(&mut timer, None).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn closed_calls_never_arm_a_delegation_deadline() {
+        let db = transcript_schedule();
+        db.execute(
+            "INSERT INTO companion_delegations VALUES('call','request','waiting_transcript',10037)",
+            [],
+        )
+        .unwrap();
+        for state in ["starting", "closing", "closed", "interrupted"] {
+            db.execute(
+                "UPDATE companion_calls SET state=?1 WHERE id='call'",
+                [state],
+            )
+            .unwrap();
+            assert_eq!(next_transcript_wake(&db, "call", 13000).unwrap(), None);
+        }
+    }
+
     #[test]
     fn optional_call_duration_has_no_default_cutoff_and_honors_explicit_bounds() {
         assert!(!duration_expired(None, Duration::MAX));

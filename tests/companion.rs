@@ -562,6 +562,142 @@ async fn duplicate_delegation_executes_one_actual_acp_prompt_and_only_settled_re
     );
     end(&f, id).await;
 }
+
+#[tokio::test]
+async fn deadline_wake_keeps_late_correction_and_duplicate_source_in_one_prompt() {
+    let f = fixture("delegate");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    until(&f, id, "delegation").await;
+    let created: i64 =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT created_at FROM companion_delegations WHERE call_id=?1 AND id='delegate-1'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(!f.home.path().join("acp.jsonl").exists());
+    // A correction delivered after the delegation still belongs to its source
+    // when its provider timeline is within/straddles the delegation anchor.
+    speech_fixture(
+        &f,
+        &call,
+        "late-correction",
+        "user",
+        95,
+        " Actually, report only; do not change anything.",
+    );
+    wait_delegation(&f, &call, "delegate-1", "completed").await;
+    let (saved_created, source): (i64, String) = f.s.db.lock().unwrap().query_row(
+        "SELECT created_at,source FROM companion_delegations WHERE call_id=?1 AND id='delegate-1'",
+        [id], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(saved_created, created);
+    let source: Value = serde_json::from_str(&source).unwrap();
+    assert_eq!(source["fragments"].as_array().unwrap().len(), 2);
+    assert_eq!(source["fragments"][1]["event_id"], "late-correction");
+    assert_eq!(source["fragments"][1]["start_ms"], 95);
+    assert_eq!(source["fragments"][1]["end_ms"], 295);
+    let log = std::fs::read_to_string(f.home.path().join("acp.jsonl")).unwrap();
+    let prompts = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|v| v["method"] == "session/prompt")
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0]["params"]["prompt"]
+            .to_string()
+            .contains("Actually, report only")
+    );
+    let dispatched_at: i64 = f.s.db.lock().unwrap().query_row(
+        "SELECT at FROM companion_events WHERE call_id=?1 AND kind='delegation' AND json_extract(data,'$.state')='dispatched'",
+        [id], |r| r.get(0),
+    ).unwrap();
+    assert!(dispatched_at - created >= 2000, "grace was shortened");
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn pending_deadline_obeys_close_access_heartbeat_and_duration_guards() {
+    for guard in ["close", "access", "private_room", "heartbeat", "duration"] {
+        let f = fixture("delegate");
+        if guard == "duration" {
+            let path = f.home.path().join("companion.json");
+            let mut c: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            c["max_call_seconds"] = json!(1);
+            std::fs::write(path, c.to_string()).unwrap();
+        }
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        until(&f, id, "delegation").await;
+        match guard {
+            "close" => {
+                request(
+                    &f,
+                    "POST",
+                    &format!("/api/v1/companion/calls/{id}/close"),
+                    Some(json!({})),
+                )
+                .await;
+            }
+            "access" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute("DELETE FROM tokens WHERE hash=?1", [auth::digest(&f.token)])
+                    .unwrap();
+            }
+            "private_room" => {
+                f.s.db.lock().unwrap().execute("INSERT INTO room_members(conversation_id,username,role,joined_at) VALUES(?1,'other','member',?2)", rusqlite::params![call["conversation_id"].as_str().unwrap(),now_ms()]).unwrap();
+            }
+            "heartbeat" => {
+                f.browser_refresh.store(false, Ordering::SeqCst);
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_calls SET heartbeat_at=?2 WHERE id=?1",
+                        rusqlite::params![id, now_ms() - 61_000],
+                    )
+                    .unwrap();
+            }
+            "duration" => {}
+            _ => unreachable!(),
+        }
+        for _ in 0..100 {
+            let state: String =
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT state FROM companion_calls WHERE id=?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+            if ["closed", "interrupted"].contains(&state.as_str()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let db = f.s.db.lock().unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM companion_calls WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            ["closed", "interrupted"].contains(&state.as_str()),
+            "{guard}: {state}"
+        );
+        let accepted: i64 = db.query_row("SELECT COUNT(*) FROM companion_delegations WHERE call_id=?1 AND state IN ('dispatched','completed')", [id], |r|r.get(0)).unwrap();
+        assert_eq!(accepted, 0, "{guard}");
+        assert!(!f.home.path().join("acp.jsonl").exists(), "{guard}");
+    }
+}
+
 #[tokio::test]
 async fn missing_human_transcript_is_held_without_inventing_task_or_opening_acp_session() {
     let f = fixture("missing");
