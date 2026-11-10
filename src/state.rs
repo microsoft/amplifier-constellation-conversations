@@ -29,6 +29,7 @@ pub struct AppState {
     pub login_gate: Arc<Semaphore>,
     pub turn_gate: Arc<Semaphore>,
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
+    pub(crate) active_steering: Mutex<HashMap<(String, String), crate::delivery::ActiveSteering>>,
 }
 impl AppState {
     pub fn open(home: PathBuf) -> Result<Arc<Self>> {
@@ -95,6 +96,7 @@ impl AppState {
             login_gate: Arc::new(Semaphore::new(2)),
             turn_gate: Arc::new(Semaphore::new(4)),
             running: Mutex::new(HashMap::new()),
+            active_steering: Mutex::new(HashMap::new()),
         }))
     }
     pub fn changed(&self) {

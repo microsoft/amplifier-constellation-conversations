@@ -642,6 +642,16 @@ pub(crate) async fn send(
     Path(id): Path<String>,
     Json(msg): Json<Send>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    send_with_delivery_window(State(s), h, Path(id), Json(msg), None).await
+}
+
+pub(crate) async fn send_with_delivery_window(
+    State(s): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(msg): Json<Send>,
+    early: Option<crate::delivery::EarlyDelivery>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
     let p = auth::check(&s, &h, "chat", true)?;
     s.require_member(&id, &p)?;
     if !crate::companion::room_identity_valid(&s, &id)? {
@@ -776,7 +786,7 @@ pub(crate) async fn send(
             } else {
                 "ambient"
             };
-            tx.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES(?1,?2,?3,?4,?5,'received',?6)",params![uuid::Uuid::new_v4().to_string(),msg.request_id,id,agent,participation,at])?;
+            tx.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at,ordinary_not_before,steering_target_turn,steering_session_id) VALUES(?1,?2,?3,?4,?5,'received',?6,?7,?8,?9)",params![uuid::Uuid::new_v4().to_string(),msg.request_id,id,agent,participation,at,early.as_ref().map_or(0, |e| e.ordinary_not_before),early.as_ref().map(|e| e.active.target_turn.as_str()),early.as_ref().map(|e| e.active.session_id.as_str())])?;
         }
         tx.execute("UPDATE conversations SET status='working',note=CASE WHEN ?3 THEN note ELSE 'Message received; waiting for an agent…' END,updated_at=?2 WHERE id=?1",params![id,at,was_working])?;
         tx.commit()?;

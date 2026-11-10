@@ -22,9 +22,93 @@ pub fn supported(init: &Value) -> bool {
     init["_meta"]["steering"]["supported"] == true
 }
 
+/// Process-local liveness, published only by the initialized active prompt.
+/// It is never recovered from a historical session or a persisted capability.
+#[derive(Clone)]
+pub(crate) struct ActiveSteering {
+    pub target_turn: String,
+    pub session_id: String,
+}
+pub(crate) struct SteeringGuard {
+    state: Arc<AppState>,
+    key: (String, String),
+    target: ActiveSteering,
+}
+impl SteeringGuard {
+    pub(crate) fn open(
+        state: &Arc<AppState>,
+        room: &str,
+        agent: &str,
+        target_turn: &str,
+        session_id: &str,
+        supported: bool,
+    ) -> Self {
+        let guard = Self {
+            state: state.clone(),
+            key: (room.into(), agent.into()),
+            target: ActiveSteering {
+                target_turn: target_turn.into(),
+                session_id: session_id.into(),
+            },
+        };
+        if supported {
+            state
+                .active_steering
+                .lock()
+                .unwrap()
+                .insert(guard.key.clone(), guard.target.clone());
+        }
+        guard
+    }
+    pub(crate) fn close(&self) {
+        let mut active = self.state.active_steering.lock().unwrap();
+        if active.get(&self.key).is_some_and(|v| {
+            v.target_turn == self.target.target_turn && v.session_id == self.target.session_id
+        }) {
+            active.remove(&self.key);
+        }
+    }
+}
+impl Drop for SteeringGuard {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+pub(crate) fn active_steering(state: &AppState, room: &str, agent: &str) -> Option<ActiveSteering> {
+    state
+        .active_steering
+        .lock()
+        .unwrap()
+        .get(&(room.into(), agent.into()))
+        .cloned()
+}
+/// Only the local Companion intake may set this window; it is not a public
+/// message field or an ACP extension. The timestamp controls ordinary fallback.
+pub(crate) struct EarlyDelivery {
+    pub active: ActiveSteering,
+    pub ordinary_not_before: i64,
+}
+
 pub fn migrate(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS input_authority(message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,browser_hash TEXT,token_hash TEXT)")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS input_deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,agent_id TEXT NOT NULL,participation TEXT NOT NULL,state TEXT NOT NULL,mode TEXT,target_turn TEXT,session_id TEXT,endpoint TEXT,receipt TEXT,attention TEXT,updated_at INTEGER NOT NULL,UNIQUE(message_id,agent_id)); CREATE INDEX IF NOT EXISTS input_delivery_queue ON input_deliveries(conversation_id,sequence);")?;
+    for (name, declaration) in [
+        ("ordinary_not_before", "INTEGER NOT NULL DEFAULT 0"),
+        ("steering_target_turn", "TEXT"),
+        ("steering_session_id", "TEXT"),
+    ] {
+        let exists = db
+            .prepare("PRAGMA table_info(input_deliveries)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|c| c == name);
+        if !exists {
+            db.execute_batch(&format!(
+                "ALTER TABLE input_deliveries ADD COLUMN {name} {declaration}"
+            ))?;
+        }
+    }
     // No retry follows a crash after transmission. Keep the session binding and
     // source text so its owner can inspect the outcome before proceeding.
     db.execute("UPDATE input_deliveries SET state=CASE WHEN state='preparing' THEN 'notAccepted' ELSE 'unknown' END,updated_at=?1 WHERE state IN ('preparing','offering','submitted','received_remote','remoteQueued') OR (state='incorporated' AND target_turn IN (SELECT id FROM messages WHERE status='streaming'))",[now_ms()])?;
@@ -51,11 +135,45 @@ fn input(db: &Connection, id: &str) -> Result<Input> {
         .collect::<rusqlite::Result<_>>()?;
     Ok(i)
 }
-pub fn next(db: &Connection, room: &str, agent: Option<&str>) -> Result<Option<Input>> {
+fn pending(db: &Connection, room: &str, agent: Option<&str>) -> Result<Option<Input>> {
     db.execute("UPDATE input_deliveries SET state='cancelled',updated_at=?2 WHERE conversation_id=?1 AND state IN ('received','promptRequired') AND (NOT EXISTS(SELECT 1 FROM room_members r JOIN messages m ON m.actor=r.username WHERE r.conversation_id=input_deliveries.conversation_id AND m.id=input_deliveries.message_id) OR NOT EXISTS(SELECT 1 FROM room_agents WHERE conversation_id=input_deliveries.conversation_id AND agent_id=input_deliveries.agent_id))",params![room,now_ms()])?;
     // An uncertain earlier input blocks only this agent in this conversation.
     let id:Option<String>=db.query_row("SELECT d.id FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.conversation_id=?1 AND (?2 IS NULL OR d.agent_id=?2) AND d.state IN ('received','promptRequired') AND EXISTS(SELECT 1 FROM room_members WHERE conversation_id=d.conversation_id AND username=m.actor) AND EXISTS(SELECT 1 FROM room_agents WHERE conversation_id=d.conversation_id AND agent_id=d.agent_id) AND NOT EXISTS(SELECT 1 FROM input_deliveries x WHERE x.conversation_id=d.conversation_id AND x.agent_id=d.agent_id AND x.state IN ('unknown','notAccepted')) ORDER BY d.sequence LIMIT 1",params![room,agent],|r|r.get(0)).optional()?;
     id.map(|id| input(db, &id)).transpose()
+}
+fn delivery_window(
+    db: &Connection,
+    input: &Input,
+) -> Result<(i64, Option<String>, Option<String>)> {
+    Ok(db.query_row("SELECT ordinary_not_before,steering_target_turn,steering_session_id FROM input_deliveries WHERE id=?1", [&input.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)
+}
+pub fn next(db: &Connection, room: &str, agent: Option<&str>) -> Result<Option<Input>> {
+    let Some(input) = pending(db, room, agent)? else {
+        return Ok(None);
+    };
+    Ok((delivery_window(db, &input)?.0 <= now_ms()).then_some(input))
+}
+pub(crate) fn next_steering(
+    db: &Connection,
+    room: &str,
+    agent: &str,
+    target: &str,
+    session: &str,
+) -> Result<Option<Input>> {
+    let Some(input) = pending(db, room, Some(agent))? else {
+        return Ok(None);
+    };
+    let (not_before, bound_target, bound_session) = delivery_window(db, &input)?;
+    Ok((not_before <= now_ms()
+        || (bound_target.as_deref() == Some(target) && bound_session.as_deref() == Some(session)))
+    .then_some(input))
+}
+fn deferred_until(db: &Connection, room: &str) -> Result<Option<i64>> {
+    let Some(input) = pending(db, room, None)? else {
+        return Ok(None);
+    };
+    let at = delivery_window(db, &input)?.0;
+    Ok((at > now_ms()).then_some(at))
 }
 /// Explain the existing no-replay fence without changing or acknowledging it.
 /// A locally received input behind this fence has not reached a model turn.
@@ -119,7 +237,7 @@ pub fn receipt(state: &AppState, turn: &str, value: &Value) -> Result<()> {
 pub fn finish(state: &AppState, turn: &str, success: bool) -> Result<()> {
     let db = state.db.lock().unwrap();
     if success {
-        db.execute("UPDATE input_deliveries SET state=CASE WHEN (mode='prompt' AND state='submitted') OR state='received_remote' THEN 'completed' ELSE 'unknown' END,updated_at=?2 WHERE target_turn=?1 AND state IN ('submitted','received_remote','remoteQueued')",params![turn,now_ms()])?;
+        db.execute("UPDATE input_deliveries SET state=CASE WHEN mode='prompt' AND state IN ('submitted','received_remote') THEN 'completed' ELSE 'unknown' END,updated_at=?2 WHERE target_turn=?1 AND state IN ('submitted','received_remote','remoteQueued')",params![turn,now_ms()])?;
     } else {
         db.execute("UPDATE input_deliveries SET state=CASE WHEN state='preparing' THEN 'notAccepted' ELSE 'unknown' END,updated_at=?2 WHERE target_turn=?1 AND state IN ('preparing','offering','submitted','received_remote','remoteQueued','incorporated')",params![turn,now_ms()])?;
     }
@@ -242,6 +360,7 @@ async fn worker(state: Arc<AppState>, room: String, mut cancel: watch::Receiver<
         } else {
             tokio::select! {p=state.turn_gate.clone().acquire_owned()=>p.ok(),_=cancel.changed()=>None}
         };
+        let mut wait_until = None;
         let next = {
             let mut running = state.running.lock().unwrap();
             let db = state.db.lock().unwrap();
@@ -259,7 +378,13 @@ async fn worker(state: Arc<AppState>, room: String, mut cancel: watch::Receiver<
             } else {
                 None
             };
-            if next.is_none() {
+            if next.is_none() && !failed && !*cancel.borrow() && permit.is_some() {
+                match deferred_until(&db, &room) {
+                    Ok(at) => wait_until = at,
+                    Err(_) => failed = true,
+                }
+            }
+            if next.is_none() && wait_until.is_none() {
                 let uncertain:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM input_deliveries WHERE conversation_id=?1 AND state IN ('unknown','notAccepted'))",[&room],|r|r.get(0)).unwrap_or(true);
                 let stopped = *cancel.borrow();
                 let status = if failed || uncertain || stopped {
@@ -284,6 +409,16 @@ async fn worker(state: Arc<AppState>, room: String, mut cancel: watch::Receiver<
             }
             next
         };
+        if let Some(at) = wait_until {
+            // A terminal/promptRequired race may leave an early Companion input
+            // queued. Preserve its original grace deadline even after restart.
+            drop(permit);
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(at.saturating_sub(now_ms()).max(0) as u64)) => {},
+                _ = cancel.changed() => {},
+            }
+            continue;
+        }
         let Some((input, recovery)) = next else {
             state.changed();
             return;
@@ -380,4 +515,87 @@ pub(crate) fn authorized_in(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    fn database(path: &std::path::Path) -> Connection {
+        let db = Connection::open(path).unwrap();
+        db.execute_batch("CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY,id TEXT UNIQUE,conversation_id TEXT,actor TEXT,text TEXT,status TEXT); CREATE TABLE IF NOT EXISTS room_members(conversation_id TEXT,username TEXT); CREATE TABLE IF NOT EXISTS room_agents(conversation_id TEXT,agent_id TEXT); CREATE TABLE IF NOT EXISTS attachments(id TEXT,message_id TEXT,created_at INTEGER);").unwrap();
+        migrate(&db).unwrap();
+        db
+    }
+    #[test]
+    fn durable_early_input_is_bound_to_exact_active_turn_and_session_and_fallback_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intake.sqlite3");
+        let db = database(&path);
+        let due = now_ms() + 60_000;
+        db.execute_batch("INSERT INTO conversations VALUES('room'); INSERT INTO room_members VALUES('room','human'); INSERT INTO room_agents VALUES('room','agent'); INSERT INTO messages VALUES(1,'source','room','human','A distinct correction and another question.','complete'); INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('input','source','room','agent','direct','received',0);").unwrap();
+        db.execute("UPDATE input_deliveries SET ordinary_not_before=?1,steering_target_turn='turn-a',steering_session_id='session-a'", [due]).unwrap();
+        assert!(next(&db, "room", None).unwrap().is_none());
+        assert!(
+            next_steering(&db, "room", "agent", "turn-b", "session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            next_steering(&db, "room", "agent", "turn-a", "session-b")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            next_steering(&db, "room", "other-agent", "turn-a", "session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            next_steering(&db, "room", "agent", "turn-a", "session-a")
+                .unwrap()
+                .unwrap()
+                .message_id,
+            "source"
+        );
+        assert_eq!(deferred_until(&db, "room").unwrap(), Some(due));
+        drop(db);
+        let db = database(&path);
+        assert!(
+            next(&db, "room", None).unwrap().is_none(),
+            "Restart must retain ordinary deadline"
+        );
+        db.execute(
+            "UPDATE input_deliveries SET ordinary_not_before=?1",
+            [now_ms() - 1],
+        )
+        .unwrap();
+        assert_eq!(
+            next(&db, "room", None).unwrap().unwrap().text,
+            "A distinct correction and another question."
+        );
+        // A lost acknowledgment is uncertain even if the old time has elapsed.
+        db.execute("UPDATE input_deliveries SET state='received_remote',mode='steering',target_turn='turn-a',session_id='session-a'", []).unwrap();
+        drop(db);
+        let db = database(&path);
+        assert_eq!(
+            db.query_row("SELECT state FROM input_deliveries", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "unknown"
+        );
+        assert!(next(&db, "room", None).unwrap().is_none());
+        assert!(
+            next_steering(&db, "room", "agent", "turn-a", "session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.query_row("SELECT text FROM messages WHERE id='source'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "A distinct correction and another question."
+        );
+    }
 }

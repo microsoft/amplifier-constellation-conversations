@@ -441,6 +441,30 @@ pub async fn mcp(
     }
     Ok((status, [("content-type", "application/json")], data).into_response())
 }
+/// Routing metadata for this call's installed tools, never a source observation.
+/// The same filtered rows are returned by discovery; no helper is invoked here.
+pub(crate) fn read_catalog(s: &AppState, id: &str) -> Result<Option<Value>> {
+    if !config(s)?.enabled {
+        return Ok(None);
+    }
+    let installed: bool = s.db.lock().unwrap().query_row(
+        "SELECT EXISTS(SELECT 1 FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.id=?1 AND c.state IN ('connecting','connected') AND g.port IS NOT NULL)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if !installed {
+        return Ok(None);
+    }
+    let sources = crate::companion_awareness::status_sources(s, id)?;
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "observed_at":now_ms(),
+        "observation_sources":sources
+    })))
+}
+
 pub async fn connections(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
