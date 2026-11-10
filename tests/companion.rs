@@ -1271,12 +1271,16 @@ async fn delegation_anchor_includes_observed_straddling_word_with_original_timin
     assert_eq!(tail["end_ms"], 13200);
     assert!(source.contains("only a clear new human request supplies action authority"));
     assert!(source.contains("Unknown effects must not be retried"));
-    assert!(source.contains("Distinguish source facts, inference and unknowns"));
-    assert!(source.contains("A status label alone does not establish a cause"));
     assert!(source.contains(
-        "When explaining a work limit or why work stopped, compare each relevant allowance or deadline with its own usage and observation time"
+        "Distinguish the reported state and any cause stated by the source from your inference"
     ));
-    assert!(source.contains("preserve the timestamp when conversion is uncertain"));
+    assert!(source.contains("A status label alone does not identify which limit ended work"));
+    assert!(source.contains(
+        "Compare each allowance or deadline with its usage and observation time separately"
+    ));
+    assert!(source.contains(
+        "label inferred causes and preserve source timestamps when conversion is uncertain"
+    ));
     assert!(
         source.contains(
             "publish it with the runtime's advertised image-attachment/output capability"

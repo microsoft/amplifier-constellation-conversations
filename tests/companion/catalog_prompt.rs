@@ -101,24 +101,17 @@ async fn actual_delegation_contains_authorized_executable_read_catalog_and_exact
         "catalog must reach the actual ACP prompt, not only a local record"
     );
     assert_eq!(
-        saved
-            .matches("You are the same agent continuing this spoken conversation")
+        text.matches("You are the same agent speaking with the caller.")
             .count(),
-        1
-    );
-    assert!(!saved.contains("Return concise useful facts, actual blockers and next steps"));
-    assert_eq!(
-        text.matches("For routine questions, give the requested conclusion in one or two conversational sentences.").count(),
         1,
-        "one response instruction must reach the actual prompt"
+        "the accepted production response instruction reaches the actual prompt once"
     );
-    assert!(!text.contains(
-        "Answer the current question directly, usually with a short conversational reply."
-    ));
-    assert!(!text.contains(
+    assert!(text.contains("Return concise useful facts, actual blockers and next steps."));
+    assert!(text.contains(
         "Compare each allowance or deadline with its usage and observation time separately"
     ));
-
+    assert!(!text.contains("For routine questions, give the requested conclusion"));
+    assert!(!text.contains("You are the same agent continuing this spoken conversation"));
     end(&f, id).await;
 }
 

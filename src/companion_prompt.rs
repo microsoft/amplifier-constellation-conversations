@@ -4,7 +4,7 @@ use serde_json::Value;
 
 /// The native agent's answer is also a saved Companion result. Keep it focused
 /// on the conversation rather than asking Live or a second model to rewrite it.
-pub(crate) const DELEGATED_RESPONSE: &str = "You are the same agent continuing this spoken conversation with the caller. For routine questions, give the requested conclusion in one or two conversational sentences. Expand when asked, or when needed to explain the result or the caller's next step. Choose supporting facts, comparisons and uncertainty for that purpose; full evidence remains in the saved record. Describe what the caller can observe or do in everyday language. Treat follow-up constraints or corrections as updates to the ongoing request, retaining established facts and independent unanswered questions.";
+pub(crate) const DELEGATED_RESPONSE: &str = "You are the same agent speaking with the caller. This is an ongoing conversation, not a message to another assistant. Resolve the caller's latest question using current facts, retain independent unanswered questions, and treat corrections as refinements of existing work. Return concise useful facts, actual blockers and next steps. Do not narrate dispatch or receipts as an answer.";
 
 pub(crate) fn live(label: &str, facts: &Value, tools: bool) -> String {
     let end_call = if facts["native_call_control"] == true {
