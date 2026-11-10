@@ -1386,3 +1386,7 @@ video.shared-media,audio.shared-media {width:100%}
 .camera-panel .preview-badge {display:block;margin:5px 0}
 
 .screen-awake-warning {font-size:10px;line-height:1.5;color:var(--muted);margin-top:3px}
+/* Coordination can be inspected without navigating away from live audio. */
+.linked-huddles {border:1px solid #d3ddd8;border-radius:12px;padding:12px;margin:12px 0;min-width:0}
+.linked-huddles>summary {cursor:pointer;font-weight:600;min-height:32px;align-content:center}
+.linked-huddles[open] .huddles {margin-top:12px}

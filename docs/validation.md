@@ -13,6 +13,9 @@ npm ci
 npx playwright install chromium
 python3 tests/browser.py
 BROWSER_STEERING=1 python3 tests/browser.py
+node --test tests/huddles-api.test.mjs
+node tests/huddles-browser.mjs
+BROWSER_HUDDLES=1 python3 tests/browser.py
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
@@ -26,6 +29,14 @@ The [Actions page](https://github.com/microsoft/amplifier-constellation-conversa
 against the published source. Earlier private deployment reports and their
 transcripts are excluded. A passing fixture verifies its tested boundary, not
 general agent quality, human approval, or live tenant compatibility.
+
+The huddle browser journey uses the actual compiled HTTPS service, cookie/CSRF
+authentication, SQLite and browser UI. It checks quiet peer posts, human
+inspection/join, follow/quiet, a committed-but-lost HTTP acknowledgment across
+reload, one result in the original conversation and Stop at phone width. It
+asserts no ACP process is invoked. Companion's separate fixtures cover active
+call layout and floor/result handling; actual model, audio and Minecraft-world
+trials remain independently scoped.
 
 `tests/steering.rs` exercises real duplex ACP subprocesses: repeated ordered input,
 source deduplication, fragmented frames, unchanged approval and one effect,

@@ -5,13 +5,19 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const files = new Map(await Promise.all(['companion.html','companion.js','companion.css','companion-floor.mjs','companion-cards.mjs','markdown.js','markdown-renderer.js','markdown.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
+const files = new Map(await Promise.all(['companion.html','companion.js','companion.css','companion-floor.mjs','companion-cards.mjs','markdown.js','markdown-renderer.js','markdown.css','huddles.mjs','huddles-api.mjs','huddles.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
 files.set('markdown.js', Buffer.concat([files.get('markdown.js'),files.get('markdown-renderer.js')]));
 files.set('companion.css', Buffer.concat([files.get('markdown.css'),files.get('companion.css')]));
 const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
 const surfaces = new Map(), surfaceCommands = new Map(), permissions = new Map();
 let holdNextSurfaceAck = false, heldSurfaceAck = null;
 let failNextResult = false;
+const huddleViews=new Map(),huddleMessages=[{id:'huddle-report-1',seq:1,role:'assistant',actor:'Coach',agent_id:'coach',status:'complete',text:'Private huddle evidence <img src=x onerror="window.huddleInjected=true">',created_at:1794330000000,target_agent_ids:[]}];
+let huddleFollowing=false,huddleListFails=false,holdNextHuddleRead=false,heldHuddleRead=null;
+const huddleDescriptor=()=>({version:1,id:'huddle-coach',conversation_id:'huddle-coach',title:'Review together',purpose:'Check the plan before returning a result.',state:'open',revision:1,
+  origin:{kind:'conversation',conversation_id:'room-coach'},inspect_url:'/ ?conversation=huddle-coach',members:[{username:'fixture-user',role:'owner'}],participants:[{id:'coach',label:'Coach',connection_id:'minecraft-coach',delivery:'external'},{id:'rook',label:'Rook',connection_id:'minecraft-rook',delivery:'external'}],preference:{mode:huddleFollowing?'follow':'quiet'},outcome_summary:{count:1,latest:{id:'huddle-report-1',created_at:1794330000000,kind:'progress'}}});
+const newHuddleView=id=>({id,revision:0,state:{selected_conversation_id:null,panel:'conversation',draft:'',draft_request_id:'',draft_request_sha256:'',search:'',history_search:'',history_before:null,attachment_ids:[],target_agent_ids:[],elicitation_drafts:{}}});
+
 const fullResultText = "Complete saved answer. " + "Source fact. ".repeat(6000) + " FINAL QUALIFIER: broader testing remains incomplete. <script>window.fullResultInjected=true</script> [Source](https://example.com/source)";
 let rejectNextUpload = false, holdNextUpload = false, heldUpload = null;
 let loggedIn = false, pollFails = false, heartbeatFails = false, controlFails = false, catalogAvailable = true, catalogFails = false, nextCall = 1;
@@ -20,7 +26,7 @@ const csrf = 'fixture-csrf';
 const server = createServer(async (request,response) => {
   const url = new URL(request.url,'http://fixture');
   const send = (status,value) => { response.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'}); response.end(JSON.stringify(value)); };
-  if (['/companion','/companion.html','/companion.js','/companion.css','/companion-floor.mjs','/companion-cards.mjs','/markdown.js'].includes(url.pathname)) {
+  if (['/companion','/companion.html','/companion.js','/companion.css','/companion-floor.mjs','/companion-cards.mjs','/markdown.js','/huddles.mjs','/huddles-api.mjs','/huddles.css'].includes(url.pathname)) {
     const name = url.pathname === '/companion' ? 'companion.html' : url.pathname.slice(1);
     response.writeHead(200,{'Content-Type':name.endsWith('.html')?'text/html':name.endsWith('.css')?'text/css':'text/javascript'}); response.end(files.get(name)); return;
   }
@@ -44,6 +50,31 @@ const server = createServer(async (request,response) => {
     if (agentPath[2] === 'capabilities') { send(200,{image_input:agentPath[1] !== 'jarvis',capabilities_available:true}); return; }
     if (request.method === 'PUT') voices.set(agentPath[1],body.voice);
     send(200,{voice:voices.get(agentPath[1]) || 'marin',available_voices:['marin','cedar','ash'],applies_to:'next_call',voice_provider:'OpenAI',voice_model:'fixture-live',available_voice_models:['fixture-live'],backend_settings_editable:false,backend:agentPath[1]==='jarvis'?null:{agent:{name:'fixture-runtime',title:'Fixture reasoning runtime'},model:{id:'fixture-model',name:'Fixture reasoning model'},observed_at:1794157902184,options:[{id:'reasoning',name:'Thinking',category:'thought_level',value:'medium',label:'Medium',editable:false}]}}); return;
+  }
+  const huddleList=url.pathname.match(/^\/api\/v1\/conversations\/([^/]+)\/huddles$/);
+  if(huddleList){
+    if(huddleListFails){send(503,{error:'Temporary huddle lookup failure.'});return;}
+    send(200,{version:1,items:huddleList[1]==='room-coach'&&authOwner==='fixture-user'?[huddleDescriptor()]:[],current:null});return;
+  }
+  const huddleView=url.pathname.match(/^\/api\/v1\/views\/([^/]+)$/);
+  if(huddleView){
+    const id=huddleView[1],view=huddleViews.get(id)||newHuddleView(id);
+    if(request.method==='PUT'){
+      if(body.expected_revision!==view.revision){send(409,{error:'view changed'});return;}
+      huddleViews.set(id,{id,revision:view.revision+1,state:body.state});
+    }else if(!huddleViews.has(id))huddleViews.set(id,view);
+    send(200,huddleViews.get(id));return;
+  }
+  if(url.pathname==='/api/v1/huddles/huddle-coach') {send(200,huddleDescriptor());return;}
+  if(url.pathname==='/api/v1/huddles/huddle-coach/preference') {huddleFollowing=body.mode==='follow';send(200,{mode:body.mode,membership_changed:false,work_authority_changed:false});return;}
+  if(url.pathname==='/api/v1/conversations/huddle-coach/messages') {
+    if(request.method==='POST'){
+      if(!huddleMessages.some(message=>message.id===body.request_id))huddleMessages.push({id:body.request_id,seq:huddleMessages.length+1,role:'user',actor:authOwner,agent_id:null,text:body.text,status:'complete',target_agent_ids:body.target_agent_ids,created_at:Date.now()});
+      send(200,{accepted:true,message_id:body.request_id});return;
+    }
+    const value={items:structuredClone(huddleMessages),next_cursor:null};
+    if(holdNextHuddleRead){holdNextHuddleRead=false;heldHuddleRead=()=>send(200,value);return;}
+    send(200,value);return;
   }
   const uploadPath = url.pathname.match(/^\/api\/v1\/companion\/calls\/([^/]+)\/uploads$/);
   if (uploadPath) {
@@ -214,6 +245,55 @@ try {
   checks.push('voice settings show reported provider/runtime/model facts and real read-only advanced values; saving the next voice preserves the current call and its voice snapshot');
   const firstRequest=requests.find(request=>request.path==='/api/v1/companion/calls');assert.equal(firstRequest.csrf,csrf);assert.equal(firstRequest.body.agent_id,'coach');
   assert.match(firstRequest.body.request_id,/^[\da-f-]{36}$/); checks.push('explicit Call creates one CSRF-protected SDP session; data channel is receive-only');
+
+  // Real Companion controls and the HTTP adapter share a call with quiet huddles.
+  await page.locator('#call-huddles:not([hidden])').waitFor();
+  assert.equal(await page.locator('#call-huddles').evaluate(node=>node.open),false);
+  const huddleBefore={peers:await page.evaluate(()=>fixture.peers.length),sent:await page.evaluate(()=>fixture.channels[0].sent.length),closes:requests.filter(r=>r.path.endsWith('/close')).length,board:await page.locator('#board-items').innerHTML()};
+  await page.locator('#call-huddles > summary').click();
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Inspect',exact:true}).click();
+  await page.locator('.huddles-message').waitFor();
+  assert.equal(await page.locator('.huddles-message img').count(),0);assert.equal(await page.evaluate(()=>window.huddleInjected),undefined);
+  assert.equal(requests.filter(r=>r.method==='POST'&&r.path==='/api/v1/conversations/huddle-coach/messages').length,0,'Inspect must not send a message');
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Follow details',exact:true}).click();
+  await wait(async()=>huddleFollowing,'follow preference not persisted');
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Quiet updates',exact:true}).click();
+  await wait(async()=>!huddleFollowing,'quiet preference not persisted');
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Follow details',exact:true}).waitFor();
+  const huddleReadCount=()=>requests.filter(r=>r.method==='GET'&&r.path==='/api/v1/conversations/huddle-coach/messages').length;
+  const huddleListCount=()=>requests.filter(r=>r.method==='GET'&&r.path==='/api/v1/conversations/room-coach/huddles').length;
+  const quietReadCount=huddleReadCount(),quietListCount=huddleListCount();
+  await wait(async()=>huddleListCount()>quietListCount,'quiet automatic discovery did not run');
+  assert.equal(huddleReadCount(),quietReadCount,'quiet history must not be replaced by automatic detail reads');
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Follow details',exact:true}).click();
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Quiet updates',exact:true}).waitFor();
+  const followedReadCount=huddleReadCount();
+  await wait(async()=>huddleReadCount()>followedReadCount,'followed history did not update through the existing call poll');
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Quiet updates',exact:true}).click();
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Follow details',exact:true}).waitFor();
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Join discussion',exact:true}).click();
+  await page.getByRole('textbox',{name:'Message the huddle'}).fill('Please compare the two paths.');
+  await page.locator('.huddles-targets summary').click();
+  await page.locator('.huddles-targets input[value="rook"]').check();
+  await page.locator('#call-huddle-view').getByRole('button',{name:'Send message',exact:true}).click();
+  await wait(async()=>/Your message was saved/.test(await page.locator('#call-huddle-view').innerText()),'huddle send not saved');
+  const humanHuddle=requests.filter(r=>r.method==='POST'&&r.path==='/api/v1/conversations/huddle-coach/messages');
+  assert.equal(humanHuddle.length,1);assert.deepEqual(humanHuddle[0].body.target_agent_ids,['rook']);assert.equal(humanHuddle[0].csrf,csrf);
+  assert.equal(humanHuddle[0].body.text,'Please compare the two paths.');
+  assert.equal(await page.evaluate(()=>fixture.peers.length),huddleBefore.peers);assert.equal(await page.evaluate(()=>fixture.channels[0].sent.length),huddleBefore.sent);
+  assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,huddleBefore.closes);assert.equal(await page.locator('#board-items').innerHTML(),huddleBefore.board);
+  assert.equal(await page.evaluate(()=>fixture.peers[0].closed||fixture.tracks[0].stopped),false);
+  assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
+  await page.setViewportSize({width:390,height:844});
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  assert(await page.locator('#hangup').isVisible());
+  if(process.env.COMPANION_SCREENSHOT)await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-huddle-mobile.png'),fullPage:true});
+  await page.setViewportSize({width:1280,height:900});
+  huddleListFails=true;await page.locator('#call-huddle-view').getByRole('button',{name:'Refresh',exact:true}).click();
+  await wait(async()=>/could not be refreshed/.test(await page.locator('#call-huddle-view').innerText()),'huddle-only failure not shown');
+  assert.equal(await page.locator('#call-status-text').innerText(),'Connected');assert.equal(await page.evaluate(()=>fixture.peers[0].closed),false);
+  huddleListFails=false;await page.locator('#call-huddles > summary').click();
+  checks.push('actual Companion huddle inspection/follow/join uses authenticated human routes, preserves the live call and whiteboard, handles local lookup failure, and fits a 390px phone');
 
   await wait(async()=>page.evaluate(()=>fixture.wakeLocks.some(lock=>!lock.released)),'foreground call did not acquire wake lock');
   assert(await page.locator('#screen-awake').isChecked());
@@ -969,6 +1049,21 @@ try {
   emit('context_delivery',{event_id:'private-context',state:'queued',content:'Private prior caller context.'});
   await wait(async()=>await page.locator('.output-card').count()===1,'logout fixture result missing');
   await wait(async()=>await page.locator('.context-entry').count()===1,'logout fixture context missing');
+  const beforeHuddleCard=await page.locator('#board-items').innerHTML();
+  const beforeHuddlePeer=await page.evaluate(()=>fixture.peers.length);
+  emit('card',{title:'Huddle update',text:'A reviewed huddle result.',kind:'note',presentation:'quiet',conversation_id:'room-coach',huddle_id:'huddle-coach',source:{huddle_id:'huddle-coach'},attribution:{actor:'Rook',reported_only:true,authority:false},evidence:[{label:'Review source',reference:'https://example.com/review'}]});
+  const huddleCard=page.locator('#cards .output-card').filter({hasText:'A reviewed huddle result.'});
+  await wait(async()=>await huddleCard.count()===1,'quiet request-bound huddle card missing');
+  assert.equal(await page.locator('#board-items').innerHTML(),beforeHuddleCard,'huddle result cannot displace the whiteboard');
+  assert.match(await huddleCard.textContent(),/Rook reported this update/);
+  if(!await page.locator('#board-history').evaluate(node=>node.open))await page.locator('#board-history > summary').click();
+  await huddleCard.getByRole('button',{name:'Inspect huddle',exact:true}).click();
+  await page.locator('.huddles-message').first().waitFor();
+  assert.equal(await page.locator('#call-huddles').evaluate(node=>node.open),true);assert.equal(await page.evaluate(()=>fixture.peers.length),beforeHuddlePeer);
+  assert.equal(await page.evaluate(()=>fixture.peers.at(-1).closed),false);assert.equal(await page.locator('#call-status-text').innerText(),'Connected');
+  assert.equal(await page.locator('#board-items').innerHTML(),beforeHuddleCard);
+  await page.locator('#call-huddles > summary').click();
+  checks.push('request-bound huddle result remains a quiet attributed card; inline Inspect preserves voice and whiteboard instead of navigating away');
   holdNextUpload=true;await page.locator('#share-files').setInputFiles({name:'late-private.txt',mimeType:'text/plain',buffer:Buffer.from('Private pending upload.')});
   await wait(async()=>heldUpload!==null,'late upload fixture did not reach storage');
   const availableBeforeLogout = requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available').length;
@@ -976,6 +1071,10 @@ try {
   await page.route('**/api/v1/companion/calls/call-6?after=0',async route=>{
     const response=await route.fetch();deliverOldStatus=()=>route.fulfill({response});
   });
+  await page.locator('#call-huddles:not([hidden])').waitFor();
+  await page.locator('#call-huddles > summary').click();
+  holdNextHuddleRead=true;await page.locator('#call-huddle-view').getByRole('button',{name:'Inspect',exact:true}).click();
+  await wait(async()=>heldHuddleRead!==null,'private huddle read was not pending');
   holdNextClose=true;await page.locator('#hangup').click();
   await wait(async()=>heldClose!==null,'close was not pending before sign-out');
   await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
@@ -986,13 +1085,15 @@ try {
   assert.equal(await page.locator('#continue-work').getAttribute('href'),'/');assert.equal(await page.locator('#ended-work-link').getAttribute('href'),'/');
   assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)));
   await page.locator('#username').fill('next-fixture-user');await page.locator('#password').fill('fixture-only');await page.locator('#sign-in').click();
-  await page.locator('#app:not([hidden])').waitFor();heldClose();heldClose=null;heldUpload();heldUpload=null;await deliverOldStatus();await page.waitForTimeout(200);
+  await page.locator('#app:not([hidden])').waitFor();heldClose();heldClose=null;heldUpload();heldUpload=null;heldHuddleRead();heldHuddleRead=null;await deliverOldStatus();await page.waitForTimeout(200);
   assert.equal(requests.filter(request=>/\/uploads$/.test(request.path)&&request.body.state==='available').length,availableBeforeLogout);
   assert.equal(await page.locator('#recover-call').isHidden(),true);assert.equal(await page.locator('#call-ended').isHidden(),true);
   assert(await page.locator('#call-recovery').isHidden());assert.equal(await page.locator('#recovery-detail').textContent(),'');assert.equal(await page.locator('#recovery-work-link').getAttribute('href'),'/');
   assert.equal(await page.getByRole('button',{name:'Call Coach',exact:true}).isEnabled(),true);
-  assert.doesNotMatch(await page.locator('body').textContent(),/Private prior caller/);
-  assert.equal(await page.evaluate(()=>Object.keys(localStorage).length+Object.keys(sessionStorage).length),0);
+  assert.doesNotMatch(await page.locator('body').textContent(),/Private prior caller|Private huddle evidence/);
+  assert(await page.locator('#call-huddles').isHidden());assert.equal(await page.locator('#call-huddle-view').textContent(),'');
+  assert.equal(await page.evaluate(()=>Object.keys(localStorage).length),0);
+  assert(await page.evaluate(()=>Object.keys(sessionStorage).every(key=>key.startsWith('constellation.huddle.view.v1:')&&/^[0-9a-f-]{36}$/i.test(sessionStorage.getItem(key)))),'browser keeps only opaque huddle view IDs, never private text');
   checks.push('sign-out clears private presentation and devices; delayed old status reads, upload receipts and close failures cannot contaminate the next owner’s login');
 
   await page.getByRole('button',{name:'Call Coach',exact:true}).click();

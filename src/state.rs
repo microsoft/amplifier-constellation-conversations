@@ -55,6 +55,7 @@ impl AppState {
         crate::companion::migrate(&db)?;
         crate::companion_tools::migrate(&db)?;
         crate::companion_surface::migrate(&db)?;
+        crate::huddles::migrate(&db)?;
         db.execute("UPDATE conversations SET status='error',note='The service restarted during this turn. Review delivery status before continuing; work was not replayed.' WHERE status='working'", [])?;
         db.execute(
             "UPDATE messages SET status='interrupted' WHERE status='streaming'",
@@ -145,7 +146,15 @@ impl AppState {
         Ok(row)
     }
     pub fn conversation_info(&self, id: &str) -> Result<Option<Value>> {
-        Ok(self.db.lock().unwrap().query_row("SELECT id,title,created_at,updated_at,status,note,agent_info,surface,read_only,owner,shared FROM conversations WHERE id=?1",[id],conversation_row).optional()?)
+        let db = self.db.lock().unwrap();
+        let mut value = db.query_row("SELECT id,title,created_at,updated_at,status,note,agent_info,surface,read_only,owner,shared FROM conversations WHERE id=?1",[id],conversation_row).optional()?;
+        if let Some(room) = &mut value {
+            let huddle: Option<Value> = db.query_row("SELECT state,revision FROM huddles WHERE room_id=?1",[id],|r|Ok(json!({"id":id,"state":r.get::<_,String>(0)?,"revision":r.get::<_,i64>(1)?}))).optional()?;
+            if let Some(huddle) = huddle {
+                room["huddle"] = huddle;
+            }
+        }
+        Ok(value)
     }
     pub fn source_message_page(
         &self,

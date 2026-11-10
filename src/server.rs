@@ -91,6 +91,33 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(index))
         .route("/app.js", get(js))
         .route(
+            "/huddles.mjs",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/huddles.mjs"),
+                )
+            }),
+        )
+        .route(
+            "/huddles-api.mjs",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/huddles-api.mjs"),
+                )
+            }),
+        )
+        .route(
+            "/huddles.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../ui/huddles.css"),
+                )
+            }),
+        )
+        .route(
             "/message-presentation.mjs",
             get(|| async {
                 (
@@ -263,6 +290,37 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(attachments::download).delete(attachments::remove),
         )
         .route("/api/v1/conversations", get(list).post(create))
+        .route("/api/v1/huddles", post(crate::huddles::create_external))
+        .route(
+            "/api/v1/conversations/{id}/huddles",
+            get(crate::huddles::list).post(crate::huddles::create),
+        )
+        .route("/api/v1/huddles/{id}", get(crate::huddles::read))
+        .route(
+            "/api/v1/huddles/{id}/participants",
+            post(crate::huddles::enroll),
+        )
+        .route(
+            "/api/v1/huddles/{id}/participants/{agent}",
+            axum::routing::delete(crate::huddles::revoke),
+        )
+        .route(
+            "/api/v1/huddles/{id}/preference",
+            axum::routing::put(crate::huddles::preference),
+        )
+        .route(
+            "/api/v1/huddles/{id}/state",
+            axum::routing::put(crate::huddles::set_state),
+        )
+        .route(
+            "/api/v1/huddles/{id}/messages",
+            get(crate::huddles::messages),
+        )
+        .route("/api/v1/huddles/{id}/posts", post(crate::huddles::post))
+        .route(
+            "/api/v1/huddles/{id}/posts/{request}",
+            get(crate::huddles::post_status),
+        )
         .route(
             "/api/v1/conversations/{id}",
             get(read).patch(rename).delete(remove),
@@ -389,7 +447,7 @@ async fn meta(State(s): State<Arc<AppState>>, h: HeaderMap) -> ApiResult<Json<Va
         safe["cwd"] = json!(agent.cwd);
     }
     Ok(Json(
-        json!({"id":s.config.id,"label":s.config.label,"owner":p.actor,"admin":p.admin,"agent":safe,"provider":{"id":s.config.provider_id(),"query_path":"/context/v1/query","surface":"web","access":"audience_scoped"},"public_url":s.config.public_url,"version":env!("CARGO_PKG_VERSION"),"approval_mode":"interactive","features":{"rooms":true,"multiple_agents":true,"attachments":true,"message_search":true},"notice":"Conversations are private until their owner explicitly shares them. Each agent keeps its own working session in each room."}),
+        json!({"id":s.config.id,"label":s.config.label,"owner":p.actor,"admin":p.admin,"agent":safe,"provider":{"id":s.config.provider_id(),"query_path":"/context/v1/query","surface":"web","access":"audience_scoped"},"public_url":s.config.public_url,"version":env!("CARGO_PKG_VERSION"),"approval_mode":"interactive","features":{"rooms":true,"multiple_agents":true,"attachments":true,"message_search":true,"huddles":true},"notice":"Conversations are private until their owner explicitly shares them. Managed agents keep separate room sessions; external huddle participants keep their existing session."}),
     ))
 }
 async fn people(State(s): State<Arc<AppState>>, h: HeaderMap) -> ApiResult<Json<Value>> {
@@ -685,6 +743,12 @@ pub(crate) async fn send_with_delivery_window(
         ));
     }
     let room = s.conversation_info(&id)?.ok_or_else(ApiError::missing)?;
+    let huddle = crate::huddles::is_huddle(&s, &id)?;
+    if huddle && (msg.text.len() > crate::huddles::MAX_TEXT || !msg.attachment_ids.is_empty()) {
+        return Err(ApiError::bad(
+            "Huddle messages support up to 6000 bytes of text; link existing evidence instead of copying files",
+        ));
+    }
     if room["read_only"] == true {
         return Err(ApiError::bad(
             "Continue this imported conversation in its original experience",
@@ -736,6 +800,7 @@ pub(crate) async fn send_with_delivery_window(
                 Json(json!({"accepted":true,"duplicate":true,"message_id":msg.request_id})),
             ));
         }
+        crate::huddles::check_open(&tx, &id)?;
         let member: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM room_members WHERE conversation_id=?1 AND username=?2)",
             params![id, p.actor],
@@ -755,10 +820,20 @@ pub(crate) async fn send_with_delivery_window(
         if count >= 32 || queued_bytes + bytes > 8 * 1024 * 1024 {
             return Err(ApiError(StatusCode::TOO_MANY_REQUESTS,"This conversation has reached its pending-message capacity. Review delivery status or wait before retrying; this message was not accepted.".into()));
         }
-        let agents: Vec<String> = tx
+        let mut agents: Vec<String> = tx
             .prepare("SELECT agent_id FROM room_agents WHERE conversation_id=?1 ORDER BY agent_id")?
             .query_map([&id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        let managed_agents = agents.clone();
+        if huddle {
+            agents.extend(
+                tx.prepare(
+                    "SELECT agent_id FROM huddle_participants WHERE room_id=?1 ORDER BY agent_id",
+                )?
+                .query_map([&id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
         if msg.target_agent_ids.iter().any(|a| !agents.contains(a)) {
             return Err(ApiError::bad(
                 "The selected agent is no longer in this room",
@@ -787,10 +862,10 @@ pub(crate) async fn send_with_delivery_window(
                 params![attachment, msg.request_id],
             )?;
         }
-        for agent in agents
-            .iter()
-            .filter(|a| msg.target_agent_ids.is_empty() || msg.target_agent_ids.contains(a))
-        {
+        for agent in agents.iter().filter(|a| {
+            managed_agents.contains(a)
+                && (msg.target_agent_ids.is_empty() || msg.target_agent_ids.contains(a))
+        }) {
             let participation = if direct || msg.target_agent_ids.contains(agent) {
                 "direct"
             } else {
@@ -799,6 +874,18 @@ pub(crate) async fn send_with_delivery_window(
             tx.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at,ordinary_not_before,steering_target_turn,steering_session_id) VALUES(?1,?2,?3,?4,?5,'received',?6,?7,?8,?9)",params![uuid::Uuid::new_v4().to_string(),msg.request_id,id,agent,participation,at,early.as_ref().map_or(0, |e| e.ordinary_not_before),early.as_ref().map(|e| e.active.target_turn.as_str()),early.as_ref().map(|e| e.active.session_id.as_str())])?;
         }
         tx.execute("UPDATE conversations SET status='working',note=CASE WHEN ?3 THEN note ELSE 'Message received; waiting for an agent…' END,updated_at=?2 WHERE id=?1",params![id,at,was_working])?;
+        if huddle {
+            tx.execute(
+                "UPDATE huddles SET revision=revision+1 WHERE room_id=?1",
+                [&id],
+            )?;
+            if managed_agents.is_empty() {
+                tx.execute(
+                    "UPDATE conversations SET status='idle',note='' WHERE id=?1",
+                    [&id],
+                )?;
+            }
+        }
         tx.commit()?;
     }
     s.audit(
@@ -806,7 +893,9 @@ pub(crate) async fn send_with_delivery_window(
         Some(&id),
         json!({"message_id":msg.request_id,"actor":p.actor,"during_work":was_working}),
     )?;
-    crate::delivery::launch(&s, &id);
+    if !huddle {
+        crate::delivery::launch(&s, &id);
+    }
     s.changed();
     Ok((
         StatusCode::ACCEPTED,
@@ -876,9 +965,11 @@ async fn cancel(
     if !s.exists(&id)? {
         return Err(ApiError::missing());
     }
+    s.db.lock().unwrap().execute("UPDATE huddles SET state='stopped',revision=revision+1 WHERE room_id=?1 AND state<>'stopped'",[&id])?;
     if let Some(tx) = s.running.lock().unwrap().get(&id) {
         let _ = tx.send(true);
     }
+    s.changed();
     Ok(Json(json!({"requested":true})))
 }
 async fn activity(State(s): State<Arc<AppState>>, h: HeaderMap) -> ApiResult<Json<Value>> {
