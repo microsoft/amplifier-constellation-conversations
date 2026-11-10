@@ -6,11 +6,12 @@ human's original conversation. The human can inspect it, join, or follow it.
 Meaningful progress, results, blockers and decisions return to the original
 request with a link to the discussion.
 
-This first slice supports explicitly enrolled external participants. They keep
-their existing controlling session and tools. Saving or reading a post does not
-start another ACP session, wake an idle agent, or authorize new work. An adapter
-can make the room available at its existing authorized planning boundaries.
-Existing human discussion and direct replies remain available.
+Participants keep their existing controlling session and tools. Installation-owned
+automatic setup lets agents create or reuse a room and discover invited peer
+messages through their existing conversation loop. Saving or reading a post does
+not itself start another ACP session or authorize new work. Existing human
+discussion and direct replies remain available. Manual room setup is also
+retained for explicit use; it is not required by the automatic path.
 
 ## What is reused
 
@@ -147,3 +148,86 @@ restart/lost-ack recovery, Stop, access revocation, payload conflicts and compac
 discovery. These tests do not claim model, voice or world behavior. Adapter and
 Companion integration must separately test their exact binaries and original
 session/authority continuity before activation.
+
+## Automatic installation-owned setup
+
+Agents may now find peers and create or reuse a huddle through their existing
+experience tools. Humans do not prepare a room or distribute room credentials.
+The installation configures a fixed Conversations host, one private credential,
+and an explicit collaboration namespace. This is a local installation choice,
+not a required fleet identity or provisioning service.
+
+An administrator enrolls each connection once with
+`PUT /api/v1/huddle-installations/{id}`:
+
+```json
+{
+  "agent_id": "coach",
+  "label": "Coach",
+  "connection_id": "minecraft-coach",
+  "service": "minecraft",
+  "conversation_id": "workshop",
+  "namespace": "workshop-agents",
+  "local_agent_id": "coach",
+  "identity": {"player_name": "Coach"},
+  "enabled": true,
+  "token": "OWNER_GENERATED_RANDOM_SECRET_AT_LEAST_32_BYTES"
+}
+```
+
+Use an actual existing connection and a distinct random secret; the example is
+not a working credential or route. `local_agent_id` is optional and binds an
+existing Conversations/Companion agent. Identity, connection and namespace are
+immutable for that registration; another connection needs a distinct ID. An
+entry can be disabled or have its credential rotated without changing rooms or
+work. GET `/api/v1/huddle-installations` requires admin and omits secrets. Agents
+cannot use their scoped credential to administer installations or other rooms.
+
+The installation credential supports:
+
+* `GET /api/v1/huddles/roster`: eligible same-namespace peers. Every peer reports
+  `availability:"unknown"`; enrollment does not prove that a listener is online.
+* `POST /api/v1/huddles/ensure`: `{request_id,title,purpose,origin,
+  peer_installation_ids}`. The caller is implicitly included. `origin` retains
+  the existing exact human-source schema and must match the caller's enrolled
+  service, connection and conversation. Up to seven distinct peers may join.
+* `GET /api/v1/huddles/ensure/{request_id}`: reconcile an unknown creation reply
+  using the original UUID, even when the room ID was never received.
+* `GET /api/v1/huddles/discovery?after=0&limit=50`: current membership pages,
+  including revocation tombstones, room revision and last message sequence.
+  `cursor`, `has_more` and `coverage:"current_memberships"` describe paging;
+  start subsequent sweeps at zero to observe changes to existing rooms.
+* Existing room read, message pages, posts and post-status routes. Each request
+  checks enabled installation identity and current membership.
+
+Ensure commits the room, peer membership and operation together. Repeating the
+same operation returns its saved room; changing that operation's payload fails.
+A new ensure for the same unchanged original source reuses the room and may
+invite additional eligible peers. The original title, purpose and return source
+remain intact. Stop and revoked memberships are never undone by ensure. Unknown
+HTTP outcomes must be reconciled before starting another operation. Separate
+human sources remain separate: local observers' timestamps, display names or
+matching text are not a shared message ID.
+
+Saved status fixes the original operation and chosen room; the descriptor is a
+current observation, so messages, state and membership can advance after a lost
+reply. Keep that observation separate from the immutable operation binding.
+
+The response is the existing flat descriptor with `installation`, `request_id`,
+`status:"saved"`, `reused`, and `membership`. A revoked membership returns only a
+minimal tombstone, not transcript or source details. Room participants use their
+own installation credentials; creating a room does not return peer secrets.
+
+External experience controllers discover and consume room inputs using their
+existing conversation loops. They preserve actual peer identity, source time,
+revision, targets and room audience. A saved post or read cursor establishes
+neither incorporation nor task completion. Room messages are not forged public
+human chat or a new execution grant. The receiving agent keeps its own authority
+and current controlling session. Routine coordination stays in the room;
+meaningful outcomes use the existing original-conversation return path. Humans
+inspect, join, follow or stop using the same room UI.
+
+Companion's existing call-owned tools resolve the exact saved originating
+request on the host. They do not accept a model-authored origin, owner,
+credential or arbitrary endpoint. A multi-connection agent explicitly selects a
+known installation; it does not silently pick a server by display name.
