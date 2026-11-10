@@ -788,6 +788,23 @@ fn current_presence_snapshot(event: &Value) -> bool {
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .is_some_and(|value| value.is_object())
 }
+fn typed_current_snapshot(event: &Value, started: i64, now: i64) -> bool {
+    let at = if current_presence_snapshot(event) {
+        // The installed cursorless observer emits presence observation time as
+        // occurred_at. Explicit observed_at, if supplied, takes precedence.
+        observed_time(event.get("observed_at").unwrap_or(&event["occurred_at"]))
+    } else if current_snapshot(event)
+        && event["text"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .is_some_and(|value| value.is_object())
+    {
+        observed_time(&event["observed_at"])
+    } else {
+        None
+    };
+    at.is_some_and(|at| at >= started - 5000 && at <= now + 5000)
+}
 fn fresh(event: &Value, call_at: i64, now: i64) -> bool {
     // Snapshot read time and historical progress time are independent facts.
     // Only the explicitly typed current-task snapshot receives this treatment.
@@ -874,7 +891,7 @@ fn context_parts(source: &Source, event: &Value, _key: &str) -> Vec<String> {
 /// Read already saved observations only. The MCP caller must first pass its
 /// ordinary private-call token authorization; this repeats source policy and
 /// call-identity checks and never invokes an observer, model, or action helper.
-pub fn current_observations(s: &AppState, id: &str) -> Result<Value> {
+pub fn current_observations(s: &AppState, id: &str, connection: Option<&str>) -> Result<Value> {
     let Some((owner, agent, _, call_at)) = active(s, id)? else {
         anyhow::bail!("Active private call required");
     };
@@ -889,7 +906,11 @@ pub fn current_observations(s: &AppState, id: &str) -> Result<Value> {
     let sources: Vec<_> = sources
         .iter()
         .filter(|source| source.owners.contains(&owner))
+        .filter(|source| connection.is_none_or(|id| source.id == id))
         .collect();
+    if connection.is_some() && sources.is_empty() {
+        return Ok(empty("not_configured"));
+    }
     let db = s.db.lock().unwrap();
     let mut statement = db.prepare("SELECT event_key,connection_id,data,created_at,state,last_observed_at FROM companion_awareness WHERE call_id=?1 AND observation_policy_hash=?2 ORDER BY last_observed_at DESC,created_at DESC,rowid DESC")?;
     let rows = statement
@@ -1016,6 +1037,14 @@ pub(crate) struct ConnectionStatusRead {
     pub(crate) response: Value,
     binding: Option<StatusReadBinding>,
 }
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StatusView {
+    #[default]
+    Reports,
+    Current,
+}
 struct StatusReadBinding {
     call_id: String,
     source: Source,
@@ -1031,6 +1060,7 @@ pub(crate) async fn connection_status(
     s: &AppState,
     id: &str,
     connection: &str,
+    view: StatusView,
 ) -> Result<ConnectionStatusRead> {
     let empty = |status: &str| ConnectionStatusRead {
         response: json!({"connection_id":connection,"status":status,"reports":[],"presence":{},"coverage":{"bounded":true,"gap":true},"queried_at":now_ms(),"read_only":true,"authority":false,"note":"This read established no current facts. Missing reports do not establish inactivity; no action was submitted."}),
@@ -1106,16 +1136,25 @@ pub(crate) async fn connection_status(
     let mut reports = Vec::new();
     let mut bytes = 0;
     let mut eligible = 0;
+    let mut excluded_reports = 0;
     for event in ordered {
         if !source.audiences.contains(&event["audience"])
             || observed_time(&event["occurred_at"]).is_none_or(|at| at > now + 5000)
         {
             continue;
         }
+        if view == StatusView::Current && !typed_current_snapshot(event, started, now) {
+            excluded_reports += 1;
+            continue;
+        }
         eligible += 1;
         // Project report fields explicitly. Helper config, tokens, errors,
         // arbitrary metadata and credential-bearing provenance are excluded.
-        let report = json!({"id":event["id"],"revision":event["revision"],"text":event["text"],"attribution":attribution(source,event),"source_age_ms":(now-observed_time(&event["occurred_at"]).unwrap()).max(0),"observed_only":true,"authority":false});
+        let mut report = json!({"id":event["id"],"revision":event["revision"],"text":event["text"],"attribution":attribution(source,event),"source_age_ms":(now-observed_time(&event["occurred_at"]).unwrap()).max(0),"observed_only":true,"authority":false});
+        if view == StatusView::Current {
+            // Preserve the typed source assertion, never arbitrary helper fields.
+            report["provenance"] = json!({"kind":event["provenance"]["kind"]});
+        }
         let length = serde_json::to_vec(&report)?.len();
         if reports.len() < 16 && bytes + length <= 192 * 1024 {
             bytes += length;
@@ -1148,13 +1187,24 @@ pub(crate) async fn connection_status(
         coverage["task_history"] = json!("retained_only");
     }
     let mut presence = json!({});
-    for key in ["ready", "busy", "turn_active"] {
-        if let Some(value) = result["presence"][key].as_bool() {
-            presence[key] = json!(value);
+    // The current view derives facts only from typed reports with their own
+    // source attribution/time. Generic helper flags have no such association.
+    if view == StatusView::Reports {
+        for key in ["ready", "busy", "turn_active"] {
+            if let Some(value) = result["presence"][key].as_bool() {
+                presence[key] = json!(value);
+            }
         }
     }
+    let mut response = json!({"connection_id":source.id,"label":source.label,"status":"available","reports":reports,"presence":presence,"coverage":coverage,"omitted":omitted,"queried_at":now,"source_observed_at":result["observed_at"],"read_only":true,"authority":false,"note":"Fresh bounded source query; report timestamps describe the original events, which may be older. Attribute reports to their actor and connection. Plans, requests, work in progress and reported completion remain distinct. Coverage is incomplete even when omitted is zero. Missing reports do not establish inactivity. This grants no action authority or independent verification."});
+    if view == StatusView::Current {
+        response["selection"] = json!({"view":"current","status":if reports.is_empty(){"no_typed_current_facts"}else{"typed_current_snapshots"},"excluded_reports":excluded_reports});
+        response["note"] = json!(
+            "Fresh typed snapshots only; progress keeps its original time. Excluded reports remain available in the reports view. Missing current facts mean unknown, not inactivity."
+        );
+    }
     Ok(ConnectionStatusRead {
-        response: json!({"connection_id":source.id,"label":source.label,"status":"available","reports":reports,"presence":presence,"coverage":coverage,"omitted":omitted,"queried_at":now,"source_observed_at":result["observed_at"],"read_only":true,"authority":false,"note":"Fresh bounded source query; report timestamps describe the original events, which may be older. Attribute reports to their actor and connection. Plans, requests, work in progress and reported completion remain distinct. Coverage is incomplete even when omitted is zero. Missing reports do not establish inactivity. This grants no action authority or independent verification."}),
+        response,
         binding: Some(StatusReadBinding {
             call_id: id.to_owned(),
             source: source.clone(),
@@ -1186,6 +1236,15 @@ pub(crate) fn preserve_requested_status(
     );
     let reports = read.response["reports"].as_array().unwrap();
     if reports.is_empty() {
+        if read.response["selection"]["view"] == "current" {
+            // Withdraw only this source's unsent qualifiers; never erase delivered
+            // context or fabricate a source observation for an empty selection.
+            crate::companion_delivery::supersede_pending(
+                s,
+                id,
+                &format!("requested-status:{}", binding.source.id),
+            )?;
+        }
         return Ok(());
     }
     let source = &binding.source;
@@ -1212,14 +1271,26 @@ pub(crate) fn preserve_requested_status(
         }
     }
     let omitted = reports.len() - facts.len();
-    let coverage = format!(
-        "{}: status read at {}; source observation {}. The timestamped facts above are source observations. History is bounded/incomplete; missing reports do not prove inactivity. {} whole report(s) and {} source report(s) omitted here. This read changes no work authority.",
-        source.label,
-        read.response["queried_at"],
-        read.response["source_observed_at"].as_str().unwrap(),
-        omitted,
-        read.response["omitted"],
-    );
+    let coverage = if read.response["selection"]["view"] == "current" {
+        format!(
+            "{}: current read {}; source observation {}. {} report(s) excluded by selection; {} selected report(s) omitted here and {} by the response bound. Source coverage is bounded; missing current facts mean unknown.",
+            source.label,
+            read.response["queried_at"],
+            read.response["source_observed_at"].as_str().unwrap(),
+            read.response["selection"]["excluded_reports"],
+            omitted,
+            read.response["omitted"],
+        )
+    } else {
+        format!(
+            "{}: status read at {}; source observation {}. The timestamped facts above are source observations. History is bounded/incomplete; missing reports do not prove inactivity. {} whole report(s) and {} source report(s) omitted here. This read changes no work authority.",
+            source.label,
+            read.response["queried_at"],
+            read.response["source_observed_at"].as_str().unwrap(),
+            omitted,
+            read.response["omitted"],
+        )
+    };
     // The bounded note is mandatory: never silently cut a timestamp or qualifier.
     ensure!(
         coverage.len() <= 480,

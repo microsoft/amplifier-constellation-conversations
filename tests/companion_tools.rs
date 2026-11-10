@@ -781,6 +781,18 @@ async fn scoped_native_permission_policy_requires_exact_source_and_never_title_o
         ("companion_connections", json!({})),
         ("companion_observations", json!({})),
         (
+            "companion_observations",
+            json!({"connection_id":"minecraft"}),
+        ),
+        (
+            "companion_connection_status",
+            json!({"connection_id":"minecraft","view":"current"}),
+        ),
+        (
+            "companion_connection_status",
+            json!({"connection_id":"minecraft","view":"reports"}),
+        ),
+        (
             "companion_connection_status",
             json!({"connection_id":"minecraft"}),
         ),
@@ -855,6 +867,25 @@ async fn scoped_native_permission_policy_requires_exact_source_and_never_title_o
             json!({"connection_id":"minecraft","url":"https://other.test"}),
         ),
         native_permission("companion_connection_status", json!({"connection_id":""})),
+        native_permission(
+            "companion_connection_status",
+            json!({"connection_id":"minecraft","view":"latest"}),
+        ),
+        native_permission(
+            "companion_connection_status",
+            json!({"connection_id":"minecraft","view":null}),
+        ),
+        native_permission("companion_observations", json!({"connection_id":null})),
+        native_permission("companion_observations", json!({"connection_id":""})),
+        native_permission("companion_observations", json!({"connection_id":"a\nb"})),
+        native_permission(
+            "companion_observations",
+            json!({"connection_id":"漢".repeat(41)}),
+        ),
+        native_permission(
+            "companion_observations",
+            json!({"connection_id":"minecraft","owner":"other"}),
+        ),
         native_permission("companion_shared", json!({"awareness_id":"../other"})),
         native_permission("companion_shared", json!({"awareness_id":"g".repeat(64)})),
         native_permission(
@@ -1524,4 +1555,54 @@ async fn action_accepts_exact_mixed_whitespace_but_rejects_changed_or_only_blank
             "Bound source must not be edited"
         );
     }
+}
+
+#[tokio::test]
+async fn evidence_read_selectors_validate_at_http_boundary_without_effects_or_auth_bypass() {
+    let f = fixture();
+    let c = call(&f);
+    for path in [
+        "observations",
+        "observations?connection_id=minecraft",
+        "connection-status?connection_id=minecraft&view=current",
+        "connection-status?connection_id=minecraft&view=reports",
+    ] {
+        let (status, response) = request(&f, &c, "GET", path, None, &c.token, false).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["read_only"], true);
+        assert_eq!(
+            request(&f, &c, "GET", path, None, "wrong-token", false)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(&f, &c, "GET", path, None, &c.token, true).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    for path in [
+        "observations?connection_id=",
+        "observations?connection_id=a%0Ab",
+        "observations?connection_id=a&connection_id=b",
+        "observations?connection_id=a&owner=other",
+        "observations?view=current",
+        "connection-status?connection_id=minecraft&view=latest",
+        "connection-status?connection_id=minecraft&view=current&view=reports",
+    ] {
+        let response = f
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/companion/calls/{}/tools/{path}", c.id))
+                    .header("authorization", format!("Bearer {}", c.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert!(effects(&f).is_empty());
 }

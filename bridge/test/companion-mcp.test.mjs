@@ -276,3 +276,34 @@ test('saved result images use a bounded 2 MiB transport without increasing phone
  receipt.image.mimeType='image/png';receipt.kind='capture';receipt.state='uploaded';result=await read();assert.equal(result.isError,true,'camera output still has its own 512 KiB boundary');
  assert.equal(requests.length,5,'read failures never recapture or retry');
 });
+
+test('scoped observation and current status schemas keep exact connection IDs without broadening',async t=>{
+  const {client,requests}=await fixture(t);
+  const connection_id='world:Constellation / east';
+  for(const [name,args] of [
+    ['companion_observations',{connection_id}],
+    ['companion_connection_status',{connection_id,view:'current'}],
+    ['companion_connection_status',{connection_id,view:'reports'}],
+  ])assert.notEqual((await client.callTool({name,arguments:args})).isError,true);
+  const root=`/api/v1/companion/calls/${callId}/tools/`;
+  assert.deepEqual(requests.map(r=>[r.method,r.path]),[
+    ['GET',`${root}observations?connection_id=world%3AConstellation%20%2F%20east`],
+    ['GET',`${root}connection-status?connection_id=world%3AConstellation%20%2F%20east&view=current`],
+    ['GET',`${root}connection-status?connection_id=world%3AConstellation%20%2F%20east&view=reports`],
+  ]);
+  for(const [name,args] of [
+    ['companion_observations',{connection_id:null}],
+    ['companion_observations',{connection_id:''}],
+    ['companion_observations',{connection_id:'a\nb'}],
+    ['companion_observations',{connection_id:'漢'.repeat(41)}],
+    ['companion_observations',{connection_id:['a','b']}],
+    ['companion_observations',{connection_id,owner:'someone-else'}],
+    ['companion_connection_status',{connection_id,view:null}],
+    ['companion_connection_status',{connection_id,view:'latest'}],
+    ['companion_connection_status',{connection_id,view:'current',command:'arbitrary'}],
+  ])assert.equal((await client.callTool({name,arguments:args})).isError,true);
+  assert.equal(requests.length,3);
+  const {tools}=await client.listTools();
+  assert.match(tools.find(x=>x.name==='companion_observations').description,/exact connection_id/);
+  assert.match(tools.find(x=>x.name==='companion_connection_status').description,/view current/);
+});

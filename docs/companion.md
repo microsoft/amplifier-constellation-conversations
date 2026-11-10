@@ -578,8 +578,12 @@ presentation heuristics, not proof that speech played or a human turn ended. An 
 observer does not block the others. Model scores are pilot thresholds, not
 calibrated accuracy or a delivery guarantee.
 
-`companion_observations` takes no arguments and reads only this call's saved,
-currently authorized facts. It does not contact a service or model. It reports
+`companion_observations` reads only this call's saved, currently authorized facts.
+For a question about one connection, pass its exact optional `connection_id` from
+`companion_connections.observation_sources`. Selection precedes projection and
+applies to reports and coverage; unknown or unauthorized IDs return no facts and
+never fall back to other connections. Omission retains the all-source read. It
+does not contact a service or model. It reports
 the latest retained revision per source event, original attribution, observation
 freshness, source age, coverage, and omissions. Bounded selection rotates across
 connections, preferring task/action reports and then recent original event times;
@@ -751,11 +755,32 @@ Current task and physical-state snapshots take priority over historical chatter
 in the bounded result. Deferred source records remain available through their
 unchanged cursor identity; prioritization does not change their original time.
 
+Use `view: "current"` for a question about current position, presence or
+assignment. This selects only typed presence/assignment snapshots observed during
+the fresh query (with the same five-second clock tolerance as the source envelope). Tasks
+require their own `observed_at`; presence uses its own `observed_at`, or
+`occurred_at` for the installed cursorless observer. It never dates an old
+snapshot from the wrapper query time or refreshes nested `progress.at`. The
+original source ID, revision, actor, audience, snapshot kind and times accompany
+each whole fact.
+`selection.excluded_reports` counts authorized reports outside this view,
+including stale or untyped reports, independently of response-bound `omitted` and
+the source's own
+`coverage.omitted_events`. A generic observer without typed current snapshots
+returns `no_typed_current_facts`, not an idle claim or an inference from untyped
+helper flags. Exclusion does not prove that history is absent; missing facts do
+not prove inactivity. Omitted `view` (or `"reports"`) preserves the existing
+current-plus-history response.
+
 Before returning that explicit read, the host also queues a bounded set of source
 qualifiers directly as thinking context. Up to four whole report facts preserve
 original report time and observation time; current assignment snapshots also keep
 `progress.at` separate from assignment status. A coverage note states omissions
 and that missing reports do not establish inactivity or independent verification.
+Only the selected report set can supply those qualifiers, so a current-only read
+cannot reintroduce historical chat through this separate context path. A successful
+empty current-only read also withdraws only that source’s still-unsent qualifier
+batch; already dispatched context, source receipts, and unrelated results remain.
 This protects the original qualifications if a reasoning model omits them while
 summarizing. The same private caller, configured source, audience and current
 policy are revalidated before delivery, and the normal conversational floor still
