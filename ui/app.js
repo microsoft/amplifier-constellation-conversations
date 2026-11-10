@@ -11,7 +11,7 @@ const date=at=>new Date(at).toLocaleDateString([],{month:'short',day:'numeric'})
 const el=(tag,className,text)=>{const n=document.createElement(tag);if(className)n.className=className;if(text!==undefined)n.textContent=text;return n;};
 let huddleView=null,huddleContext=null,huddleRefresh=null,huddleRefreshAgain=false;
 function clearHuddles(){huddleContext=null;huddleRefreshAgain=false;huddleView?.destroy();huddleView=null;$('conversation-huddles').hidden=true;$('conversation-huddles').open=false;}
-async function refreshLinkedHuddles(){
+async function refreshLinkedHuddles(automatic=true){
   const c=ui.conversation;
   if(!c||!ui.session?.authenticated||$('app').hidden||c.id!==ui.view?.state.selected_conversation_id){clearHuddles();return;}
   const key=JSON.stringify([ui.session.owner,c.id]);
@@ -30,7 +30,7 @@ async function refreshLinkedHuddles(){
         }catch(error){if(huddleContext?.key===options.context.key){$('conversation-huddles').hidden=false;$('conversation-huddle-count').textContent='';}throw error;}
       }});
       huddleRefresh=huddleView.setContext(huddleContext);
-    }else huddleRefresh=huddleView.refresh();
+    }else huddleRefresh=huddleView.refresh({automatic});
     await huddleRefresh;
   }catch{
     if(huddleContext?.key===key){$('conversation-huddles').hidden=false;$('conversation-huddle-view').textContent='Huddles could not be opened. Your conversation is still available.';}
@@ -39,7 +39,7 @@ async function refreshLinkedHuddles(){
     if(huddleRefreshAgain){huddleRefreshAgain=false;void refreshLinkedHuddles();}
   }
 }
-$('conversation-huddles').ontoggle=()=>{if(!$('conversation-huddles').open)huddleView?.close();else void refreshLinkedHuddles();};
+$('conversation-huddles').ontoggle=()=>{if(!$('conversation-huddles').open)huddleView?.close();else void refreshLinkedHuddles(false);};
 function renderText(target,text){
   target.classList.add('markdown');
   target.innerHTML=renderMarkdown(text);

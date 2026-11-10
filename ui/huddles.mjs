@@ -67,7 +67,7 @@ export function createHuddles({root, list, read, setFollowing, send, findSubmiss
     }));
     if (!summaries.length) directory.append(node('p','huddles-empty','No linked huddles are available here.'));
   }
-  async function refresh() {
+  async function refresh({automatic=false}={}) {
     if (!context || destroyed) return;
     const token = generation, sequence = ++listRequest; status.textContent = 'Checking huddles…';
     try {
@@ -75,7 +75,8 @@ export function createHuddles({root, list, read, setFollowing, send, findSubmiss
       if (!valid(token) || sequence !== listRequest) return;
       if (!Array.isArray(result?.items) || result.items.some(item => typeof item?.id !== 'string')) throw new Error('invalid view');
       summaries = result.items; renderDirectory(); status.textContent = '';
-      if (selected) await load(selected,cursor);
+      if(selected&&!summaries.some(item=>item.id===selected)){close();status.textContent='That huddle is no longer available.';return;}
+      if (selected && (!automatic || room?.following === true)) await load(selected,cursor);
     } catch (error) {
       if (!valid(token) || sequence !== listRequest) return;
       if (denied(error)) { revoke(); return; }
@@ -125,7 +126,7 @@ export function createHuddles({root, list, read, setFollowing, send, findSubmiss
     const top = node('div','huddles-heading'); top.append(button('Back to huddles',close),node('h3',null,room.title || 'Work huddle'));
     const follow = button(room.following ? 'Quiet updates' : 'Follow details', () => changeFollowing(id,!room.following));
     follow.disabled = draft.following; follow.setAttribute('aria-pressed',String(room.following === true));
-    const description = node('p','huddles-meta',room.following ? 'Following details in this view. Voice updates are considered separately.' : 'Routine coordination stays here. Important results can return to the original conversation.');
+    const description = node('p','huddles-meta',room.following ? 'Following details in this view. Voice updates are considered separately.' : 'Routine coordination stays here. Refresh to see new discussion. Important results can return to the original conversation.');
     const controls = node('div','huddles-controls'); controls.append(follow,button('Refresh discussion',()=>load(id,cursor)));
     const history = node('div','huddles-history'); history.setAttribute('aria-label','Huddle discussion'); history.setAttribute('aria-live','off');
     const messages = room.messages.slice(-100);

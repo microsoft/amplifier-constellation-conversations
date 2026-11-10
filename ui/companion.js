@@ -70,7 +70,7 @@ function refreshHuddles(call) {
   // it never creates input, a model turn, or voice context.
   if (!current(call) || !call.huddles || call.huddleRefresh || Date.now()-call.huddleRefreshAt<5000) return;
   call.huddleRefreshAt=Date.now();
-  call.huddleRefresh=call.huddles.refresh().finally(()=>{call.huddleRefresh=null;});
+  call.huddleRefresh=call.huddles.refresh({automatic:true}).finally(()=>{call.huddleRefresh=null;});
 }
 $('call-huddles').ontoggle=()=>{
   const call=state.call;if(!current(call)||!call.huddles)return;
