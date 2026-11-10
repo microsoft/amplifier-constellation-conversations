@@ -1848,6 +1848,189 @@ async fn message_search_paginates_without_overlap_and_never_reads_another_room()
 }
 
 #[tokio::test]
+async fn spoken_history_module_is_embedded_and_never_cached() {
+    let f = fixture();
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/message-presentation.mjs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/javascript; charset=utf-8"
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        include_bytes!("../ui/message-presentation.mjs")
+    );
+}
+
+#[tokio::test]
+async fn spoken_history_presentation_requires_exact_call_room_and_preserves_canonical_source() {
+    let f = fixture();
+    let room = f.state.create("Voice history").unwrap();
+    let other = f.state.create("Other history").unwrap();
+    let id = room["id"].as_str().unwrap();
+    let other_id = other["id"].as_str().unwrap();
+    let internal = "The live voice conversation delegated help at 64000ms. Internal guidance. Configured Companion read catalog: {\"private_route\":true}";
+    {
+        let db = f.state.db.lock().unwrap();
+        for (call, call_room, owner) in [
+            ("voice-call", id, "owner"),
+            ("other-call", other_id, "owner"),
+            ("wrong-owner", id, "robin"),
+        ] {
+            db.execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at) VALUES(?1,?2,?1,'hash','default',?3,'closed',1,1)",rusqlite::params![call,owner,call_room]).unwrap();
+        }
+        for (n, message) in ["linked", "typed-prefix", "cross-room", "cross-owner"]
+            .into_iter()
+            .enumerate()
+        {
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user',?3,'complete',?4,?4,'owner')",rusqlite::params![message,id,internal,n as i64]).unwrap();
+        }
+        for (call, message) in [
+            ("voice-call", "linked"),
+            ("other-call", "cross-room"),
+            ("wrong-owner", "cross-owner"),
+        ] {
+            db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at,source,request_text) VALUES(?1,?2,64000,'completed',?2,1,'{\"original\":true}','Where are you now?')",rusqlite::params![call,message]).unwrap();
+        }
+    }
+    let canonical = f.state.messages(id, 100).unwrap();
+    let source = f.state.source_message_page(id, 100, None, "").unwrap();
+    let (status, history) = request(
+        &f.app,
+        "GET",
+        &format!("/api/v1/conversations/{id}/messages?limit=2"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("presentation").is_none())
+    );
+    let (_, earlier) = request(
+        &f.app,
+        "GET",
+        &format!(
+            "/api/v1/conversations/{id}/messages?before={}",
+            history["next_cursor"]
+        ),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let items = earlier["items"].as_array().unwrap();
+    assert_eq!(items[0]["id"], "linked");
+    assert_eq!(items[0]["text"], internal);
+    assert_eq!(items[0]["presentation"]["text"], "Where are you now?");
+    assert_eq!(items[0]["presentation"]["label"], "From voice");
+    assert_eq!(items[0]["presentation"]["excerpt"], true);
+    assert!(
+        items[1].get("presentation").is_none(),
+        "Typed matching prefix is ordinary text"
+    );
+    let (_, initial) = request(
+        &f.app,
+        "GET",
+        &format!("/api/v1/conversations/{id}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(
+        initial["messages"][0]["presentation"],
+        items[0]["presentation"]
+    );
+    assert_eq!(f.state.messages(id, 100).unwrap(), canonical);
+    assert_eq!(
+        f.state.source_message_page(id, 100, None, "").unwrap(),
+        source
+    );
+    assert_eq!(
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT text FROM messages WHERE id='linked'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+        internal
+    );
+    assert!(
+        !f._home.path().join("frames.jsonl").exists(),
+        "History reads never invoke ACP"
+    );
+}
+
+#[tokio::test]
+async fn spoken_history_missing_or_malformed_labels_are_neutral_not_backend_text() {
+    let f = fixture();
+    let room = f.state.create("Voice labels").unwrap();
+    let id = room["id"].as_str().unwrap();
+    {
+        let db = f.state.db.lock().unwrap();
+        db.execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at) VALUES('call','owner','call','hash','default',?1,'closed',1,1)",[id]).unwrap();
+        for (n, label) in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("bad\0label"),
+            Some("blob"),
+            Some("large"),
+            Some("ambiguous"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message = format!("request-{n}");
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user','INTERNAL BACKEND INPUT','complete',1,1,'owner')",rusqlite::params![message,id]).unwrap();
+            db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at,request_text) VALUES('call',?1,1,'completed',?1,1,?2)",rusqlite::params![message,label]).unwrap();
+        }
+        db.execute(
+            "UPDATE companion_delegations SET request_text=zeroblob(4) WHERE id='request-4'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE companion_delegations SET request_text=?1 WHERE id='request-5'",
+            ["x".repeat(49_153)],
+        )
+        .unwrap();
+        db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at,request_text) VALUES('call','duplicate',1,'completed','request-6',1,'Other request')",[]).unwrap();
+    }
+    let before = f.state.messages(id, 100).unwrap();
+    let (_, history) = request(
+        &f.app,
+        "GET",
+        &format!("/api/v1/conversations/{id}/messages"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    for message in history["items"].as_array().unwrap() {
+        assert_eq!(message["presentation"]["text"], "Spoken request");
+        assert_eq!(message["text"], "INTERNAL BACKEND INPUT");
+    }
+    assert_eq!(f.state.messages(id, 100).unwrap(), before);
+}
+
+#[tokio::test]
 async fn removing_a_person_revokes_access_even_during_active_work() {
     let f = fixture();
     let c = f.state.create("Revocation during work").unwrap();

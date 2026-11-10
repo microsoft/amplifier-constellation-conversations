@@ -191,7 +191,11 @@ async fn fresh_status_reads_only_fixed_source_and_projects_current_access_withou
     );
     assert_eq!(calls(&f, "observer").len(), 1);
     assert_eq!(
-        status_sources(&f.s, &f.id).unwrap(),
+        status_sources(&f.s, &f.id)
+            .unwrap()
+            .iter()
+            .map(|source| json!({"id":source["id"],"label":source["label"],"read_only":source["read_only"]}))
+            .collect::<Vec<_>>(),
         vec![json!({"id":"minecraft","label":"Workshop","read_only":true})]
     );
     rewrite_policy(&f, |v| {
@@ -204,6 +208,9 @@ async fn fresh_status_reads_only_fixed_source_and_projects_current_access_withou
     );
     assert_eq!(calls(&f, "observer").len(), 1);
 }
+
+#[path = "companion_catalog_tests.rs"]
+mod catalog;
 
 #[tokio::test]
 async fn fresh_status_withholds_inflight_results_after_policy_identity_or_call_revocation() {

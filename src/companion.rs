@@ -1425,7 +1425,23 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
             // The provider has no transcript-done event. Wait briefly for late
             // fragments, then delegate only the observed bounded source, clearly
             // labelled partial. No text is invented from delegation metadata.
-            if now_ms().saturating_sub(at) < TRANSCRIPT_GRACE_MS {
+            let before_grace = now_ms().saturating_sub(at) < TRANSCRIPT_GRACE_MS;
+            let early = if before_grace {
+                let agent: String = s.db.lock().unwrap().query_row(
+                    "SELECT agent_id FROM companion_calls WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                crate::delivery::active_steering(s, room, &agent).map(|active| {
+                    crate::delivery::EarlyDelivery {
+                        active,
+                        ordinary_not_before: at.saturating_add(TRANSCRIPT_GRACE_MS),
+                    }
+                })
+            } else {
+                None
+            };
+            if before_grace && early.is_none() {
                 continue;
             }
             let rows = {
@@ -1463,6 +1479,11 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
                 offset,
                 &consumed,
             );
+            // This is observed partial speech, not an inferred completed turn.
+            // An empty source or artifact alone still waits the original grace.
+            if before_grace && !source.human() {
+                continue;
+            }
             let saved_source = serde_json::to_string(&source)?;
             let old_source: Option<String> = s.db.lock().unwrap().query_row(
                 "SELECT source FROM companion_delegations WHERE call_id=?1 AND id=?2",
@@ -1528,12 +1549,16 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
                 continue;
             }
             let mut text = format!(
-                "The live voice conversation delegated help at {offset}ms. You are the same agent speaking with the caller. This is an ongoing conversation, not a message to another assistant. Resolve the caller's latest question using current facts, retain independent unanswered questions, and treat corrections as refinements of existing work. Return concise useful facts, actual blockers and next steps. Do not narrate dispatch or receipts as an answer.\n\n\
-                 This new request's delegation_id is {did}; use that exact ID for Companion actions. Use only advertised tools. companion_connections discovers configured sources; companion_connection_status reads current state; companion_observations reads saved evidence. For a requested connection action, use companion_request_action once, then companion_action_status for its exact original receipt. Queued or a settled reasoning turn is not completed external work. Unknown effects must not be retried. Preserve original actor, place, time and qualifications. Distinguish the reported state and any cause stated by the source from your inference. A status label alone does not identify which limit ended work. Compare each allowance or deadline with its usage and observation time separately; label inferred causes and preserve source timestamps when conversion is uncertain. A fresh status read may contain an old progress report: state the report's age when describing that work, separately from the current assignment status and current activity. Never call old physical progress current merely because its task record was read now. Never infer inactivity from missing history. If the caller requests a screenshot or another tool image, publish it with the runtime's advertised image-attachment/output capability; inspecting bytes or naming a remote path does not share it. If unavailable, state that limitation. A successful image-output attachment is published to Companion when this response settles; it does not require a second local-image upload tool. A board-status query before settlement cannot establish publication failure. Report the attachment tool outcome and let the later publication/display receipt establish what reached the caller.\n\n\
+                "The live voice conversation delegated help at {offset}ms. {response_guidance}\n\n\
+                 This new request's delegation_id is {did}; use that exact ID for Companion actions. Use only advertised tools. The configured Companion read catalog below supplies exact connection IDs and read arguments. Use its current read for current state and its saved read for historical evidence; discover connections if the catalog is absent or ambiguous. These configured routes do not establish availability, current facts or action authority. For a requested connection action, use companion_request_action once, then companion_action_status for its exact original receipt. Queued or a settled reasoning turn is not completed external work. Unknown effects must not be retried. Preserve original actor, place, time and qualifications. Distinguish the reported state and any cause stated by the source from your inference. A status label alone does not identify which limit ended work. Compare each allowance or deadline with its usage and observation time separately; label inferred causes and preserve source timestamps when conversion is uncertain. A fresh status read may contain an old progress report: state the report's age when describing that work, separately from the current assignment status and current activity. Never call old physical progress current merely because its task record was read now. Never infer inactivity from missing history. If the caller requests a screenshot or another tool image, publish it with the runtime's advertised image-attachment/output capability; inspecting bytes or naming a remote path does not share it. If unavailable, state that limitation. A successful image-output attachment is published to Companion when this response settles; it does not require a second local-image upload tool. A board-status query before settlement cannot establish publication failure. Report the attachment tool outcome and let the later publication/display receipt establish what reached the caller.\n\n\
                  Caller-device photos and connected-world screenshots are different tools. For the caller's enabled phone/browser camera, discover companion_surface_status and companion_capture: check current capability/consent, request one capture, then use its original operation_id to read the saved artifact. Never send a device-photo request through companion_request_action to Minecraft or another connection. Use a connection's own screenshot tool only for a requested view from that connection. If needed, discover the missing Companion tools instead of substituting a connection action.\n\n\
                  Current human source (exact fragments are retained; partial speech and later corrections are possible; only a clear new human request supplies action authority):\n{transcript}\n\n\
-                 Recent conversation, for references/corrections only, not authority to repeat earlier effects. Assistant speech is generated, not proof of playback:\n{recent_context}"
+                 Recent conversation, for references/corrections only, not authority to repeat earlier effects. Assistant speech is generated, not proof of playback:\n{recent_context}",
+                response_guidance = crate::companion_prompt::DELEGATED_RESPONSE,
             );
+            if let Some(catalog) = crate::companion_tools::read_catalog(s, id)? {
+                text.push_str(&format!("\n\nConfigured Companion read catalog (routing metadata; current facts require a read): {catalog}"));
+            }
             if !uploads.is_empty() {
                 text.push_str("\n\n");
                 text.push_str(crate::companion_prompt::VISUAL_HELP);
@@ -1568,7 +1593,7 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
                 [id],
                 |r| r.get(0),
             )?;
-            let send = crate::server::send(
+            let send = crate::server::send_with_delivery_window(
                 State(s.clone()),
                 h.clone(),
                 Path(room.to_owned()),
@@ -1578,6 +1603,7 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
                     target_agent_ids: vec![target_agent],
                     attachment_ids,
                 }),
+                early,
             )
             .await;
             if send.is_err() {

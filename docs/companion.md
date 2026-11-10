@@ -579,6 +579,15 @@ observer does not block the others. Model scores are pilot thresholds, not
 calibrated accuracy or a delivery guarantee.
 
 `companion_observations` reads only this call's saved, currently authorized facts.
+Each delegated backend request includes a fresh, compact catalog of the current
+caller's configured read sources when its Companion tools are installed. The
+same rows appear in `companion_connections.observation_sources`: exact
+`connection_id`, label, and literal arguments for saved observations, current
+snapshots, and source reports. These IDs belong to Companion, independently of
+Instance context-provider IDs. The catalog runs no helper or model and proves
+neither availability nor action authority. Tool execution rechecks access;
+omitting the status view still selects reports for existing clients.
+
 For a question about one connection, pass its exact optional `connection_id` from
 `companion_connections.observation_sources`. Selection precedes projection and
 applies to reports and coverage; unknown or unauthorized IDs return no facts and
@@ -627,6 +636,15 @@ that answer once. Source incorporation alone is not completion. Repeated elapsed
 time does not generate repeated waiting speech. After hang-up, accepted work can
 finish and retain its result, but cannot dispatch another voice request or append
 more voice context.
+
+An explicit provider delegation with observed human words can reach an already
+active, negotiated steering target before the normal two-second transcript wait.
+The target is bound to that live session and prompt; this does not imply the
+caller finished speaking. If the target ends or definitively requires a new
+prompt, ordinary fallback retains the original source and original two-second
+deadline. Empty input, cold starts, and unsupported endpoints keep the normal
+wait. A received-only steering acknowledgment remains unknown at terminal unless
+the endpoint supplies incorporation evidence; it is never automatically resent.
 
 Results are durably queued separately from the voice transport. Fresh authenticated
 browser observations decide when a result may enter the speaking context: both

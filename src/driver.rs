@@ -898,6 +898,14 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     let mut output = String::new();
     let mut answer = crate::answer::Answer::default();
     let mut steering_open = crate::delivery::supported(&init);
+    let steering_guard = crate::delivery::SteeringGuard::open(
+        &state,
+        &conversation,
+        &agent_id,
+        &message_id,
+        &sid,
+        steering_open,
+    );
     let mut pending_input: Option<PendingInput> = None;
     let mut terminal: Option<Value> = None;
     let mut intake = tokio::time::interval(Duration::from_millis(50));
@@ -910,16 +918,17 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                     if pending_input.as_ref().is_some_and(|p| !p.attention && tokio::time::Instant::now() >= p.acknowledge_by) {
                         let pending = pending_input.take().unwrap();
                         crate::delivery::set(&state,&pending.input.id,"unknown")?;
-                        steering_open=false;
+                        steering_open=false;steering_guard.close();
                         continue;
                     }
                     if steering_open && pending_input.is_none() && terminal.is_none() {
-                        let next={let db=state.db.lock().unwrap();crate::delivery::next(&db,&conversation,Some(&agent_id))?};
+                        let next={let db=state.db.lock().unwrap();crate::delivery::next_steering(&db,&conversation,&agent_id,&message_id,&sid)?};
                         if let Some(input)=next {
                             crate::delivery::check_owner(&state,&input)?;
-                            if !crate::delivery::authorized(&state,&input.message_id,&input.actor)? {crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;continue;}
+                            if !crate::delivery::authorized(&state,&input.message_id,&input.actor)? {crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;steering_guard.close();continue;}
                             let prepared=steering_params(&state,&input,&sid,&init);
-                            let mut params=match prepared {Ok(params)=>params,Err(_)=>{crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;continue;}};
+                            let mut params=match prepared {Ok(params)=>params,Err(_)=>{crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;steering_guard.close();continue;}};
+                            if !crate::companion::room_identity_valid(&state,&input.room)? {crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;steering_guard.close();continue;}
                             let attention=input.participation=="ambient"&&crate::attention::supported(&init);
                             crate::delivery::bind(&state,&input.id,&message_id,&sid,&endpoint,"steering",if attention{"offering"}else{"submitted"})?;
                             let id = if attention {
@@ -946,8 +955,8 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                     c.peer.write(reply).await?;continue;
                 },
                 v=c.peer.read()=>v?,
-                _=cancel_signal(&mut cancel_rx)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; return Err(TurnFailure::new("cancelled", "turn").into());},
-                _=tokio::time::sleep_until(deadline)=>{pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; return Err(TurnFailure::new("timeout", "turn").into());},
+                _=cancel_signal(&mut cancel_rx)=>{steering_guard.close();pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; return Err(TurnFailure::new("cancelled", "turn").into());},
+                _=tokio::time::sleep_until(deadline)=>{steering_guard.close();pending_callbacks.abort_all();callbacks.stop();c.peer.cancel(request_id,&sid).await; return Err(TurnFailure::new("timeout", "turn").into());},
             }
         };
         if v.get("method").is_none() && pending_input.as_ref().is_some_and(|p| v["id"] == p.id) {
@@ -1014,6 +1023,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                     },
                 )?;
                 steering_open = false;
+                steering_guard.close();
             } else if v["error"]["code"] == -32601
                 && v.get("result").is_none()
                 && pending.params["_meta"]
@@ -1022,9 +1032,11 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
             {
                 crate::delivery::set(&state, &pending.input.id, "promptRequired")?;
                 steering_open = false;
+                steering_guard.close();
             } else {
                 crate::delivery::set(&state, &pending.input.id, "unknown")?;
                 steering_open = false;
+                steering_guard.close();
                 if result["outcome"] == "startedNewTurn" {
                     bail!(
                         "The agent started detached work despite promptRequired; inspect delivery before continuing"
@@ -1034,6 +1046,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
             continue;
         }
         if v.get("method").is_none() && v["id"] == request_id {
+            steering_guard.close();
             if pending_input.is_some() {
                 terminal = Some(v);
                 continue;

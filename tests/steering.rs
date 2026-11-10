@@ -840,3 +840,38 @@ async fn a_revoked_source_credential_cannot_start_queued_work() {
     );
     assert!(!f.frames().iter().any(|v| v["method"] == "session/cancel"));
 }
+
+#[tokio::test]
+async fn received_only_steering_is_unknown_after_terminal_and_is_never_replayed() {
+    let f = Fixture::new("received-only", false, false);
+    let first = f.send("Read the original source.").await;
+    f.frames_at_least("session/prompt", 1).await;
+    let second = f
+        .send("Only tell me whether it was recorded; do not resend it.")
+        .await;
+    f.frames_at_least("_session/steering", 1).await;
+    f.release();
+    f.idle().await;
+    let deliveries = f.deliveries();
+    assert_eq!(
+        deliveries
+            .iter()
+            .find(|d| d["message_id"] == first)
+            .unwrap()["state"],
+        "completed"
+    );
+    assert_eq!(
+        deliveries
+            .iter()
+            .find(|d| d["message_id"] == second)
+            .unwrap()["state"],
+        "unknown"
+    );
+    assert_eq!(
+        f.frames()
+            .iter()
+            .filter(|v| v["method"] == "session/prompt")
+            .count(),
+        1
+    );
+}

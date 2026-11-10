@@ -21,6 +21,8 @@ use std::{
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
+#[path = "companion/catalog_prompt.rs"]
+mod catalog_prompt;
 struct Fixture {
     home: TempDir,
     s: Arc<AppState>,
@@ -3744,4 +3746,451 @@ async fn tools_disabled_browser_floor_defers_saved_result_until_fresh_open_witho
         0
     );
     end(&f, id).await;
+}
+
+fn companion_steering_peer(f: &Fixture, mode: &str) {
+    let db = f.s.db.lock().unwrap();
+    let mut config: Value = serde_json::from_str(
+        &db.query_row(
+            "SELECT config FROM agent_endpoints WHERE id='default'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    config["args"] = json!([format!(
+        "{}/tests/steering_agent.py",
+        env!("CARGO_MANIFEST_DIR")
+    )]);
+    config["env"]["STEERING_MODE"] = json!(mode);
+    config["env"]["STEERING_RELEASE"] = json!(f.home.path().join("steering-release"));
+    db.execute(
+        "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+        [config.to_string()],
+    )
+    .unwrap();
+}
+fn companion_acp_frames(f: &Fixture) -> Vec<Value> {
+    std::fs::read_to_string(f.home.path().join("acp.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|v| serde_json::from_str(v).ok())
+        .collect()
+}
+async fn companion_frame(f: &Fixture, method: &str, count: usize) {
+    for _ in 0..500 {
+        if companion_acp_frames(f)
+            .iter()
+            .filter(|v| v["method"] == method)
+            .count()
+            >= count
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("Missing {method}: {:?}", companion_acp_frames(f));
+}
+fn fresh_voice_fixture(f: &Fixture, call: &Value, delegation: &str, offset: i64) -> i64 {
+    let created = now_ms();
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,?2,?3,'waiting_transcript',?4,?5)",rusqlite::params![call["id"].as_str().unwrap(),delegation,offset,uuid::Uuid::new_v4().to_string(),created]).unwrap();
+    created
+}
+
+#[tokio::test]
+async fn observed_continuation_uses_actual_active_steering_before_grace_and_links_one_answer() {
+    let f = fixture("quiet");
+    companion_steering_peer(&f, "native");
+    let (_, call) = start(&f).await;
+    speech_fixture(
+        &f,
+        &call,
+        "opening",
+        "user",
+        100,
+        "Was the greeting recorded in this world?",
+    );
+    pending_voice_fixture(&f, &call, "opening-request", 200);
+    companion_frame(&f, "session/prompt", 1).await;
+    speech_fixture(
+        &f,
+        &call,
+        "constraint",
+        "user",
+        500,
+        " Just tell me whether it was posted; don't send it again.",
+    );
+    let created = fresh_voice_fixture(&f, &call, "constraint-request", 700);
+    companion_frame(&f, "_session/steering", 1).await;
+    assert!(
+        now_ms() < created + 2000,
+        "Observed continuation waited past its active steering window"
+    );
+    let frames = companion_acp_frames(&f);
+    let steering = frames
+        .iter()
+        .find(|v| v["method"] == "_session/steering")
+        .unwrap();
+    assert!(
+        steering["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("don't send it again")
+    );
+    std::fs::write(f.home.path().join("steering-release"), b"1").unwrap();
+    wait_delegation(&f, &call, "opening-request", "completed").await;
+    wait_delegation(&f, &call, "constraint-request", "completed").await;
+    let id = call["id"].as_str().unwrap();
+    {
+        let db = f.s.db.lock().unwrap();
+        let targets: i64 = db.query_row("SELECT COUNT(DISTINCT d.target_turn) FROM input_deliveries d JOIN companion_delegations c ON c.message_id=d.message_id WHERE c.call_id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(targets, 1);
+        let cards: i64 = db.query_row("SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='card' AND event_key LIKE 'result:%'", [id], |r| r.get(0)).unwrap();
+        assert_eq!(cards, 1);
+        let source: String = db
+            .query_row(
+                "SELECT source FROM companion_delegations WHERE call_id=?1 AND id='constraint-request'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let source: Value = serde_json::from_str(&source).unwrap();
+        assert_eq!(source["offset_ms"], 700);
+        assert_eq!(source["fragments"].as_array().unwrap().len(), 1);
+    }
+    assert_eq!(
+        companion_acp_frames(&f)
+            .iter()
+            .filter(|v| v["method"] == "session/prompt")
+            .count(),
+        1
+    );
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn continuation_prompt_required_waits_original_deadline_before_plain_fallback() {
+    let f = fixture("quiet");
+    companion_steering_peer(&f, "idle");
+    let (_, call) = start(&f).await;
+    speech_fixture(
+        &f,
+        &call,
+        "initial",
+        "user",
+        100,
+        "Read the existing result.",
+    );
+    pending_voice_fixture(&f, &call, "initial-request", 200);
+    companion_frame(&f, "session/prompt", 1).await;
+    speech_fixture(
+        &f,
+        &call,
+        "next",
+        "user",
+        500,
+        "And separately tell me your current position.",
+    );
+    let created = fresh_voice_fixture(&f, &call, "next-request", 700);
+    companion_frame(&f, "_session/steering", 1).await;
+    assert!(
+        now_ms() < created + 2000,
+        "Continuation did not use the active window"
+    );
+    companion_frame(&f, "session/prompt", 2).await;
+    let (not_before, target_started, mode): (i64, i64, String) = f.s.db.lock().unwrap().query_row(
+        "SELECT i.ordinary_not_before,m.created_at,i.mode FROM companion_delegations d JOIN input_deliveries i ON i.message_id=d.message_id JOIN messages m ON m.id=i.target_turn WHERE d.call_id=?1 AND d.id='next-request'",
+        [call["id"].as_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(not_before, created + 2000);
+    assert!(
+        target_started >= not_before,
+        "Fallback bypassed the original transcript deadline"
+    );
+    assert_eq!(mode, "prompt");
+    std::fs::write(f.home.path().join("steering-release"), b"1").unwrap();
+    wait_delegation(&f, &call, "next-request", "completed").await;
+    let frames = companion_acp_frames(&f);
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|v| v["method"] == "_session/steering")
+            .count(),
+        1
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|v| v["method"] == "session/prompt")
+            .count(),
+        2
+    );
+    let prompts: Vec<_> = frames
+        .iter()
+        .filter(|v| v["method"] == "session/prompt")
+        .collect();
+    assert_eq!(
+        prompts[0]["params"]["sessionId"],
+        prompts[1]["params"]["sessionId"]
+    );
+    assert!(
+        prompts[1]["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("separately tell me your current position")
+    );
+    end(&f, call["id"].as_str().unwrap()).await;
+}
+
+#[tokio::test]
+async fn unsupported_active_peer_keeps_transcript_grace_and_never_receives_steering() {
+    let f = fixture("quiet");
+    companion_steering_peer(&f, "generic");
+    let (_, call) = start(&f).await;
+    speech_fixture(&f, &call, "first", "user", 100, "Read the saved result.");
+    pending_voice_fixture(&f, &call, "first-request", 200);
+    companion_frame(&f, "session/prompt", 1).await;
+    speech_fixture(
+        &f,
+        &call,
+        "second",
+        "user",
+        500,
+        "Clarify the same record without resending it.",
+    );
+    let created = fresh_voice_fixture(&f, &call, "second-request", 700);
+    std::fs::write(f.home.path().join("steering-release"), b"1").unwrap();
+    companion_frame(&f, "session/prompt", 2).await;
+    wait_delegation(&f, &call, "second-request", "completed").await;
+    let admitted: i64 = f.s.db.lock().unwrap().query_row("SELECT m.created_at FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='second-request'", [call["id"].as_str().unwrap()], |r| r.get(0)).unwrap();
+    assert!(admitted >= created + 2000);
+    assert!(
+        !companion_acp_frames(&f)
+            .iter()
+            .any(|v| v["method"] == "_session/steering")
+    );
+    end(&f, call["id"].as_str().unwrap()).await;
+}
+
+#[tokio::test]
+async fn observed_continuation_received_only_remains_unknown_with_source_retained() {
+    let f = fixture("quiet");
+    companion_steering_peer(&f, "received-only");
+    let (_, call) = start(&f).await;
+    speech_fixture(&f, &call, "first", "user", 100, "Read the existing result.");
+    pending_voice_fixture(&f, &call, "first-request", 200);
+    companion_frame(&f, "session/prompt", 1).await;
+    speech_fixture(
+        &f,
+        &call,
+        "refinement",
+        "user",
+        500,
+        " Do not send it again; just clarify whether it was received.",
+    );
+    fresh_voice_fixture(&f, &call, "refinement-request", 700);
+    companion_frame(&f, "_session/steering", 1).await;
+    std::fs::write(f.home.path().join("steering-release"), b"1").unwrap();
+    wait_delegation(&f, &call, "first-request", "completed").await;
+    wait_delegation(&f, &call, "refinement-request", "unknown").await;
+    let (source, delivery): (String, String) = f.s.db.lock().unwrap().query_row("SELECT d.source,i.state FROM companion_delegations d JOIN input_deliveries i ON i.message_id=d.message_id WHERE d.call_id=?1 AND d.id='refinement-request'", [call["id"].as_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert!(source.contains("Do not send it again"));
+    assert_eq!(delivery, "unknown");
+    assert_eq!(
+        companion_acp_frames(&f)
+            .iter()
+            .filter(|v| v["method"] == "session/prompt")
+            .count(),
+        1
+    );
+    end(&f, call["id"].as_str().unwrap()).await;
+}
+
+#[tokio::test]
+async fn active_steering_never_admits_an_empty_or_assistant_only_source_before_grace() {
+    let f = fixture("quiet");
+    companion_steering_peer(&f, "native");
+    let (_, call) = start(&f).await;
+    speech_fixture(&f, &call, "opening", "user", 100, "Read the saved result.");
+    pending_voice_fixture(&f, &call, "opening-request", 200);
+    companion_frame(&f, "session/prompt", 1).await;
+    speech_fixture(
+        &f,
+        &call,
+        "backchannel",
+        "assistant",
+        500,
+        "Let me check that.",
+    );
+    let created = fresh_voice_fixture(&f, &call, "empty-request", 700);
+    wait_delegation(&f, &call, "empty-request", "held").await;
+    let at: i64 = f.s.db.lock().unwrap().query_row("SELECT at FROM companion_events WHERE call_id=?1 AND kind='delegation' AND json_extract(data,'$.id')='empty-request' AND json_extract(data,'$.state')='held'", [call["id"].as_str().unwrap()], |r|r.get(0)).unwrap();
+    assert!(at >= created + 2000);
+    assert!(
+        !companion_acp_frames(&f)
+            .iter()
+            .any(|v| v["method"] == "_session/steering")
+    );
+    std::fs::write(f.home.path().join("steering-release"), b"1").unwrap();
+    wait_delegation(&f, &call, "opening-request", "completed").await;
+    end(&f, call["id"].as_str().unwrap()).await;
+}
+
+async fn cancelling_prompt_has_no_early_continuation_window(timeout: bool) {
+    let f = fixture("quiet");
+    companion_steering_peer(&f, "held-cancel");
+    let (_, call) = start(&f).await;
+    speech_fixture(&f, &call, "initial", "user", 100, "Read the saved result.");
+    pending_voice_fixture(&f, &call, "initial-request", 200);
+    companion_frame(&f, "session/prompt", 1).await;
+    if timeout {
+        // Exercise the active-prompt deadline only after real ACP setup. A
+        // one-second wall timeout could expire during slow CI initialization
+        // and never reach the cancellation window this regression checks.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::resume();
+    } else {
+        assert_eq!(
+            request(
+                &f,
+                "POST",
+                &format!(
+                    "/api/v1/conversations/{}/cancel",
+                    call["conversation_id"].as_str().unwrap()
+                ),
+                Some(json!({}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    companion_frame(&f, "session/cancel", 1).await;
+    // The peer is now holding cancellation acknowledgment. An in-flight
+    // cancellation must not advertise a still-usable steering window.
+    speech_fixture(
+        &f,
+        &call,
+        "new-human",
+        "user",
+        500,
+        "A distinct new question; do not repeat the old request.",
+    );
+    let created = fresh_voice_fixture(&f, &call, "new-request", 700);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        now_ms() < created + 2000,
+        "Test must inspect the original grace interval"
+    );
+    let (state, inputs): (String,i64) = f.s.db.lock().unwrap().query_row("SELECT d.state,(SELECT COUNT(*) FROM input_deliveries i WHERE i.message_id=d.message_id) FROM companion_delegations d WHERE d.call_id=?1 AND d.id='new-request'", [call["id"].as_str().unwrap()], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    // Release even on the failing baseline so the private peer cannot linger.
+    std::fs::write(f.home.path().join("cancel-release"), b"1").unwrap();
+    assert_eq!(
+        state, "waiting_transcript",
+        "Cancelling prompt leaked an early window"
+    );
+    assert_eq!(inputs, 0);
+    assert!(
+        !companion_acp_frames(&f)
+            .iter()
+            .any(|v| v["method"] == "_session/steering")
+    );
+    wait_delegation(&f, &call, "initial-request", "unknown").await;
+    end(&f, call["id"].as_str().unwrap()).await;
+}
+#[tokio::test]
+async fn cancel_ack_wait_closes_active_continuation_window_immediately() {
+    cancelling_prompt_has_no_early_continuation_window(false).await;
+}
+#[tokio::test]
+async fn timeout_cancel_ack_wait_closes_active_continuation_window_immediately() {
+    cancelling_prompt_has_no_early_continuation_window(true).await;
+}
+
+async fn queued_continuation_rechecks_private_identity(endpoint_changed: bool) {
+    let f = fixture("quiet");
+    companion_steering_peer(&f, "held-steer");
+    let (_, call) = start(&f).await;
+    speech_fixture(&f, &call, "first", "user", 100, "Read the saved result.");
+    pending_voice_fixture(&f, &call, "first-request", 200);
+    companion_frame(&f, "session/prompt", 1).await;
+    speech_fixture(
+        &f,
+        &call,
+        "first-followup",
+        "user",
+        500,
+        "Keep the earlier source timestamp.",
+    );
+    fresh_voice_fixture(&f, &call, "first-followup-request", 700);
+    companion_frame(&f, "_session/steering", 1).await;
+    speech_fixture(
+        &f,
+        &call,
+        "second-followup",
+        "user",
+        900,
+        "A distinct private question that must not reach a changed participant.",
+    );
+    fresh_voice_fixture(&f, &call, "second-followup-request", 1100);
+    let id = call["id"].as_str().unwrap();
+    let room = call["conversation_id"].as_str().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let queued: bool = f.s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM companion_delegations d JOIN input_deliveries i ON i.message_id=d.message_id WHERE d.call_id=?1 AND d.id='second-followup-request' AND i.state='received')", [id], |r|r.get(0)).unwrap();
+        if queued {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Second source did not reach durable intake"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    {
+        let db = f.s.db.lock().unwrap();
+        if endpoint_changed {
+            db.execute("UPDATE agent_endpoints SET config=json_set(config,'$.label','Changed participant endpoint') WHERE id='default'", []).unwrap();
+        } else {
+            db.execute("INSERT INTO room_members(conversation_id,username,role,joined_at) VALUES(?1,'other','member',?2)", rusqlite::params![room,now_ms()]).unwrap();
+        }
+    }
+    std::fs::write(f.home.path().join("steering-ack-release"), b"1").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let delivery = loop {
+        let delivery: String = f.s.db.lock().unwrap().query_row("SELECT i.state FROM companion_delegations d JOIN input_deliveries i ON i.message_id=d.message_id WHERE d.call_id=?1 AND d.id='second-followup-request'", [id], |r|r.get(0)).unwrap();
+        if delivery != "received" {
+            break delivery;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Identity rejection did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    // Release the first prompt even if the failing baseline forwarded source.
+    std::fs::write(f.home.path().join("steering-release"), b"1").unwrap();
+    assert_eq!(
+        delivery, "notAccepted",
+        "Queued private source crossed a changed identity"
+    );
+    assert_eq!(
+        companion_acp_frames(&f)
+            .iter()
+            .filter(|v| v["method"] == "_session/steering")
+            .count(),
+        1
+    );
+    let source: String = f.s.db.lock().unwrap().query_row("SELECT source FROM companion_delegations WHERE call_id=?1 AND id='second-followup-request'", [id], |r|r.get(0)).unwrap();
+    assert!(source.contains("distinct private question"));
+    end(&f, id).await;
+}
+#[tokio::test]
+async fn queued_continuation_rechecks_endpoint_before_active_steering() {
+    queued_continuation_rechecks_private_identity(true).await;
+}
+#[tokio::test]
+async fn queued_continuation_rechecks_private_membership_before_active_steering() {
+    queued_continuation_rechecks_private_identity(false).await;
 }

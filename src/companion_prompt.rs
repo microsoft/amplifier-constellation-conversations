@@ -2,6 +2,10 @@
 //! authority. See OpenAI's GPT-Live prompting and delegation guides.
 use serde_json::Value;
 
+/// The native agent's answer is also a saved Companion result. Keep it focused
+/// on the conversation rather than asking Live or a second model to rewrite it.
+pub(crate) const DELEGATED_RESPONSE: &str = "You are the same agent speaking with the caller. This is an ongoing conversation, not a message to another assistant. Resolve the caller's latest question using current facts, retain independent unanswered questions, and treat corrections as refinements of existing work. Return concise useful facts, actual blockers and next steps. Do not narrate dispatch or receipts as an answer.";
+
 pub(crate) fn live(label: &str, facts: &Value, tools: bool) -> String {
     let end_call = if facts["native_call_control"] == true {
         "When the caller explicitly ends this call, stop adding conversation and request the end-call capability. Do not merely promise it has ended. Use a natural farewell, but do not say the connection is closed before confirmation. If a phrase could mean ending a work step rather than the call, ask one brief clarification. The call's independent native control can close the connection even while other work is blocked."

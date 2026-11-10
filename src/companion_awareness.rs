@@ -1027,7 +1027,16 @@ pub(crate) fn status_sources(s: &AppState, id: &str) -> Result<Vec<Value>> {
         .into_iter()
         .flatten()
         .filter(|source| source.owners.contains(&owner))
-        .map(|source| json!({"id":source.id,"label":source.label,"read_only":true}))
+        .map(|source| {
+            json!({
+                "id":source.id,"connection_id":source.id,"label":source.label,"read_only":true,
+                "reads":{
+                    "saved":{"tool":"companion_observations","arguments":{"connection_id":source.id}},
+                    "current":{"tool":"companion_connection_status","arguments":{"connection_id":source.id,"view":"current"}},
+                    "reports":{"tool":"companion_connection_status","arguments":{"connection_id":source.id,"view":"reports"}}
+                }
+            })
+        })
         .collect())
 }
 
