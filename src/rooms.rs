@@ -128,11 +128,16 @@ impl AppState {
     pub fn room_agents(&self, room: &str) -> anyhow::Result<Vec<Value>> {
         let db = self.db.lock().unwrap();
         let mut q=db.prepare("SELECT e.id,e.config FROM room_agents r JOIN agent_endpoints e ON e.id=r.agent_id WHERE r.conversation_id=?1 ORDER BY e.id")?;
-        Ok(q.query_map([room], |r| {
-            let c: Value = serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default();
-            Ok(json!({"id":r.get::<_,String>(0)?,"label":c["label"]}))
-        })?
-        .collect::<rusqlite::Result<_>>()?)
+        let mut items: Vec<Value> = q
+            .query_map([room], |r| {
+                let c: Value = serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default();
+                Ok(json!({"id":r.get::<_,String>(0)?,"label":c["label"]}))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(q);
+        drop(db);
+        items.extend(crate::huddles::participants(self, room)?);
+        Ok(items)
     }
     pub fn owner_context(&self, room: &str) -> anyhow::Result<bool> {
         let c = self.conversation_info(room)?;
@@ -404,6 +409,11 @@ pub async fn attach_agent(
     let p = auth::check(&s, &h, "chat", true)?;
     s.require_owner(&id, &p)?;
     native(&s, &id)?;
+    if crate::huddles::is_huddle(&s, &id)? {
+        return Err(ApiError::bad(
+            "Enroll the existing external participant for this huddle; do not start a second ACP session",
+        ));
+    }
     if !a.share_history {
         return Err(ApiError::bad(
             "Confirm share_history:true to let this agent read the room's existing messages and files",
@@ -441,6 +451,11 @@ pub async fn detach_agent(
     let p = auth::check(&s, &h, "chat", true)?;
     s.require_owner(&id, &p)?;
     native(&s, &id)?;
+    if crate::huddles::is_huddle(&s, &id)? {
+        return Err(ApiError::bad(
+            "Revoke this huddle participant through its participant control",
+        ));
+    }
     let running = s.running.lock().unwrap();
     if running.contains_key(&id) {
         return Err(ApiError::busy());
