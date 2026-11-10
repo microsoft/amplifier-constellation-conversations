@@ -1717,7 +1717,23 @@ async fn closed_call_mcp_proxy_forwards_only_saved_receipt_operations() {
     };
     let read = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"companion_surface_status","arguments":{}}});
     assert_eq!(mcp(read.clone(), c.token.clone()).await, StatusCode::OK);
-    assert_eq!(mcp(read, foreign.token).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        mcp(read, foreign.token.clone()).await,
+        StatusCode::FORBIDDEN
+    );
+    let huddle = uuid::Uuid::new_v4().to_string();
+    let operation = uuid::Uuid::new_v4().to_string();
+    for args in [
+        json!({"installation_id":"coach-game","request_id":operation,"operation":"ensure"}),
+        json!({"installation_id":"coach-game","request_id":operation,"operation":"post","huddle_id":huddle}),
+    ] {
+        let receipt = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"companion_huddle_status","arguments":args}});
+        assert_eq!(mcp(receipt.clone(), c.token.clone()).await, StatusCode::OK);
+        assert_eq!(
+            mcp(receipt, foreign.token.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+    }
     for (tool, args) in [
         (
             "companion_hangup",
@@ -1731,10 +1747,47 @@ async fn closed_call_mcp_proxy_forwards_only_saved_receipt_operations() {
             "companion_surface_status",
             json!({"artifact_id":uuid::Uuid::new_v4().to_string()}),
         ),
+        ("companion_huddles", json!({})),
+        (
+            "companion_huddle_read",
+            json!({"installation_id":"coach-game","huddle_id":huddle}),
+        ),
+        (
+            "companion_huddle_ensure",
+            json!({"installation_id":"coach-game","request_id":operation,"delegation_id":"d","title":"Team check","purpose":"Discuss the original request","peer_installation_ids":[]}),
+        ),
+        (
+            "companion_huddle_post",
+            json!({"installation_id":"coach-game","huddle_id":huddle,"request_id":operation,"delegation_id":"d","text":"A new report","kind":"message"}),
+        ),
+        (
+            "companion_huddle_status",
+            json!({"installation_id":"coach-game","request_id":operation,"operation":"post"}),
+        ),
+        (
+            "companion_huddle_status",
+            json!({"installation_id":"coach-game","request_id":operation,"operation":"ensure","huddle_id":huddle}),
+        ),
+        (
+            "companion_huddle_status",
+            json!({"installation_id":"coach-game","request_id":operation,"operation":"ensure","source":"invented"}),
+        ),
+        (
+            "companion_huddle_status",
+            json!({"installation_id":"coach-game","request_id":"not-a-uuid","operation":"ensure"}),
+        ),
+        (
+            "companion_huddle_status",
+            json!({"installation_id":"other/path","request_id":operation,"operation":"ensure"}),
+        ),
+        (
+            "companion_huddle_status",
+            json!({"installation_id":"coach-game","request_id":operation,"operation":"ensure-again"}),
+        ),
     ] {
         assert_eq!(mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}),c.token.clone()).await,StatusCode::FORBIDDEN);
     }
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     transport.abort();
 }
 
