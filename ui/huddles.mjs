@@ -76,7 +76,12 @@ export function createHuddles({root, list, read, setFollowing, send, findSubmiss
       if (!Array.isArray(result?.items) || result.items.some(item => typeof item?.id !== 'string')) throw new Error('invalid view');
       summaries = result.items; renderDirectory(); status.textContent = '';
       if(selected&&!summaries.some(item=>item.id===selected)){close();status.textContent='That huddle is no longer available.';return;}
+      if(selected&&room){
+        const summary=summaries.find(item=>item.id===selected);
+        room={...room,...summary,messages:room.messages,before:room.before,submission:room.submission};
+      }
       if (selected && (!automatic || room?.following === true)) await load(selected,cursor);
+      else if(selected&&room)renderRoom();
     } catch (error) {
       if (!valid(token) || sequence !== listRequest) return;
       if (denied(error)) { revoke(); return; }

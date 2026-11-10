@@ -816,7 +816,7 @@ function addCard(call, title, text, conversationId, data = {}) {
   if (!current(call)) return;
   const card = element('article', 'output-card');
   if (data.card_id) card.dataset.cardId = String(data.card_id);
-  const heading = element('h2', null, title); heading.append(savedCardTime(data.event_at));
+  const heading = element('h2', null, title); heading.append(savedCardTime(data.huddle_id ? data.attribution?.occurred_at : data.event_at));
   card.append(heading);
   if (typeof data.huddle_id === 'string' && data.huddle_id && data.source?.huddle_id === data.huddle_id) {
     const attribution=data.attribution||{};

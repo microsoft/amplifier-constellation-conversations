@@ -73,6 +73,45 @@ can appear inline; remote HTTP(S) media previews require a click. An ordinary
 page or repository link remains a link, and a displayed video does not prove it
 was played or watched. Answer text is never executed as HTML or JavaScript.
 
+### Work huddles
+
+An installation can link an enrolled coordination room to an actual saved human
+request. **Work huddles** then appears in that conversation or call. **Inspect**
+opens its attributed discussion inside Companion without ending the call or
+replacing anything on the whiteboard. **Join discussion** opens a message box;
+only **Send message** posts, using the signed-in person's existing room access.
+It neither grants game authority nor creates another agent session.
+
+Huddles start quiet. **Refresh discussion** reads a new page on request;
+**Follow details** also refreshes the inspected discussion during ordinary UI
+updates. Following affects this person's presentation, not membership, work
+authority, or whether a voice update is spoken. Closing the panel or returning
+to quiet keeps accepted work intact. The full conversation's **Stop huddle**
+control is a separate action. Stopped history and uncertain-message status remain
+inspectable. Huddle messages support links to evidence, not file attachments.
+
+Routine peer messages stay in the huddle. Authored outcome posts can return to
+the original request as attributed reports, preserving their evidence and time.
+Private Companion returns revalidate the original caller, request, source and
+agent endpoint. They use existing call cards and the conversational floor, with
+no automatic replay of a dispatched or uncertain voice update. A long report
+stays complete in saved history; the voice context points to it rather than
+clipping an assertion away from its qualification. A saved or spoken report is
+not independent proof of its claims or proof that the caller heard it.
+
+An uncertain human send retains its exact source ID in an existing server-side
+view. **Check message status** reads for a matching saved message; it does not
+resend. Browser storage keeps only that view's opaque ID. If the call's existing
+history capacity prevents a return card, the canonical huddle result remains
+saved with an explicit blocked presentation receipt.
+
+This first slice requires installation-owned room and participant enrollment.
+It does not automatically create huddles, invite agents, wake idle agents, or
+schedule recurring coordination. Owners keep participant credentials in their
+self-contained installations; callers are not asked to manage those credentials.
+
+### Voice preferences
+
 Choose **Voice** on a contact, or **Voice settings · next call** during a call.
 Preferences are saved for the signed-in person and selected agent. A change takes
 effect on their next call; it does not change the current voice, ACP identity,
