@@ -1033,6 +1033,7 @@ try {
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','late close fixture did not connect');
   const lateCloseCall=[...calls.values()].at(-1);holdNextClose=true;
   await page.locator('#hangup').click();await wait(async()=>heldClose!==null,'late close was not held');
+  assert.equal(await page.locator('#ended-title').innerText(),'Ending call…','a local hangup is not terminal provider confirmation');
   let deliverOldCatalog;
   await page.route('**/api/v1/companion',async route=>{
     const response=await route.fetch();deliverOldCatalog=()=>route.fulfill({response});
@@ -1044,6 +1045,7 @@ try {
   const writesBeforeTerminal=requests.filter(r=>r.method!=='GET').length;
   lateCloseCall.state='closed';await page.locator('#check-call-status').click();
   await wait(async()=>await page.locator('#call-recovery').isHidden(),'known terminal call remained blocked behind pending close');
+  assert.equal(await page.locator('#ended-title').innerText(),'Call ended');
   assert(await page.getByRole('button',{name:'Call Coach',exact:true}).isEnabled());
   assert.equal(requests.filter(r=>r.method!=='GET').length,writesBeforeTerminal);
   assert(await page.evaluate(()=>fixture.peers.every(peer=>peer.closed)),'terminal observation must release any retained old transport');
@@ -1109,6 +1111,81 @@ try {
     await page.locator('#hangup').click();await wait(async()=>await page.locator('#call-recovery').isHidden(),'pending creation successor did not settle');
     checks.push(`late original creation ${lateOutcome} ${deliveryStage} preserves explicit recovery ownership and never restores a settled call`);
   }
+
+  events.length=0;
+  await page.locator('#back-to-contacts').click();await page.getByRole('button',{name:'Call Coach',exact:true}).click();
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','closing presentation fixture did not connect');
+  const closingCall=[...calls.values()].at(-1),closesBeforeClosing=requests.filter(r=>r.path.endsWith('/close')).length;
+  emit('call_control',{type:'call_control',action:'end_call',decision:'requested'});
+  emit('context_delivery',{state:'queued',event_id:'known-closing-context',content:'Closing fixture context.'});
+  await wait(async()=>await page.locator('.context-entry').count()===1,'initial closing context receipt missing');
+  assert.equal(await page.locator('#call-status-text').innerText(),'Connected','a decision alone does not acknowledge host closing');
+  checks.push('a voice close decision alone does not show closing or release media before host acknowledgement');
+
+  // A status snapshot may already say closing while its event batch includes
+  // an earlier error. Only the ordered host acknowledgement permits quieting.
+  closingCall.state='closing';closingCall.closeChecks=1000;
+  emit('provider',{type:'error',error:{code:'context_injection_incomplete',client_event_id:'known-closing-context'}});
+  emit('lifecycle',{type:'host_close_requested',source:'voice_control'});
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Ending call…','acknowledged closing fell back to Connecting');
+  assert.match(await page.locator('#notice-text').innerText(),/voice update could not be confirmed/);
+  await page.locator('#dismiss-notice').click();
+  emit('delegation',{id:'closing-pending',state:'waiting_transcript'});
+  emit('provider',{type:'error',error:{code:'context_injection_incomplete',client_event_id:'known-closing-context'}});
+  emit('context_delivery',{state:'provider_error',event_id:'known-closing-context',error:{code:'context_injection_incomplete'}});
+  await wait(async()=>/Voice receipt uncertain/.test(await page.locator('.context-entry').first().innerText()),'closing append failure lost its detailed receipt');
+  assert(await page.locator('#notice').isHidden());
+  assert.equal(await page.locator('#call-status-text').innerText(),'Ending call…');
+  assert.match(await page.locator('#work-status').innerText(),/This call is ending/);
+  assert.doesNotMatch(await page.locator('#work-status').innerText(),/keep talking/);
+  assert(await page.evaluate(()=>!fixture.peers.at(-1).closed&&!fixture.tracks.at(-1).stopped));
+  assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeClosing);
+  checks.push('only a known context append rejected after host close acknowledgement stays quiet; its uncertain Context receipt and media lifecycle remain intact, and earlier errors still warn');
+
+  for (const error of [
+    {code:'context_injection_incomplete',client_event_id:'unknown-closing-context'},
+    {code:'different_failure',client_event_id:'known-closing-context'},
+    {code:'context_injection_incomplete'},
+    // Reordered/previously failed delivery is not a known pending append.
+    {code:'context_injection_incomplete',client_event_id:'known-closing-context'},
+  ]) {
+    emit('provider',{type:'error',error});
+    await wait(async()=>await page.locator('#notice').isVisible(),'unrelated closing error was concealed');
+    await page.locator('#dismiss-notice').click();
+  }
+  emit('context_delivery',{state:'queued',event_id:'mismatched-closing-context',content:'A pending update with conflicting later correlation.'});
+  for (const client_event_id of ['other-context',null,'',17]) {
+    emit('provider',{type:'error',client_event_id:'mismatched-closing-context',error:{code:'context_injection_incomplete',client_event_id}});
+    await wait(async()=>await page.locator('#notice').isVisible(),'conflicting or malformed nested correlation was concealed');
+    await page.locator('#dismiss-notice').click();
+  }
+  emit('error',{message:'A separate connection failure remains visible.'});
+  emit('context_delivery',{state:'accepted',event_id:'second-closing-context',content:'Another accepted append.'});
+  emit('provider',{type:'error',client_event_id:'second-closing-context',error:{code:'context_injection_incomplete',client_event_id:'second-closing-context'}});
+  emit('context_delivery',{state:'provider_error',event_id:'second-closing-context'});
+  await wait(async()=>await page.locator('.context-entry').count()===4,'closing context audit did not remain available');
+  assert.equal(await page.locator('#notice-text').innerText(),'A separate connection failure remains visible.');
+  checks.push('unknown correlations, different provider errors, and independent failures remain visible during closing; expected append errors never clear an earlier warning');
+  await page.locator('#dismiss-notice').click();
+
+  pollFails=true;
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Checking call status…','unknown closing status was presented as confirmed');
+  assert.match(await page.locator('#call-detail').innerText(),/final call status is not confirmed/);
+  assert(await page.locator('#call-ended').isHidden());
+  pollFails=false;
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Ending call…','closing status did not recover');
+  await page.evaluate(()=>{const peer=fixture.peers.at(-1);peer.connectionState='failed';peer.dispatchEvent(new Event('connectionstatechange'));});
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Audio connection lost','actual audio failure was hidden by closing presentation');
+  await page.evaluate(()=>{const peer=fixture.peers.at(-1);peer.connectionState='connected';peer.dispatchEvent(new Event('connectionstatechange'));});
+  checks.push('closing status outages remain explicitly unconfirmed and actual audio failure stays visible without an automatic new call');
+
+  closingCall.state='closed';closingCall.closure={confirmed:true,provider_reason:'close_requested',reason:'Your microphone and camera are off. Accepted work can continue.'};
+  await page.locator('#call-ended:not([hidden])').waitFor();
+  assert.equal(await page.locator('#ended-title').innerText(),'Call ended');
+  assert.equal(await page.locator('#ended-detail').innerText(),closingCall.closure.reason);
+  assert(await page.evaluate(()=>fixture.tracks.every(t=>t.stopped)&&fixture.peers.every(p=>p.closed)));
+  assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeClosing);
+  checks.push('matching terminal closure shows Call ended and releases devices through the existing path without another close request');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:checks.length,checks,scope:'real Chromium UI; fake API, media, and provider; no paid calls'},null,2));
 } finally { await browser.close(); await new Promise(resolve=>server.close(resolve)); }
