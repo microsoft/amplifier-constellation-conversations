@@ -49,7 +49,8 @@ for line in sys.stdin:
     if os.environ.get("FIXTURE_FORM_PHASE") == method:
         assert ask_form({"requestId": value["id"]})["action"] == "accept"
     if method == "initialize":
-        write({"id": value["id"], "result": {"protocolVersion": 1, "authMethods": ([{"id":"browser","name":"Browser sign-in"},{"id":"terminal","type":"terminal","name":"Terminal"}] if os.environ.get("FIXTURE_AUTH") else []), "agentInfo": {"name": "Fixture individual", "version": "1"}, "agentCapabilities": {"loadSession": True, "mcpCapabilities": {"http": True}, "promptCapabilities": {"image": bool(os.environ.get("FIXTURE_IMAGES")), "embeddedContext": bool(os.environ.get("FIXTURE_EMBEDDED"))}}}})
+        restore = os.environ.get("FIXTURE_RESTORE", "load")
+        write({"id": value["id"], "result": {"protocolVersion": 1, "authMethods": ([{"id":"browser","name":"Browser sign-in"},{"id":"terminal","type":"terminal","name":"Terminal"}] if os.environ.get("FIXTURE_AUTH") else []), "agentInfo": {"name": "Fixture individual", "version": "1"}, "agentCapabilities": {"loadSession": restore in ("load", "both"), "sessionCapabilities": {"resume": {}} if restore in ("resume", "both") else {}, "mcpCapabilities": {"http": True}, "promptCapabilities": {"image": bool(os.environ.get("FIXTURE_IMAGES")), "embeddedContext": bool(os.environ.get("FIXTURE_EMBEDDED"))}}}})
     elif method == "authenticate":
         assert params["methodId"] == "browser"
         write({"id":"auth-url","method":"elicitation/create","params":{"requestId":value["id"],"mode":"url","elicitationId":"login-flow","url":"https://example.test/authorize","message":"Authorize the fixture agent."}})
@@ -58,13 +59,15 @@ for line in sys.stdin:
             with open(os.environ["FIXTURE_LOG"],"a") as stream:stream.write(json.dumps(reply)+"\n")
         authenticated=reply.get("result",{}).get("action")=="accept"
         write({"id":value["id"],"result":{}} if authenticated else {"id":value["id"],"error":{"code":-32000,"message":"not authenticated"}})
-    elif method in ("session/new", "session/load"):
+    elif method in ("session/new", "session/load", "session/resume"):
+        if method == "session/resume" and os.environ.get("FIXTURE_RESUME_ERROR"):
+            write({"id":value["id"],"error":{"code":int(os.environ["FIXTURE_RESUME_ERROR"]),"message":"Fixture restore refused"}});continue
         if os.environ.get("FIXTURE_AUTH") and not authenticated:
             write({"id":value["id"],"error":{"code":-32000,"message":"Sign-in required"}});continue
         sid=params.get("sessionId",str(uuid.uuid4()))
         if os.environ.get("FIXTURE_COMPANION_PERMISSIONS")=="known":
             companion_permission(sid,"setup","companion_connections")
-        setup = {"sessionId":sid}
+        setup = {} if method == "session/resume" else {"sessionId":sid}
         if os.environ.get("FIXTURE_MODEL_SETTINGS"):
             setup.update({"models":{"currentModelId":"fixture-local-model","availableModels":[{"modelId":"fixture-local-model","name":"Fixture local model"}]},
                 "configOptions":[{"id":"effort","name":"Thinking","category":"thought_level","type":"select","currentValue":"low","options":[{"value":"low","name":"Low"}]}]})

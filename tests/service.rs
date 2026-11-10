@@ -379,8 +379,18 @@ async fn view_state_supports_remote_control_and_conflict_detection() {
 }
 #[tokio::test]
 async fn actual_acp_session_resumes_preserves_mcp_and_exposes_permissions() {
+    for (mode, method) in [
+        ("resume", "session/resume"),
+        ("both", "session/resume"),
+        ("load", "session/load"),
+    ] {
+        assert_acp_restore(mode, method).await;
+    }
+}
+async fn assert_acp_restore(mode: &str, method: &str) {
     let f = fixture();
     let mut connection = serde_json::to_value(&f.state.config.agent).unwrap();
+    connection["env"]["FIXTURE_RESTORE"] = json!(mode);
     connection["session_cwd"] = json!("C:\\Remote Agent\\workspace");
     assert_eq!(
         request(
@@ -430,7 +440,29 @@ async fn actual_acp_session_resumes_preserves_mcp_and_exposes_permissions() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     let new = rows.iter().find(|r| r["method"] == "session/new").unwrap();
-    let load = rows.iter().find(|r| r["method"] == "session/load").unwrap();
+    let load = rows.iter().find(|r| r["method"] == method).unwrap();
+    assert_eq!(
+        rows.iter().filter(|r| r["method"] == "session/new").count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["method"] == "session/load" || r["method"] == "session/resume")
+            .count(),
+        1
+    );
+    let binding: String = f
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT session_id FROM room_agents WHERE conversation_id=?1 AND agent_id='default'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(load["params"]["sessionId"], binding);
     // The Python peer launched in its real local cwd while the remote path
     // crossed ACP unchanged on both creation and restore.
     assert_eq!(new["params"]["cwd"], "C:\\Remote Agent\\workspace");
@@ -462,6 +494,138 @@ async fn actual_acp_session_resumes_preserves_mcp_and_exposes_permissions() {
                 .unwrap()
         )
     );
+}
+#[tokio::test]
+async fn actual_acp_resume_refusal_keeps_binding_without_replaying_work() {
+    for code in [-32601, -32602, -32000] {
+        let f = fixture();
+        let mut connection = serde_json::to_value(&f.state.config.agent).unwrap();
+        connection["env"]["FIXTURE_RESTORE"] =
+            json!(if code == -32601 { "both" } else { "resume" });
+        connection["env"]["FIXTURE_RESUME_ERROR"] = json!(code.to_string());
+        assert_eq!(
+            request(
+                &f.app,
+                "POST",
+                "/api/v1/agents",
+                Some(&f.admin),
+                Some(json!({"id":"default","config":connection}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let c = f.state.create("Failed restore").unwrap();
+        let id = c["id"].as_str().unwrap();
+        let binding = || -> String {
+            f.state.db.lock().unwrap().query_row(
+            "SELECT session_id FROM room_agents WHERE conversation_id=?1 AND agent_id='default'",
+            [id], |r| r.get(0)).unwrap()
+        };
+        let mut prior = None;
+        for text in ["first retained input", "second input must not replay"] {
+            assert_eq!(
+                request(
+                    &f.app,
+                    "POST",
+                    &format!("/api/v1/conversations/{id}/messages"),
+                    Some(&f.admin),
+                    Some(json!({"text":text,"request_id":uuid::Uuid::new_v4()}))
+                )
+                .await
+                .0,
+                StatusCode::ACCEPTED
+            );
+            wait_idle(&f, id).await;
+            if let Some(saved) = &prior {
+                assert_eq!(&binding(), saved);
+            } else {
+                prior = Some(binding());
+            }
+        }
+        let conversation = f.state.conversation(id).unwrap().unwrap();
+        assert_eq!(conversation["status"], "error");
+        assert!(
+            conversation["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["text"] == "second input must not replay")
+        );
+        let frames = std::fs::read_to_string(f._home.path().join("frames.jsonl")).unwrap();
+        let rows: Vec<Value> = frames
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        for method in ["session/new", "session/resume", "session/prompt"] {
+            assert_eq!(
+                rows.iter().filter(|r| r["method"] == method).count(),
+                1,
+                "{code}: {method}"
+            );
+        }
+        assert!(!rows.iter().any(|r| r["method"] == "session/load"));
+    }
+}
+#[tokio::test]
+async fn actual_acp_without_restore_keeps_bounded_transcript_fallback() {
+    let f = fixture();
+    let mut connection = serde_json::to_value(&f.state.config.agent).unwrap();
+    connection["env"]["FIXTURE_RESTORE"] = json!("neither");
+    assert_eq!(
+        request(
+            &f.app,
+            "POST",
+            "/api/v1/agents",
+            Some(&f.admin),
+            Some(json!({"id":"default","config":connection}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let c = f.state.create("No restore capability").unwrap();
+    let id = c["id"].as_str().unwrap();
+    for text in ["first room marker", "second room marker"] {
+        assert_eq!(
+            request(
+                &f.app,
+                "POST",
+                &format!("/api/v1/conversations/{id}/messages"),
+                Some(&f.admin),
+                Some(json!({"text":text,"request_id":uuid::Uuid::new_v4()}))
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED
+        );
+        wait_idle(&f, id).await;
+    }
+    assert_eq!(f.state.conversation(id).unwrap().unwrap()["status"], "idle");
+    let frames = std::fs::read_to_string(f._home.path().join("frames.jsonl")).unwrap();
+    let rows: Vec<Value> = frames
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        rows.iter().filter(|r| r["method"] == "session/new").count(),
+        2
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r["method"] == "session/load" || r["method"] == "session/resume")
+    );
+    let prompts: Vec<_> = rows
+        .iter()
+        .filter(|r| r["method"] == "session/prompt")
+        .collect();
+    assert_ne!(
+        prompts[0]["params"]["sessionId"],
+        prompts[1]["params"]["sessionId"]
+    );
+    let second = prompts[1]["params"]["prompt"][0]["text"].as_str().unwrap();
+    assert!(second.contains("first room marker") && second.contains("second room marker"));
 }
 async fn wait_idle(f: &Fixture, id: &str) {
     for _ in 0..240 {
