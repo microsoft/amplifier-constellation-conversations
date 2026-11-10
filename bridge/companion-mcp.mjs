@@ -10,6 +10,27 @@ const REQUEST_LIMIT = 64 * 1024;
 const RESPONSE_LIMIT = 256 * 1024;
 const SURFACE_RESPONSE_LIMIT = 3 * 1024 * 1024;
 const DELEGATION = z.string().min(1).max(160);
+const HUDDLE_ID = z.string().min(1).max(200).regex(/^[A-Za-z0-9_.:-]+$/)
+  .describe('Exact installation or participant ID from this call’s authorized huddle discovery; never a display name or credential.');
+/** @param {number} max */
+const huddleText = max => z.string().min(1).refine(value=>value.trim().length>0&&!value.includes('\0')&&Buffer.byteLength(value)<=max);
+const HUDDLE_DELEGATION = DELEGATION.refine(value=>Buffer.byteLength(value)<=160&&!/[\u0000-\u001f\u007f-\u009f]/.test(value));
+const HUDDLE_TITLE = huddleText(480).refine(value=>[...value].length<=120);
+const HUDDLE_CURSOR = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const HUDDLE_OUTCOME = z.object({kind:z.enum(['progress','result','blocked','decision']),
+  evidence:z.array(z.object({label:huddleText(200),reference:huddleText(1000)}).strict()).max(8)}).strict()
+  .refine(value=>Buffer.byteLength(JSON.stringify(value))<=8000);
+/** @param {Record<string,string|number|undefined>} values */
+const huddleQuery = values => '?'+Object.entries(values).filter(([,value])=>value!==undefined)
+  .map(([key,value])=>`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`).join('&');
+/** @param {string} path @param {Record<string,unknown>|undefined} body */
+function huddleRecovery(path,body) {
+  if(typeof body?.installation_id!=='string'||typeof body?.request_id!=='string')return null;
+  const room=path.match(/^huddles\/([0-9a-f-]+)\/posts$/i)?.[1];
+  if(path!=='huddles/ensure'&&!room)return null;
+  return {tool:'companion_huddle_status',arguments:{installation_id:body.installation_id,
+    request_id:body.request_id,operation:room?'post':'ensure',...(room?{huddle_id:room}:{})}};
+}
 const READ_CONNECTION = z.string().min(1).refine(v=>Buffer.byteLength(v)<=120&&!/[\u0000-\u001f\u007f-\u009f]/.test(v))
   .describe('Exact Companion connection_id from this call\'s configured read catalog or companion_connections observation_sources. Instance provider_id and conversation_id are different identifiers.');
 const CARD_ID = z.union([z.string().regex(/^[1-9][0-9]{0,18}$/),z.string().regex(/^upload:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)]);
@@ -50,6 +71,8 @@ function buildServer(config,stopSignal) {
   const server = new McpServer({name:'companion',version:'0.1.0'});
   /** @param {string} path @param {string} method @param {Record<string,unknown>} [body] @returns {Promise<import('@modelcontextprotocol/sdk/types.js').CallToolResult>} */
   async function call(path,method='GET',body) {
+    const recovery=method==='POST'?huddleRecovery(path,body):null;
+    const huddleGuidance='No automatic retry was made. Check companion_huddle_status with the exact original operation, installation_id and request_id below (and huddle_id for a post). Do not use a new request ID or room to resolve uncertainty. A rejection does not prove an earlier request was never delivered.';
     try {
       // Never follow a redirect carrying the call credential; never retry effects.
       const response = await fetch(new URL(path,config.apiRoot),{
@@ -60,7 +83,7 @@ function buildServer(config,stopSignal) {
       if(!response.ok) {
         await response.body?.cancel();
         return {isError:true,...textResult({error:'companion_request_rejected',status:response.status,
-          ...(method==='POST'?{guidance:'Inspect the request receipt before trying again; rejection does not prove an earlier request was never delivered.'}:{})})};
+          ...(recovery?{guidance:huddleGuidance,recovery}:method==='POST'?{guidance:'Inspect the request receipt before trying again; rejection does not prove an earlier request was never delivered.'}:{})})};
       }
       if(!response.body)throw new Error('empty_companion_response');
       const value=await boundedJson(/** @type {AsyncIterable<Uint8Array>} */ (/** @type {unknown} */ (response.body)),path.startsWith('surface/')?SURFACE_RESPONSE_LIMIT:RESPONSE_LIMIT);
@@ -85,13 +108,43 @@ function buildServer(config,stopSignal) {
       return textResult(value);
     } catch {
       return {isError:true,...textResult({error:'companion_unavailable',
-        ...(method==='POST'?{outcome:'unknown',guidance:path==='actions'?'No automatic retry was made. Check companion_action_status with the same request_id before any further action.':['view','capture','hangup','feedback'].includes(path)?'No automatic retry was made. Check companion_surface_status with the original operation_id. Never request another capture to resolve uncertainty.':'No automatic retry was made. Inspect companion_shared before displaying this again.'}:{})})};
+        ...(method==='POST'?{outcome:'unknown',...(recovery?{guidance:huddleGuidance,recovery}:{guidance:path==='actions'?'No automatic retry was made. Check companion_action_status with the same request_id before any further action.':['view','capture','hangup','feedback'].includes(path)?'No automatic retry was made. Check companion_surface_status with the original operation_id. Never request another capture to resolve uncertainty.':'No automatic retry was made. Inspect companion_shared before displaying this again.'})}:{})})};
     }
   }
   server.registerTool('companion_connections',{
     description:'Discover this call’s installation-configured experience connections and exact read arguments when they are not already in the call context. Configuration alone does not prove current availability or authorize an action.',
     inputSchema:z.object({}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
   },()=>call('connections'));
+  server.registerTool('companion_huddles',{
+    description:'Discover eligible installed huddle connections for this caller and agent. With no arguments, return only authorized local installation choices. Select an exact installation_id to discover its eligible peers and bounded current memberships; after/limit require that ID. Enrollment is not online presence, accepted work or execution authority. A membership page is a current sweep, not a guarantee of future state. Credentials remain private to the host.',
+    inputSchema:z.object({installation_id:HUDDLE_ID.optional(),after:HUDDLE_CURSOR.optional(),limit:z.number().int().min(1).max(50).optional()}).strict()
+      .refine(value=>value.installation_id!==undefined||(value.after===undefined&&value.limit===undefined)),
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },args=>call(args.installation_id===undefined?'huddles':'huddles'+huddleQuery(args)));
+  server.registerTool('companion_huddle_ensure',{
+    description:'Create or reuse a quiet huddle for the caller’s actual current request using the exact delegation_id and discovered installation/peer IDs. The host derives the original source, actor and audience; do not supply them. Creator is included automatically. This does not start a second agent session or grant world/task authority. A created room does not prove peers accepted work. Preserve this request_id; after uncertainty inspect companion_huddle_status with operation ensure and the same installation_id/request_id, even if no room ID was returned. Never replace an uncertain request with a new ID or silently reopen stopped work.',
+    inputSchema:z.object({installation_id:HUDDLE_ID,request_id:UUID,delegation_id:HUDDLE_DELEGATION,title:HUDDLE_TITLE,purpose:huddleText(2000),
+      peer_installation_ids:z.array(HUDDLE_ID).max(7).refine(ids=>new Set(ids).size===ids.length)}).strict(),
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },args=>call('huddles/ensure','POST',args));
+  server.registerTool('companion_huddle_read',{
+    description:'Read one authorized huddle’s ordered messages through its exact installed identity, with original actors, source times and cursor coverage. Use returned IDs, not guessed names. Reading does not acknowledge, create work, join another session or narrate routine coordination. A missing or omitted report does not establish inactivity or completion.',
+    inputSchema:z.object({installation_id:HUDDLE_ID,huddle_id:UUID,after:HUDDLE_CURSOR.optional(),limit:z.number().int().min(1).max(100).optional()}).strict(),
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },({huddle_id,...query})=>call(`huddles/${huddle_id}/messages${huddleQuery(query)}`));
+  server.registerTool('companion_huddle_post',{
+    description:'Post attributed coordination through the current agent’s installed huddle identity and actual caller delegation. Routine kind message stays in the huddle. Use kind outcome with an explicit result/progress/blocked/decision and evidence only for a meaningful report; the host preserves the original request and returns it through the existing quiet card/background path. An outcome is your report, not independent verification, heard speech or task completion. Keep the original request_id and inspect companion_huddle_status after uncertainty; never resend with a new ID. No model-supplied actor, source, token or callback is accepted.',
+    inputSchema:z.object({installation_id:HUDDLE_ID,huddle_id:UUID,delegation_id:HUDDLE_DELEGATION,request_id:UUID,text:huddleText(6000),
+      target_agent_ids:z.array(HUDDLE_ID).max(8).refine(ids=>new Set(ids).size===ids.length),kind:z.enum(['message','outcome']),outcome:HUDDLE_OUTCOME.optional()}).strict()
+      .refine(value=>value.kind==='outcome'?value.outcome!==undefined:value.outcome===undefined),
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },({huddle_id,...body})=>call(`huddles/${huddle_id}/posts`,'POST',body));
+  server.registerTool('companion_huddle_status',{
+    description:'Read the exact durable ensure or post receipt using its original installation_id/request_id. Ensure status needs no room ID; post status requires its exact huddle_id. Missing or unknown remains unknown; do not create another room/post to test whether the first succeeded. Saved, peer incorporation, work completion and heard/read by a human are distinct.',
+    inputSchema:z.object({installation_id:HUDDLE_ID,request_id:UUID,operation:z.enum(['ensure','post']),huddle_id:UUID.optional()}).strict()
+      .refine(value=>value.operation==='post'?value.huddle_id!==undefined:value.huddle_id===undefined),
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },({installation_id,request_id,operation,huddle_id})=>call((operation==='ensure'?`huddles/ensure/${request_id}`:`huddles/${huddle_id}/posts/${request_id}`)+huddleQuery({installation_id})));
   server.registerTool('companion_observations',{
     description:'Read bounded saved reports for this caller and agent, with original actor, audience, source and timestamps. For a question about one connection, pass its exact connection_id from the current call catalog or companion_connections observation_sources; omit only for an all-source overview. An unknown or unauthorized ID never falls back to other sources. Use this for historical context; use companion_connection_status with view current for a fresh current-state question. No new platform call or effect. This is not complete source history even if omitted is zero. Missing reports do not prove inactivity. Preserve requests, plans, progress and reported completion as distinct; other agents’ reports are not your own work.',
     inputSchema:z.object({connection_id:READ_CONNECTION.optional()}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
