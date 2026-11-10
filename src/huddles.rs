@@ -740,12 +740,7 @@ fn parent_return(
     {
         return Ok(json!({"state":"blocked","reason":"original_source_or_audience_changed"}));
     }
-    let companion: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM companion_calls WHERE conversation_id=?1)",
-        [conversation_id],
-        |r| r.get(0),
-    )?;
-    if companion {
+    if crate::companion_huddles::is_companion(db, conversation_id)? {
         return Ok(json!({"state":"available","delivery":"companion_owned"}));
     }
     let id = uuid::Uuid::new_v4().to_string();
@@ -848,8 +843,28 @@ pub async fn post(
         } else {
             json!({"state":"not_requested"})
         };
-        let receipt = json!({"version":1,"status":"saved","message_id":body.request_id,"request_id":body.request_id,"room_id":room,"sequence":seq,"kind":body.kind,"created_at":at,"agent_id":actor.agent,"connection_id":actor.connection,"origin":origin,"return":returned,"revision":auth::digest(&payload),"text_sha256":auth::digest(&body.text),"source":body.source,"outcome":body.outcome,"target_agent_ids":body.target_agent_ids,"inspect_url":format!("{}/?conversation={room}",s.config.public_url.trim_end_matches('/'))});
+        let mut receipt = json!({"version":1,"status":"saved","message_id":body.request_id,"request_id":body.request_id,"room_id":room,"sequence":seq,"kind":body.kind,"created_at":at,"agent_id":actor.agent,"connection_id":actor.connection,"origin":origin,"return":returned,"revision":auth::digest(&payload),"text_sha256":auth::digest(&body.text),"source":body.source,"outcome":body.outcome,"target_agent_ids":body.target_agent_ids,"inspect_url":format!("{}/?conversation={room}",s.config.public_url.trim_end_matches('/'))});
         tx.execute("INSERT INTO huddle_posts(message_id,room_id,agent_id,payload,receipt) VALUES(?1,?2,?3,?4,?5)",params![body.request_id,room,actor.agent,payload,receipt.to_string()])?;
+        if body.kind == "outcome"
+            && let Origin::Conversation {
+                conversation_id,
+                actor: owner,
+                ..
+            } = &origin
+            && crate::companion_huddles::is_companion(&tx, conversation_id)?
+        {
+            receipt["return"] = if let Some(row) =
+                outcome_for_parent(&tx, conversation_id, &owner.id, &body.request_id)?
+            {
+                crate::companion_huddles::record_return(&s, &tx, &row)?
+            } else {
+                json!({"state":"blocked","delivery":"companion_owned","reason":"original_request_or_private_audience_changed"})
+            };
+            tx.execute(
+                "UPDATE huddle_posts SET receipt=?2 WHERE message_id=?1",
+                params![body.request_id, receipt.to_string()],
+            )?;
+        }
         tx.execute(
             "UPDATE conversations SET updated_at=?2 WHERE id=?1",
             params![room, at],

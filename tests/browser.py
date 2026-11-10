@@ -63,7 +63,9 @@ with tempfile.TemporaryDirectory(prefix='browser-',dir=artifacts) as temporary:
             assert json.loads(revoked.stdout)['enabled'] is False
             payload={'url':f'https://127.0.0.1:{port}','cookie_name':'acv_'+config['id'].replace('-',''),'cookie':cookie,'sam_cookie':sam_cookie,'control':(home/'secrets/control-token').read_text(),'context_token':(home/'secrets/context-token').read_text(),'import_token':(home/'secrets/import-token').read_text(),'screenshot':str(artifacts/'browser-desktop.png'),'home':str(home)}
             node=os.environ.get('NODE_BIN','node')
-            subprocess.run([node,str(ROOT/('tests/steering-browser.mjs' if os.environ.get('BROWSER_STEERING') else 'tests/browser.mjs'))],input=json.dumps(payload),text=True,check=True)
+            browser_test = ('tests/huddles-integration-browser.mjs' if os.environ.get('BROWSER_HUDDLES') else
+                            'tests/steering-browser.mjs' if os.environ.get('BROWSER_STEERING') else 'tests/browser.mjs')
+            subprocess.run([node,str(ROOT/browser_test)],input=json.dumps(payload),text=True,check=True)
         finally:
             process.terminate()
             try:process.wait(timeout=5)

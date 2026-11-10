@@ -899,3 +899,111 @@ async fn reassigned_connection_cannot_adopt_prior_connection_operation() {
     );
     assert_eq!(count(&f, "huddle_posts"), 1);
 }
+
+#[tokio::test]
+async fn http_intake_commits_companion_return_for_closed_call_or_retains_explicit_blockage() {
+    for case in ["closed", "audience_changed", "capacity"] {
+        let f = fixture();
+        let parent = f.state.create("Private original call").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let source = uid();
+        let call = uid();
+        let endpoint = auth::digest(
+            &serde_json::to_string(&f.state.agent("default").unwrap().unwrap()).unwrap(),
+        );
+        {
+            let db = f.state.db.lock().unwrap();
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user','Review together and return the checked result.','complete',?3,?3,'owner')",params![source,parent,now_ms()]).unwrap();
+            db.execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at,endpoint_hash) VALUES(?1,'owner',?2,'fixture','default',?3,'ended',?4,?4,?5)",params![call,uid(),parent,now_ms(),endpoint]).unwrap();
+        }
+        let d = huddle(&f, &parent, &source).await;
+        let room = d["id"].as_str().unwrap();
+        let token = enroll(&f, room, "maker").await;
+        if case == "audience_changed" {
+            ok(
+                &f,
+                "POST",
+                &format!("/api/v1/conversations/{parent}/members"),
+                &f.token,
+                Some(json!({"username":"robin","share_history":true})),
+            )
+            .await;
+        }
+        if case == "capacity" {
+            f.state.db.lock().unwrap().execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'full','fixture',?2,1)",params![call,"x".repeat(8*1024*1024)]).unwrap();
+        }
+        let before = count(&f, "messages");
+        let body = post("outcome");
+        let saved = ok(
+            &f,
+            "POST",
+            &format!("/api/v1/huddles/{room}/posts"),
+            &token,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(saved["status"], "saved");
+        assert_eq!(saved["return"]["delivery"], "companion_owned");
+        assert_eq!(
+            saved["return"]["state"],
+            if case == "closed" {
+                "stored"
+            } else {
+                "blocked"
+            }
+        );
+        if case == "capacity" {
+            assert_eq!(saved["return"]["reason"], "presentation_capacity");
+        }
+        assert_eq!(
+            count(&f, "messages"),
+            before + if case == "closed" { 2 } else { 1 }
+        );
+        assert_eq!(
+            f.state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM companion_events WHERE kind IN ('huddle_return','card')",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            if case == "closed" { 2 } else { 0 }
+        );
+        let retry = ok(
+            &f,
+            "POST",
+            &format!("/api/v1/huddles/{room}/posts"),
+            &token,
+            Some(body.clone()),
+        )
+        .await;
+        let status = ok(
+            &f,
+            "GET",
+            &format!(
+                "/api/v1/huddles/{room}/posts/{}",
+                body["request_id"].as_str().unwrap()
+            ),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(retry, saved);
+        assert_eq!(status, saved);
+        assert_eq!(
+            count(&f, "messages"),
+            before + if case == "closed" { 2 } else { 1 }
+        );
+        assert_eq!(count(&f, "input_deliveries"), 0);
+        assert_eq!(
+            count(&f, "companion_voice_batches"),
+            0,
+            "Closed call intake must not speak or launch a model"
+        );
+    }
+}

@@ -26,7 +26,7 @@ jobs:
       - run: npm test --prefix bridge
       - run: python3 -m unittest discover -s bridge/test -p 'test_*.py'
       - run: node tests/voice.mjs
-      - run: node --test tests/companion-floor.test.mjs tests/message-presentation.test.mjs
+      - run: node --test tests/companion-floor.test.mjs tests/message-presentation.test.mjs tests/huddles-api.test.mjs
       - run: node tests/companion-duplex-eval.mjs --self-test
       - run: cargo build --locked
       - run: npm ci && npx playwright install --with-deps chromium
@@ -38,6 +38,10 @@ jobs:
       - run: node tests/companion-duplex-eval.mjs --self-test-browser
         if: matrix.os == 'ubuntu-24.04'
       - run: node tests/companion-browser.mjs
+        if: matrix.os == 'ubuntu-24.04'
+      - run: node tests/huddles-browser.mjs
+        if: matrix.os == 'ubuntu-24.04'
+      - run: BROWSER_HUDDLES=1 python3 tests/browser.py
         if: matrix.os == 'ubuntu-24.04'
       - run: python3 tests/browser.py
         if: matrix.os == 'ubuntu-24.04'
