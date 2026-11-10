@@ -161,8 +161,10 @@ export function createHuddleApi({api,getContext,storage=globalThis.sessionStorag
     async findSubmission({context,signal,huddleId,requestId}) {
       context=identity(context,signal);
       if(!uuid(requestId))return result(requestId,'unknown');
+      // Losing access to the parent or room must clear private presentation.
+      // A missing SOURCE receipt below is different: it proves no outcome.
+      await authorized(context,signal,huddleId);
       try {
-        await authorized(context,signal,huddleId);
         const saved=await pending(await readView(context,signal,huddleId),huddleId);
         if(!saved||saved.requestId!==requestId)return result(requestId,'unknown');
         const page=await request(context,signal,`/api/v1/huddles/${encodeURIComponent(huddleId)}/messages?after=${saved.after}&limit=100`);
@@ -176,11 +178,14 @@ export function createHuddleApi({api,getContext,storage=globalThis.sessionStorag
         if(match) {
           if(match.role!=='user'||match.actor!==context.owner||match.agent_id!==null||match.text!==saved.text
             ||match.status!=='complete'||!equal(match.target_agent_ids,saved.targetAgentIds))return result(requestId,'unknown');
-          await clearPending(context,signal,huddleId,saved);return result(requestId,'recorded');
+          await clearPending(context,signal,huddleId,saved);identity(context,signal);return result(requestId,'recorded');
         }
         if(page.next_cursor>saved.after)await updatePending(context,signal,huddleId,saved,{history_before:page.next_cursor+1});
         return result(requestId,'unknown');
-      } catch {return result(requestId,'unknown');}
+      } catch(error) {
+        if([401,403].includes(error?.status)||error?.code==='access_revoked')throw error;
+        return result(requestId,'unknown');
+      }
     }
   };
 }

@@ -18,7 +18,10 @@ function fixture() {
   const api=async(path,method='GET',body,options={})=>{
     const user=f.context.owner,call={path,method,body:body===undefined?undefined:copy(body),owner:user};calls.push(call);
     const url=new URL(path,'https://fixture.invalid');
-    if(url.pathname===`/api/v1/conversations/${parent}/huddles`)return {version:1,items:[copy(d)],current:null};
+    if(url.pathname===`/api/v1/conversations/${parent}/huddles`){
+      if(f.authorityStatus)throw Object.assign(new Error('access no longer available'),{status:f.authorityStatus});
+      return {version:1,items:[copy(d)],current:null};
+    }
     if(url.pathname===`/api/v1/conversations/${room}/huddles`)return {version:1,items:[],current:copy(d)};
     if(url.pathname===`/api/v1/huddles/${room}`)return copy(d);
     if(url.pathname===`/api/v1/huddles/${room}/preference`&&method==='PUT'){d.preference.mode=body.mode;return {mode:body.mode,membership_changed:false,work_authority_changed:false};}
@@ -50,7 +53,9 @@ function fixture() {
     }
     if(url.pathname===`/api/v1/huddles/${room}/messages`){
       if(f.page404)throw Object.assign(new Error('not found is not proof of rejection'),{status:404});
+      if(f.pageStatus)throw Object.assign(new Error('source access revoked'),{status:f.pageStatus});
       const after=Number(url.searchParams.get('after')),all=messages.filter(message=>message.seq>after),items=all.slice(0,100),next=items.at(-1)?.seq??after;
+      if(f.pageHook)await f.pageHook();
       return {version:1,items:copy(items),next_cursor:next,has_more:all.length>100,coverage:{after,through:next,complete_through_cursor:true},state:d.state,revision:d.revision};
     }
     throw new Error('Unexpected fixture route: '+method+' '+path);
@@ -112,6 +117,26 @@ test('source 404, missing receipt and mismatched POST acknowledgment all stay un
     f.page404=true;assert.equal((await f.adapter.findSubmission({...f.args(),requestId:args.requestId})).state,'unknown');assert.equal(f.view().state.draft_request_id,args.requestId);
     f.page404=false;f.messages.splice(1);assert.equal((await f.adapter.findSubmission({...f.args(),requestId:args.requestId})).state,'unknown');assert.equal(f.posts().length,1);
   }
+});
+
+test('status check propagates lost parent/room authority for immediate widget revocation without clearing or resending the source',async()=>{
+  for(const status of [401,403,404]){
+    const f=fixture();await f.adapter.read(f.args());f.mode='throw';const {args}=await f.send();f.authorityStatus=status;
+    await assert.rejects(f.adapter.findSubmission({...f.args(),requestId:args.requestId}),error=>error.status===status);
+    assert.equal(f.view().state.draft_request_id,args.requestId);assert.equal(f.posts().length,1);
+  }
+});
+
+test('source authorization failure and a context switch during a status read propagate revocation, while receipt404 remains unknown',async()=>{
+  for(const status of [401,403]){
+    const f=fixture();await f.adapter.read(f.args());f.mode='throw';const {args}=await f.send();f.pageStatus=status;
+    await assert.rejects(f.adapter.findSubmission({...f.args(),requestId:args.requestId}),error=>error.status===status);
+    assert.equal(f.view().state.draft_request_id,args.requestId);assert.equal(f.posts().length,1);
+  }
+  const f=fixture();await f.adapter.read(f.args());f.mode='throw';const {args}=await f.send();
+  f.pageHook=()=>{f.context={key:'other-call',owner:'someone-else',parentId:parent};};
+  await assert.rejects(f.adapter.findSubmission({...f.args(),requestId:args.requestId}),error=>error.status===403);
+  assert.equal(f.view().state.draft_request_id,args.requestId);assert.equal(f.posts().length,1);
 });
 
 test('matching text alone is not receipt proof: exact ID, actor, role, agent null, status and targets are required',async()=>{
