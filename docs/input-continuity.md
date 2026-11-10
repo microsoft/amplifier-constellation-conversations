@@ -52,7 +52,12 @@ do not grant additional model/tool allowance.
   processes more messages in the room.
 
 Receipts are per recipient and appear under the original human message. The
-conversation API and `/deliveries` expose the same states, source ID, target
+successful end of a prompt does not promote a received-only steering receipt to
+incorporation. Such an input retains an unknown outcome and the no-replay fence;
+an explicit incorporation receipt and target completion remain separate facts.
+The original prompt input can settle from its own matching terminal response.
+
+The conversation API and `/deliveries` expose the same states, source ID, target
 turn, session, arrival sequence and bounded receipt metadata. Raw prompts,
 attention tickets and credentials are not copied into delivery metadata. The
 latest 256 history rows stay bounded, with every unresolved delivery retained

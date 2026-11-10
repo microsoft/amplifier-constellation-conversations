@@ -29,6 +29,7 @@ pub struct AppState {
     pub login_gate: Arc<Semaphore>,
     pub turn_gate: Arc<Semaphore>,
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
+    pub(crate) active_steering: Mutex<HashMap<(String, String), crate::delivery::ActiveSteering>>,
 }
 impl AppState {
     pub fn open(home: PathBuf) -> Result<Arc<Self>> {
@@ -95,6 +96,7 @@ impl AppState {
             login_gate: Arc::new(Semaphore::new(2)),
             turn_gate: Arc::new(Semaphore::new(4)),
             running: Mutex::new(HashMap::new()),
+            active_steering: Mutex::new(HashMap::new()),
         }))
     }
     pub fn changed(&self) {
@@ -128,7 +130,9 @@ impl AppState {
     pub fn conversation(&self, id: &str) -> Result<Option<Value>> {
         let mut row = self.conversation_info(id)?;
         if let Some(ref mut c) = row {
-            c["messages"] = json!(self.messages(id, 100)?);
+            let mut messages = self.messages(id, 100)?;
+            self.present_messages(id, &mut messages)?;
+            c["messages"] = json!(messages);
             c["deliveries"] = json!(crate::delivery::list(self, id)?);
             c["members"] = json!(self.members(id)?);
             c["agents"] = json!(self.room_agents(id)?);
@@ -157,6 +161,45 @@ impl AppState {
     }
     pub fn messages(&self, id: &str, limit: usize) -> Result<Vec<Value>> {
         self.message_page(id, None, limit, "")
+    }
+    /// Browser presentation only. Canonical message text, source context and
+    /// backend input stay unchanged, including already saved call histories.
+    pub fn present_messages(&self, room: &str, messages: &mut [Value]) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare(
+            "SELECT CASE WHEN typeof(d.request_text)='text' AND length(CAST(d.request_text AS BLOB))<=49152 THEN d.request_text ELSE NULL END
+             FROM companion_delegations d JOIN companion_calls c ON c.id=d.call_id
+             JOIN messages m ON m.id=d.message_id AND m.conversation_id=c.conversation_id
+             WHERE m.id=?1 AND m.conversation_id=?2 AND m.role='user' AND m.actor=c.owner LIMIT 2",
+        )?;
+        for message in messages {
+            if message["role"] != "user" {
+                continue;
+            }
+            let labels = query
+                .query_map(params![message["id"].as_str().unwrap_or(""), room], |r| {
+                    r.get::<_, Option<String>>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if labels.is_empty() {
+                continue;
+            }
+            // Never recognize orchestration by a text prefix. Ambiguous or
+            // missing labels remain neutral instead of inventing caller words.
+            let text = if labels.len() == 1 {
+                labels[0]
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty() && !s.contains('\0'))
+            } else {
+                None
+            };
+            message["presentation"] = json!({
+                "kind":"spoken_request", "label":"From voice",
+                "text":text.unwrap_or("Spoken request"), "excerpt":true,
+                "canonical_text_unchanged":true
+            });
+        }
+        Ok(())
     }
     pub fn message_page(
         &self,

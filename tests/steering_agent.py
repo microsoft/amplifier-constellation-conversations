@@ -24,7 +24,7 @@ def complete():
     global active,inputs
     if active is None:return
     for id in inputs:
-        if mode in ('unsettled','regress-queued'):continue
+        if mode in ('unsettled','regress-queued','received-only'):continue
         r=receipt(id,'incorporated')
         write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':''},'_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipt':r}}}}})
     write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Completed the work once.'}}}})
@@ -63,6 +63,8 @@ while True:
         assert p['_meta']['steering']['idleBehavior']=='promptRequired'
         id=p['_meta']['steering']['inputId']
         if mode=='generic':raise AssertionError('Generic peer received steering')
+        if mode=='held-steer':
+            while not log.with_name('steering-ack-release').exists():time.sleep(.01)
         if mode=='disconnect':receipt(id,'unknown');sys.exit(0)
         if mode in ('idle','attention_idle') and active is not None:
             complete();write({'id':value['id'],'result':{'outcome':'promptRequired','_meta':{'com.microsoft.amplifier.attention':{'ticketState':'restored'}}}})
@@ -93,6 +95,9 @@ while True:
         for id in p['inputIds']:receipts[id]['reconciled']=True
         receipt_file.write_text(json.dumps(receipts));write({'id':value['id'],'result':{'inputReceipts':list(receipts.values())}})
     elif method=='session/cancel':
+        if mode=='held-cancel':
+            log.with_name('cancel-observed').write_text('cancel received')
+            while not log.with_name('cancel-release').exists():time.sleep(.01)
         if active is not None:write({'id':active,'result':{'stopReason':'cancelled'}});active=None
     elif value.get('id')=='permission' and method is None:
         approved=True

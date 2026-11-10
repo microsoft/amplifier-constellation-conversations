@@ -10,6 +10,8 @@ const REQUEST_LIMIT = 64 * 1024;
 const RESPONSE_LIMIT = 256 * 1024;
 const SURFACE_RESPONSE_LIMIT = 3 * 1024 * 1024;
 const DELEGATION = z.string().min(1).max(160);
+const READ_CONNECTION = z.string().min(1).refine(v=>Buffer.byteLength(v)<=120&&!/[\u0000-\u001f\u007f-\u009f]/.test(v))
+  .describe('Exact Companion connection_id from this call\'s configured read catalog or companion_connections observation_sources. Instance provider_id and conversation_id are different identifiers.');
 const CARD_ID = z.union([z.string().regex(/^[1-9][0-9]{0,18}$/),z.string().regex(/^upload:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)]);
 const CAPTURE_PREREQUISITES = {
   browser_unavailable:'Return to the active call in the browser before requesting a photo.',
@@ -87,16 +89,16 @@ function buildServer(config,stopSignal) {
     }
   }
   server.registerTool('companion_connections',{
-    description:'List this call’s installation-configured experience connections and supported actions. Configuration alone does not prove current availability or authorize an action.',
+    description:'Discover this call’s installation-configured experience connections and exact read arguments when they are not already in the call context. Configuration alone does not prove current availability or authorize an action.',
     inputSchema:z.object({}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
   },()=>call('connections'));
   server.registerTool('companion_observations',{
-    description:'Read bounded saved reports for this caller and agent, with original actor, audience, source and timestamps. For a question about one connection, pass its exact connection_id from companion_connections observation_sources; omit only for an all-source overview. An unknown or unauthorized ID never falls back to other sources. Use this for historical context; use companion_connection_status with view current for a fresh current-state question. No new platform call or effect. This is not complete source history even if omitted is zero. Missing reports do not prove inactivity. Preserve requests, plans, progress and reported completion as distinct; other agents’ reports are not your own work.',
-    inputSchema:z.object({connection_id:z.string().min(1).refine(v=>Buffer.byteLength(v)<=120&&!/[\u0000-\u001f\u007f-\u009f]/.test(v)).optional()}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
+    description:'Read bounded saved reports for this caller and agent, with original actor, audience, source and timestamps. For a question about one connection, pass its exact connection_id from the current call catalog or companion_connections observation_sources; omit only for an all-source overview. An unknown or unauthorized ID never falls back to other sources. Use this for historical context; use companion_connection_status with view current for a fresh current-state question. No new platform call or effect. This is not complete source history even if omitted is zero. Missing reports do not prove inactivity. Preserve requests, plans, progress and reported completion as distinct; other agents’ reports are not your own work.',
+    inputSchema:z.object({connection_id:READ_CONNECTION.optional()}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
   },({connection_id})=>call(connection_id===undefined?'observations':`observations?connection_id=${encodeURIComponent(connection_id)}`));
   server.registerTool('companion_connection_status',{
-    description:'Make one fresh bounded read of a configured source for this caller. Choose exact connection_id from companion_connections observation_sources or companion_observations sources. Use view current for current position, presence or assignment: it selects typed snapshots only, excluding historical chat. If that source has no typed snapshots, the result does not imply inactivity. Omitted view (or reports) retains current snapshots plus history. Original observation and progress times remain unchanged; exclusion is selection, not proof of absence. Runs only the fixed read-only observer; no action, model or source mutation. Agent reports are not independent completion verification.',
-    inputSchema:z.object({connection_id:z.string().min(1).refine(v=>Buffer.byteLength(v)<=120&&!/[\u0000-\u001f\u007f-\u009f]/.test(v)),view:z.enum(['reports','current']).optional()}).strict(),
+    description:'Make one fresh bounded read of a configured source for this caller. Choose exact connection_id from the current call catalog, companion_connections observation_sources or companion_observations sources. Use view current for current position, presence or assignment: it selects typed snapshots only, excluding historical chat. If that source has no typed snapshots, the result does not imply inactivity. Omitted view (or reports) retains current snapshots plus history. Original observation and progress times remain unchanged; exclusion is selection, not proof of absence. Runs only the fixed read-only observer; no action, model or source mutation. Agent reports are not independent completion verification.',
+    inputSchema:z.object({connection_id:READ_CONNECTION,view:z.enum(['reports','current']).describe('current selects typed current snapshots; reports includes current snapshots and historical reports. Omission retains the reports view.').optional()}).strict(),
     annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
   },({connection_id,view})=>call(`connection-status?connection_id=${encodeURIComponent(connection_id)}${view===undefined?'':`&view=${view}`}`));
   server.registerTool('companion_hangup',{
