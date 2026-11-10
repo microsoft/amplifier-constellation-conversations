@@ -102,7 +102,13 @@ function refreshStatus(call) {
   if (!current(call)) return;
   call.connected = call.peer?.connectionState === 'connected' && call.providerConnected === true;
   let status = 'connecting', title = 'Connecting…', detail = 'Opening a voice conversation.';
-  if (call.pollError || call.heartbeatError || call.reconcilingUntil || call.peer?.connectionState === 'disconnected') {
+  if (call.closing && !call.failed && call.peer?.connectionState !== 'failed') {
+    status = 'closing'; title = 'Ending call…';
+    detail = 'Waiting for the voice service to confirm. Accepted work can continue in the conversation.';
+    if (call.pollError || call.heartbeatError || call.reconcilingUntil) {
+      title = 'Checking call status…'; detail = 'Ending was requested, but the final call status is not confirmed.';
+    }
+  } else if (call.pollError || call.heartbeatError || call.reconcilingUntil || call.peer?.connectionState === 'disconnected') {
     status = 'reconnecting'; title = 'Connection interrupted'; detail = 'Checking the existing call. No new call or work is being started.';
   } else if (call.peer?.connectionState === 'failed' || call.failed) {
     status = 'error'; title = 'Audio connection lost'; detail = 'End this call and call again. Work already accepted stays in its conversation.';
@@ -357,6 +363,7 @@ async function poll(call) {
     if (!current(call) || call.pollRequest !== request) return;
     call.pollError = false; controlReceived(call);
     call.providerConnected = result.state === 'connected';
+    if (result.state === 'closing') call.closing = true;
     for (const event of result.events || []) renderEvent(call, event);
     renderCallPermissions(call, result.permissions);
     pollSurface(call);
@@ -364,7 +371,7 @@ async function poll(call) {
     if (['closed','interrupted'].includes(result.state)) {
       endCall(terminalMessage(result), false); showTerminal(result); return;
     }
-    refreshStatus(call);
+    refreshStatus(call); refreshWorkStatus(call);
   } catch (error) {
     if (!current(call) || call.pollRequest !== request) return;
     call.pollError = true; refreshStatus(call);
@@ -426,7 +433,12 @@ function renderEvent(call, event) {
   if (call.seen.size > 500) call.seen.delete(call.seen.values().next().value);
   const data = event.data || {};
   renderContextEvent(call, event);
-  if (event.kind === 'transcript' && ['user','assistant'].includes(data.role) && typeof data.text === 'string') {
+  if (event.kind === 'lifecycle' && data.type === 'host_close_requested') {
+    // The host accepted closure; a spoken intention or decision alone is not
+    // this receipt, and only the matching terminal later means the call ended.
+    call.closing = true; call.closingSequence ??= event.seq;
+    refreshStatus(call); refreshWorkStatus(call);
+  } else if (event.kind === 'transcript' && ['user','assistant'].includes(data.role) && typeof data.text === 'string') {
     const followTranscript = followsEnd($('transcript-panel')), followCaption = followsEnd($('latest-caption'));
     const speaker = data.role === 'user' ? 'You' : call.contact.label;
     const previous = call.transcriptRow;
@@ -463,6 +475,17 @@ function renderEvent(call, event) {
   } else if (event.kind === 'upload' && typeof data.upload_id === 'string') {
     renderShareEvent(call, data);
   } else if (event.kind === 'provider' && data.type === 'error') {
+    // A known context append can lose its receipt during acknowledged close.
+    // Preserve its Context entry and durable error, without a misleading
+    // invitation to keep talking. Other errors, and earlier errors, stay loud.
+    const correlationIds = [data.client_event_id, data.error?.client_event_id].filter(id => id !== undefined);
+    const clientEventId = correlationIds[0];
+    const exactCorrelation = correlationIds.length > 0
+      && correlationIds.every(id => typeof id === 'string' && id.length > 0 && id === clientEventId);
+    const closingAppend = Number.isSafeInteger(call.closingSequence) && event.seq > call.closingSequence
+      && data.error?.code === 'context_injection_incomplete' && exactCorrelation
+      && ['queued','accepted'].includes(call.contextItems.get(`voice:${clientEventId}`)?.facts.deliveryState);
+    if (closingAppend) return;
     // The correlated context receipt describes the same rejection and stays
     // quiet. A server error alone neither closes the call nor retries work.
     const correlated = typeof data.client_event_id === 'string' || typeof data.error?.client_event_id === 'string';
@@ -567,7 +590,7 @@ function renderContextEvent(call, event) {
     };
     const [status,note] = descriptions[data.state] || ['Voice receipt unknown','No recognized delivery state is available.'];
     const key = `voice:${text(data.event_id) || `event-${event.seq}`}`;
-    const facts = {title:'Voice context',status,note};
+    const facts = {title:'Voice context',status,note,deliveryState:data.state};
     if (text(data.content)) facts.content = data.content;
     if (text(data.source_label)) facts.source = data.source_label;
     else if (text(data.channel) && !call.contextItems.get(key)?.facts.source) facts.source = ({thinking:'Companion · background context',commentary:'Companion · conversational context'})[data.channel] || 'Companion · voice context';
@@ -615,6 +638,10 @@ function refreshWorkStatus(call) {
   if (!current(call)) return;
   $('work-status').hidden = call.working.size === 0;
   if (!call.working.size) { $('work-status').textContent = ''; return; }
+  if (call.closing) {
+    $('work-status').textContent = 'This call is ending. Request status remains in the conversation.';
+    return;
+  }
   const update = [...call.progress.values()].at(-1);
   const elapsed = Number.isSafeInteger(update?.elapsed_seconds) && update.elapsed_seconds >= 0 ? ` after ${update.elapsed_seconds} seconds` : '';
   $('work-status').textContent = update
@@ -1105,7 +1132,8 @@ function terminalMessage(result) {
 }
 function showTerminal(result) {
   $('ended-detail').textContent = terminalMessage(result);
-  if (result.state === 'interrupted' || result.closure?.provider_reason === 'connection_lost') $('ended-title').textContent = 'Call interrupted';
+  $('ended-title').textContent = result.state === 'interrupted' || result.closure?.provider_reason === 'connection_lost'
+    ? 'Call interrupted' : 'Call ended';
 }
 function finishRecovery(recovery, result) {
   if (state.recovery !== recovery || state.call || result.id !== recovery.callId || !['closed','interrupted'].includes(result.state)) return;
@@ -1177,7 +1205,8 @@ function endCall(message = 'Your microphone and camera are off. Accepted work ca
   call.clientCloseReason = reason; call.closeDiagnostics = diagnostics(call,reason === 'page_exit'?'page_exit':'call_close');
   call.ended = true; state.call = null; state.generation++; releaseMedia(call, retainTransport && Boolean(call.id)); document.body.classList.remove('call-active');
   $('call-screen').hidden = true; $('phonebook').hidden = true; $('call-ended').hidden = false;
-  $('ended-title').textContent = call.connected ? 'Until next time.' : 'Call ended.';
+  $('ended-title').textContent = call.id && ['user_hangup','surface_hangup'].includes(reason)
+    ? 'Ending call…' : 'Call ended';
   $('ended-detail').textContent = message;
   $('ended-work-link').hidden = !call.conversationId;
   if (call.conversationId) $('ended-work-link').href = conversationLink(call.conversationId);
