@@ -91,6 +91,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(index))
         .route("/app.js", get(js))
         .route(
+            "/message-presentation.mjs",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/message-presentation.mjs"),
+                )
+            }),
+        )
+        .route(
             "/voice.js",
             get(|| async {
                 (
@@ -517,6 +526,7 @@ async fn message_history(
     } else {
         None
     };
+    s.present_messages(&id, &mut items)?;
     Ok(Json(
         json!({"items":items,"next_cursor":cursor,"search":search}),
     ))
