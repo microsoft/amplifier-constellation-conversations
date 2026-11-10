@@ -671,3 +671,63 @@ async fn explicit_manual_replacement_does_not_leave_old_installation_authorized(
         .is_success()
     );
 }
+
+#[tokio::test]
+async fn credential_rotation_invalidates_already_authenticated_mutations() {
+    let f = fixture();
+    let mut a = registered(&f, "lead", "world").await;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", token(&a)).parse().unwrap(),
+    );
+    let captured = huddle_auto::authenticate(&f.state, &headers).unwrap();
+    let raw = ensure_body("lead", "world", vec![]);
+    let body: huddle_auto::Ensure = serde_json::from_value(raw).unwrap();
+    a["token"] = json!(auth::random_token());
+    ok(
+        &f,
+        "PUT",
+        "/api/v1/huddle-installations/lead",
+        &f.token,
+        Some(a.clone()),
+    )
+    .await;
+    assert!(huddle_auto::ensure_for(&f.state, &captured, body).is_err());
+    let room = ensure(&f, &a, ensure_body("lead", "world", vec![])).await;
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", token(&a)).parse().unwrap(),
+    );
+    let captured = huddle_auto::authenticate(&f.state, &headers).unwrap();
+    let post = serde_json::from_value(message("message")).unwrap();
+    let refused = agent_conversations::huddles::post_for_installation_guarded(
+        &f.state,
+        &captured,
+        room["id"].as_str().unwrap(),
+        post,
+        |db| {
+            db.execute(
+                "UPDATE huddle_installations SET token_hash=?1 WHERE id='lead'",
+                [auth::digest(&auth::random_token())],
+            )?;
+            Ok(())
+        },
+    );
+    assert!(refused.is_err());
+    assert_eq!(
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM huddle_posts", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        !serde_json::to_string(&captured)
+            .unwrap()
+            .contains("credential_hash")
+    );
+}

@@ -39,6 +39,11 @@ pub struct Installation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
     pub enabled: bool,
+    // Scoped tokens must remain current when a mutation commits. Internal
+    // Companion principals use their separate transactional call guard instead.
+    // This generation is private and never crosses the wire or reaches models.
+    #[serde(skip)]
+    credential_hash: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,7 +119,19 @@ fn load(db: &Connection, id: &str) -> ApiResult<Installation> {
     Ok(serde_json::from_str(&raw).map_err(anyhow::Error::from)?)
 }
 pub(crate) fn current(db: &Connection, installation: &Installation) -> ApiResult<()> {
-    if !installation.enabled || load(db, &installation.id)? != *installation {
+    let mut stored = load(db, &installation.id)?;
+    if let Some(expected) = &installation.credential_hash {
+        let actual: String = db.query_row(
+            "SELECT token_hash FROM huddle_installations WHERE id=?1",
+            [&installation.id],
+            |r| r.get(0),
+        )?;
+        if &actual != expected {
+            return Err(ApiError::forbidden());
+        }
+        stored.credential_hash = Some(actual);
+    }
+    if !installation.enabled || stored != *installation {
         return Err(ApiError::forbidden());
     }
     Ok(())
@@ -137,6 +154,7 @@ pub async fn install(
         local_agent_id: body.local_agent_id,
         identity: body.identity,
         enabled: body.enabled,
+        credential_hash: None,
     };
     if ![
         &entry.id,
@@ -232,11 +250,12 @@ pub fn authenticate(s: &AppState, h: &HeaderMap) -> ApiResult<Installation> {
             |r| r.get(0),
         )
         .optional()?;
-    let entry: Installation = serde_json::from_str(&raw.ok_or_else(ApiError::unauthorized)?)
+    let mut entry: Installation = serde_json::from_str(&raw.ok_or_else(ApiError::unauthorized)?)
         .map_err(anyhow::Error::from)?;
     if !entry.enabled {
         return Err(ApiError::forbidden());
     }
+    entry.credential_hash = Some(auth::digest(token));
     Ok(entry)
 }
 /// Call-owned Companion tooling supplies its verified owner and current agent.
@@ -325,7 +344,7 @@ fn validate_origin(
             actor,
             ..
         } if !external_only && actor.id == s.config.owner => {
-            let member:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM room_members WHERE conversation_id=?1 AND username=?2)",params![conversation_id,actor.id],|r|r.get(0))?;
+            let member:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM room_members m JOIN conversations c ON c.id=m.conversation_id WHERE c.id=?1 AND m.username=?2 AND c.read_only=0)",params![conversation_id,actor.id],|r|r.get(0))?;
             if !member
                 || huddles::parent_source(db, conversation_id, message_id, &actor.id)? != *origin
             {
