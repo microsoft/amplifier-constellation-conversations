@@ -24,7 +24,7 @@ const callback = async(name,args,result)=>{
 fixture.release = (name,result)=>{const item=fixture.pending.find(x=>x.name===name);if(!item)throw new Error('missing pending');fixture.pending.splice(fixture.pending.indexOf(item),1);item.resolve(result??item.result);};
 fixture.reject = (name,status)=>{const item=fixture.pending.find(x=>x.name===name);fixture.pending.splice(fixture.pending.indexOf(item),1);item.reject(Object.assign(new Error('private diagnostic that must stay hidden'),{status}));};
 const view=window.view=createHuddles({root:document.querySelector('#huddles'),
- list:args=>callback('list',args,{items:[{...fixture.room,messages:undefined}]}),
+ list:args=>callback('list',args,{items:fixture.listEmpty?[]:[{...fixture.room,messages:undefined}]}),
  read:args=>callback('read',args,args.before?{...fixture.room,messages:[{id:'old1',actor:'Coach',text:'Original decision.',createdAt:'2026-11-09T01:02:03Z'}],before:null}:structuredClone(fixture.room)),
  setFollowing:async args=>{const result=await callback('follow',args,{following:args.following});fixture.room.following=result.following;return result;},
  send:async args=>{const result=await callback('send',args,{requestId:args.requestId,state:fixture.mode});if(fixture.mode==='throw')throw new Error('private token diagnostic');return result;},
@@ -172,6 +172,45 @@ try {
   await page.evaluate(async()=>{fixture.room.messages.push({id:'newer-end',actor:'Coach',text:'Another distinct contribution.',createdAt:'2026-11-10T13:14:16Z'});await view.refresh();});
   assert.equal(await page.locator('.huddles-history').evaluate(el=>el.scrollHeight-el.scrollTop-el.clientHeight<2),true);
   checks.push('Peer refresh preserves a reader’s older scroll position; only a reader already at the end follows new messages.');
+
+  await reset();await page.getByRole('button',{name:'Inspect',exact:true}).click();
+  await page.getByRole('button',{name:'Join discussion',exact:true}).waitFor();
+  const quietReads=await count('read');
+  await page.evaluate(async()=>{fixture.room.messages.push({id:'quiet-new',actor:'Rook',text:'New routine detail.',createdAt:'2026-11-10T13:14:15Z'});await view.refresh({automatic:true});});
+  assert.equal(await count('read'),quietReads);assert.equal(await page.locator('.huddles-message').count(),2);
+  await page.getByRole('button',{name:'Refresh discussion',exact:true}).click();await page.getByText('New routine detail.',{exact:true}).waitFor();
+  assert.equal(await count('read'),quietReads+1);
+  await page.getByRole('button',{name:'Follow details',exact:true}).click();await page.getByRole('button',{name:'Quiet updates',exact:true}).waitFor();
+  await page.evaluate(async()=>{fixture.room.messages.push({id:'follow-new',actor:'Coach',text:'Following reveals this detail.',createdAt:'2026-11-10T13:14:16Z'});await view.refresh({automatic:true});});
+  await page.getByText('Following reveals this detail.',{exact:true}).waitFor();assert.equal(await count('read'),quietReads+2);
+  await page.getByRole('button',{name:'Quiet updates',exact:true}).click();await page.getByRole('button',{name:'Follow details',exact:true}).waitFor();
+  await page.evaluate(async()=>{fixture.listEmpty=true;await view.refresh({automatic:true});});
+  assert.equal(await page.locator('.huddles-inspector').isHidden(),true);assert.equal(await page.locator('.huddles-message').count(),0);
+  assert.equal(await count('send'),0);assert.equal(await page.evaluate(()=>fixture.closed),0);
+  checks.push('Automatic discovery keeps quiet history still; explicit Refresh and followed details fetch messages, while revoked discovery clears even a quiet inspected view.');
+
+  await reset();await page.getByRole('button',{name:'Inspect',exact:true}).click();
+  await page.getByRole('button',{name:'Join discussion',exact:true}).click();
+  await page.getByRole('textbox',{name:'Message the huddle'}).fill('Local draft before a remote Stop.');
+  const metadataReads=await count('read');
+  await page.evaluate(async()=>{fixture.room.status='Discussion stopped';fixture.room.canSend=false;fixture.room.participants=fixture.room.participants.filter(person=>person.id!=='rook');await view.refresh({automatic:true});});
+  assert.equal(await count('read'),metadataReads);
+  assert.equal(await page.getByRole('button',{name:'Join discussion',exact:true}).count(),0);
+  assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).count(),0,'remote Stop summary must disable stale quiet composer without an extra history read');
+  assert.equal(await page.getByRole('textbox',{name:'Message the huddle'}).count(),0);
+  assert.equal(await count('send'),0);
+  checks.push('Quiet automatic metadata applies remote Stop and participant changes without rereading history or leaving a stale composer.');
+
+  await reset();
+  await page.evaluate(()=>{fixture.room.canSend=false;fixture.room.status='Discussion stopped';fixture.room.submission={requestId:'stopped-unknown',text:'An earlier unresolved message',targetAgentIds:['coach'],state:'unknown'};});
+  await page.getByRole('button',{name:'Inspect',exact:true}).click();await page.getByRole('button',{name:'Check message status',exact:true}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Join discussion',exact:true}).count(),0);
+  assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isDisabled(),true);assert.equal(await page.getByRole('textbox',{name:'Message the huddle'}).isDisabled(),true);
+  await page.getByRole('button',{name:'Check message status',exact:true}).click();assert.equal(await count('lookup'),1);assert.equal(await count('send'),0);
+  await page.evaluate(()=>{fixture.lookups='recorded';});await page.getByRole('button',{name:'Check message status',exact:true}).click();
+  await page.waitForFunction(()=>!document.querySelector('.huddles-composer'));
+  assert.equal(await count('send'),0);assert.equal(await count('lookup'),2);
+  checks.push('Stopping a discussion denies new input but retains read-only reconciliation of an earlier unknown send without replay.');
 
   await reset();await page.setViewportSize({width:390,height:844});
   await page.getByRole('button',{name:'Inspect',exact:true}).click();await page.getByRole('button',{name:'Join discussion',exact:true}).click();
