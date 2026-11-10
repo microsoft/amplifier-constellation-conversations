@@ -315,44 +315,70 @@ pub(crate) fn reconcile(s: &AppState, call: &str) -> Result<()> {
         if !live {
             return Ok(());
         }
-        let origins = {
-            let mut query=tx.prepare("SELECT id,conversation_id FROM companion_calls WHERE owner=?1 AND agent_id=?2 ORDER BY created_at,id")?;
+        // Normal post intake records the return atomically. Recovery only
+        // examines actual linked outcome posts with no saved return, not every
+        // former call or its complete result history on each voice poll.
+        let recovery = {
+            let mut query=tx.prepare("SELECT c.id,c.conversation_id,p.message_id FROM huddle_posts p JOIN huddles h ON h.room_id=p.room_id JOIN companion_calls c ON c.conversation_id=json_extract(h.origin,'$.conversation_id') WHERE c.owner=?1 AND c.agent_id=?2 AND c.endpoint_hash=(SELECT endpoint_hash FROM companion_calls WHERE id=?3) AND json_extract(h.origin,'$.kind')='conversation' AND json_extract(h.origin,'$.actor.id')=?1 AND json_extract(p.payload,'$.kind')='outcome' AND COALESCE(json_extract(p.receipt,'$.return.state'),'') IN ('','available') AND EXISTS(SELECT 1 FROM room_members WHERE conversation_id=h.room_id AND username=?1) AND NOT EXISTS(SELECT 1 FROM companion_events e WHERE e.call_id=c.id AND e.kind='huddle_return' AND json_extract(e.data,'$.origin_call_id')=c.id AND json_extract(e.data,'$.row.message.id')=p.message_id) ORDER BY p.rowid")?;
             query
-                .query_map(params![identity.owner, identity.agent], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                .query_map(params![identity.owner, identity.agent, call], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (origin, parent) in &origins {
-            if !crate::companion_history::same_private_identity(&tx, call, origin)? {
+        for (origin, parent, message) in recovery {
+            if !crate::companion_history::same_private_identity(&tx, call, &origin)? {
                 continue;
             }
-            // Recovery for an older producer or a receipt missing before this
-            // feature. Normal intake records atomically, without this bound.
-            for row in crate::huddles::outcomes_for_parent(&tx, parent, &identity.owner)? {
+            if let Some(row) =
+                crate::huddles::outcome_for_parent(&tx, &parent, &identity.owner, &message)?
+            {
                 record_return(s, &tx, &row)?;
             }
         }
         let records = {
-            let mut query=tx.prepare("SELECT e.data FROM companion_events e JOIN companion_calls c ON c.id=e.call_id WHERE e.kind='huddle_return' AND c.owner=?1 AND c.agent_id=?2 ORDER BY e.seq")?;
+            // Only the original return is a candidate. Later-call copies are
+            // presentation receipts, not additional work. Exclude prior
+            // dispatch/uncertainty and current delivery before loading text;
+            // an already-presented result stays in its original saved history.
+            let mut query=tx.prepare("SELECT e.event_key,e.data FROM companion_events e JOIN companion_calls c ON c.id=e.call_id WHERE e.kind='huddle_return' AND c.owner=?1 AND c.agent_id=?2 AND c.endpoint_hash=(SELECT endpoint_hash FROM companion_calls WHERE id=?3) AND json_extract(e.data,'$.origin_call_id')=e.call_id AND substr(e.event_key,1,14)='huddle-return:' AND length(e.event_key)=78 AND NOT EXISTS(SELECT 1 FROM companion_voice_batches b WHERE b.semantic_key='huddle:'||substr(e.event_key,15) AND (b.call_id=?3 OR b.state IN ('dispatching','sent','unknown') OR (b.state='pending' AND EXISTS(SELECT 1 FROM companion_calls active WHERE active.id=b.call_id AND active.state IN ('starting','connecting','connected','closing'))))) ORDER BY e.seq")?;
             query
-                .query_map(params![identity.owner, identity.agent], |r| {
-                    r.get::<_, String>(0)
+                .query_map(params![identity.owner, identity.agent, call], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut candidates = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for raw in records {
+        for (saved_key, raw) in records {
             let record: Value = serde_json::from_str(&raw)?;
             let row = &record["row"];
             let key = key(row);
-            if !seen.insert(key.clone()) || !record_allowed(&tx, call, &record)? {
+            if saved_key != event_key(row)
+                || !seen.insert(key.clone())
+                || !record_allowed(&tx, call, &record)?
+            {
                 continue;
             }
             let semantic = semantic_key(row);
-            // Always make authorized evidence inspectable, even when previous
-            // transport was unknown. This never claims it was spoken/heard.
+            if prior_dispatch(&tx, call, &semantic)? {
+                continue;
+            }
+            let already:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_voice_batches WHERE call_id=?1 AND semantic_key=?2)",params![call,semantic],|r|r.get(0))?;
+            if already {
+                continue;
+            }
+            let another_live:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_voice_batches b JOIN companion_calls c ON c.id=b.call_id WHERE b.call_id!=?1 AND b.semantic_key=?2 AND b.state='pending' AND c.state IN ('starting','connecting','connected','closing'))",params![call,semantic],|r|r.get(0))?;
+            if another_live {
+                continue;
+            }
+            // Only a genuinely pending requested result is copied into this
+            // call. Older dispatched/unknown results remain inspectable in
+            // their original conversation rather than refilling every call.
             let event_key = event_key(row);
             let card_key = format!("huddle-card:{key}");
             let card = card(row);
@@ -375,17 +401,6 @@ pub(crate) fn reconcile(s: &AppState, call: &str) -> Result<()> {
             })?
             .is_none()
             {
-                continue;
-            }
-            if prior_dispatch(&tx, call, &semantic)? {
-                continue;
-            }
-            let already:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_voice_batches WHERE call_id=?1 AND semantic_key=?2)",params![call,semantic],|r|r.get(0))?;
-            if already {
-                continue;
-            }
-            let another_live:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_voice_batches b JOIN companion_calls c ON c.id=b.call_id WHERE b.call_id!=?1 AND b.semantic_key=?2 AND b.state='pending' AND c.state IN ('starting','connecting','connected','closing'))",params![call,semantic],|r|r.get(0))?;
-            if another_live {
                 continue;
             }
             // Pending means no transport attempt. Only terminal source calls
@@ -801,14 +816,25 @@ mod tests {
                 "{state}"
             );
             let db = f.s.db.lock().unwrap();
-            let raw: String = db
+            let raw: Option<String> = db
                 .query_row(
                     "SELECT data FROM companion_events WHERE call_id=?1 AND kind='card'",
                     [&later],
                     |r| r.get(0),
                 )
+                .optional()
                 .unwrap();
-            assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["source"], row);
+            if state == "pending" {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&raw.unwrap()).unwrap()["source"],
+                    row
+                );
+            } else {
+                assert!(
+                    raw.is_none(),
+                    "{state}: previously dispatched reports stay in original history"
+                );
+            }
             let old: String = db
                 .query_row(
                     "SELECT state FROM companion_voice_batches WHERE call_id=?1",
@@ -825,6 +851,62 @@ mod tests {
                 }
             );
         }
+    }
+    #[test]
+    fn completed_history_is_not_copied_but_a_late_requested_result_arrives_once() {
+        let f = fixture();
+        for n in 0..55 {
+            let row = post(&f, &format!("Previously reported outcome {n}"), "outcome");
+            record(&f, &row);
+        }
+        reconcile(&f.s, &f.call).unwrap();
+        {
+            let db = f.s.db.lock().unwrap();
+            db.execute(
+                "UPDATE companion_voice_batches SET state='sent' WHERE call_id=?1",
+                [&f.call],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE companion_calls SET state='closed' WHERE id=?1",
+                [&f.call],
+            )
+            .unwrap();
+        }
+        let (later, _) = call(&f.s, "A fresh call");
+        reconcile(&f.s, &later).unwrap();
+        {
+            let db = f.s.db.lock().unwrap();
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind IN ('huddle_return','card')",[&later],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+        assert!(batches(&f, &later).is_empty());
+        let late = post(
+            &f,
+            "The requested follow-up has arrived, with this qualification.",
+            "outcome",
+        );
+        record(&f, &late);
+        reconcile(&f.s, &later).unwrap();
+        reconcile(&f.s, &later).unwrap();
+        assert_eq!(batches(&f, &later).len(), 1);
+        let db = f.s.db.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
+                [&later],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let raw: String = db
+            .query_row(
+                "SELECT data FROM companion_events WHERE call_id=?1 AND kind='card'",
+                [&later],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["source"], late);
     }
     #[test]
     fn independent_outcomes_and_old_queued_result_survive_recent_list_bound() {
