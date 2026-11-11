@@ -26,7 +26,7 @@ All paths below start with `/api/v1`.
 | `/import-sources` | GET, POST | Owner-only source listing; POST `{source,surface}` creates an independently scoped importer. |
 | `/import-sources/{source}/rotate` | POST | Replaces the source credential and enables the source. |
 | `/import-sources/{source}` | DELETE | Revokes the source credential immediately; retains imported conversations. |
-| `/imports/{source}/{session_id}` | PUT | Append-only transcript snapshots from an authorized external ACP experience. See README. |
+| `/imports/{source}/{session_id}` | PUT | Append-only transcript snapshots from an authorized external ACP experience. See [transcript imports](#transcript-imports). |
 
 At most one agent prompt per room and four per installation run concurrently. Follow-ups for the currently active agent use negotiated `_session/steering` with `idleBehavior: promptRequired`; ordinary ACP queues them until that prompt finishes. Other recipients retain their own ordered queue. Each ordinary next prompt takes a fair turn among waiting rooms; steering retains the active turn's original deadline. A message is at most 60 KB; pending input is bounded to 32 source messages and 8 MiB including attachments per room. See [input continuity](input-continuity.md) for receipts, unknown outcomes, restored attention, and generic ACP limits.
 
@@ -58,6 +58,25 @@ Attachment limits: four per message, images at most 2 MB each, UTF-8 text files 
 Create and rotate return `{source,surface,enabled,token,token_file}`. Treat `token` as a secret: it appears only in these authenticated responses, never in source listings or activity. The CLI `import-source create/rotate --token-out <file>` stores it privately instead of printing it. Listings contain only source, surface, enabled and timestamps. Creating an active source returns 409; creating a revoked source with the original surface enables it with a new credential. Source surfaces are immutable. Revoke and rotate do not change imported conversation IDs. Token files are operator copies; revocation is persisted in the database and copying an old file back cannot restore access.
 
 Each token permits only `PUT /imports/{its-source}/{session_id}` with its configured surface. It cannot read any conversation, use the context-provider API, issue prompts or manage sources. Import source names allow letters, digits, hyphens, dots and underscores; all endpoints use trusted HTTPS. The original single-source token migrates once without changing its value or existing history.
+
+### Transcript imports
+
+`PUT /api/v1/imports/{source}/{session_id}` accepts:
+
+```json
+{
+  "label": "A Toad conversation",
+  "surface": "toad",
+  "messages": [
+    {"id": "user-1", "role": "user", "text": "A question", "created_at": 1793510000000},
+    {"id": "agent-1", "role": "assistant", "text": "A reply", "created_at": 1793510001000}
+  ]
+}
+```
+
+Send a complete snapshot with the unchanged existing prefix and any new messages appended. Repeating a snapshot is idempotent. Changing or removing old messages, changing the source surface, or reusing a message ID is rejected. Bounds: 500 messages, 900 KB of text, 1 MB request, 200 KB per message. The caller should verify it is observing the intended agent endpoint before importing. Only user prompts and completed assistant replies should be included; exclude grants, MCP credentials, tool responses, and hidden reasoning. Import never runs a model prompt.
+
+The returned `conversation_id` can be viewed in the web UI and retrieved through the context provider with `surface: "toad"` preserved. Continue the original conversation in its original experience, or start a new web conversation with the same agent. Deleting an imported copy is local removal: a source bridge that still retains and replays its transcript can recreate it.
 
 ## View interface
 
@@ -152,7 +171,9 @@ content. Decisions are single-use and expire within five minutes or the active
 turn deadline. Agent withdrawal, user cancellation, disconnect and restart remove
 unanswered forms. Activity contains decisions, not answers.
 
-The client advertises only `elicitation.form`. Forms can arrive during initialize,
+The client advertises `elicitation.form` and `elicitation.url`; external steps use
+the [sign-in and URL flow](shared-rooms.md#agent-sign-in-and-external-steps).
+Forms can arrive during initialize,
 new/load setup using the originating `requestId`, or within a bound session using
 `sessionId`. Unsupported modes/schemas and foreign scopes are rejected. Flat text,
 number, integer, boolean and enum fields (including arrays of choices) are

@@ -1,8 +1,9 @@
-# Constellation Companion (preview)
+# Companion call interface
 
-This document defines the call service and describes its reference web client.
-The [component vision](VISION.md) gives the broader intent; current screens are
-developer, administrator and reference access, not a prescribed future product UX.
+This document defines the current call service and describes its reference web
+client. The [Companion vision](companion-vision.md) gives the product intent;
+current screens do not prescribe future product UX. See the
+[agreements and interfaces](README.md) for shared commitments and service ownership.
 
 Companion is a foreground web voice experience for an existing ACP agent. Open
 `/companion`, choose a saved contact, and start a call. One person calls one agent
@@ -387,8 +388,7 @@ When enabled, the per-call bridge uses the official MCP SDK to expose
 through ordinary ACP `mcpServers`; the agent must advertise HTTP MCP support.
 These tools apply only to the private call and selected agent. They do not merge
 sessions or imply write authority from context access. Installation ownership
-follows the shared
-[self-contained installation agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/family.v1-candidate.md#self-contained-installation-baseline).
+follows the [shared agreements](README.md#shared-agreements).
 
 The backend must be able to reach Conversations' public HTTPS address from its own
 network namespace. A working browser connection does not prove that route. For a

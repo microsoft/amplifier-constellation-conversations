@@ -8,6 +8,7 @@ agents, personal profiles, account credentials, or exported conversations.
 cargo fmt --check
 cargo test --locked
 cargo build --locked
+python3 tests/import_sources_cli.py
 node tests/voice.mjs
 npm ci
 npx playwright install chromium
@@ -47,3 +48,7 @@ The steering browser suite runs the HTTPS app through Chromium and checks the
 working composer, a lost send acknowledgment across reload, unchanged approval,
 truthful delivery labels, explicit recovery by both UI and programmatic control,
 and mobile layout. These fixtures do not call a model or exercise live services.
+
+## Source management and browser fixtures
+
+The source-management test exercises a real HTTPS service through the CLI: create, scope, rotate, idempotent import and revoke across restart, including private credential output. The browser test uses an actual HTTPS service and model-free ACP subprocess, a disposable owner session, and Chromium. Set `PLAYWRIGHT_MODULE`, `CHROMIUM_EXECUTABLE`, and optionally `NODE_BIN` for your environment. `AGENT_CONVERSATIONS_BINARY` selects an already-built binary; `BROWSER_ARTIFACT_DIR` keeps temporary fixtures and screenshots outside the checkout. The fixture seeds only its own temporary browser session; it does not claim to verify a real account's PAM password.

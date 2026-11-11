@@ -2,9 +2,9 @@
 
 Agent Conversations owns its browser conversations. An ACP connection identifies an existing independently running agent or an attach command; the service does not install agents, read their private state, or share Slack storage. The same endpoint may also be attached to Slack, Zed, or a fleet experience.
 
-These local interfaces implement the Constellation
-[family ownership agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/family.v1-candidate.md).
-The screen instructions below describe the reference client.
+The [shared agreements](README.md#shared-agreements) define cross-component
+ownership. This document defines local participation and access behavior; screen
+instructions describe the reference client.
 
 ## Start simply
 
@@ -101,3 +101,59 @@ written into the conversation or activity audit. Unanswered requests expire and
 are removed on cancellation. Only HTTPS (or loopback HTTP) destinations are
 accepted. The same decisions are available through the elicitation API and view
 controls; `elicitation_open_url` is the browser action for an external step.
+
+## Reference browser: phone and voice
+
+The responsive reference browser can be added to a phone or desktop home screen
+using its Install/Share menu. It uses the same authenticated service and ACP
+connections. The install shell never caches transcripts or credentials for
+offline use; reconnect to your network/Tailscale to use your agents.
+
+Press **Start voice** once in each page and grant microphone access. Speech
+drafts a message; **“Workshop, send message”** submits it through the ordinary
+conversation API. **Read replies aloud** queues completed replies. Voice pauses
+while reading and while the page is hidden. Browser speech support varies, and
+its speech service may process audio remotely. Typing and device keyboard
+dictation remain available when browser recognition is absent.
+
+Commands also include new conversation, clear draft, stop agent, show activity,
+show connection, show participants, hide participants, read last reply, stop
+reading, stop listening, and open conversation followed by an exact title.
+They require the “Workshop” prefix. This is a hands-free path for existing
+conversation/view controls, not a second agent or an always-listening assistant.
+
+For a single pending action, **read approval**, **show action details**,
+**allow once** and **reject once** use the same person-bound permission endpoint
+as the buttons. Ambiguous multiple requests require selection on screen;
+voice never chooses an action or grants a permanent policy implicitly.
+**Reply to [agent name/everyone]** and **name conversation [title]** control
+the existing target picker and conversation title.
+
+Voice preferences and help visibility use authenticated view state. The browser
+also exposes `window.agentConversationsControl.perform({action, text})`,
+`.voice.transcript(text)`, `.view()` and `.setView(changes)` for authorized UI
+automation. Remote preferences cannot grant microphone consent. All ordinary
+conversation and view APIs remain usable without the packaged UI.
+
+Agents can also ask structured questions through standard ACP form elicitation.
+The question names its requesting agent and appears only to the person who
+started the turn. Review or edit the fields, then send, decline or cancel.
+Drafts survive page reload and can be prepared through view control; preparing a
+draft does not submit it. Forms collect ordinary task information, not credentials
+or permission to run tools. External steps use the separate
+[sign-in and URL flow](#agent-sign-in-and-external-steps). See the
+[form API](api.md#structured-questions) for automation and constraints.
+
+## Optional shared group attention
+
+Ambient group turns discover `com.microsoft.amplifier.attention` v1 on the ACP
+endpoint. The browser service supplies bounded delivered room messages and the
+original trigger timestamp; Instance supplies social policy and a one-use offer.
+A hold removes the empty response placeholder without sending a model prompt.
+Source changes and cancellation discard the offer. Engines without this optional
+host feature continue to receive ordinary bounded ACP participation prompts.
+Direct conversations and explicitly selected recipients retain ordinary ACP.
+
+ACP updates remain available as they arrive. Direct chat displays streamed text;
+shared rooms buffer draft text until the final public contribution or `[[PASS]]`
+is known. This is a presentation choice, not missing streaming in the agent.

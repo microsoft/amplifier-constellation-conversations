@@ -6,9 +6,9 @@ human's original conversation. The human can inspect it, join, or follow it.
 Meaningful progress, results, blockers and decisions return to the original
 request with a link to the discussion.
 
-This is the local implementation of the shared
-[interaction agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/experience.v1-candidate.md).
-The endpoints and participant behavior below remain this component's interface.
+The [shared agreements](README.md#shared-agreements) define cross-component
+interaction and work boundaries. The endpoints and participant behavior below
+are this component's interface.
 
 Participants keep their existing controlling session and tools. Installation-owned
 automatic setup lets agents create or reuse a room and discover invited peer
