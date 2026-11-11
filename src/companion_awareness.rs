@@ -494,6 +494,45 @@ fn requested_outcome_bound(
     )
 }
 
+/// Only known queue/admission bookkeeping can be retained without a Live
+/// update. Uncertainty, blockers, source replies and authority facts are not it.
+fn input_bookkeeping_only(update: &Value) -> bool {
+    update["scope"] == "conversation"
+        && update["provenance"]["kind"] == "minecraft_input_outcome"
+        && update["provenance"]["version"] == 1
+        && matches!(
+            update["delivery_state"].as_str(),
+            Some("queued" | "admitted")
+        )
+        && update["conversation"]["blocked_reason"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        && [
+            "responses",
+            "source_replies",
+            "task_authorizations",
+            "work_resumptions",
+        ]
+        .iter()
+        .all(|key| update[*key].as_array().is_none_or(Vec::is_empty))
+        && [
+            "responses_omitted",
+            "source_replies_omitted",
+            "private_responses_withheld",
+            "work_resumptions_omitted",
+        ]
+        .iter()
+        .all(|key| update[*key].as_u64().unwrap_or(0) == 0)
+        && [
+            "domain_responses_omitted",
+            "domain_source_replies_omitted",
+            "domain_private_responses_withheld",
+            "domain_work_resumptions_omitted",
+        ]
+        .iter()
+        .all(|key| update[*key] != true)
+}
+
 fn preserve_requested_outcome(
     s: &AppState,
     destination: &str,
@@ -524,7 +563,13 @@ fn preserve_requested_outcome(
     if !live || !requested_outcome_bound(&tx, destination, source, &event)? {
         return Ok(false);
     }
-    let changed = tx.execute("UPDATE companion_awareness SET state='ready',decision=?3 WHERE call_id=?1 AND event_key=?2 AND state='observed'",params![destination,key,json!({"status":"not_requested","reason":"bound_requested_outcome"}).to_string()])? == 1;
+    let bookkeeping = input_bookkeeping_only(update);
+    let decision = if bookkeeping {
+        json!({"status":"retained","reason":"input_delivery_bookkeeping"})
+    } else {
+        json!({"status":"not_requested","reason":"bound_requested_outcome"})
+    };
+    let changed = tx.execute("UPDATE companion_awareness SET state=?3,decision=?4 WHERE call_id=?1 AND event_key=?2 AND state='observed'",params![destination,key,if bookkeeping {"observed"} else {"ready"},decision.to_string()])? == 1;
     if changed {
         // Keep the full attributed receipt visible in call history even though
         // optional ambient judgment and proactive speech are not requested.
@@ -917,76 +962,212 @@ fn reply_parts(source: &Source, event: &Value, update: &Value) -> Vec<(String, S
         .collect()
 }
 
-/// Exact private answer bodies may be spoken separately from their provenance.
-/// Only an existing, whole, unambiguous reply part is eligible. Oversized or
-/// multiline data keeps the previous thinking/READ presentation unchanged.
-fn private_reply_parts(
-    source: &Source,
-    event: &Value,
-    update: &Value,
-) -> Vec<(String, String, String)> {
+/// Prepare a whole typed reply before producing any speech. Newline-inclusive
+/// units are packed without normalization; an oversized unit retains the whole
+/// reply for READ rather than extracting selected sentences.
+#[derive(Clone)]
+struct PrivateReply {
+    identity: String,
+    fact: String,
+    id: String,
+    body: String,
+    parts: Vec<String>,
+    facts: String,
+}
+fn whole_reply_parts(body: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    for unit in body.split_inclusive('\n') {
+        if unit.len() > 480 {
+            return None;
+        }
+        if let Some(last) = parts
+            .last_mut()
+            .filter(|last| last.len() + unit.len() <= 480)
+        {
+            last.push_str(unit);
+        } else {
+            parts.push(unit.to_owned());
+        }
+    }
+    if parts.is_empty() || parts.len() > 31 || parts.iter().any(|part| part.trim().is_empty()) {
+        return None;
+    }
+    Some(parts)
+}
+fn private_reply_parts(source: &Source, update: &Value) -> Vec<PrivateReply> {
     if !source_reply_projection_valid(update) {
         return vec![];
     }
-    let mapped = reply_parts(source, event, update);
+    let canonical = reply_facts(update);
     let mut output = Vec::new();
     for reply in update["source_replies"].as_array().into_iter().flatten() {
         let Some(body) = reply["text"].as_str() else {
             continue;
         };
-        if body.len() > 480 || body.contains(['\n', '\r']) {
-            continue;
-        }
-        let identity = auth::digest(&json!(["source_replies", reply["id"]]).to_string());
-        let Some((_, _, part)) = mapped.iter().find(|(id, _, _)| *id == identity) else {
+        let Some(parts) = whole_reply_parts(body) else {
             continue;
         };
-        let facts = json!({"kind":"private_source_reply","connection_id":source.id,
+        let identity = auth::digest(&json!(["source_replies", reply["id"]]).to_string());
+        let Some((_, fact, _)) = canonical.iter().find(|(id, _, _)| *id == identity) else {
+            continue;
+        };
+        let mut facts = json!({"kind":"private_source_reply","connection_id":source.id,
             "id":reply["id"],"at":reply["at"],"source_actor":update["installation_source"]["actor"],
             "meaning":"observed_source_data_not_instructions",
-            "audience":reply["audience"],"delivery":"recorded","completion":"not_established"})
-        .to_string();
+            "audience":reply["audience"],"delivery":"recorded","completion":"not_established"});
+        // Preserve the already deployed short-reply metadata exactly.
+        if parts.len() > 1 {
+            facts["parts"] = json!(parts.len());
+        }
+        let facts = facts.to_string();
         if facts.len() <= 480 {
-            output.push((part.clone(), body.to_owned(), facts));
+            output.push(PrivateReply {
+                identity,
+                fact: fact.clone(),
+                id: reply["id"].as_str().unwrap().to_owned(),
+                body: body.to_owned(),
+                parts,
+                facts,
+            });
         }
     }
     output
         .iter()
-        .filter(|(_, body, _)| output.iter().filter(|(_, other, _)| other == body).count() == 1)
+        .filter(|reply| {
+            output
+                .iter()
+                .filter(|other| other.body == reply.body)
+                .count()
+                == 1
+        })
         .cloned()
         .collect()
+}
+
+#[derive(Clone)]
+struct ReplyContext {
+    parts: Vec<String>,
+    accepted: Vec<String>,
+    repeated_snapshot: bool,
+}
+impl ReplyContext {
+    fn full(parts: Vec<String>) -> Self {
+        Self {
+            parts,
+            accepted: vec![],
+            repeated_snapshot: false,
+        }
+    }
+}
+fn reply_command(command: &Value, channel: &str, content: &str) -> bool {
+    command["op"] == "append" && command["channel"] == channel && command["content"] == content
+}
+fn private_reply_accepted(reply: &PrivateReply, commands: &[(String, Value)]) -> bool {
+    if reply.parts.len() == 1 {
+        // Legacy short replies had all qualifiers before all reply bodies.
+        return commands.iter().any(|(batch, command)| {
+            reply_command(command, "thinking", &reply.facts)
+                && commands.iter().any(|(other, command)| {
+                    other == batch && reply_command(command, "commentary", &reply.parts[0])
+                })
+        });
+    }
+    // Multipart publication is an exact contiguous group in one stored batch.
+    // Membership, multiplicity, order and every part ACK must all be proved.
+    commands.windows(reply.parts.len() + 1).any(|group| {
+        reply_command(&group[0].1, "thinking", &reply.facts)
+            && group.iter().all(|(batch, _)| batch == &group[0].0)
+            && group.iter().enumerate().all(|(index, (_, command))| {
+                command["event_id"].is_string()
+                    && group[..index]
+                        .iter()
+                        .all(|(_, prior)| prior["event_id"] != command["event_id"])
+            })
+            && group[1..]
+                .iter()
+                .zip(&reply.parts)
+                .all(|((_, command), part)| reply_command(command, "commentary", part))
+    })
 }
 
 fn requested_reply_presentation(
     db: &rusqlite::Connection,
     source: &Source,
     event: &Value,
-    parts: Vec<String>,
+    context: ReplyContext,
 ) -> Result<Vec<(&'static str, String)>> {
-    let mut thinking = Vec::new();
-    let mut replies = Vec::new();
     let update: Option<String> = db.query_row(
         "SELECT data FROM companion_observation_revisions WHERE call_id=?1 AND request_id=?2 AND revision=?3",
         params![event["provenance"]["source_call_id"].as_str(),
             event["id"].as_str().and_then(|id|id.strip_prefix("action:")), event["revision"].as_str()],
         |row| row.get(0),
     ).optional()?;
-    let mapped = update
-        .map(|raw| serde_json::from_str::<Value>(&raw))
-        .transpose()?
-        .map(|update| private_reply_parts(source, event, &update))
-        .unwrap_or_default();
-    for part in parts {
-        if let Some((_, body, facts)) = mapped.iter().find(|(original, _, _)| *original == part) {
-            thinking.push(("thinking", facts.clone()));
-            replies.push(("commentary", body.clone()));
-        } else {
-            thinking.push(("thinking", part));
+    let Some(update) = update else {
+        return Ok(context
+            .parts
+            .into_iter()
+            .map(|part| ("thinking", part))
+            .collect());
+    };
+    let update: Value = serde_json::from_str(&update)?;
+    if input_bookkeeping_only(&update) || context.repeated_snapshot {
+        return Ok(vec![]);
+    }
+    let mapped = private_reply_parts(source, &update);
+    let accepted_ids: Vec<_> = update["source_replies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|reply| {
+            let identity = auth::digest(&json!(["source_replies", reply["id"]]).to_string());
+            reply_facts(&update)
+                .iter()
+                .any(|(id, fact, _)| *id == identity && context.accepted.contains(fact))
+                .then(|| reply["id"].as_str().unwrap().to_owned())
+        })
+        .collect();
+    let full = context_parts(source, event, "");
+    let project = |spoken: &[PrivateReply]| {
+        let mut omitted = accepted_ids.clone();
+        omitted.extend(spoken.iter().map(|reply| reply.id.clone()));
+        let mut presented = event.clone();
+        presented["text"] = json!(observation_text_for_presentation(
+            &source.label,
+            &update,
+            true,
+            &omitted
+        ));
+        context_parts(source, &presented, "")
+            .into_iter()
+            .filter(|part| !full.contains(part) || context.parts.contains(part))
+            .collect::<Vec<_>>()
+    };
+    let mut spoken = Vec::new();
+    for reply in mapped
+        .into_iter()
+        .filter(|reply| !context.accepted.contains(&reply.fact))
+    {
+        let mut trial = spoken.clone();
+        trial.push(reply);
+        if project(&trial).len()
+            + trial
+                .iter()
+                .map(|reply| 1 + reply.parts.len())
+                .sum::<usize>()
+            <= 32
+        {
+            spoken = trial;
         }
     }
-    // Source qualifications precede speech; acceptance remains per complete batch.
-    thinking.extend(replies);
-    Ok(thinking)
+    let mut presentation: Vec<_> = project(&spoken)
+        .into_iter()
+        .map(|part| ("thinking", part))
+        .collect();
+    for reply in spoken {
+        presentation.push(("thinking", reply.facts));
+        presentation.extend(reply.parts.into_iter().map(|part| ("commentary", part)));
+    }
+    Ok(presentation)
 }
 
 fn reply_facts(update: &Value) -> Vec<(String, String, String)> {
@@ -1036,29 +1217,39 @@ fn requested_reply_context_parts(
     source: &Source,
     event: &Value,
     policy: &str,
-) -> Result<Vec<String>> {
+) -> Result<ReplyContext> {
     let full = context_parts(source, event, "");
     let Some(request) = event["id"]
         .as_str()
         .and_then(|id| id.strip_prefix("action:"))
     else {
-        return Ok(full);
+        return Ok(ReplyContext::full(full));
     };
     let Some(origin) = event["provenance"]["source_call_id"].as_str() else {
-        return Ok(full);
+        return Ok(ReplyContext::full(full));
     };
     let current: Option<String> = db.query_row(
         "SELECT data FROM companion_observation_revisions WHERE call_id=?1 AND request_id=?2 AND revision=?3",
         params![origin, request, event["revision"].as_str()], |r| r.get(0)).optional()?;
     let Some(current) = current else {
-        return Ok(full);
+        return Ok(ReplyContext::full(full));
     };
     let update: Value = serde_json::from_str(&current)?;
-    let mut pending = reply_parts(source, event, &update);
+    let mut pending = reply_facts(&update);
     if pending.is_empty() {
-        return Ok(full);
+        return Ok(ReplyContext::full(full));
     }
     let mut accepted = Vec::new();
+    let mut repeated_snapshot = false;
+    let mut uninterrupted_snapshot = true;
+    let substantive = |value: &Value| {
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("revision");
+            object.remove("observed_at");
+        }
+        value
+    };
     // Bounded lookback is an optimization, never permission to discard data:
     // unproven older acceptance simply leaves the full current part available.
     let mut stmt = db.prepare(
@@ -1093,7 +1284,7 @@ fn requested_reply_context_parts(
     for row in rows {
         let (key, raw_event, state, raw_update, old_policy) = row?;
         let Some(raw_update) = raw_update else {
-            return Ok(full);
+            return Ok(ReplyContext::full(full));
         };
         let old_event: Value = serde_json::from_str(&raw_event)?;
         let mut old_update: Value = serde_json::from_str(&raw_update)?;
@@ -1102,17 +1293,20 @@ fn requested_reply_context_parts(
             || old_update["request_id"].as_str() != Some(request)
             || !old_update["provenance"].is_object()
         {
-            return Ok(full);
+            return Ok(ReplyContext::full(full));
         }
         old_update["observed_at"] = old_event["occurred_at"].clone();
         let Some(owner) = old_event["audience"]["owner"].as_str() else {
-            return Ok(full);
+            return Ok(ReplyContext::full(full));
         };
         if old_event["audience"] != event["audience"]
             || old_event != requested_outcome_event(owner, source, origin, &old_update)
         {
-            return Ok(full);
+            return Ok(ReplyContext::full(full));
         }
+        // An intervening substantive change breaks whole-snapshot equivalence
+        // even when its reply body was already accepted in an older revision.
+        uninterrupted_snapshot &= substantive(&update) == substantive(&old_update);
         let old_facts = reply_facts(&old_update);
         // A changed then reverted reply is a correction, not an old duplicate.
         // Do not reach past a newer different meaning to reuse older acceptance.
@@ -1125,14 +1319,14 @@ fn requested_reply_context_parts(
             continue;
         }
         let old_parts = reply_parts(source, &old_event, &old_update);
-        let private_parts = private_reply_parts(source, &old_event, &old_update);
+        let private_parts = private_reply_parts(source, &old_update);
         let mut commands = db.prepare(
-            "SELECT j.value FROM companion_awareness_appends p
+            "SELECT b.id,j.value FROM companion_awareness_appends p
              JOIN companion_voice_batches b ON b.call_id=p.call_id
              JOIN json_each(b.updates) j ON json_extract(j.value,'$.event_id')=p.event_id
              WHERE p.call_id=?1 AND p.event_key=?2 AND p.state='accepted'
                AND b.state IN ('dispatching','sent','unknown') AND b.semantic_key=?3
-               AND json_extract(j.value,'$.channel')=p.channel LIMIT 64",
+               AND json_extract(j.value,'$.channel')=p.channel ORDER BY b.created_at,b.rowid,CAST(j.key AS INTEGER) LIMIT 64",
         )?;
         let commands = commands
             .query_map(
@@ -1141,50 +1335,60 @@ fn requested_reply_context_parts(
                     key,
                     format!("awareness:{}:{}", source.id, event["id"].as_str().unwrap())
                 ],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )?
-            .map(|r| Ok(serde_json::from_str::<Value>(&r?)?))
+            .map(|r| {
+                let (batch, raw) = r?;
+                Ok((batch, serde_json::from_str::<Value>(&raw)?))
+            })
             .collect::<Result<Vec<_>>>()?;
-        pending.retain(|(identity, fact, part)| {
+        pending.retain(|(identity, fact, _)| {
             let confirmed = old_parts.iter().any(|(old_identity, old_fact, old_part)| {
                 old_identity == identity
                     && old_fact == fact
-                    && (commands.iter().any(|command| {
-                        command["op"] == "append"
-                            && command["channel"] == "thinking"
-                            && command["content"] == *old_part
-                    }) || private_parts.iter().any(|(part, body, facts)| {
-                        part == old_part
-                            && commands.iter().any(|command| {
-                                command["op"] == "append"
-                                    && command["channel"] == "commentary"
-                                    && command["content"] == *body
-                            })
-                            && commands.iter().any(|command| {
-                                command["op"] == "append"
-                                    && command["channel"] == "thinking"
-                                    && command["content"] == *facts
-                            })
-                    }))
+                    && commands
+                        .iter()
+                        .any(|(_, command)| reply_command(command, "thinking", old_part))
+            }) || private_parts.iter().any(|reply| {
+                reply.identity == *identity
+                    && reply.fact == *fact
+                    && private_reply_accepted(reply, &commands)
             });
             if confirmed {
-                accepted.push(part.clone());
+                accepted.push(fact.clone());
             }
             !confirmed
         });
+        // A new observation clock/revision is not new source information. Only
+        // an exact substantive snapshot with every reply proved accepted may
+        // also suppress its unchanged qualifications. Changed blockers, status,
+        // authority or source fields cannot take this path.
+        repeated_snapshot |= uninterrupted_snapshot
+            && reply_facts(&update)
+                .iter()
+                .all(|(_, fact, _)| accepted.contains(fact));
         if pending.is_empty() {
             break;
         }
     }
+    let accepted_parts: Vec<_> = reply_parts(source, event, &update)
+        .into_iter()
+        .filter(|(_, fact, _)| accepted.contains(fact))
+        .map(|(_, _, part)| part)
+        .collect();
     let projected: Vec<_> = full
         .iter()
-        .filter(|part| !accepted.contains(part))
+        .filter(|part| !accepted_parts.contains(part))
         .cloned()
         .collect();
-    Ok(if projected.is_empty() {
-        full
-    } else {
-        projected
+    Ok(ReplyContext {
+        parts: if projected.is_empty() {
+            full
+        } else {
+            projected
+        },
+        accepted,
+        repeated_snapshot,
     })
 }
 
@@ -1340,13 +1544,6 @@ pub(crate) fn status_sources(s: &AppState, id: &str) -> Result<Vec<Value>> {
         .collect())
 }
 
-/// The binding stays inside the host; it is not helper-provided metadata or an
-/// extra wire capability. Tool authorization is checked again before presentation.
-pub(crate) struct ConnectionStatusRead {
-    pub(crate) response: Value,
-    binding: Option<StatusReadBinding>,
-}
-
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StatusView {
@@ -1354,15 +1551,6 @@ pub(crate) enum StatusView {
     Reports,
     Current,
 }
-struct StatusReadBinding {
-    call_id: String,
-    source: Source,
-    policy: String,
-    owner: String,
-    agent: String,
-    room: String,
-}
-
 /// Fresh bounded read through one already-configured observation helper. Never
 /// run a decision/action helper, advance background cursors, or present context.
 pub(crate) async fn connection_status(
@@ -1370,11 +1558,8 @@ pub(crate) async fn connection_status(
     id: &str,
     connection: &str,
     view: StatusView,
-) -> Result<ConnectionStatusRead> {
-    let empty = |status: &str| ConnectionStatusRead {
-        response: json!({"connection_id":connection,"status":status,"reports":[],"presence":{},"coverage":{"bounded":true,"gap":true},"queried_at":now_ms(),"read_only":true,"authority":false,"note":"This read established no current facts. Missing reports do not establish inactivity; no action was submitted."}),
-        binding: None,
-    };
+) -> Result<Value> {
+    let empty = |status: &str| json!({"connection_id":connection,"status":status,"reports":[],"presence":{},"coverage":{"bounded":true,"gap":true},"queried_at":now_ms(),"read_only":true,"authority":false,"note":"This read established no current facts. Missing reports do not establish inactivity; no action was submitted."});
     let Some((owner, agent, room, _)) = active(s, id)? else {
         anyhow::bail!("Active private call required")
     };
@@ -1512,319 +1697,7 @@ pub(crate) async fn connection_status(
             "Fresh typed snapshots only; progress keeps its original time. Excluded reports remain available in the reports view. Missing current facts mean unknown, not inactivity."
         );
     }
-    Ok(ConnectionStatusRead {
-        response,
-        binding: Some(StatusReadBinding {
-            call_id: id.to_owned(),
-            source: source.clone(),
-            policy: fingerprint,
-            owner,
-            agent,
-            room,
-        }),
-    })
-}
-
-/// Preserve essential source qualifications independently of the reasoning
-/// model's summary. A requested read is context, never a request to speak or act.
-pub(crate) fn preserve_requested_status(
-    s: &AppState,
-    id: &str,
-    read: &ConnectionStatusRead,
-) -> Result<()> {
-    let Some(binding) = &read.binding else {
-        return Ok(());
-    };
-    ensure!(
-        binding.call_id == id
-            && active(s, id)?.is_some_and(|(owner, agent, room, _)| {
-                owner == binding.owner && agent == binding.agent && room == binding.room
-            })
-            && config(s)?.is_some_and(|(_, policy)| policy == binding.policy),
-        "Requested observation access changed"
-    );
-    let reports = read.response["reports"].as_array().unwrap();
-    if reports.is_empty() {
-        if read.response["selection"]["view"] == "current" {
-            // Withdraw only this source's unsent qualifiers; never erase delivered
-            // context or fabricate a source observation for an empty selection.
-            crate::companion_delivery::supersede_pending(
-                s,
-                id,
-                &format!("requested-status:{}", binding.source.id),
-            )?;
-        }
-        return Ok(());
-    }
-    let source = &binding.source;
-    let mut selected: Vec<_> = reports.iter().collect();
-    // Physical presence and assignment state are separate current facts. Keep
-    // both ahead of historical chat without refreshing a progress report.
-    selected.sort_by_key(
-        |report| match report["attribution"]["snapshot_kind"].as_str() {
-            Some("presence") => 0,
-            Some("assignment") => 1,
-            _ => 2,
-        },
-    );
-    let mut facts = Vec::new();
-    for report in selected {
-        if facts.len() == 4 {
-            break;
-        }
-        let Some(text) = requested_report_qualifier(source, report, &read.response) else {
-            continue;
-        };
-        if text.len() <= 480 {
-            facts.push((report, text, false));
-        }
-    }
-    let omitted = reports.len() - facts.len();
-    let mut coverage = if read.response["selection"]["view"] == "current" {
-        format!(
-            "{}: current read {}; source observation {}. {} report(s) excluded by selection; {} selected report(s) omitted here and {} by the response bound. Source coverage is bounded; missing current facts mean unknown.",
-            source.label,
-            read.response["queried_at"],
-            read.response["source_observed_at"].as_str().unwrap(),
-            read.response["selection"]["excluded_reports"],
-            omitted,
-            read.response["omitted"],
-        )
-    } else {
-        format!(
-            "{}: status read at {}; source observation {}. The timestamped facts above are source observations. History is bounded/incomplete; missing reports do not prove inactivity. {} whole report(s) and {} source report(s) omitted here. This read changes no work authority.",
-            source.label,
-            read.response["queried_at"],
-            read.response["source_observed_at"].as_str().unwrap(),
-            omitted,
-            read.response["omitted"],
-        )
-    };
-    // These are source capability limits, not evidence that an action failed
-    // or never happened. Missing/null/true values establish no such limit.
-    let unsupported: Vec<_> = ["verified_completion_supported", "work_completion_supported"]
-        .iter()
-        .filter(|key| read.response["coverage"][**key].as_bool() == Some(false))
-        .map(|key| format!("{key}=false"))
-        .collect();
-    if !unsupported.is_empty() {
-        coverage.push_str(&format!(" Source coverage: {}.", unsupported.join("; ")));
-    }
-    // The bounded note is mandatory: never silently cut a timestamp or qualifier.
-    ensure!(
-        coverage.len() <= 480,
-        "Requested status qualifications exceed context bound"
-    );
-    facts.push((&reports[0], coverage, true));
-    let mut commands = Vec::new();
-    for (report, content, summary) in facts {
-        let event_id = format!(
-            "requested-status:{}",
-            auth::digest(&json!([source.id, report["id"], summary]).to_string())
-        );
-        let revision = auth::digest(
-            &json!([
-                report,
-                read.response["queried_at"],
-                read.response["source_observed_at"],
-                content
-            ])
-            .to_string(),
-        );
-        // Retain the exact authorized audience and source-time association. The
-        // application constructs these fields from the filtered read, not from
-        // arbitrary helper provenance or the backend's eventual prose.
-        let event = json!({
-            "id":event_id,"revision":revision,"kind":"requested_status_qualifier",
-            "text":content,"occurred_at":report["attribution"]["occurred_at"],
-            "observed_at":read.response["source_observed_at"],
-            "actor":report["attribution"]["actor"],"audience":report["attribution"]["audience"],
-            "provenance":{"kind":"companion_requested_connection_status","read_only":true,
-                "report_id":report["id"],"report_revision":report["revision"],
-                "attribution":report["attribution"],"queried_at":read.response["queried_at"],
-                "coverage_note":summary,"authority":false}
-        });
-        ensure!(
-            event_valid(&event) && source.audiences.contains(&event["audience"]),
-            "Invalid requested status qualification"
-        );
-        record_source_event(s, id, source, &event, &binding.policy, false)?;
-        let key = event_key(&source.id, &event);
-        let append_id = format!("awareness-{key}");
-        {
-            let db = s.db.lock().unwrap();
-            db.execute("INSERT OR IGNORE INTO companion_awareness_appends VALUES(?1,?2,?3,'thinking','queued')", params![id,key,append_id])?;
-            db.execute("UPDATE companion_awareness SET state='context_queued',append_channel='thinking' WHERE call_id=?1 AND event_key=?2 AND state='observed'",params![id,key])?;
-        }
-        commands.push(json!({"op":"append","channel":"thinking","event_id":append_id,"delegation_id":null,"content":content}));
-    }
-    // Later reads replace only an unsent qualifier batch for this same source.
-    // Independent backend answers and action outcomes keep their own identities.
-    crate::companion_delivery::enqueue_batch(
-        s,
-        id,
-        &format!("requested-status:{}", source.id),
-        commands,
-    )?;
-    Ok(())
-}
-
-// Age is a deterministic qualification of the original source time at this read,
-// not a new observation. Keep exact timestamps beside the human-readable form.
-fn source_age_at_read(timestamp: &Value, read_at: &Value) -> String {
-    let source_at = observed_time(timestamp).or_else(|| {
-        timestamp.as_i64().filter(|at| {
-            *at > 0
-                && time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(*at) * 1_000_000)
-                    .is_ok()
-        })
-    });
-    let Some((source_at, read_at)) = source_at.zip(read_at.as_i64().filter(|at| *at > 0)) else {
-        return "age unknown at read".into();
-    };
-    let Some(age) = read_at.checked_sub(source_at).filter(|age| *age >= 0) else {
-        return "future-dated relative to this read; age unknown".into();
-    };
-    let (amount, unit) = if age >= 86_400_000 {
-        (age / 86_400_000, "day")
-    } else if age >= 3_600_000 {
-        (age / 3_600_000, "hour")
-    } else if age >= 60_000 {
-        (age / 60_000, "minute")
-    } else {
-        return "less than a minute old at read".into();
-    };
-    format!(
-        "about {amount} {unit}{} old at read",
-        if amount == 1 { "" } else { "s" }
-    )
-}
-
-fn requested_report_qualifier(source: &Source, report: &Value, response: &Value) -> Option<String> {
-    let attribution = &report["attribution"];
-    let actor = attribution["actor"].as_str().unwrap_or("source");
-    let occurred = attribution["occurred_at"].as_str().unwrap();
-    let observed = attribution["observed_at"]
-        .as_str()
-        .unwrap_or_else(|| response["source_observed_at"].as_str().unwrap());
-    if attribution["snapshot_kind"] == "presence"
-        && let Ok(presence) = serde_json::from_str::<Value>(report["text"].as_str().unwrap())
-    {
-        let position = &presence["position"];
-        let position = if ["x", "y", "z"].iter().all(|key| {
-            position[*key]
-                .as_f64()
-                .is_some_and(|n| n.is_finite() && n.abs() <= 30_000_000.0)
-        }) {
-            format!("({}, {}, {})", position["x"], position["y"], position["z"])
-        } else {
-            "not reported".into()
-        };
-        let flags: Vec<_> = ["ready", "busy", "turn_active"]
-            .iter()
-            .filter_map(|key| {
-                presence[*key]
-                    .as_bool()
-                    .map(|value| format!("{key}={value}"))
-            })
-            .collect();
-        let age = source_age_at_read(&attribution["occurred_at"], &response["queried_at"]);
-        let mut text = format!(
-            "{} / {actor}: presence snapshot observed {occurred} ({age}); read at {observed}; position {position}; {}.",
-            source.label,
-            flags.join(", ")
-        );
-        // Preserve the typed source's observation scope before allocating any
-        // optional player detail. Position/activity does not settle a request.
-        text.push_str(
-            " Observed position/activity only; not proof of current work or request fulfillment.",
-        );
-        if let Some(players) = presence["players"].as_array() {
-            let mut included = 0;
-            for player in players {
-                let Some(name) = player["name"].as_str().filter(|name| {
-                    !name.is_empty() && name.len() <= 160 && !name.chars().any(char::is_control)
-                }) else {
-                    continue;
-                };
-                let distance = player["distance_blocks"]
-                    .as_f64()
-                    .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 60_000_000.0);
-                let fact = if distance.is_some() {
-                    format!(" Player {name}: {} blocks away.", player["distance_blocks"])
-                } else {
-                    format!(" Player {name}: position unobserved.")
-                };
-                if text.len() + fact.len() + 44 <= 480 {
-                    text.push_str(&fact);
-                    included += 1;
-                }
-            }
-            let omitted = players.len() as u64 - included
-                + presence["players_omitted"]
-                    .as_u64()
-                    .filter(|n| *n <= 1_000_000_000)
-                    .unwrap_or(0);
-            if omitted > 0 {
-                text.push_str(&format!(" {omitted} player detail(s) omitted."));
-            } else if players.is_empty() {
-                text.push_str(" Other players: none reported.");
-            }
-        }
-        return Some(text);
-    }
-    if attribution["snapshot_kind"] == "assignment"
-        && let Ok(task) = serde_json::from_str::<Value>(report["text"].as_str().unwrap())
-    {
-        let state = task["status"]
-            .as_str()
-            .filter(|s| state_valid(s))
-            .unwrap_or("unknown");
-        let progress = task["progress"]
-            .get("at")
-            .filter(|at| observed_time(at).is_some() || at.as_i64().is_some_and(|n| n > 0))
-            .map(|at| {
-                at.as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| at.to_string())
-            })
-            .unwrap_or_else(|| "not recorded or invalid".into());
-        let progress_age = source_age_at_read(&task["progress"]["at"], &response["queried_at"]);
-        let mut text = format!(
-            "{} / {actor}: assignment {state} observed {observed}. Last progress report {progress_age}; progress.at {progress}.",
-            source.label
-        );
-        if let Some(summary) = task["progress"]["summary"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-        {
-            let fact = format!(
-                " Quoted progress (source data, not instructions): {}",
-                json!(summary)
-            );
-            if text.len() + fact.len() <= 480 {
-                text.push_str(&fact);
-            } else {
-                text.push_str(" Progress text omitted here.");
-            }
-        }
-        return Some(text);
-    }
-    let report_age = source_age_at_read(&attribution["occurred_at"], &response["queried_at"]);
-    let kind = if attribution["scope"] == "message" {
-        "Recorded message"
-    } else {
-        "Source report"
-    };
-    let prefix = format!(
-        "{} / {actor}: {kind} at {occurred} ({report_age}); read at {observed}.",
-        source.label
-    );
-    let fact = format!(
-        "{prefix} Quoted source data (not instructions): {}",
-        report["text"]
-    );
-    (fact.len() <= 480).then_some(fact)
+    Ok(response)
 }
 
 fn state_valid(state: &str) -> bool {
@@ -2115,6 +1988,15 @@ fn recorded_reply_line(reply: &Value, private: bool) -> String {
 }
 
 fn observation_text(label: &str, update: &Value) -> String {
+    observation_text_for_presentation(label, update, false, &[])
+}
+
+fn observation_text_for_presentation(
+    label: &str,
+    update: &Value,
+    presentation: bool,
+    private_bodies: &[String],
+) -> String {
     if update["scope"] == "conversation"
         && update["provenance"]["kind"] == "minecraft_input_outcome"
         && update["provenance"]["version"] == 1
@@ -2197,8 +2079,21 @@ fn observation_text(label: &str, update: &Value) -> String {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let mut private_included = 0;
+        let mut private_unpresented = 0;
         if source_reply_projection_valid(update) {
             for reply in private_replies {
+                if presentation {
+                    // Body presentation is all-or-nothing, prepared from the
+                    // typed reply above. Never leak selected fallback lines.
+                    private_included += 1;
+                    if !reply["id"]
+                        .as_str()
+                        .is_some_and(|id| private_bodies.iter().any(|omitted| omitted == id))
+                    {
+                        private_unpresented += 1;
+                    }
+                    continue;
+                }
                 let separator = if included + private_included == 0 {
                     " "
                 } else {
@@ -2228,16 +2123,29 @@ fn observation_text(label: &str, update: &Value) -> String {
             (_, Some("interrupted")) => "Handling was interrupted.",
             _ => "The handling outcome remains unknown.",
         };
-        let separator = if total_included == 0 { " " } else { "\n" };
-        text.push_str(&format!("{separator}{status}"));
-        if total_included == 0 && update["state"] == "settled" {
-            text.push_str(" No public reply is included in this record.");
+        // Queue/admission and ordinary turn scope are retained in the canonical
+        // record, not offered as standalone Live updates. Missing terminal
+        // answers and actual uncertainty remain explicit.
+        if !presentation
+            || matches!(
+                update["delivery_state"].as_str(),
+                Some("unknown" | "interrupted")
+            )
+            || (update["state"] == "settled" && total_included == 0)
+        {
+            let separator = if total_included == 0 { " " } else { "\n" };
+            text.push_str(&format!("{separator}{status}"));
+            if total_included == 0 && update["state"] == "settled" {
+                text.push_str(" No public reply is included in this record.");
+            }
         }
         let turn = &update["conversation"];
-        match turn["conversation_only"].as_bool() {
-            Some(true) => text.push_str("\nRecorded turn scope: conversation only."),
-            Some(false) => text.push_str("\nRecorded turn scope: not limited to conversation."),
-            None => {}
+        if !presentation {
+            match turn["conversation_only"].as_bool() {
+                Some(true) => text.push_str("\nRecorded turn scope: conversation only."),
+                Some(false) => text.push_str("\nRecorded turn scope: not limited to conversation."),
+                None => {}
+            }
         }
         if let Some(reason) = turn["blocked_reason"]
             .as_str()
@@ -2269,7 +2177,7 @@ fn observation_text(label: &str, update: &Value) -> String {
                 "\nSome returned replies are not included here; no partial reply was summarized.",
             );
         }
-        if private_included < private_replies.len() {
+        if private_included < private_replies.len() || private_unpresented > 0 {
             text.push_str("\nSome returned private replies are not included here; no partial reply was summarized.");
         }
         if update["source_replies_omitted"].as_u64().unwrap_or(0) > 0
@@ -2293,6 +2201,12 @@ fn observation_text(label: &str, update: &Value) -> String {
                 text.push_str("\nUnrelated private game response content was withheld; it is not evidence available to this call.");
             } else {
                 text.push_str("\nPrivate response content was withheld; it is not evidence available to this call.");
+            }
+        }
+        if presentation {
+            let prefix = format!("{label}:\n");
+            if let Some(rest) = text.strip_prefix(&prefix) {
+                text = format!("{label}: {rest}");
             }
         }
         return text;
@@ -2886,26 +2800,33 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
             )?;
             return Ok(());
         }
-        let parts = if requested {
-            // An incomplete historical lookup cannot prove prior acceptance.
-            // Keep the full, already validated current observation instead.
+        let context = if requested {
             requested_reply_context_parts(&s.db.lock().unwrap(), id, source, &event, &fingerprint)
-                .unwrap_or_else(|_| context_parts(source, &event, &key))
+                .unwrap_or_else(|_| ReplyContext::full(context_parts(source, &event, &key)))
         } else {
-            context_parts(source, &event, &key)
+            ReplyContext::full(context_parts(source, &event, &key))
         };
-        // Both thinking and commentary wait in the shared durable delivery queue.
-        // Receipt retention is independent of the caller's conversational floor.
-        let speak = notify && parts.len() == 1;
+        let speak = notify && context.parts.len() == 1;
         let presentation = if requested {
-            requested_reply_presentation(&s.db.lock().unwrap(), source, &event, parts.clone())
-                .unwrap_or_else(|_| parts.into_iter().map(|part| ("thinking", part)).collect())
+            requested_reply_presentation(&s.db.lock().unwrap(), source, &event, context.clone())
+                .unwrap_or_else(|_| {
+                    context
+                        .parts
+                        .into_iter()
+                        .map(|part| ("thinking", part))
+                        .collect()
+                })
         } else {
-            parts
+            context
+                .parts
                 .into_iter()
                 .map(|part| (if speak { "commentary" } else { "thinking" }, part))
                 .collect()
         };
+        if presentation.is_empty() {
+            s.db.lock().unwrap().execute("UPDATE companion_awareness SET state='observed',decision=?3 WHERE call_id=?1 AND event_key=?2 AND state='ready'",params![id,key,json!({"status":"retained","reason":"input_delivery_bookkeeping"}).to_string()])?;
+            return Ok(());
+        }
         let channel = if presentation
             .iter()
             .all(|(channel, _)| *channel == "thinking")

@@ -1361,7 +1361,7 @@ async fn action_preserves_original_human_time_and_refuses_changed_transcript() {
 }
 
 #[tokio::test]
-async fn explicit_status_response_queues_qualified_context_before_backend_paraphrase() {
+async fn explicit_status_response_retains_qualified_return_without_unsolicited_context() {
     let f = fixture();
     let c = call(&f);
     let current = time::OffsetDateTime::now_utc();
@@ -1397,24 +1397,28 @@ async fn explicit_status_response_queues_qualified_context_before_backend_paraph
     assert_eq!(value["reports"][0]["text"], report["events"][0]["text"]);
     assert!(value.get("binding").is_none());
     let db = f.s.db.lock().unwrap();
-    let (raw, state): (String, String) = db
-        .query_row(
-            "SELECT updates,state FROM companion_voice_batches WHERE call_id=?1",
-            [&c.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "pending");
-    let commands: Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(commands.as_array().unwrap().len(), 2);
-    assert!(
-        commands
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|v| v["channel"] == "thinking")
+    assert_eq!(
+        value["reports"][0]["attribution"]["occurred_at"],
+        report["events"][0]["occurred_at"]
     );
-    assert!(raw.contains(&old) && raw.contains(&now));
+    assert!(value["reports"][0]["text"].as_str().unwrap().contains(&old));
+    assert_eq!(value["coverage"]["bounded"], true);
+    assert_eq!(value["coverage"]["gap"], true);
+    for table in [
+        "companion_voice_batches",
+        "companion_awareness_appends",
+        "companion_awareness",
+    ] {
+        assert_eq!(
+            db.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE call_id=?1"),
+                [&c.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
             .get::<_, i64>(0))
