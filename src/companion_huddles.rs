@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_request_text_is_not_a_source_identity_and_later_speech_demotes_pending_result() {
+    fn identical_request_text_keeps_distinct_sources_and_conversation_preserves_pending_result() {
         let f = fixture();
         let (first, first_id) = request(&f, "first-identical", "Check it.", now_ms() - 5000);
         let (second, second_id) = request(&f, "second-identical", "Check it.", now_ms() - 4000);
@@ -1318,8 +1318,8 @@ mod tests {
         let saved = batches(&f, &f.call);
         assert_eq!(saved[0][1]["delegation_id"], first_id);
         assert_eq!(saved[1][1]["delegation_id"], second_id);
-        // The existing late-result policy changes presentation after the caller
-        // speaks again, without changing the request, facts or accepted work.
+        // Ordinary conversation does not replace the second awaited result.
+        // Its exact request identity, public answer and facts remain intact.
         {
             let db = f.s.db.lock().unwrap();
             db.execute(
@@ -1356,16 +1356,14 @@ mod tests {
         let ready = crate::companion_delivery::take_ready(&f.s, &f.call)
             .unwrap()
             .unwrap();
+        let answer = ready["commands"].as_array().unwrap().last().unwrap();
+        assert_eq!(answer["channel"], "commentary");
+        assert_eq!(answer["delegation_id"], second_id);
+        assert_eq!(answer["content"], "Second result");
         assert!(
-            ready["commands"]
-                .as_array()
+            crate::companion_delivery::take_ready(&f.s, &f.call)
                 .unwrap()
-                .iter()
-                .all(|c| c["channel"] == "thinking")
-        );
-        assert_eq!(
-            ready["commands"].as_array().unwrap().last().unwrap()["content"],
-            "Second result"
+                .is_none()
         );
     }
 
