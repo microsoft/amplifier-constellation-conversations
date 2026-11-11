@@ -417,18 +417,26 @@ export async function selfTestBrowser(){
     assert(metrics.caller_speech_ms>=400&&metrics.caller_speech_ms<800,JSON.stringify(metrics));assert(metrics.assistant_speech_ms>=400&&metrics.assistant_speech_ms<800);assert(metrics.overlapping_audio_ms>=200&&metrics.overlapping_audio_ms<450);
     await page.close();const gatePage=await browser.newPage();await gatePage.exposeFunction('__duplexPcm',()=>{});await gatePage.addInitScript(installBrowserAudioHarness);await gatePage.goto('http://127.0.0.1:'+server.address().port);
     await gatePage.evaluate(async()=>{
-      await __duplex.init();const h=__duplex,c=h.context,sourcePeer=h.sourcePeer=new h.Peer(),targetPeer=h.gatePeer=new RTCPeerConnection(),stream=c.createMediaStreamDestination(),osc=h.gateTone=c.createOscillator();osc.frequency.value=440;osc.connect(stream);osc.start();h.nodes.push(osc);for(const track of stream.stream.getTracks())sourcePeer.addTrack(track,stream.stream);
+      await __duplex.init();const h=__duplex,c=h.context,sourcePeer=h.sourcePeer=new h.Peer(),targetPeer=h.gatePeer=new RTCPeerConnection(),stream=c.createMediaStreamDestination(),osc=h.gateTone=c.createOscillator();osc.frequency.value=440;osc.connect(stream);h.nodes.push(osc);for(const track of stream.stream.getTracks())sourcePeer.addTrack(track,stream.stream);
       targetPeer.ontrack=async e=>{const audio=document.getElementById('remote-audio');audio.srcObject=e.streams[0];await audio.play();};
       const ice=peer=>new Promise(resolve=>{if(peer.iceGatheringState==='complete')return resolve();peer.addEventListener('icegatheringstatechange',()=>{if(peer.iceGatheringState==='complete')resolve();});});
       await sourcePeer.setLocalDescription(await sourcePeer.createOffer());await ice(sourcePeer);await targetPeer.setRemoteDescription(sourcePeer.localDescription);await targetPeer.setLocalDescription(await targetPeer.createAnswer());await ice(targetPeer);await sourcePeer.setRemoteDescription(targetPeer.localDescription);
     });
-    await gatePage.waitForFunction(()=>__duplex.gatePeer.connectionState==='connected'&&__duplex.lastGain===1,null,{timeout:10000});await sleep(400);
-    const before=await gatePage.evaluate(()=>__duplex.sample());
-    await gatePage.evaluate(()=>{document.getElementById('remote-audio').muted=true;__duplex.gateTone.frequency.value=880;});await sleep(400);const muted=await gatePage.evaluate(()=>__duplex.sample());
+    await gatePage.waitForFunction(()=>__duplex.gatePeer.connectionState==='connected'&&__duplex.lastGain===1,null,{timeout:10000});
+    const audible=async()=>{const sample=await gatePage.evaluate(()=>__duplex.sample());return sample.caller_heard_rms>.01&&sample.raw_received_rms>.01?sample:null;};
+    // Connected transport and an open UI gate do not establish audio arrival.
+    // Keep the source silent first, then start beyond the old 400ms assumption.
+    // A permanently silent/broken path must still fail the bounded observation.
+    await assert.rejects(()=>waitFor(audible,.3,'silent source'),/Timed out: silent source/);
+    await gatePage.evaluate(()=>__duplex.gateTone.start(__duplex.context.currentTime+.75));
+    const before=await waitFor(audible,10,'generated audio reaches caller relay');
+    const bytes=state=>state.stats.filter(s=>s.type==='inbound-rtp').reduce((n,s)=>n+(s.bytesReceived||0),0);
+    await gatePage.evaluate(()=>{document.getElementById('remote-audio').muted=true;__duplex.gateTone.frequency.value=880;});
+    const muted=await waitFor(async()=>{const sample=await gatePage.evaluate(()=>__duplex.sample());return sample.raw_received_rms>.01&&sample.caller_heard_rms<.0001&&bytes(sample)>bytes(before)?sample:null;},10,'UI mute silences relay while RTP continues');
     assert(before.caller_heard_rms>.01);assert(muted.raw_received_rms>.01,'Raw received audio must continue under the UI mute');assert(muted.caller_heard_rms<.0001,'Caller relay must honor the real application mute');
-    const bytes=state=>state.stats.filter(s=>s.type==='inbound-rtp').reduce((n,s)=>n+(s.bytesReceived||0),0);assert(bytes(muted)>bytes(before),'Actual RTP reception continues while application playback is muted');
-    await gatePage.evaluate(()=>{__duplex.gateTone.frequency.value=1320;});await sleep(150);await gatePage.evaluate(()=>{document.getElementById('remote-audio').muted=false;});await sleep(300);
-    const resumed=await gatePage.evaluate(()=>{const data=new Uint8Array(__duplex.postAnalyser.frequencyBinCount);__duplex.postAnalyser.getByteFrequencyData(data);let peak=0;for(let i=1;i<data.length;i++)if(data[i]>data[peak])peak=i;return {frequency:peak*__duplex.context.sampleRate/__duplex.postAnalyser.fftSize,gain:__duplex.lastGain};});
+    assert(bytes(muted)>bytes(before),'Actual RTP reception continues while application playback is muted');
+    await gatePage.evaluate(()=>{__duplex.gateTone.frequency.value=1320;document.getElementById('remote-audio').muted=false;});
+    const resumed=await waitFor(async()=>{const sample=await gatePage.evaluate(()=>{const data=new Uint8Array(__duplex.postAnalyser.frequencyBinCount);__duplex.postAnalyser.getByteFrequencyData(data);let peak=0;for(let i=1;i<data.length;i++)if(data[i]>data[peak])peak=i;return {frequency:peak*__duplex.context.sampleRate/__duplex.postAnalyser.fftSize,gain:__duplex.lastGain};});return sample.gain===1&&Math.abs(sample.frequency-1320)<80?sample:null;},10,'current live signal resumes after UI unmute');
     assert.equal(resumed.gain,1);assert(Math.abs(resumed.frequency-1320)<80,'Resume must carry the current live signal, not the muted-period signal');
     await gatePage.evaluate(async()=>{__duplex.sourcePeer.close();__duplex.gatePeer.close();await __duplex.stop();});
     return {passed:true,scope:'Actual Chromium dual-channel clock plus real local-WebRTC post-application-mute relay; no GPT-Live/API/Companion outcome claim',chunks:chunks.length,metrics,post_gate:{before,muted,resumed,rtp_continued:true,muted_relay_silent:true,current_signal_only_after_resume:true}};
