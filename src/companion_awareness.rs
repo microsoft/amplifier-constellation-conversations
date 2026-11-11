@@ -1280,7 +1280,7 @@ pub(crate) fn preserve_requested_status(
         }
     }
     let omitted = reports.len() - facts.len();
-    let coverage = if read.response["selection"]["view"] == "current" {
+    let mut coverage = if read.response["selection"]["view"] == "current" {
         format!(
             "{}: current read {}; source observation {}. {} report(s) excluded by selection; {} selected report(s) omitted here and {} by the response bound. Source coverage is bounded; missing current facts mean unknown.",
             source.label,
@@ -1300,6 +1300,16 @@ pub(crate) fn preserve_requested_status(
             read.response["omitted"],
         )
     };
+    // These are source capability limits, not evidence that an action failed
+    // or never happened. Missing/null/true values establish no such limit.
+    let unsupported: Vec<_> = ["verified_completion_supported", "work_completion_supported"]
+        .iter()
+        .filter(|key| read.response["coverage"][**key].as_bool() == Some(false))
+        .map(|key| format!("{key}=false"))
+        .collect();
+    if !unsupported.is_empty() {
+        coverage.push_str(&format!(" Source coverage: {}.", unsupported.join("; ")));
+    }
     // The bounded note is mandatory: never silently cut a timestamp or qualifier.
     ensure!(
         coverage.len() <= 480,
@@ -1423,6 +1433,11 @@ fn requested_report_qualifier(source: &Source, report: &Value, response: &Value)
             "{} / {actor}: presence snapshot observed {occurred} ({age}); read at {observed}; position {position}; {}.",
             source.label,
             flags.join(", ")
+        );
+        // Preserve the typed source's observation scope before allocating any
+        // optional player detail. Position/activity does not settle a request.
+        text.push_str(
+            " Observed position/activity only; not proof of current work or request fulfillment.",
         );
         if let Some(players) = presence["players"].as_array() {
             let mut included = 0;
