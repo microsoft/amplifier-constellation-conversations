@@ -96,8 +96,16 @@ pub(super) fn resolve_post_in(
     let source = source.ok_or_else(|| {
         ApiError::bad("An active caller request or admitted peer continuation is required")
     })?;
-    if !crate::huddle_delivery::active_source(db, call, parent, agent, &source, room, installation)?
-        || !crate::delivery::authorized_in(s, db, &source, owner)?
+    if !crate::huddle_delivery::active_source(
+        s,
+        db,
+        call,
+        parent,
+        agent,
+        &source,
+        room,
+        installation,
+    )? || !crate::delivery::authorized_in(s, db, &source, owner)?
     {
         return Err(ApiError::forbidden());
     }

@@ -177,16 +177,84 @@ fn active(db: &Connection, call: &str, parent: &str, agent: &str) -> Result<Vec<
     }
     Ok(result)
 }
+/// Only an exact human source already forwarded to this active peer can be
+/// used by its continuation. The room keeps its immutable original origin;
+/// later completed caller requests retain their own separate source identity.
+#[allow(clippy::too_many_arguments)]
 pub fn active_source(
+    s: &AppState,
     db: &Connection,
     call: &str,
     parent: &str,
     agent: &str,
-    original_message: &str,
+    source: &str,
     room: &str,
     installation: &str,
 ) -> Result<bool> {
-    Ok(active(db,call,parent,agent)?.iter().any(|b| b.room==room && b.installation==installation && matches!(&b.origin,Origin::Conversation{message_id,..} if message_id==original_message)))
+    for b in active(db, call, parent, agent)? {
+        if b.room != room || b.installation != installation {
+            continue;
+        }
+        let Origin::Conversation {
+            message_id: original,
+            actor: owner,
+            ..
+        } = &b.origin
+        else {
+            continue;
+        };
+        // Both authorities matter: a later caller request must never keep a
+        // revoked original room request alive, or borrow its surviving grant.
+        if !crate::delivery::authorized_in(s, db, original, &owner.id)?
+            || !crate::delivery::authorized_in(s, db, source, &owner.id)?
+        {
+            continue;
+        }
+        if original == source {
+            return Ok(true);
+        }
+        let Ok(Origin::Conversation {
+            source_revision,
+            occurred_at,
+            ..
+        }) = crate::huddles::parent_source(db, parent, source, &owner.id)
+        else {
+            continue;
+        };
+        let recipient: Value = serde_json::from_str(&b.recipient_definition)?;
+        let sender: Value = serde_json::from_str(&b.sender_definition)?;
+        // Explicit prior addressing, exact source fields, and canonical sequence
+        // provide the link. No latest-message selection or inferred reply-to.
+        let forwarded: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM huddle_posts p
+             JOIN messages m ON m.id=p.message_id
+             JOIN messages reply ON reply.id=?1
+             JOIN json_each(json_extract(p.payload,'$.target_agent_ids')) target
+             WHERE p.room_id=?2 AND p.agent_id=?3
+               AND m.conversation_id=?2 AND m.agent_id=?3
+               AND m.role='assistant' AND m.status='complete' AND m.seq<reply.seq
+               AND target.value=?4
+               AND json_extract(p.payload,'$.source.id')=?5
+               AND json_extract(p.payload,'$.source.conversation_id')=?6
+               AND json_extract(p.payload,'$.source.revision')=?7
+               AND json_extract(p.payload,'$.source.occurred_at')=?8)",
+            params![
+                b.message,
+                room,
+                recipient["agent_id"].as_str(),
+                sender["agent_id"].as_str(),
+                source,
+                parent,
+                source_revision,
+                occurred_at
+            ],
+            |r| r.get(0),
+        )?;
+        if forwarded {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 /// Peer-only current execution cannot use a call's broader effect capability.
 pub fn active_quiet_peer_turn(
@@ -578,6 +646,7 @@ pub(crate) mod tests {
         let db = f.s.db.lock().unwrap();
         assert!(
             !active_source(
+                &f.s,
                 &db,
                 &f.call,
                 &f.parent,
@@ -596,6 +665,7 @@ pub(crate) mod tests {
         .unwrap();
         assert!(
             active_source(
+                &f.s,
                 &db,
                 &f.call,
                 &f.parent,
@@ -611,8 +681,10 @@ pub(crate) mod tests {
             (f.room.as_str(), "other-install"),
         ] {
             assert!(
-                !active_source(&db, &f.call, &f.parent, "default", &f.source, room, install)
-                    .unwrap()
+                !active_source(
+                    &f.s, &db, &f.call, &f.parent, "default", &f.source, room, install
+                )
+                .unwrap()
             );
         }
         assert!(active_peer_actor(&db, &f.call, &f.parent, "default", "Peer").unwrap());
@@ -906,6 +978,7 @@ pub(crate) mod tests {
         .unwrap();
         assert!(
             !active_source(
+                &f.s,
                 &db,
                 &f.call,
                 &f.parent,
