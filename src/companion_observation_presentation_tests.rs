@@ -442,6 +442,10 @@ async fn multipart_same_snapshot_is_silent_but_changed_qualifications_and_correc
         let f = fixture();
         let (request, queue) = retained_action(&f);
         let mut update = cumulative_private_outcome(&f, &request, &queue);
+        // Deliberately separated source clocks: timestamp() has whole-second
+        // precision, so incidental elapsed wall time must not order revisions.
+        let source_clock = now_ms() - 2000;
+        update["observed_at"] = json!(timestamp(source_clock));
         update["source_replies"][0]["text"] = json!(multipart_body());
         cumulative_response(&f, &update);
         let first = cumulative_parts(&f).await;
@@ -449,7 +453,7 @@ async fn multipart_same_snapshot_is_silent_but_changed_qualifications_and_correc
         assert_eq!(states(&f), vec!["context_accepted"]);
         let original = update.clone();
         update["revision"] = json!(format!("same-body-{mode}"));
-        update["observed_at"] = json!(timestamp(now_ms() + 1));
+        update["observed_at"] = json!(timestamp(source_clock + 1000));
         match mode {
             "blocker" => update["conversation"]["blocked_reason"] = json!("new_recorded_blocker"),
             "unknown" => {
@@ -514,11 +518,22 @@ async fn multipart_same_snapshot_is_silent_but_changed_qualifications_and_correc
         }
         assert_eq!(
             action_observation(&f.s, &f.id, &request).unwrap(),
-            Some(update)
+            Some(update.clone())
         );
         if mode == "body" {
             let mut reverted = original;
+            reverted["revision"] = json!("stale-original-observation");
+            cumulative_response(&f, &reverted);
+            assert!(
+                cumulative_parts(&f).await.is_empty(),
+                "older observation must not replace current correction"
+            );
+            assert_eq!(
+                action_observation(&f.s, &f.id, &request).unwrap(),
+                Some(update)
+            );
             reverted["revision"] = json!("corrected-back-to-original");
+            reverted["observed_at"] = json!(timestamp(source_clock + 2000));
             cumulative_response(&f, &reverted);
             assert_eq!(spoken_body(&cumulative_parts(&f).await), multipart_body());
         }

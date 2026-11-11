@@ -85,10 +85,14 @@ while (p/'decision-block').exists():time.sleep(0.005)
 mode=(p/'decision-mode').read_text() if (p/'decision-mode').exists() else 'quiet'
 if mode=='fail':sys.exit(1)
 result={'version':1,'request_id':body['request_id'],'event_id':body['event']['id'],'status':'decided','decision':'notify' if mode=='notify' else 'quiet','provider_choice':'notify' if mode=='notify' else 'quiet','confidence':0.95,'selected_probability':0.95,'model':'gpt-6-luna','reason':'provider_decision','model_requests':1}
+if mode=='legacy-later':result.update(decision='later',provider_choice='later')
+if mode=='weak-notify':result.update(decision='notify',provider_choice='notify',confidence=0.7,selected_probability=0.7)
 if mode=='low-confidence':result.update(decision='later',provider_choice='quiet',confidence=0.19,selected_probability=0.39,reason='low_confidence')
 if mode.startswith('predicate-'):
  for key in ['confidence','selected_probability','provider_choice']:result.pop(key)
  result.update(assessment={'kind':'relevance_and_proactive_v1','relevant_probability':0.95,'proactive_probability':0.5},decision='quiet',reason='relevant_context')
+ if mode=='predicate-home-first':result['assessment'].update(relevant_probability=0.92,proactive_probability=0.04)
+ if mode=='predicate-home-second':result['assessment'].update(relevant_probability=0.95,proactive_probability=0.47)
  if mode=='predicate-notify':result['assessment']['proactive_probability']=0.95;result.update(decision='notify',reason='relevant_proactive')
  if mode=='predicate-uncertain':result['assessment']['relevant_probability']=0.5;result['reason']='uncertain_relevance'
  if mode=='predicate-malformed':result['assessment']['relevant_probability']='yes'
@@ -373,6 +377,7 @@ async fn worker_deduplicates_before_paid_subprocess_and_refuses_changed_immutabl
 #[tokio::test]
 async fn unavailable_source_does_not_starve_other_connections_or_ready_context() {
     let f = fixture();
+    std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
     rewrite_policy(&f, |v| {
         let mut unavailable = v["agents"]["default"][0].clone();
         unavailable["id"] = json!("offline");
@@ -387,7 +392,7 @@ async fn unavailable_source_does_not_starve_other_connections_or_ready_context()
     let _ = run(&f).await;
     assert_eq!(calls(&f, "decision").len(), 1);
     assert_eq!(cards(&f).len(), 1);
-    assert_eq!(rx.try_recv().unwrap()["channel"], "thinking");
+    assert_eq!(rx.try_recv().unwrap()["channel"], "commentary");
 }
 
 #[tokio::test]
@@ -416,6 +421,7 @@ async fn worker_failures_and_mismatched_decision_identity_are_retained_without_r
 async fn ready_source_removed_from_policy_never_appends_or_reevaluates() {
     for removed in ["audience", "source", "owner"] {
         let f = fixture();
+        std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
         run(&f).await.unwrap();
         assert_eq!(states(&f), vec!["context_queued"]);
         observations(&f, vec![]);
@@ -538,6 +544,7 @@ async fn crash_after_paid_intent_is_unknown_and_never_replayed() {
 #[tokio::test]
 async fn oversized_whole_report_stays_saved_without_partial_voice_claim() {
     let f = fixture();
+    std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
     let mut event = source_event();
     event["text"] = json!(format!(
         "{} The final check FAILED; do not claim completion.",
@@ -557,7 +564,7 @@ async fn oversized_whole_report_stays_saved_without_partial_voice_claim() {
     provider_event(
         &f.s,
         &f.id,
-        &json!({"type":"session.thinking.appended","client_event_id":command["event_id"]}),
+        &json!({"type":format!("session.{}.appended",command["channel"].as_str().unwrap()),"client_event_id":command["event_id"]}),
     )
     .unwrap();
     assert_eq!(states(&f), vec!["context_accepted"]);
@@ -568,23 +575,24 @@ async fn oversized_whole_report_stays_saved_without_partial_voice_claim() {
 #[tokio::test]
 async fn append_settlement_requires_matching_call_id_and_channel_without_claiming_playback() {
     let f = fixture();
+    std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
     let mut rx = quiet_browser(&f);
     run(&f).await.unwrap();
     let command = rx.try_recv().unwrap();
     let event_id = command["event_id"].as_str().unwrap();
     assert!(event_id.starts_with("awareness-"));
     assert_eq!(states(&f), vec!["context_queued"]);
-    let mut acknowledgment = json!({"type":"session.thinking.appended","client_event_id":event_id,"start_ms":100,"end_ms":120});
+    let mut acknowledgment = json!({"type":"session.commentary.appended","client_event_id":event_id,"start_ms":100,"end_ms":120});
     provider_event(&f.s, "another-call", &acknowledgment).unwrap();
     assert_eq!(states(&f), vec!["context_queued"]);
     acknowledgment["client_event_id"] = json!(format!("awareness-{}", "a".repeat(64)));
     provider_event(&f.s, &f.id, &acknowledgment).unwrap();
     assert_eq!(states(&f), vec!["context_queued"]);
     acknowledgment["client_event_id"] = json!(event_id);
-    acknowledgment["type"] = json!("session.commentary.appended");
+    acknowledgment["type"] = json!("session.thinking.appended");
     provider_event(&f.s, &f.id, &acknowledgment).unwrap();
     assert_eq!(states(&f), vec!["context_queued"]);
-    acknowledgment["type"] = json!("session.thinking.appended");
+    acknowledgment["type"] = json!("session.commentary.appended");
     provider_event(&f.s, &f.id, &acknowledgment).unwrap();
     assert_eq!(states(&f), vec!["context_accepted"]);
     provider_event(&f.s, &f.id, &acknowledgment).unwrap();
@@ -608,6 +616,7 @@ async fn official_nested_append_error_requires_unambiguous_identity_and_never_re
         ("rate_limit_error", "unknown"),
     ] {
         let f = fixture();
+        std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
         let mut rx = quiet_browser(&f);
         run(&f).await.unwrap();
         let command = rx.try_recv().unwrap();
@@ -635,7 +644,7 @@ async fn official_nested_append_error_requires_unambiguous_identity_and_never_re
         provider_event(
             &f.s,
             &f.id,
-            &json!({"type":"session.thinking.appended","client_event_id":event_id}),
+            &json!({"type":format!("session.{}.appended",command["channel"].as_str().unwrap()),"client_event_id":event_id}),
         )
         .unwrap();
         run(&f).await.unwrap();
@@ -691,14 +700,14 @@ async fn quiet_facts_remain_available_during_new_requests_without_spoken_notice(
     let mut rx = quiet_browser(&f);
     f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'long-running',0,'dispatched','retained-work',?2)",params![f.id,now_ms()-60000]).unwrap();
     run(&f).await.unwrap();
-    assert_eq!(rx.try_recv().unwrap()["channel"], "thinking");
+    assert!(rx.try_recv().is_err());
     let mut second = source_event();
     second["id"] = json!("another-fact");
     observations(&f, vec![second]);
     f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'fresh-request',100,'waiting_transcript','new-work',?2)",params![f.id,now_ms()]).unwrap();
     run(&f).await.unwrap();
-    assert_eq!(rx.try_recv().unwrap()["channel"], "thinking");
-    assert!(states(&f).iter().all(|v| v == "context_queued"));
+    assert!(rx.try_recv().is_err());
+    assert!(states(&f).iter().all(|v| v == "retained"));
     f.s.db
         .lock()
         .unwrap()
@@ -710,6 +719,13 @@ async fn quiet_facts_remain_available_during_new_requests_without_spoken_notice(
     run(&f).await.unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(calls(&f, "decision").len(), 2);
+    assert_eq!(
+        current_observations(&f.s, &f.id, None).unwrap()["observations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     let work: String =
         f.s.db
             .lock()
@@ -726,6 +742,7 @@ async fn quiet_facts_remain_available_during_new_requests_without_spoken_notice(
 #[tokio::test]
 async fn peer_source_attribution_reaches_decisions_cards_and_voice_without_actor_substitution() {
     let f = fixture();
+    std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
     let mut event = source_event();
     event["actor"] = json!("Rook");
     event["kind"] = json!("message");
@@ -2308,6 +2325,7 @@ async fn unknown_receipt_remains_unknown_and_missing_enrollment_is_not_recreated
 #[tokio::test]
 async fn current_snapshot_is_presented_without_forging_old_progress_time() {
     let f = fixture();
+    std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
     let old = timestamp(now_ms() - 14 * 3600 * 1000);
     let mut event = source_event();
     event["kind"] = json!("task_observation");
@@ -3222,6 +3240,7 @@ fn add_human_context(f: &Fixture, key: &str, text: &str) {
 #[tokio::test]
 async fn human_context_change_during_settled_decision_requires_a_new_context_evaluation() {
     let f = fixture();
+    std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
     std::fs::write(f.home.path().join("decision-block"), "").unwrap();
     let s = f.s.clone();
     let id = f.id.clone();
@@ -3258,6 +3277,7 @@ async fn human_context_change_during_settled_decision_requires_a_new_context_eva
 #[tokio::test]
 async fn changed_unsent_context_withdraws_old_parts_without_satisfying_new_append_receipts() {
     let f = fixture();
+    std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
     let mut event = source_event();
     event["kind"] = json!("presence_observation");
     event["text"] = json!(r#"{"position":{"x":17,"y":64,"z":3},"players":[],"busy":false}"#);
@@ -3311,7 +3331,7 @@ async fn changed_unsent_context_withdraws_old_parts_without_satisfying_new_appen
         provider_event(
             &f.s,
             &f.id,
-            &json!({"type":"session.thinking.appended","client_event_id":command["event_id"]}),
+            &json!({"type":format!("session.{}.appended",command["channel"].as_str().unwrap()),"client_event_id":command["event_id"]}),
         )
         .unwrap();
     }
@@ -3323,6 +3343,7 @@ async fn changed_unsent_context_withdraws_old_parts_without_satisfying_new_appen
 async fn unknown_paid_decision_or_append_is_not_retried_for_a_new_human_context() {
     for unknown in ["decision", "append"] {
         let f = fixture();
+        std::fs::write(f.home.path().join("decision-mode"), "notify").unwrap();
         let mut rx = quiet_browser(&f);
         if unknown == "decision" {
             std::fs::write(f.home.path().join("decision-mode"), "fail").unwrap();
@@ -3387,17 +3408,26 @@ async fn long_agent_speech_cannot_evict_retained_human_selection_from_decision_e
 
 #[tokio::test]
 async fn independent_relevance_allows_quiet_evidence_and_only_strong_proactive_advice_notifies() {
-    for (mode, channel) in [
-        ("predicate-quiet", "thinking"),
-        ("predicate-notify", "commentary"),
-    ] {
+    for (mode, channel) in [("predicate-quiet", ""), ("predicate-notify", "commentary")] {
         let f = fixture();
         std::fs::write(f.home.path().join("decision-mode"), mode).unwrap();
         let mut rx = quiet_browser(&f);
         run(&f).await.unwrap();
-        let command = rx.try_recv().unwrap();
-        assert_eq!(command["channel"], channel);
-        assert_eq!(states(&f), vec!["context_queued"]);
+        if channel.is_empty() {
+            assert!(rx.try_recv().is_err());
+            assert_eq!(states(&f), vec!["retained"]);
+            assert_eq!(
+                current_observations(&f.s, &f.id, None).unwrap()["observations"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        } else {
+            let command = rx.try_recv().unwrap();
+            assert_eq!(command["channel"], channel);
+            assert_eq!(states(&f), vec!["context_queued"]);
+        }
         let raw: String =
             f.s.db
                 .lock()
@@ -3440,7 +3470,7 @@ async fn uncertain_refused_or_malformed_predicate_advice_never_appends_or_retrie
 #[test]
 fn predicate_policy_keeps_raw_probabilities_and_legacy_confidence_distinct() {
     for (relevant, proactive, decision, reason, state, notify) in [
-        (0.85, 0.5, "quiet", "relevant_context", "ready", false),
+        (0.85, 0.5, "quiet", "relevant_context", "retained", false),
         (0.85, 0.9, "notify", "relevant_proactive", "ready", true),
         (
             0.849,
@@ -3463,7 +3493,7 @@ fn predicate_policy_keeps_raw_probabilities_and_legacy_confidence_distinct() {
     legacy["selected_probability"] = json!(0.95);
     legacy["decision"] = json!("quiet");
     legacy["reason"] = json!("provider_decision");
-    assert_eq!(decision_policy(&legacy), Some(("ready", false)));
+    assert_eq!(decision_policy(&legacy), Some(("retained", false)));
 }
 
 #[test]
@@ -5116,3 +5146,6 @@ async fn private_reply_changed_body_and_returned_correction_are_new_whole_facts(
         accept_cumulative_parts(&f, &parts);
     }
 }
+
+#[path = "companion_ambient_policy_tests.rs"]
+mod ambient_policy;
