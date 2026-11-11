@@ -346,7 +346,15 @@ fn external_action_result_state_and_target_scope_preserve_ordinary_answers() {
             assert!(batch.is_none(), "{state}: pending action prose stays local");
         } else {
             let batch = batch.unwrap();
-            assert_eq!(batch["commands"][0]["channel"], "commentary", "{state}");
+            assert_eq!(
+                batch["commands"][0]["channel"],
+                if state == "unknown" {
+                    "thinking"
+                } else {
+                    "commentary"
+                },
+                "{state}"
+            );
             assert_eq!(
                 batch["commands"][0]["content"],
                 "The result remains exactly as authored."
@@ -577,7 +585,7 @@ fn unknown_submission_without_observer_and_mixed_receipts_keep_the_existing_answ
         let batch = crate::companion_delivery::take_ready(&f.s, &f.call)
             .unwrap()
             .unwrap();
-        assert_eq!(batch["commands"][0]["channel"], "commentary");
+        assert_eq!(batch["commands"][0]["channel"], "thinking");
         assert_eq!(batch["commands"][0]["content"], text);
         observe_results(&f.s, &f.call, &f.room, true).unwrap();
         assert!(
@@ -615,7 +623,35 @@ fn definite_failure_or_completion_with_pending_sibling_keeps_existing_answer() {
         let batch = crate::companion_delivery::take_ready(&f.s, &f.call)
             .unwrap()
             .unwrap();
-        assert_eq!(batch["commands"][0]["channel"], "commentary");
+        assert_eq!(batch["commands"][0]["channel"], "thinking");
         assert_eq!(batch["commands"][0]["content"], text);
     }
+}
+
+#[test]
+fn unknown_submission_keeps_long_answer_on_original_thinking_channel() {
+    let f = fixture();
+    let text = "The submission receipt is unknown; whether the action occurred is unconfirmed. "
+        .repeat(12);
+    seed_pending_action(&f, "answer", &text, "unknown");
+    observe_results(&f.s, &f.call, &f.room, true).unwrap();
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.call)
+        .unwrap()
+        .unwrap();
+    let commands = batch["commands"].as_array().unwrap();
+    assert!(commands.len() > 2);
+    assert!(commands.iter().all(|c| c["channel"] == "thinking"));
+    assert_eq!(
+        commands
+            .iter()
+            .skip(1)
+            .map(|c| c["content"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        complete_fragments(&text, 360, 16).0
+    );
+    assert!(
+        events(&f)
+            .iter()
+            .any(|e| e["message_id"] == "answer" && e["text"] == text)
+    );
 }

@@ -2066,7 +2066,17 @@ fn complete_fragments(text: &str, limit: usize, max_parts: usize) -> (Vec<String
 }
 fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str) -> Result<()> {
     let has_text = !text.trim().is_empty();
-    let (fresh, late, request_id, attachments, present_image, delegation, linked, pending_action) = {
+    let (
+        fresh,
+        late,
+        request_id,
+        attachments,
+        present_image,
+        delegation,
+        linked,
+        pending_action,
+        quiet_action_result,
+    ) = {
         let mut db = s.db.lock().unwrap();
         let tx = db.transaction()?;
         // Keep this guard at publication as well as observation: neither a
@@ -2126,8 +2136,9 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
         // not the external action's answer; that source returns independently.
         // Unknown or terminal sibling receipts retain the existing answer path:
         // withholding a queued sibling must not hide uncertainty or failure.
-        let pending_action: bool = tx.query_row(
-            "SELECT COUNT(*) > 0 AND COUNT(*) = COALESCE(SUM(a.state IN ('submitting','queued','accepted')),0)
+        let (pending_action, quiet_action_result): (bool, bool) = tx.query_row(
+            "SELECT COUNT(*) > 0 AND COUNT(*) = COALESCE(SUM(a.state IN ('submitting','queued','accepted')),0),
+                    COALESCE(MAX(a.state IN ('submitting','queued','accepted','unknown')),0)
              FROM companion_actions a
              JOIN companion_delegations x ON x.call_id=a.call_id AND x.id=a.delegation_id
              JOIN companion_calls c ON c.id=x.call_id
@@ -2137,7 +2148,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                  AND m.role='user' AND m.actor=c.owner
              WHERE a.call_id=?1 AND d.target_turn=?2 AND d.state IN ('completed','incorporated')",
             params![id, message],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let delegation = links.last().map(|(did, _, _)| did.clone());
         for (did, source_id, receipt) in &links {
@@ -2195,6 +2206,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
             delegation,
             !links.is_empty(),
             pending_action,
+            quiet_action_result,
         )
     };
     if fresh || linked {
@@ -2224,7 +2236,11 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 queue_append(
                     s,
                     id,
-                    "commentary",
+                    if quiet_action_result {
+                        "thinking"
+                    } else {
+                        "commentary"
+                    },
                     delegation,
                     live_text,
                     &uuid::Uuid::new_v4().to_string(),
@@ -2249,7 +2265,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 let mut appends = vec![("thinking", header)];
                 for (i, part) in parts.iter().enumerate() {
                     appends.push((
-                        if image_count == 0 && i + 1 == parts.len() {
+                        if !quiet_action_result && image_count == 0 && i + 1 == parts.len() {
                             "commentary"
                         } else {
                             "thinking"
@@ -2291,7 +2307,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                     "Request {request_id} settled with {} saved artifacts in shared space. {} Do not invent artifact contents.",
                     attachments.len(),
                     if pending_action {
-                        "The native answer is retained in call history; the external action's outcome is not established by these artifacts."
+                        "The agent reply is saved in call history; the external action's outcome is not established by these artifacts."
                     } else {
                         "No public text answer was returned."
                     }
