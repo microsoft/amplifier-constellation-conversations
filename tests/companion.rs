@@ -922,19 +922,12 @@ for line in sys.stdin:
         .iter()
         .filter(|v| v["op"] == "append")
         .collect::<Vec<_>>();
-    assert_eq!(appends.len(), 3);
+    assert_eq!(appends.len(), 2);
     assert_eq!(appends[0]["channel"], "thinking");
     assert!(appends[0]["content"].as_str().unwrap().is_empty());
     assert_eq!(appends[1]["channel"], "instructions");
     assert!(
         appends[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("still awaits checked information")
-    );
-    assert_eq!(appends[2]["channel"], "instructions");
-    assert!(
-        appends[2]["content"]
             .as_str()
             .unwrap()
             .contains("remains unknown after its handshake")
@@ -1399,14 +1392,10 @@ async fn consecutive_delegation_anchors_do_not_redispatch_previous_straddling_fr
                     .is_some_and(|id| id.starts_with("delegation-facts-"))
         })
         .collect::<Vec<_>>();
-    assert_eq!(fact_controls.len(), 2);
-    assert_ne!(fact_controls[0]["event_id"], fact_controls[1]["event_id"]);
-    assert!(fact_controls.iter().all(|v| {
-        v["content"]
-            .as_str()
-            .unwrap()
-            .contains("still awaits checked information")
-    }));
+    // Pending work must not append a session-wide instruction to wait. The
+    // original delegation still owns its eventual result, while Live can keep
+    // conversing from known facts without another backend turn.
+    assert!(fact_controls.is_empty());
     for delegation in ["delegate-1", "delegate-2"] {
         let receipt = intake
             .iter()

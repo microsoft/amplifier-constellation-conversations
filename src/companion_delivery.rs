@@ -121,14 +121,11 @@ pub(crate) fn floor_open_in(db: &Connection, call: &str) -> Result<bool> {
     Ok(now_ms() - last_user >= 1200)
 }
 
-/// A result can become earlier context while it waits for the caller's floor.
+/// A result can become earlier context after another durable work request.
+/// Ordinary speech may be acknowledgment or independent conversation; it does
+/// not replace an awaited answer. The floor guard still waits for the caller.
 /// This changes presentation only, not its text, source identity or outcome.
-fn demote_earlier_result(
-    db: &Connection,
-    call: &str,
-    queued_at: i64,
-    commands: &mut Vec<Value>,
-) -> Result<bool> {
+fn demote_earlier_result(db: &Connection, call: &str, commands: &mut Vec<Value>) -> Result<bool> {
     let mut earlier = false;
     let mut original = None;
     for command in commands.iter().filter(|c| c["channel"] == "commentary") {
@@ -136,8 +133,8 @@ fn demote_earlier_result(
             continue;
         };
         let changed: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM companion_delegations d WHERE d.call_id=?1 AND d.id=?2 AND (EXISTS(SELECT 1 FROM companion_delegations newer WHERE newer.call_id=d.call_id AND newer.id!=d.id AND (newer.created_at>d.created_at OR (newer.created_at=d.created_at AND newer.offset_ms>d.offset_ms))) OR EXISTS(SELECT 1 FROM companion_events e WHERE e.call_id=d.call_id AND e.kind='transcript' AND json_extract(e.data,'$.role')='user' AND e.at>?3)))",
-            params![call, delegation, queued_at],
+            "SELECT EXISTS(SELECT 1 FROM companion_delegations d WHERE d.call_id=?1 AND d.id=?2 AND EXISTS(SELECT 1 FROM companion_delegations newer WHERE newer.call_id=d.call_id AND newer.id!=d.id AND (newer.created_at>d.created_at OR (newer.created_at=d.created_at AND newer.offset_ms>d.offset_ms))))",
+            params![call, delegation],
             |r| r.get(0),
         )?;
         if changed {
@@ -153,7 +150,7 @@ fn demote_earlier_result(
             command["channel"] = json!("thinking");
         }
     }
-    commands.insert(0, json!({"op":"append","channel":"thinking","event_id":uuid::Uuid::new_v4().to_string(),"delegation_id":original,"content":"These facts answer an earlier question. The caller has spoken again or supplied a newer request. Keep the facts as context and use them only if still relevant to the latest point. Do not interrupt or repeat an earlier answer. This does not cancel accepted work."}));
+    commands.insert(0, json!({"op":"append","channel":"thinking","event_id":uuid::Uuid::new_v4().to_string(),"delegation_id":original,"content":"These facts answer an earlier question. The caller has supplied a newer work request. Keep the facts as context and use them only if still relevant to the latest point. Do not interrupt or repeat an earlier answer. This does not cancel accepted work."}));
     Ok(true)
 }
 
@@ -163,8 +160,8 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     if !floor_open_in(&tx, call)? {
         return Ok(None);
     }
-    let row: Option<(String,String,i64)>=tx.query_row("SELECT id,updates,created_at FROM companion_voice_batches WHERE call_id=?1 AND state='pending' ORDER BY created_at,rowid LIMIT 1",[call],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let Some((id, raw, queued_at)) = row else {
+    let row: Option<(String,String)>=tx.query_row("SELECT id,updates FROM companion_voice_batches WHERE call_id=?1 AND state='pending' ORDER BY created_at,rowid LIMIT 1",[call],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((id, raw)) = row else {
         return Ok(None);
     };
     let mut commands: Vec<Value> = serde_json::from_str(&raw)?;
@@ -182,7 +179,7 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
         tx.commit()?;
         return Ok(None);
     }
-    if demote_earlier_result(&tx, call, queued_at, &mut commands)? {
+    if demote_earlier_result(&tx, call, &mut commands)? {
         tx.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'context_delivery',?3,?4)",params![call,format!("batch:{id}:earlier-context"),json!({"batch_id":id,"state":"presentation_changed","reason":"newer_human_context","automatic_replay_allowed":false,"facts_preserved":true}).to_string(),now_ms()])?;
     }
     tx.execute("UPDATE companion_voice_batches SET state='dispatching',updates=?3,updated_at=?2 WHERE id=?1 AND state='pending'",params![id,now_ms(),serde_json::to_string(&commands)?])?;
@@ -331,7 +328,7 @@ mod tests {
 
     #[test]
     fn queued_answer_becomes_context_after_correction_without_losing_independent_answers() {
-        for evidence in ["delegation", "speech"] {
+        {
             let f = fixture();
             let old_at = now_ms() - 6000;
             f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'earlier',100,'completed','original-input',?2)",params![f.call,old_at]).unwrap();
@@ -361,11 +358,7 @@ mod tests {
                     params![f.call, json!({"state":"ready","floor":"user"}).to_string()],
                 )
                 .unwrap();
-                if evidence == "delegation" {
-                    db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'correction',200,'dispatched','correction-input',?2)",params![f.call,old_at+1000]).unwrap();
-                } else {
-                    db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'correction','transcript',?2,?3)",params![f.call,json!({"role":"user","text":"Actually, keep the door red."}).to_string(),old_at+1000]).unwrap();
-                }
+                db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'correction',200,'dispatched','correction-input',?2)",params![f.call,old_at+1000]).unwrap();
             }
             assert!(take_ready(&f.s, &f.call).unwrap().is_none());
             f.s.db.lock().unwrap().execute("UPDATE companion_surfaces SET user_speaking=0,updated_at=?2,playback=?3 WHERE call_id=?1",params![f.call,now_ms(),json!({"state":"ready","floor":"open"}).to_string()]).unwrap();
@@ -394,6 +387,51 @@ mod tests {
                 "The roof remains unfinished."
             );
             assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn local_conversation_does_not_demote_the_pending_answer_or_bypass_the_floor() {
+        for speech in [
+            "Thanks, take your time.",
+            "While that runs, what did I say my name was?",
+        ] {
+            let f = fixture();
+            let old_at = now_ms() - 6000;
+            f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'pending',100,'completed','original-input',?2)",params![f.call,old_at]).unwrap();
+            let mut answer = update("pending-answer", "The checked shelf contains three cups.");
+            answer["channel"] = json!("commentary");
+            answer["delegation_id"] = json!("pending");
+            enqueue_batch(&f.s, &f.call, "result:pending", vec![answer.clone()]).unwrap();
+            {
+                let db = f.s.db.lock().unwrap();
+                db.execute(
+                    "UPDATE companion_voice_batches SET created_at=?2 WHERE call_id=?1",
+                    params![f.call, old_at],
+                )
+                .unwrap();
+                db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'local-conversation','transcript',?2,?3)",params![f.call,json!({"role":"user","text":speech}).to_string(),now_ms()]).unwrap();
+                db.execute(
+                    "UPDATE companion_surfaces SET user_speaking=1,playback=?2 WHERE call_id=?1",
+                    params![f.call, json!({"state":"ready","floor":"user"}).to_string()],
+                )
+                .unwrap();
+            }
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+            f.s.db.lock().unwrap().execute("UPDATE companion_surfaces SET user_speaking=0,updated_at=?2,playback=?3 WHERE call_id=?1",params![f.call,now_ms(),json!({"state":"ready","floor":"open"}).to_string()]).unwrap();
+            // A quiet microphone does not erase the recent speech guard.
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+            f.s.db.lock().unwrap().execute("UPDATE companion_events SET at=?2 WHERE call_id=?1 AND event_key='local-conversation'",params![f.call,now_ms()-2000]).unwrap();
+            let batch = take_ready(&f.s, &f.call).unwrap().unwrap();
+            assert_eq!(batch["commands"], json!([answer.clone()]));
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+            sent(&f.s, &f.call, batch["batch_id"].as_str().unwrap()).unwrap();
+            // Neither a later poll nor re-enqueuing the same answer replays it.
+            enqueue_batch(&f.s, &f.call, "result:pending", vec![answer]).unwrap();
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+            let db = f.s.db.lock().unwrap();
+            let presentations: i64 = db.query_row("SELECT count(*) FROM companion_events WHERE call_id=?1 AND json_extract(data,'$.state')='presentation_changed'",[&f.call],|r|r.get(0)).unwrap();
+            assert_eq!(presentations, 0);
         }
     }
 
