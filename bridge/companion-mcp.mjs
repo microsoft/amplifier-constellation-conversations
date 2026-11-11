@@ -116,31 +116,31 @@ function buildServer(config,stopSignal) {
     inputSchema:z.object({}).strict(),annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
   },()=>call('connections'));
   server.registerTool('companion_huddles',{
-    description:'Discover eligible installed huddle connections for this caller and agent. With no arguments, return only authorized local installation choices. Select an exact installation_id to discover its eligible peers and bounded current memberships; after/limit require that ID. Enrollment is not online presence, accepted work or execution authority. A membership page is a current sweep, not a guarantee of future state. Credentials remain private to the host.',
+    description:'Find this agent’s installed huddle connections and their peers and rooms. Omit installation_id for local choices; supply an exact returned ID for its peer roster and current membership pages. Listed peers have unknown availability.',
     inputSchema:z.object({installation_id:HUDDLE_ID.optional(),after:HUDDLE_CURSOR.optional(),limit:z.number().int().min(1).max(50).optional()}).strict()
       .refine(value=>value.installation_id!==undefined||(value.after===undefined&&value.limit===undefined)),
     annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },args=>call(args.installation_id===undefined?'huddles':'huddles'+huddleQuery(args)));
   server.registerTool('companion_huddle_ensure',{
-    description:'Create or reuse a quiet huddle for the caller’s actual current request using the exact delegation_id and discovered installation/peer IDs. The host derives the original source, actor and audience; do not supply them. Creator is included automatically. This does not start a second agent session or grant world/task authority. A created room does not prove peers accepted work. Preserve this request_id; after uncertainty inspect companion_huddle_status with operation ensure and the same installation_id/request_id, even if no room ID was returned. Never replace an uncertain request with a new ID or silently reopen stopped work.',
+    description:'Create or reuse a quiet room for the current request. Use its exact delegation_id and discovered installation and peer IDs; the host supplies identity and original destination. This does not start a second agent session. Keep request_id and resolve an uncertain reply with companion_huddle_status.',
     inputSchema:z.object({installation_id:HUDDLE_ID,request_id:UUID,delegation_id:HUDDLE_DELEGATION,title:HUDDLE_TITLE,purpose:huddleText(2000),
       peer_installation_ids:z.array(HUDDLE_ID).max(7).refine(ids=>new Set(ids).size===ids.length)}).strict(),
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },args=>call('huddles/ensure','POST',args));
   server.registerTool('companion_huddle_read',{
-    description:'Read one authorized huddle’s ordered messages through its exact installed identity, with original actors, source times and cursor coverage. Use returned IDs, not guessed names. Reading does not acknowledge, create work, join another session or narrate routine coordination. A missing or omitted report does not establish inactivity or completion.',
+    description:'Read ordered huddle messages with original actors, source times and cursor coverage. Use a returned room ID. Reading does not acknowledge the messages or narrate routine coordination.',
     inputSchema:z.object({installation_id:HUDDLE_ID,huddle_id:UUID,after:HUDDLE_CURSOR.optional(),limit:z.number().int().min(1).max(100).optional()}).strict(),
     annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },({huddle_id,...query})=>call(`huddles/${huddle_id}/messages${huddleQuery(query)}`));
   server.registerTool('companion_huddle_post',{
-    description:'Post attributed coordination through the current agent’s installed huddle identity and actual caller delegation. The huddle must return to this call’s original conversation; older-call or external rooms are inspectable but cannot receive this call’s posts. A later delegation in this same call may continue the existing room without changing its original return destination. Routine kind message stays in the huddle. Use kind outcome with an explicit result/progress/blocked/decision and evidence only for a meaningful report; the host preserves the original request and returns it through the existing quiet card/background path. An outcome is your report, not independent verification, heard speech or task completion. Keep the original request_id and inspect companion_huddle_status after uncertainty; never resend with a new ID. No model-supplied actor, source, token or callback is accepted.',
+    description:'Send routine coordination as message; send a meaningful result, progress, blocker or decision as outcome with evidence. Use the current delegation_id and a huddle returning to this conversation. A follow-up can reuse it while retaining its source and original destination. A report is not independent verification. Keep request_id for status after an uncertain reply.',
     inputSchema:z.object({installation_id:HUDDLE_ID,huddle_id:UUID,delegation_id:HUDDLE_DELEGATION,request_id:UUID,text:huddleText(6000),
       target_agent_ids:z.array(HUDDLE_ID).max(8).refine(ids=>new Set(ids).size===ids.length),kind:z.enum(['message','outcome']),outcome:HUDDLE_OUTCOME.optional()}).strict()
       .refine(value=>value.kind==='outcome'?value.outcome!==undefined:value.outcome===undefined),
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },({huddle_id,...body})=>call(`huddles/${huddle_id}/posts`,'POST',body));
   server.registerTool('companion_huddle_status',{
-    description:'Read the exact durable ensure or post receipt using its original installation_id/request_id. Ensure status needs no room ID; post status requires its exact huddle_id. Missing or unknown remains unknown; do not create another room/post to test whether the first succeeded. Saved, peer incorporation, work completion and heard/read by a human are distinct.',
+    description:'Resolve an uncertain operation with its original installation_id and request_id. Ensure status needs no room ID; post status needs huddle_id. Missing stays unknown: do not create another operation to probe success.',
     inputSchema:z.object({installation_id:HUDDLE_ID,request_id:UUID,operation:z.enum(['ensure','post']),huddle_id:UUID.optional()}).strict()
       .refine(value=>value.operation==='post'?value.huddle_id!==undefined:value.huddle_id===undefined),
     annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
