@@ -179,8 +179,8 @@ Use an actual existing connection and a distinct random secret; the example is
 not a working credential or route. `local_agent_id` is optional and binds an
 existing Conversations/Companion agent. Identity, connection and namespace are
 immutable for that registration; another connection needs a distinct ID. An
-entry can be disabled or have its credential rotated without changing rooms or
-work. GET `/api/v1/huddle-installations` requires admin and omits secrets. Agents
+entry can be disabled, have its credential rotated, or be linked to a newly
+configured local contact without changing rooms or work. GET `/api/v1/huddle-installations` requires admin and omits secrets. Agents
 cannot use their scoped credential to administer installations or other rooms.
 
 The installation credential supports:

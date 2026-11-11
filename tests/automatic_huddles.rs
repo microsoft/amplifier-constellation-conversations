@@ -731,3 +731,43 @@ async fn credential_rotation_invalidates_already_authenticated_mutations() {
             .contains("credential_hash")
     );
 }
+
+#[tokio::test]
+async fn newly_configured_local_contact_can_link_existing_installation_without_new_rooms() {
+    let f = fixture();
+    let mut a = registration("lead", "world");
+    a.as_object_mut().unwrap().remove("local_agent_id");
+    ok(
+        &f,
+        "PUT",
+        "/api/v1/huddle-installations/lead",
+        &f.token,
+        Some(a.clone()),
+    )
+    .await;
+    let room = ensure(&f, &a, ensure_body("lead", "world", vec![])).await;
+    assert!(
+        huddle_auto::local_installations(&f.state, "owner", "default")
+            .unwrap()
+            .is_empty()
+    );
+    a["local_agent_id"] = json!("default");
+    ok(
+        &f,
+        "PUT",
+        "/api/v1/huddle-installations/lead",
+        &f.token,
+        Some(a.clone()),
+    )
+    .await;
+    let linked = huddle_auto::local_installations(&f.state, "owner", "default").unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(
+        huddle_auto::discovery_for(&f.state, &linked[0], Default::default()).unwrap()["items"][0]["id"],
+        room["id"]
+    );
+    assert_eq!(
+        ok(&f, "GET", "/api/v1/huddles/discovery", token(&a), None).await["items"][0]["id"],
+        room["id"]
+    );
+}

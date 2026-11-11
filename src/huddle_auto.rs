@@ -201,6 +201,9 @@ pub async fn install(
                 serde_json::from_str(&prior).map_err(anyhow::Error::from)?;
             old.label = entry.label.clone();
             old.enabled = entry.enabled;
+            // Linking an existing connection to a newly configured local
+            // contact is an administrative mapping update, not a new identity.
+            old.local_agent_id = entry.local_agent_id.clone();
             if old != entry {
                 return Err(conflict(
                     "Installation identity is immutable; enroll a distinct installation for another connection",
