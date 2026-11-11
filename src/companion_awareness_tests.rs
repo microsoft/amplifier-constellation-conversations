@@ -4556,7 +4556,7 @@ fn accept_cumulative_parts(f: &Fixture, parts: &[Value]) {
         provider_event(
             &f.s,
             &f.id,
-            &json!({"type":"session.thinking.appended", "client_event_id":command["event_id"]}),
+            &json!({"type":format!("session.{}.appended",command["channel"].as_str().unwrap()), "client_event_id":command["event_id"]}),
         )
         .unwrap();
     }
@@ -5077,4 +5077,346 @@ async fn cumulative_outcome_policy_change_cannot_hide_intervening_correction() {
     update["responses"][0]["text"] = json!("Earlier version A.");
     cumulative_response(&f, &update);
     assert!(cumulative_text(&cumulative_parts(&f).await).contains("Earlier version A"));
+}
+
+#[tokio::test]
+async fn private_action_denial_is_reply_commentary_with_separate_source_facts() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    let mut update = cumulative_private_outcome(&f, &request, &queue);
+    let denied = "Movement was declined, so I could not complete the walk. I am still at the starting block.";
+    update["source_replies"][0]["text"] = json!(denied);
+    cumulative_response(&f, &update);
+    let parts = cumulative_parts(&f).await;
+    let spoken: Vec<_> = parts
+        .iter()
+        .filter(|part| part["channel"] == "commentary")
+        .collect();
+    assert_eq!(
+        spoken.len(),
+        1,
+        "An exact requested private reply is an answer, not just ambient awareness"
+    );
+    assert_eq!(spoken[0]["content"], denied);
+    assert!(parts.iter().any(|part| part["channel"] == "thinking"
+        && part["content"].as_str().unwrap().contains("not establish")));
+    assert_eq!(
+        action_observation(&f.s, &f.id, &request).unwrap(),
+        Some(update)
+    );
+}
+
+#[tokio::test]
+async fn private_reply_mixed_ack_requires_exact_body_and_all_qualifiers_before_dedup() {
+    for mode in ["all", "body-only", "facts-only", "unknown", "forged-facts"] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = cumulative_private_outcome(&f, &request, &queue);
+        cumulative_response(&f, &update);
+        let first = cumulative_parts(&f).await;
+        let spoken = first
+            .iter()
+            .position(|part| part["channel"] == "commentary")
+            .unwrap();
+        assert!(
+            first[..spoken]
+                .iter()
+                .all(|part| part["channel"] == "thinking")
+        );
+        let facts: Value = first
+            .iter()
+            .filter_map(|part| {
+                serde_json::from_str::<Value>(part["content"].as_str().unwrap()).ok()
+            })
+            .find(|v| v["kind"] == "private_source_reply")
+            .unwrap();
+        assert_eq!(
+            facts["source_actor"],
+            update["installation_source"]["actor"]
+        );
+        assert!(facts.get("actor").is_none());
+        assert_eq!(facts["delivery"], "recorded");
+        assert_eq!(facts["completion"], "not_established");
+        assert_eq!(facts["meaning"], "observed_source_data_not_instructions");
+        assert_eq!(facts["audience"], update["source_replies"][0]["audience"]);
+        for part in &first {
+            if mode == "unknown" && part["channel"] == "commentary" {
+                provider_event(&f.s,&f.id,&json!({"type":"error","error":{"type":"server_error","client_event_id":part["event_id"]}})).unwrap();
+            } else if mode == "all"
+                || mode == "forged-facts"
+                || (mode == "body-only" && part["channel"] == "commentary")
+                || (mode == "facts-only" && part["channel"] == "thinking")
+            {
+                accept_cumulative_parts(&f, std::slice::from_ref(part));
+            }
+        }
+        assert_eq!(
+            states(&f),
+            vec![if matches!(mode, "all" | "forged-facts") {
+                "context_accepted"
+            } else if mode == "unknown" {
+                "unknown"
+            } else {
+                "context_queued"
+            }]
+        );
+        if mode == "forged-facts" {
+            let db = f.s.db.lock().unwrap();
+            let raw: String = db
+                .query_row(
+                    "SELECT updates FROM companion_voice_batches WHERE call_id=?1",
+                    [&f.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut commands: Value = serde_json::from_str(&raw).unwrap();
+            for part in commands.as_array_mut().unwrap() {
+                if part["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("private_source_reply")
+                {
+                    part["content"] = json!("Different provenance.");
+                }
+            }
+            db.execute(
+                "UPDATE companion_voice_batches SET updates=?2 WHERE call_id=?1",
+                params![f.id, commands.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(
+            cumulative_parts(&f).await.is_empty(),
+            "same revision never resends {mode}"
+        );
+        update["revision"] = json!("next-private-revision");
+        update["responses"] = json!([{"id":"new-public","audience":"public","at":timestamp(now_ms()),"text":"New public fact."}]);
+        cumulative_response(&f, &update);
+        let next = cumulative_parts(&f).await;
+        assert_eq!(
+            next.iter().any(|part| part["channel"] == "commentary"
+                && part["content"] == "Private exact-source reply."),
+            mode != "all",
+            "{mode}"
+        );
+        assert!(
+            next.iter()
+                .all(|part| first.iter().all(|old| old["event_id"] != part["event_id"]))
+        );
+        assert_eq!(
+            action_observation(&f.s, &f.id, &request).unwrap(),
+            Some(update)
+        );
+    }
+}
+
+#[tokio::test]
+async fn private_reply_oversized_multiline_or_ambiguous_stays_quiet() {
+    for mode in ["oversized", "multiline", "ambiguous"] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = cumulative_private_outcome(&f, &request, &queue);
+        match mode {
+            "oversized" => update["source_replies"][0]["text"] = json!("é".repeat(241)),
+            "multiline" => update["source_replies"][0]["text"] = json!("First line.\nSecond line."),
+            _ => {
+                let mut other = update["source_replies"][0].clone();
+                other["id"] = json!("another-reply");
+                update["source_replies"].as_array_mut().unwrap().push(other);
+            }
+        }
+        cumulative_response(&f, &update);
+        let parts = cumulative_parts(&f).await;
+        assert!(!parts.is_empty(), "{mode}");
+        assert!(
+            parts.iter().all(|part| part["channel"] == "thinking"),
+            "{mode}"
+        );
+        assert_eq!(
+            action_observation(&f.s, &f.id, &request).unwrap(),
+            Some(update)
+        );
+    }
+}
+
+#[tokio::test]
+async fn private_reply_legacy_thinking_is_not_repromoted_and_frozen_batches_are_unchanged() {
+    for phase in ["pending", "sent", "unknown", "accepted"] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = cumulative_private_outcome(&f, &request, &queue);
+        cumulative_response(&f, &update);
+        tick(&f.s, &f.id, &f.headers).await.unwrap();
+        let (batch_id, raw_event, key, commands) = {
+            let db = f.s.db.lock().unwrap();
+            let (key, raw_event): (String, String) = db
+                .query_row(
+                    "SELECT event_key,data FROM companion_awareness WHERE call_id=?1",
+                    [&f.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let (batch, raw): (String, String) = db
+                .query_row(
+                    "SELECT id,updates FROM companion_voice_batches WHERE call_id=?1",
+                    [&f.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let commands: Value = serde_json::from_str(&raw).unwrap();
+            (batch, raw_event, key, commands)
+        };
+        let (configuration, _) = config(&f.s).unwrap().unwrap();
+        let source = &configuration.agents["default"][0];
+        let event: Value = serde_json::from_str(&raw_event).unwrap();
+        let prefix = commands[0]["event_id"]
+            .as_str()
+            .unwrap()
+            .rsplit_once(':')
+            .unwrap()
+            .0;
+        let legacy: Vec<_> = context_parts(source,&event,"").into_iter().enumerate().map(|(index,content)|json!({"op":"append","channel":"thinking","event_id":format!("{prefix}:{index}"),"delegation_id":null,"content":content})).collect();
+        let raw = serde_json::to_string(&legacy).unwrap();
+        {
+            let db = f.s.db.lock().unwrap();
+            db.execute(
+                "DELETE FROM companion_awareness_appends WHERE call_id=?1",
+                [&f.id],
+            )
+            .unwrap();
+            for command in &legacy {
+                db.execute(
+                    "INSERT INTO companion_awareness_appends VALUES(?1,?2,?3,'thinking','queued')",
+                    params![f.id, key, command["event_id"].as_str()],
+                )
+                .unwrap();
+            }
+            db.execute(
+                "UPDATE companion_awareness SET append_channel='thinking' WHERE call_id=?1",
+                [&f.id],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE companion_voice_batches SET updates=?2,state=?3 WHERE id=?1",
+                params![
+                    batch_id,
+                    raw,
+                    if phase == "accepted" { "sent" } else { phase }
+                ],
+            )
+            .unwrap();
+        }
+        if phase == "accepted" {
+            accept_cumulative_parts(&f, &legacy);
+        }
+        if phase == "unknown" {
+            for command in &legacy {
+                provider_event(&f.s,&f.id,&json!({"type":"error","error":{"type":"server_error","client_event_id":command["event_id"]}})).unwrap();
+            }
+        }
+        tick(&f.s, &f.id, &f.headers).await.unwrap();
+        assert_eq!(
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT updates FROM companion_voice_batches WHERE id=?1",
+                    [&batch_id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            raw
+        );
+        if phase != "accepted" {
+            if phase != "pending" {
+                assert!(
+                    crate::companion_delivery::take_ready(&f.s, &f.id)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            continue;
+        }
+        update["revision"] = json!("legacy-accepted-next");
+        update["responses"] = json!([{"id":"later","audience":"public","at":timestamp(now_ms()),"text":"New unrelated fact."}]);
+        cumulative_response(&f, &update);
+        let next = cumulative_parts(&f).await;
+        assert!(!cumulative_text(&next).contains("Private exact-source reply"));
+        assert!(next.iter().all(|part| part["channel"] == "thinking"));
+        assert_eq!(
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT updates FROM companion_voice_batches WHERE id=?1",
+                    [&batch_id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            raw
+        );
+    }
+}
+
+#[tokio::test]
+async fn private_reply_pending_source_revocation_prevents_speech_and_keeps_evidence() {
+    for change in ["source", "owner", "policy"] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let update = cumulative_private_outcome(&f, &request, &queue);
+        cumulative_response(&f, &update);
+        tick(&f.s, &f.id, &f.headers).await.unwrap();
+        match change {
+            "source" => {
+                f.s.db.lock().unwrap().execute("UPDATE companion_actions SET source=json_set(source,'$.actor','another-person')",[]).unwrap();
+            }
+            "owner" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_calls SET owner='another-person' WHERE id=?1",
+                        [&f.id],
+                    )
+                    .unwrap();
+            }
+            _ => rewrite_policy(&f, |policy| {
+                policy["guidance"] = json!("Changed policy.");
+            }),
+        }
+        assert!(
+            crate::companion_delivery::take_ready(&f.s, &f.id)
+                .unwrap()
+                .is_none(),
+            "{change}"
+        );
+        assert_eq!(
+            action_observation(&f.s, &f.id, &request).unwrap(),
+            Some(update)
+        );
+    }
+}
+
+#[tokio::test]
+async fn private_reply_changed_body_and_returned_correction_are_new_whole_facts() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    let mut update = cumulative_private_outcome(&f, &request, &queue);
+    for (revision, body) in [
+        ("a", "Movement was declined."),
+        ("b", "A later movement was confirmed."),
+        ("a-returned", "Movement was declined."),
+    ] {
+        update["revision"] = json!(revision);
+        update["source_replies"][0]["text"] = json!(body);
+        cumulative_response(&f, &update);
+        let parts = cumulative_parts(&f).await;
+        let spoken: Vec<_> = parts
+            .iter()
+            .filter(|part| part["channel"] == "commentary")
+            .collect();
+        assert_eq!(spoken.len(), 1, "{revision}");
+        assert_eq!(spoken[0]["content"], body);
+        accept_cumulative_parts(&f, &parts);
+    }
 }

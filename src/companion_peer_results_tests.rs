@@ -252,3 +252,161 @@ fn an_explicit_huddle_outcome_still_returns_after_a_quiet_peer_turn() {
     assert!(raw.contains(text));
     assert!(!raw.contains("Working through a routine peer detail"));
 }
+
+#[test]
+fn external_action_result_keeps_compound_facts_quiet_across_incorporated_refinement() {
+    let f = fixture();
+    let text = "I am back, though the movement was only queued. The independent answer is 137 cm.";
+    answer(&f, "action-answer", text);
+    delivery(&f, "action-input", "action-answer", false);
+    delivery(&f, "refinement", "action-answer", false);
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute(
+            "UPDATE input_deliveries SET state='incorporated' WHERE message_id='refinement'",
+            [],
+        )
+        .unwrap();
+        for (id, message, at) in [
+            ("original", "action-input", 1),
+            ("followup", "refinement", 2),
+        ] {
+            db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,?2,0,'dispatched',?3,?4)", params![f.call,id,message,at]).unwrap();
+        }
+        db.execute("INSERT INTO companion_actions VALUES(?1,'action-request','original','minecraft','Walk and return.','{}','queued',?2,?3)", params![f.call,json!({"state":"queued","receipt":{"queued":true}}).to_string(),now_ms()]).unwrap();
+    }
+    observe_results(&f.s, &f.call, &f.room, true).unwrap();
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.call)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        batch["commands"][0]["channel"], "thinking",
+        "Queued external work is not a completed action answer"
+    );
+    assert_eq!(
+        batch["commands"][0]["content"], text,
+        "Compound independent facts remain available unchanged"
+    );
+    assert_eq!(
+        events(&f)
+            .iter()
+            .filter(|event| event["message_id"] == "action-answer" && event["text"] == text)
+            .count(),
+        1
+    );
+    observe_results(&f.s, &f.call, &f.room, true).unwrap();
+    assert!(
+        crate::companion_delivery::take_ready(&f.s, &f.call)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn external_action_result_state_and_target_scope_preserve_ordinary_answers() {
+    for state in [
+        "submitting",
+        "queued",
+        "accepted",
+        "unknown",
+        "failed",
+        "completed",
+        "none",
+        "other-target",
+        "other-call",
+    ] {
+        let f = fixture();
+        answer(&f, "answer", "The result remains exactly as authored.");
+        delivery(&f, "input", "answer", false);
+        {
+            let db = f.s.db.lock().unwrap();
+            db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'original',0,'dispatched','input',1)", [&f.call]).unwrap();
+        }
+        if state != "none" {
+            let action_delegation = if state == "other-target" {
+                answer(&f, "other-answer", "Other result.");
+                delivery(&f, "other-input", "other-answer", false);
+                f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'other',0,'completed','other-input',2)", [&f.call]).unwrap();
+                "other"
+            } else {
+                "original"
+            };
+            let action_call = if state == "other-call" {
+                let other = uuid::Uuid::new_v4().to_string();
+                f.s.db.lock().unwrap().execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at) VALUES(?1,'owner',?1,'fixture','default',?2,'connected',1,1)", params![other,f.room]).unwrap();
+                other
+            } else {
+                f.call.clone()
+            };
+            let stored_state = if state.starts_with("other-") {
+                "queued"
+            } else {
+                state
+            };
+            f.s.db.lock().unwrap().execute("INSERT INTO companion_actions VALUES(?1,'request',?2,'minecraft','Walk.','{}',?3,?4,1)",params![action_call,action_delegation,stored_state,json!({"state":stored_state}).to_string()]).unwrap();
+        }
+        observe_results(&f.s, &f.call, &f.room, true).unwrap();
+        let batch = crate::companion_delivery::take_ready(&f.s, &f.call)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            batch["commands"][0]["channel"],
+            if matches!(state, "submitting" | "queued" | "accepted" | "unknown") {
+                "thinking"
+            } else {
+                "commentary"
+            },
+            "{state}"
+        );
+        assert_eq!(
+            batch["commands"][0]["content"],
+            "The result remains exactly as authored."
+        );
+    }
+}
+
+#[test]
+fn external_action_long_compound_answer_stays_whole_in_context_after_domain_terminal() {
+    let f = fixture();
+    let text = "The independent measurement is 137 cm. ".repeat(20);
+    answer(&f, "answer", &text);
+    delivery(&f, "input", "answer", false);
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'original',0,'dispatched','input',1)", [&f.call]).unwrap();
+        db.execute("INSERT INTO companion_actions VALUES(?1,'request','original','minecraft','Walk.','{}','queued',?2,1)",params![f.call,json!({"state":"queued","observation":{"state":"settled","conversation":{"terminal_state":"interrupted"},"source_replies":[{"text":"The movement was declined."}]}}).to_string()]).unwrap();
+    }
+    observe_results(&f.s, &f.call, &f.room, true).unwrap();
+    let batch = crate::companion_delivery::take_ready(&f.s, &f.call)
+        .unwrap()
+        .unwrap();
+    let commands = batch["commands"].as_array().unwrap();
+    assert!(commands.len() > 2);
+    assert!(commands.iter().all(|part| part["channel"] == "thinking"));
+    assert_eq!(
+        commands
+            .iter()
+            .skip(1)
+            .map(|part| part["content"].as_str().unwrap())
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        complete_fragments(&text, 360, 16).0
+    );
+    let db = f.s.db.lock().unwrap();
+    assert_eq!(
+        db.query_row("SELECT text FROM messages WHERE id='answer'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        text
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM companion_actions WHERE request_id='request'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "queued"
+    );
+}

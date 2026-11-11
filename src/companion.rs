@@ -2066,7 +2066,7 @@ fn complete_fragments(text: &str, limit: usize, max_parts: usize) -> (Vec<String
 }
 fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str) -> Result<()> {
     let has_text = !text.trim().is_empty();
-    let (fresh, late, request_id, attachments, present_image, delegation, linked) = {
+    let (fresh, late, request_id, attachments, present_image, delegation, linked, pending_action) = {
         let mut db = s.db.lock().unwrap();
         let tx = db.transaction()?;
         // Keep this guard at publication as well as observation: neither a
@@ -2120,6 +2120,23 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
         let links = tx.prepare("SELECT x.id,x.message_id,d.state FROM companion_delegations x JOIN input_deliveries d ON d.message_id=x.message_id JOIN companion_calls c ON c.id=x.call_id AND c.agent_id=d.agent_id AND c.conversation_id=d.conversation_id JOIN messages m ON m.id=d.target_turn AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id AND m.role='assistant' WHERE x.call_id=?1 AND x.state='dispatched' AND d.target_turn=?2 AND d.state IN ('completed','incorporated') AND m.status='complete' ORDER BY x.created_at,x.id")?
             .query_map(params![id,message], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // A reasoning turn can incorporate a later refinement of the original
+        // action. Bind every source on this exact target, not only the newest
+        // delegation chosen for presentation. A pending transport receipt is
+        // not the external action's answer; that source returns independently.
+        let pending_action: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM companion_actions a
+             JOIN companion_delegations x ON x.call_id=a.call_id AND x.id=a.delegation_id
+             JOIN companion_calls c ON c.id=x.call_id
+             JOIN input_deliveries d ON d.message_id=x.message_id
+                 AND d.conversation_id=c.conversation_id AND d.agent_id=c.agent_id
+             JOIN messages m ON m.id=d.message_id AND m.conversation_id=c.conversation_id
+                 AND m.role='user' AND m.actor=c.owner
+             WHERE a.call_id=?1 AND d.target_turn=?2 AND d.state IN ('completed','incorporated')
+                 AND a.state IN ('submitting','queued','accepted','unknown'))",
+            params![id, message],
+            |r| r.get(0),
+        )?;
         let delegation = links.last().map(|(did, _, _)| did.clone());
         for (did, source_id, receipt) in &links {
             tx.execute("UPDATE companion_voice_batches SET state='superseded',updated_at=?3 WHERE call_id=?1 AND semantic_key=?2 AND state='pending'",params![id,pending_context_key(did),now_ms()])?;
@@ -2175,6 +2192,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
             present_image,
             delegation,
             !links.is_empty(),
+            pending_action,
         )
     };
     if fresh || linked {
@@ -2199,7 +2217,11 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 queue_append(
                     s,
                     id,
-                    "commentary",
+                    if pending_action {
+                        "thinking"
+                    } else {
+                        "commentary"
+                    },
                     delegation,
                     text,
                     &uuid::Uuid::new_v4().to_string(),
@@ -2224,7 +2246,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 let mut appends = vec![("thinking", header)];
                 for (i, part) in parts.iter().enumerate() {
                     appends.push((
-                        if image_count == 0 && i + 1 == parts.len() {
+                        if !pending_action && image_count == 0 && i + 1 == parts.len() {
                             "commentary"
                         } else {
                             "thinking"
