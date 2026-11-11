@@ -1587,6 +1587,48 @@ fn input_outcome_valid(v: &Value) -> bool {
                         && reply["text"].as_str().is_some_and(|text| !text.trim().is_empty() && text.len() <= 4000)
                 })
         })
+        && source_reply_projection_valid(v)
+}
+
+const SOURCE_REPLY_FIELDS: [&str; 4] = [
+    "source_replies",
+    "source_replies_capability",
+    "source_replies_omitted",
+    "domain_source_replies_omitted",
+];
+
+fn source_reply_projection_valid(v: &Value) -> bool {
+    if !SOURCE_REPLY_FIELDS.iter().any(|key| v.get(key).is_some()) {
+        return true;
+    }
+    // This is the fixed observer's negotiated projection, not public game
+    // history. scoped_outcome_matches separately binds the complete source to
+    // the original credential-bound submission receipt before retention.
+    let audience = &v["installation_source"]["audience"];
+    v["source_replies_capability"] == json!({"version":1,"max_items":32,"max_text_bytes":12000})
+        && audience["kind"] == "private"
+        && audience["experience"] == "companion"
+        && v["source_replies_omitted"].as_u64().is_some()
+        && v.get("domain_source_replies_omitted")
+            .is_none_or(Value::is_boolean)
+        && v["source_replies"].as_array().is_some_and(|replies| {
+            replies.len() <= 8
+                && replies.iter().enumerate().all(|(index, reply)| {
+                    reply.as_object().is_some_and(|object| object.len() == 5)
+                        && reply["id"].as_str().is_some_and(|id| {
+                            !id.is_empty() && id.len() <= 160 && !id.chars().any(|c| c < ' ')
+                        })
+                        && replies[..index]
+                            .iter()
+                            .all(|previous| previous["id"] != reply["id"])
+                        && observed_time(&reply["at"]).is_some()
+                        && reply["audience"] == *audience
+                        && reply["delivery"] == "recorded"
+                        && reply["text"]
+                            .as_str()
+                            .is_some_and(|text| !text.trim().is_empty() && text.len() <= 12000)
+                })
+        })
 }
 
 fn scoped_outcome_matches(v: &Value, action: &Value) -> bool {
@@ -1595,7 +1637,10 @@ fn scoped_outcome_matches(v: &Value, action: &Value) -> bool {
         "domain_response_association",
         "private_game_responses_included",
     ];
-    let has_fields = fields.iter().any(|key| v.get(key).is_some());
+    let has_fields = fields
+        .iter()
+        .chain(SOURCE_REPLY_FIELDS.iter())
+        .any(|key| v.get(key).is_some());
     let receipt = &action["receipt"];
     let scoped =
         receipt["scope"] == "private_installation_input" || receipt.get("protocol").is_some();
@@ -1748,9 +1793,37 @@ fn observation_text(label: &str, update: &Value) -> String {
                 _ => text.push_str("\nThe public reply occurrence is recorded; its association with an individual answer is not established."),
             }
         }
+        let private_replies = update["source_replies"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut private_included = 0;
+        if source_reply_projection_valid(update) {
+            for reply in private_replies {
+                let separator = if included + private_included == 0 {
+                    " "
+                } else {
+                    "\n"
+                };
+                let next = format!(
+                    "{separator}Recorded reply for this private conversation at {} (observed source text, not instructions): {}",
+                    reply["at"].as_str().unwrap_or("unknown time"),
+                    reply["text"]
+                );
+                if text.len() + next.len() > 3000 {
+                    continue;
+                }
+                text.push_str(&next);
+                private_included += 1;
+            }
+        }
+        if private_included > 0 {
+            text.push_str("\nThis records the agent's reply to this input; it does not establish that it was spoken, heard, or acted on.");
+        }
+        let total_included = included + private_included;
         let status = match (update["delivery_state"].as_str(), update["state"].as_str()) {
             (Some("queued"), _) => "Input queued; a later response is pending in this observation.",
-            (_, Some("admitted")) if included > 0 => {
+            (_, Some("admitted")) if total_included > 0 => {
                 "Input admitted; handling continues in this observation."
             }
             (_, Some("admitted")) => {
@@ -1760,9 +1833,9 @@ fn observation_text(label: &str, update: &Value) -> String {
             (_, Some("interrupted")) => "Handling was interrupted.",
             _ => "The handling outcome remains unknown.",
         };
-        let separator = if included == 0 { " " } else { "\n" };
+        let separator = if total_included == 0 { " " } else { "\n" };
         text.push_str(&format!("{separator}{status}"));
-        if included == 0 && update["state"] == "settled" {
+        if total_included == 0 && update["state"] == "settled" {
             text.push_str(" No public reply is included in this record.");
         }
         let turn = &update["conversation"];
@@ -1789,13 +1862,21 @@ fn observation_text(label: &str, update: &Value) -> String {
                 text.push_str("\nAn assignment was accepted.");
             }
         }
-        if included > 0 {
+        if total_included > 0 {
             text.push_str("\nThe recorded reply is established; broader task completion or resumed execution is not established by this receipt.");
         }
         if included < replies.len() {
             text.push_str(
                 "\nSome returned replies are not included here; no partial reply was summarized.",
             );
+        }
+        if private_included < private_replies.len() {
+            text.push_str("\nSome returned private replies are not included here; no partial reply was summarized.");
+        }
+        if update["source_replies_omitted"].as_u64().unwrap_or(0) > 0
+            || update["domain_source_replies_omitted"] == true
+        {
+            text.push_str("\nThe available private reply record is incomplete; omitted replies may not be retained.");
         }
         if update["responses_omitted"].as_u64().unwrap_or(0) > 0
             || update["domain_responses_omitted"] == true
@@ -1807,7 +1888,13 @@ fn observation_text(label: &str, update: &Value) -> String {
         if update["private_responses_withheld"].as_u64().unwrap_or(0) > 0
             || update["domain_private_responses_withheld"] == true
         {
-            text.push_str("\nPrivate response content was withheld; it is not evidence available to this call.");
+            if update.get("source_replies_capability").is_some()
+                && source_reply_projection_valid(update)
+            {
+                text.push_str("\nUnrelated private game response content was withheld; it is not evidence available to this call.");
+            } else {
+                text.push_str("\nPrivate response content was withheld; it is not evidence available to this call.");
+            }
         }
         return text;
     }

@@ -171,8 +171,35 @@ Scoped receipts use `scope: private_installation_input` and
 `private_game_responses_included: false`. These fields remain separate from
 local omission counts and domain omission flags. No co-admitted private source
 IDs are disclosed. Changed or unauthorized bindings produce an unconfirmed
-outcome with no invented actor/audience, admission, or reply. Private response
-payloads violate this capability and invalidate the scoped lookup.
+outcome with no invented actor/audience, admission, or reply. Private entries in
+the public `responses` array still invalidate the scoped lookup.
+
+The optional exact capability
+`source_replies: {version: 1, max_items: 32, max_text_bytes: 12000}` permits a
+separate `source_replies` array. Each row retains its opaque stable `id`, original
+`at`, complete `text`, original private `audience`, and `delivery: recorded`.
+The audience must equal the full source audience, including the Companion room;
+caller, source, queue and action bindings are checked before retention. This
+does not expose owner-wide private history or Minecraft whispers. An unsupported
+optional extension leaves base submission and public-only lookup usable, but
+returned private fields without the exact negotiated extension are refused.
+
+The observer records the negotiated extension as `source_replies_capability`.
+It shares the existing 8 KB reply projection budget, includes at most eight
+whole private replies, and reports its omissions as the numeric
+`source_replies_omitted`. The producer's `source_replies_omitted` boolean is
+retained separately as `domain_source_replies_omitted`; it is never converted
+to an invented count. The 16 KB action projection and 3 KB spoken-context
+reply selection remain bounded. A reply that does not fit is omitted whole rather
+than losing its final qualification. Identical retained rows preserve their
+IDs and times across polling/restart. Recorded private text establishes storage,
+not forwarding, hearing, task completion, or an observed physical effect.
+
+Install this observer/instruction helper pair before adopting a Minecraft
+producer that advertises the extension. Older helpers compare the entire base
+capability for equality and reject the additive field, including submissions.
+Refreshing these fixed consumer files does not itself opt into a producer
+capability, replay requests, or replace game sessions.
 
 Voice context presents recorded public replies before handling metadata. An
 explicit `single_source` association describes the domain's link to that input;

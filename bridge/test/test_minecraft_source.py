@@ -92,6 +92,15 @@ class ScopedTests(unittest.TestCase):
             self.assertEqual(result["state"],"failed")
             self.assertEqual(len(transport.calls),1)
             self.assertNotIn(TOKEN,json.dumps(result))
+    def test_optional_reply_extension_does_not_block_original_submission(self):
+        for extension in [{"version":1,"max_items":32,"max_text_bytes":12000},
+                          {"version":2,"future":"not interpreted"}, None]:
+            transport=Transport([{**instruction.SOURCE_CAPABILITY,"source_replies":extension},self.receipt])
+            result=instruction.submit(self.home,self.value,transport,self.config)
+            self.assertEqual(result["state"],"queued")
+            self.assertEqual(result["source"],self.wire)
+            self.assertEqual(len(transport.calls),2)
+            self.assertEqual(json.loads(transport.calls[-1].data),{"text":self.source["original_text"],"source":self.wire})
     def test_uncertain_submission_and_wrong_receipt_never_retry(self):
         for response in [TimeoutError(TOKEN),{**self.receipt,"source_request_id":str(uuid.uuid4())},
                          {**self.receipt,"duplicate":0},{**self.receipt,"received_at":"yesterday"}]:

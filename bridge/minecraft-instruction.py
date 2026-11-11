@@ -28,6 +28,7 @@ SOURCE_CAPABILITY = {"version": 1, "submission": {"method": "POST", "path": "/ta
                      "outcomes": {"method": "POST", "path": "/source-outcomes", "max_items": 16},
                      "source_identity": "credential_bound_caller_and_exact_source",
                      "idempotency": "same_caller_source_request_id_and_payload", "private_game_responses": False}
+SOURCE_REPLIES_CAPABILITY = {"version": 1, "max_items": 32, "max_text_bytes": 12000}
 
 
 def source_client(path, installation):
@@ -54,12 +55,19 @@ def source_client(path, installation):
 
 
 def source_capability(value):
-    # The candidate's fixed shape is deliberately opt-in. A changed method,
-    # route, private-response claim, or identity contract is not negotiated v1.
-    return (isinstance(value, dict) and value == SOURCE_CAPABILITY
+    # Keep the base v1 contract usable when the optional reply extension is not
+    # understood. It never relaxes the fixed paths, identity or public contract.
+    return (isinstance(value, dict)
+            and {key: item for key, item in value.items() if key != "source_replies"} == SOURCE_CAPABILITY
             and type(value.get("version")) is int
             and type(value.get("private_game_responses")) is bool
             and type(value.get("outcomes", {}).get("max_items")) is int)
+
+
+def source_replies_capability(value):
+    """Private replies require this explicit extension, never merely parent v1."""
+    return (isinstance(value, dict) and value == SOURCE_REPLIES_CAPABILITY
+            and all(type(value.get(key)) is int for key in SOURCE_REPLIES_CAPABILITY))
 
 
 def valid_source(value):

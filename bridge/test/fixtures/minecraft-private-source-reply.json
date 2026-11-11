@@ -1,0 +1,153 @@
+{
+  "scope": "Disposable actual producer modules, no model/service/world call",
+  "capability": {
+    "version": 1,
+    "submission": {
+      "method": "POST",
+      "path": "/task"
+    },
+    "outcomes": {
+      "method": "POST",
+      "path": "/source-outcomes",
+      "max_items": 16
+    },
+    "source_identity": "credential_bound_caller_and_exact_source",
+    "idempotency": "same_caller_source_request_id_and_payload",
+    "private_game_responses": false,
+    "source_replies": {
+      "version": 1,
+      "max_items": 32,
+      "max_text_bytes": 12000
+    }
+  },
+  "input": {
+    "text": "Report the observed result privately to this conversation.",
+    "source": {
+      "version": 1,
+      "request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+      "call_id": "disposable-companion-call",
+      "intent_id": "disposable-companion-intent",
+      "revision": "494a44c0d722179668679ce2738fc22f33c9749c435dd20ccbe41eab4e40e632",
+      "occurred_at": "2026-11-11T05:39:04.385Z",
+      "actor": {
+        "id": "fixture-authenticated-human",
+        "label": "fixture-authenticated-human"
+      },
+      "audience": {
+        "kind": "private",
+        "experience": "companion",
+        "id": "disposable-companion-room"
+      }
+    }
+  },
+  "receipt": {
+    "queued": true,
+    "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+    "source_request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+    "received_at": "2026-11-11T05:39:04.410Z",
+    "duplicate": false
+  },
+  "query": {
+    "version": 1,
+    "requests": [
+      {
+        "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+        "source": {
+          "version": 1,
+          "request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+          "call_id": "disposable-companion-call",
+          "intent_id": "disposable-companion-intent",
+          "revision": "494a44c0d722179668679ce2738fc22f33c9749c435dd20ccbe41eab4e40e632",
+          "occurred_at": "2026-11-11T05:39:04.385Z",
+          "actor": {
+            "id": "fixture-authenticated-human",
+            "label": "fixture-authenticated-human"
+          },
+          "audience": {
+            "kind": "private",
+            "experience": "companion",
+            "id": "disposable-companion-room"
+          }
+        }
+      }
+    ]
+  },
+  "response": {
+    "version": 1,
+    "observed_at": "2026-11-11T05:39:04.434Z",
+    "outcomes": [
+      {
+        "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+        "delivery": "terminal",
+        "admitted_at": "2026-11-11T05:39:04.411Z",
+        "terminal_at": "2026-11-11T05:39:04.434Z",
+        "conversation_only": true,
+        "turn_task_id": null,
+        "blocked_reason": null,
+        "responses": [],
+        "task_authorizations": [],
+        "work_resumptions": [],
+        "completion": "not_established",
+        "source": {
+          "caller": {
+            "id": "companion",
+            "label": "Companion"
+          },
+          "version": 1,
+          "request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+          "call_id": "disposable-companion-call",
+          "intent_id": "disposable-companion-intent",
+          "revision": "494a44c0d722179668679ce2738fc22f33c9749c435dd20ccbe41eab4e40e632",
+          "occurred_at": "2026-11-11T05:39:04.385Z",
+          "actor": {
+            "id": "fixture-authenticated-human",
+            "label": "fixture-authenticated-human"
+          },
+          "audience": {
+            "kind": "private",
+            "experience": "companion",
+            "id": "disposable-companion-room"
+          }
+        },
+        "response_association": "single_source",
+        "private_game_responses_included": false,
+        "source_replies": [
+          {
+            "id": "f05ad84f2050b225ce65d094fb0c7c13c22d4fd6882ecd415c40045341089808",
+            "at": "2026-11-11T05:39:04.411Z",
+            "text": "Fixture observation: feet block (-314,73,68). This is a recorded report, not a transport or physical-completion proof.",
+            "audience": {
+              "kind": "private",
+              "experience": "companion",
+              "id": "disposable-companion-room"
+            },
+            "delivery": "recorded"
+          }
+        ]
+      }
+    ]
+  },
+  "cross_caller_response": {
+    "version": 1,
+    "observed_at": "2026-11-11T05:39:04.435Z",
+    "outcomes": [
+      {
+        "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+        "delivery": "unknown",
+        "reason": "not_retained_or_not_authorized",
+        "completion": "not_established"
+      }
+    ]
+  },
+  "checks": {
+    "stable_id_and_time": true,
+    "reload_preserved": true,
+    "owner_outcomes_withhold_private": true,
+    "cross_caller_unknown": true,
+    "completion_not_established": true
+  },
+  "limitations": [
+    "No consumer forwarding or spoken delivery proof.",
+    "No natural model or live movement claim."
+  ]
+}
