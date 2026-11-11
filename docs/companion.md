@@ -641,11 +641,12 @@ bounded polls so newer requests cannot permanently hide older unresolved ones.
 
 An outcome for an already requested action is a result, not optional ambient
 news. A validated saved observation bound to its original caller, request and
-connection enters context without a relevance-model decision. Its status and
-qualifications stay quiet. An exact private source reply can be offered as speech,
+connection enters context without a relevance-model decision. Status and
+qualifications are supplied as context, which can still influence Live speech.
+An exact private source reply can be offered as speech,
 with its recorded-only provenance supplied first. Only a whole, unambiguous reply
-that fits the existing append bound takes this route; other facts remain in quiet
-context and full history. It still waits for the conversational floor and passes
+whose complete ordered parts fit the existing append and batch bounds takes this
+route; unavailable bodies retain an explicit notice and full history. It still waits for the conversational floor and passes
 the same private-audience, source, revision and call checks. Arbitrary observer text cannot claim this route by
 labeling itself an action result. A result receipt does not establish fulfillment
 or require a spoken interruption. Waiting behind a long human explanation does
@@ -922,6 +923,18 @@ without an unsolicited Live update. Meaningful source replies, recorded blockers
 interruptions, unknown outcomes, task authority and resumption facts retain their
 existing qualifications. Turn scope and ordinary handling-ended bookkeeping are
 not standalone progress or completion announcements.
+
+Validated private replies are mapped from their complete source record before
+voice formatting. Whole newline-inclusive units may be packed into ordered
+480-byte appends; concatenating their bodies reproduces the original reply
+exactly. Source qualifications precede the complete body group. Every part and
+qualification must be accepted before a later cumulative observation can omit
+that exact reply. Acceptance does not prove it was spoken or heard. Unchanged
+fully accepted snapshots do not repeat their qualifications merely because the
+observation revision changed; changed replies, blockers, authority and coverage
+remain eligible. Legacy queued, sent and uncertain batches are never rewritten.
+If a whole unit or complete reply group cannot fit the existing bounded batch,
+only an explicit unavailable notice is offered; the full reply stays in READ.
 
 ### Coherent speech and bounded presentation
 

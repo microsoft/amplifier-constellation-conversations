@@ -4908,14 +4908,13 @@ async fn private_reply_mixed_ack_requires_exact_body_and_all_qualifiers_before_d
 }
 
 #[tokio::test]
-async fn private_reply_oversized_multiline_or_ambiguous_stays_quiet() {
-    for mode in ["oversized", "multiline", "ambiguous"] {
+async fn private_reply_oversized_or_ambiguous_stays_quiet() {
+    for mode in ["oversized", "ambiguous"] {
         let f = fixture();
         let (request, queue) = retained_action(&f);
         let mut update = cumulative_private_outcome(&f, &request, &queue);
         match mode {
             "oversized" => update["source_replies"][0]["text"] = json!("é".repeat(241)),
-            "multiline" => update["source_replies"][0]["text"] = json!("First line.\nSecond line."),
             _ => {
                 let mut other = update["source_replies"][0].clone();
                 other["id"] = json!("another-reply");
