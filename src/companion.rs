@@ -2066,7 +2066,17 @@ fn complete_fragments(text: &str, limit: usize, max_parts: usize) -> (Vec<String
 }
 fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str) -> Result<()> {
     let has_text = !text.trim().is_empty();
-    let (fresh, late, request_id, attachments, present_image, delegation, linked, pending_action) = {
+    let (
+        fresh,
+        late,
+        request_id,
+        attachments,
+        present_image,
+        delegation,
+        linked,
+        pending_action,
+        quiet_action_result,
+    ) = {
         let mut db = s.db.lock().unwrap();
         let tx = db.transaction()?;
         // Keep this guard at publication as well as observation: neither a
@@ -2124,18 +2134,21 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
         // action. Bind every source on this exact target, not only the newest
         // delegation chosen for presentation. A pending transport receipt is
         // not the external action's answer; that source returns independently.
-        let pending_action: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM companion_actions a
+        // Unknown or terminal sibling receipts retain the existing answer path:
+        // withholding a queued sibling must not hide uncertainty or failure.
+        let (pending_action, quiet_action_result): (bool, bool) = tx.query_row(
+            "SELECT COUNT(*) > 0 AND COUNT(*) = COALESCE(SUM(a.state IN ('submitting','queued','accepted')),0),
+                    COALESCE(MAX(a.state IN ('submitting','queued','accepted','unknown')),0)
+             FROM companion_actions a
              JOIN companion_delegations x ON x.call_id=a.call_id AND x.id=a.delegation_id
              JOIN companion_calls c ON c.id=x.call_id
              JOIN input_deliveries d ON d.message_id=x.message_id
                  AND d.conversation_id=c.conversation_id AND d.agent_id=c.agent_id
              JOIN messages m ON m.id=d.message_id AND m.conversation_id=c.conversation_id
                  AND m.role='user' AND m.actor=c.owner
-             WHERE a.call_id=?1 AND d.target_turn=?2 AND d.state IN ('completed','incorporated')
-                 AND a.state IN ('submitting','queued','accepted','unknown'))",
+             WHERE a.call_id=?1 AND d.target_turn=?2 AND d.state IN ('completed','incorporated')",
             params![id, message],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let delegation = links.last().map(|(did, _, _)| did.clone());
         for (did, source_id, receipt) in &links {
@@ -2193,6 +2206,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
             delegation,
             !links.is_empty(),
             pending_action,
+            quiet_action_result,
         )
     };
     if fresh || linked {
@@ -2212,22 +2226,27 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 )
             })
             .count();
-        if has_text || image_count > 0 {
-            if text.len() <= 480 && image_count == 0 {
+        // A completed reasoning turn is not the connected source's answer.
+        // Thinking also reaches the speech model, so pending-action prose stays
+        // in the canonical result/card rather than being supplied as Live facts.
+        // Actual attachments retain their independent publication path.
+        let live_text = if pending_action { "" } else { text };
+        if !live_text.trim().is_empty() || image_count > 0 {
+            if live_text.len() <= 480 && image_count == 0 {
                 queue_append(
                     s,
                     id,
-                    if pending_action {
+                    if quiet_action_result {
                         "thinking"
                     } else {
                         "commentary"
                     },
                     delegation,
-                    text,
+                    live_text,
                     &uuid::Uuid::new_v4().to_string(),
                 )?;
             } else {
-                let (parts, omitted) = complete_fragments(text, 360, 16);
+                let (parts, omitted) = complete_fragments(live_text, 360, 16);
                 // Keep task evidence separate from spoken wording. Behavioral
                 // instructions live in the session prompt, not in result text.
                 let header = format!(
@@ -2246,7 +2265,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 let mut appends = vec![("thinking", header)];
                 for (i, part) in parts.iter().enumerate() {
                     appends.push((
-                        if !pending_action && image_count == 0 && i + 1 == parts.len() {
+                        if !quiet_action_result && image_count == 0 && i + 1 == parts.len() {
                             "commentary"
                         } else {
                             "thinking"
@@ -2285,8 +2304,13 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 "thinking",
                 delegation,
                 &format!(
-                    "Request {request_id} settled with {} saved artifacts in shared space. No public text answer was returned. Do not invent artifact contents.",
-                    attachments.len()
+                    "Request {request_id} settled with {} saved artifacts in shared space. {} Do not invent artifact contents.",
+                    attachments.len(),
+                    if pending_action {
+                        "The agent reply is saved in call history; the external action's outcome is not established by these artifacts."
+                    } else {
+                        "No public text answer was returned."
+                    }
                 ),
                 &uuid::Uuid::new_v4().to_string(),
             )?;
