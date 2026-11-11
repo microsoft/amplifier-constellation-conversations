@@ -716,7 +716,7 @@ function refreshWorkStatus(call) {
   const update = [...call.progress.values()].at(-1);
   const elapsed = Number.isSafeInteger(update?.elapsed_seconds) && update.elapsed_seconds >= 0 ? ` after ${update.elapsed_seconds} seconds` : '';
   $('work-status').textContent = update
-    ? (update.state === 'blocked' ? 'An earlier request needs review before more work can start. Open the conversation to review it.' : update.state === 'awaiting_permission' ? 'A request is waiting for your decision. Open work controls to review it.' : `Last update: a request was still pending${elapsed}. No completed result has arrived.`) + (call.working.size > 1 ? ` ${call.working.size} requests pending.` : '')
+    ? (update.state === 'blocked' ? 'An earlier request needs review before more work can start. Open the conversation to review it.' : update.state === 'awaiting_permission' ? 'A request is waiting for your decision. Open work controls to review it.' : `Last update: a request was still pending${elapsed}.`) + (call.working.size > 1 ? ` ${call.working.size} requests pending.` : '')
     : `${call.contact.label} has ${call.working.size === 1 ? 'a pending request' : call.working.size + ' pending requests'}. You can keep talking.`;
 }
 // Answer content uses sanitized Markdown and validated links. No raw HTML,
@@ -841,6 +841,38 @@ function appendCard(call, card, intent = false) {
   }
   updateBoard(call); followChange($('space-panel'),following);
 }
+function appendPresenceSummary(answer, text, data) {
+  const source = data.source, attribution = data.attribution;
+  // Render only the existing typed, attributed observation. Ordinary JSON and
+  // other cards keep their original renderer; no work status is inferred.
+  if (data.observed_only !== true || source?.kind !== 'presence_observation'
+      || source.provenance?.kind !== 'minecraft_public_presence' || source.provenance.authority !== false
+      || attribution?.scope !== 'presence_observation' || attribution.snapshot_kind !== 'presence'
+      || attribution.current_state_snapshot !== true || attribution.observed_only !== true || attribution.authority !== false
+      || typeof source.connection_id !== 'string' || !source.connection_id || source.connection_id !== attribution.connection_id
+      || source.actor !== attribution.actor || source.text !== text
+      || source.audience?.kind !== 'public' || source.audience.experience !== 'minecraft'
+      || source.audience.connection_id !== source.connection_id
+      || !['kind','experience','connection_id'].every(key=>source.audience[key] === attribution.audience?.[key])) return false;
+  let presence;
+  try { presence = JSON.parse(text); } catch { return false; }
+  if (!presence || typeof presence !== 'object' || Array.isArray(presence)) return false;
+  const summary = element('div','presence-summary card-text');
+  const observed = contextTime(source.observed_at ?? source.occurred_at);
+  const timing = element('p',null,observed ? 'Observed ' : 'Observation time not recorded.');
+  if (observed) {
+    const time = element('time',null,observed.toLocaleString()); time.dateTime = observed.toISOString(); timing.append(time);
+  }
+  summary.append(timing);
+  const position = presence.position;
+  summary.append(element('p',null,position && ['x','y','z'].every(axis=>typeof position[axis] === 'number' && Number.isFinite(position[axis]))
+    ? `Position: ${position.x}, ${position.y}, ${position.z}` : 'Position unavailable in this snapshot.'));
+  summary.append(element('p','card-context','Saved observation.'));
+  const details = element('details');
+  details.append(element('summary',null,'Details'),element('pre','permission-detail',JSON.stringify(source,null,2)));
+  answer.append(summary,details);
+  return true;
+}
 function addCard(call, title, text, conversationId, data = {}) {
   if (!current(call)) return;
   const card = element('article', 'output-card');
@@ -864,7 +896,9 @@ function addCard(call, title, text, conversationId, data = {}) {
   }
   if (data.late) card.append(element('p', 'card-context', 'Answer to your earlier request'));
   const answer = element('div', 'card-answer'), note = data.kind === 'note', explicitMedia = !note && safeLink(data.url, conversationId);
-  if (note) answer.append(element('p',null,text)); else appendRichText(answer, text, conversationId, !explicitMedia); card.append(answer);
+  if (note) answer.append(element('p',null,text));
+  else if (!appendPresenceSummary(answer,text,data)) appendRichText(answer, text, conversationId, !explicitMedia);
+  card.append(answer);
   if (explicitMedia) appendMedia(card, {url:explicitMedia,name:typeof data.title === 'string' ? data.title : 'Shared media',kind:data.kind}, conversationId);
   if (data.truncated) addFullResultControl(call,card,answer,data,conversationId);
   for (const item of (!note && Array.isArray(data.attachments) ? data.attachments : []).slice(0,8)) {
