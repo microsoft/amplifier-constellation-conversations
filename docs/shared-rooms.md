@@ -1,6 +1,10 @@
-# Shared conversations (0.3)
+# Shared conversations
 
 Agent Conversations owns its browser conversations. An ACP connection identifies an existing independently running agent or an attach command; the service does not install agents, read their private state, or share Slack storage. The same endpoint may also be attached to Slack, Zed, or a fleet experience.
+
+These local interfaces implement the Constellation
+[family ownership agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/family.v1-candidate.md).
+The screen instructions below describe the reference client.
 
 ## Start simply
 

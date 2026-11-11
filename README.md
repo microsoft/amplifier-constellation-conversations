@@ -1,10 +1,24 @@
 # Agent Conversations
 
-Part of [Amplifier Constellation](https://github.com/microsoft/amplifier-constellation).
+Reusable conversation and coordination services for people and **existing ACP
+agents**, part of [Amplifier Constellation](https://github.com/microsoft/amplifier-constellation).
 
-A standalone web experience for talking to an **existing ACP agent**. Each conversation has its own working session, while the endpoint retains the agent's identity and its authorized continuity across Slack, native clients, and other experiences.
+Conversations owns its rooms, membership, messages, source access, and observable
+huddles. Each conversation has its own working session, while the configured ACP
+endpoint retains the agent's identity and authorized continuity across Slack,
+native clients, and other experiences. Consumers use the service's APIs and tools
+to compose these capabilities into their own experiences.
 
-This repository contains an ACP client, a private conversation store, a browser UI, and an optional context-provider API. It does not install an agent runtime, assign a persona, read another application's database, or manage a fleet.
+This repository contains an ACP client, a private conversation store, an optional
+context-provider API, and reference browser clients. The packaged UI and Companion
+preview provide developer, administration, and reference access; they do not
+prescribe the UX of future products. Conversations does not install an agent
+runtime, assign a persona, read another application's database, or manage a fleet.
+
+- [Component vision](docs/VISION.md): intended value and the contribution to the family.
+- [Documentation](docs/README.md): service interfaces and implementation guides.
+- [API reference](docs/api.md): resources, supported operations, and view control.
+- [Family and interaction agreements](https://github.com/microsoft/amplifier-constellation/tree/main/contracts): shared promises and ownership.
 
 The service supports explicitly allowed local users, private conversations, and shared rooms with several independently configured ACP agents. Existing conversations stay private on upgrade. See [shared rooms](docs/shared-rooms.md) for setup, participation, attachments, and audience boundaries. Multiple conversations can run concurrently against the configured endpoints. Imported transcripts from other experiences are viewable here, with their original surface identified, but remain read-only.
 
@@ -15,16 +29,18 @@ configured, agents create or reuse a huddle and invite known peers through their
 existing tools; people do not prepare rooms. Inspection and follow preferences
 do not grant work authority or start another agent.
 
-## Companion preview
+## Companion reference preview
 
 [Constellation Companion](docs/companion.md) adds full-duplex GPT-Live calls to
-existing ACP agents, with per-agent voices and separate background work. It has
-its own `/companion` interface and optional server-side bridge; existing text
-conversations and browser dictation keep their current behavior.
+existing ACP agents, with per-agent voices and separate background work. Its
+`/companion` reference interface and optional server-side bridge exercise those
+services. Companion owns its voice-provider connection; the selected ACP engine
+owns backend reasoning-provider calls. Existing text conversations and browser
+dictation keep their current behavior.
 
-## Phone and voice
+## Reference browser: phone and voice
 
-The responsive browser experience can be added to a phone or desktop home screen
+The responsive reference browser can be added to a phone or desktop home screen
 using its Install/Share menu. It uses the same authenticated service and ACP
 connections. The install shell never caches transcripts or credentials for
 offline use; reconnect to your network/Tailscale to use your agents.
