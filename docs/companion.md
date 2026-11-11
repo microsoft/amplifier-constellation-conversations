@@ -657,12 +657,17 @@ labeling itself an action result. A result receipt does not establish fulfillmen
 or require a spoken interruption. Waiting behind a long human explanation does
 not erase a bound result; its original timestamp remains explicit.
 
-A backend answer linked to an external action whose receipt remains submitting,
-queued, accepted, or unknown is supplied as context, not automatic action-result
-speech. This checks every input incorporated into that exact backend turn. The
-whole answer, including independent compound facts, remains in its original card
-and history; automatic speech of those independent facts is not guaranteed.
-Definite helper failure/completion and image-publication handling are unchanged.
+When every external action linked to a backend turn has only a known submitting,
+queued or accepted receipt, that turn's native prose stays in its original card,
+history and authenticated result read. It is not automatically appended to Live:
+thinking can be spoken, and a transport receipt establishes neither execution nor
+non-execution. This checks all inputs incorporated into that exact target turn;
+separate target answers and actual artifact publication remain available. Mixed
+same-target independent prose is preserved for inspection, not automatically
+split or spoken. Any unknown or terminal helper receipt on that target keeps the
+existing answer path so uncertainty or failure is not hidden. Independently
+correlated source replies, blockers and interrupted outcomes retain their own
+presentation path. Existing queued/sent/unknown result batches are unchanged.
 Recorded source replies are not independent proof of physical completion or
 hearing. Previously accepted whole replies, including older thinking-only
 presentations, are not offered again merely to change their speech channel;
