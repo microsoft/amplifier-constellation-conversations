@@ -206,12 +206,20 @@ test('connection errors remain unknown presentation advice, not actions or retry
   assert.equal('authorized' in result,false);assert.equal('completed' in result,false);
 });
 
-test('absolute provider deadline aborts a stalled request with no retry or spoken fallback',async()=>{
-  let calls=0,signal;
-  const before=performance.now();
-  const result=await evaluateAwareness(request(),{apiKey:'fixture-api-secret',timeoutMs:25,fetch:async(_url,options)=>{calls++;signal=options.signal;return new Promise(()=>{});}});
+test('absolute provider deadline aborts a stalled request with no retry or spoken fallback',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  let calls=0,signal,started,settled=false;
+  const entered=new Promise(resolve=>{started=resolve;});
+  const pending=evaluateAwareness(request(),{apiKey:'fixture-api-secret',timeoutMs:25,fetch:async(_url,options)=>{calls++;signal=options.signal;started();return new Promise(()=>{});}}).then(result=>{settled=true;return result;});
+  await entered;
+  // Observe the deadline itself, not how soon a loaded CI runner resumes.
+  t.mock.timers.tick(24);await Promise.resolve();
+  assert.equal(signal.aborted,false);assert.equal(settled,false);
+  t.mock.timers.tick(1);
+  const result=await pending;
   assert.equal(result.reason,'provider_timeout');assert.equal(result.decision,'quiet');assert.equal(calls,1);assert.equal(signal.aborted,true);
-  assert.ok(performance.now()-before<500);
+  t.mock.timers.tick(15000);await Promise.resolve();
+  assert.equal(calls,1);
 });
 
 test('caller cannot silently widen timeout and untrusted usage metadata is not copied',async()=>{
