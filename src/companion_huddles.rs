@@ -987,17 +987,14 @@ mod tests {
             let db = f.s.db.lock().unwrap();
             assert!(presentation_allowed(&f.s, &db, &f.call, &commands).unwrap());
         }
-        // The first answer became older context; the actual refinement is still
-        // bound to its own request even though its room Origin stays initial.
+        // A newer request alone does not cancel the first answer. Each report
+        // remains bound to its request even though the room Origin stays initial.
         let first = crate::companion_delivery::take_ready(&f.s, &f.call)
             .unwrap()
             .unwrap();
-        assert!(
-            first["commands"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|c| c["channel"] == "thinking")
+        assert_eq!(
+            first["commands"].as_array().unwrap().last().unwrap()["channel"],
+            "commentary"
         );
         let second = crate::companion_delivery::take_ready(&f.s, &f.call)
             .unwrap()

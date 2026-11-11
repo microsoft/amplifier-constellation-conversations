@@ -104,7 +104,7 @@ for line in sys.stdin:
   emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});break
  if c['op']=='append':
   if not c['content'].strip() and c['channel']!='thinking':emit({'type':'error','code':'invalid_content','message':'Empty content'});continue
-  if voice=='append_error' and c['content'] and c['channel']!='instructions':
+  if voice=='append_error' and c['content'] and c['channel']=='commentary':
    if second_sent:continue
    second_sent=True
    for suffix,client,outer in [('unrelated','never-queued',None),('conflict',c['event_id'],'another-command'),('matched',c['event_id'],None)]:
@@ -922,12 +922,31 @@ for line in sys.stdin:
         .iter()
         .filter(|v| v["op"] == "append")
         .collect::<Vec<_>>();
-    assert_eq!(appends.len(), 2);
+    assert_eq!(appends.len(), 3);
     assert_eq!(appends[0]["channel"], "thinking");
     assert!(appends[0]["content"].as_str().unwrap().is_empty());
-    assert_eq!(appends[1]["channel"], "instructions");
+    let pending = appends
+        .iter()
+        .find(|c| {
+            c["event_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("request-pending-")
+        })
+        .unwrap();
+    assert_eq!(pending["channel"], "thinking");
     assert!(
-        appends[1]["content"]
+        pending["content"]
+            .as_str()
+            .unwrap()
+            .contains("No matching completed answer")
+    );
+    let capability = appends
+        .iter()
+        .find(|c| c["channel"] == "instructions")
+        .unwrap();
+    assert!(
+        capability["content"]
             .as_str()
             .unwrap()
             .contains("remains unknown after its handshake")
@@ -1571,7 +1590,7 @@ async fn upload_awareness_is_owned_durable_idempotent_and_does_not_auto_prompt()
 }
 
 #[tokio::test]
-async fn superseded_result_preserves_qualifiers_full_lookup_and_delegation_without_interrupting() {
+async fn independent_older_result_preserves_qualifiers_and_remains_speakable() {
     let f = fixture("quiet");
     let (_, call) = start(&f).await;
     let id = call["id"].as_str().unwrap();
@@ -1587,8 +1606,8 @@ async fn superseded_result_preserves_qualifiers_full_lookup_and_delegation_witho
         db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES('late-result',?1,'assistant',?2,'complete',?3,?3,'Coach','default')",rusqlite::params![room,text,now_ms()]).unwrap();
         db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,target_turn,updated_at) VALUES('late-delivery','late-source',?1,'default','direct','completed','late-result',?2)",rusqlite::params![room,now_ms()]).unwrap();
         db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'late-delegation',100,'dispatched','late-source',?2)",rusqlite::params![id,now_ms()-190_000]).unwrap();
-        // The result is earlier context because a distinct request replaced it,
-        // not simply because useful work took longer than thirty seconds.
+        // A distinct newer request affects board placement, not whether this
+        // independently requested answer remains eligible for speech.
         db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('new-question',?1,'user','Now check the other issue','sent',?2,?2,'owner')",rusqlite::params![room,now_ms()]).unwrap();
         db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('new-question','new-question',?1,'default','direct','queued',?2)",rusqlite::params![room,now_ms()]).unwrap();
     }
@@ -1646,9 +1665,13 @@ async fn superseded_result_preserves_qualifiers_full_lookup_and_delegation_witho
         .filter(|v: &Value| v["op"] == "append")
         .collect();
     assert!(!appends.is_empty());
-    assert!(appends.iter().all(|v| v["channel"] == "thinking"
-        && v["delegation_id"] == "late-delegation"
-        && v["content"].as_str().unwrap().len() <= 480));
+    assert!(
+        appends
+            .iter()
+            .all(|v| v["delegation_id"] == "late-delegation"
+                && v["content"].as_str().unwrap().len() <= 480)
+    );
+    assert_eq!(appends.last().unwrap()["channel"], "commentary");
     assert!(appends.iter().any(|v| {
         v["content"]
             .as_str()

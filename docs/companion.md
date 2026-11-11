@@ -960,11 +960,16 @@ was played. Historical content without a retained receipt remains unknown.
 `companion_view` can open this tab with `action: "show_context"`.
 
 At delegation receipt the host sends the documented empty thinking append to
-cancel a pending automatic acknowledgment. A separate fixed instruction marks
-the delegated question as still awaiting checked facts, so a waiting interval is
-not an invitation to invent status or plausible work details. Both are recorded
-once per delegation. Dispatch remains visible without injecting waiting narration. It is not a guarantee of silence: already-generated
-speech and independent model speech remain separate.
+cancel a pending automatic acknowledgment. After durable intake, one quiet,
+source-bound receipt records that the request is saved and its matching answer
+has not returned. It does not claim execution or external progress. Unchanged
+polls do not add announcements; a terminal result withdraws only that request's
+unsent pending context. Accepted or unknown deliveries stay in the audit.
+
+Independent answers remain eligible when newer questions arrive. Chronology
+alone does not mean cancellation or replacement; the conversational floor still
+defers delivery while the caller speaks. Image-board placement retains its own
+current-result policy. Context acceptance does not prove speech or playback.
 
 Relevant attributed observations are supplied directly to voice. Facts from one
 connection must not answer a question about another connection, even when the

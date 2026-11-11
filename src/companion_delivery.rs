@@ -121,39 +121,6 @@ pub(crate) fn floor_open_in(db: &Connection, call: &str) -> Result<bool> {
     Ok(now_ms() - last_user >= 1200)
 }
 
-/// A result can become earlier context after another durable work request.
-/// Ordinary speech may be acknowledgment or independent conversation; it does
-/// not replace an awaited answer. The floor guard still waits for the caller.
-/// This changes presentation only, not its text, source identity or outcome.
-fn demote_earlier_result(db: &Connection, call: &str, commands: &mut Vec<Value>) -> Result<bool> {
-    let mut earlier = false;
-    let mut original = None;
-    for command in commands.iter().filter(|c| c["channel"] == "commentary") {
-        let Some(delegation) = command["delegation_id"].as_str() else {
-            continue;
-        };
-        let changed: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM companion_delegations d WHERE d.call_id=?1 AND d.id=?2 AND EXISTS(SELECT 1 FROM companion_delegations newer WHERE newer.call_id=d.call_id AND newer.id!=d.id AND (newer.created_at>d.created_at OR (newer.created_at=d.created_at AND newer.offset_ms>d.offset_ms))))",
-            params![call, delegation],
-            |r| r.get(0),
-        )?;
-        if changed {
-            earlier = true;
-            original = Some(delegation.to_owned());
-        }
-    }
-    if !earlier {
-        return Ok(false);
-    }
-    for command in commands.iter_mut() {
-        if command["channel"] == "commentary" {
-            command["channel"] = json!("thinking");
-        }
-    }
-    commands.insert(0, json!({"op":"append","channel":"thinking","event_id":uuid::Uuid::new_v4().to_string(),"delegation_id":original,"content":"These facts answer an earlier question. The caller has supplied a newer work request. Keep the facts as context and use them only if still relevant to the latest point. Do not interrupt or repeat an earlier answer. This does not cancel accepted work."}));
-    Ok(true)
-}
-
 pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     let mut db = s.db.lock().unwrap();
     let tx = db.transaction()?;
@@ -164,7 +131,7 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     let Some((id, raw)) = row else {
         return Ok(None);
     };
-    let mut commands: Vec<Value> = serde_json::from_str(&raw)?;
+    let commands: Vec<Value> = serde_json::from_str(&raw)?;
     let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND state IN ('connecting','connected'))", [call], |r|r.get(0))?;
     if !active
         || crate::companion_history::private_identity(&tx, call)?.is_none()
@@ -179,8 +146,26 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
         tx.commit()?;
         return Ok(None);
     }
-    if demote_earlier_result(&tx, call, &mut commands)? {
-        tx.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'context_delivery',?3,?4)",params![call,format!("batch:{id}:earlier-context"),json!({"batch_id":id,"state":"presentation_changed","reason":"newer_human_context","automatic_replay_allowed":false,"facts_preserved":true}).to_string(),now_ms()])?;
+    // Recheck the exact pending source at dispatch: a terminal result can arrive
+    // while the caller holds the floor. Never append stale waiting context then.
+    for command in &commands {
+        if command["event_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("request-pending-"))
+            && !crate::companion::pending_context_matches(
+                &tx,
+                call,
+                command["delegation_id"].as_str().unwrap_or(""),
+                command["content"].as_str().unwrap_or(""),
+            )?
+        {
+            tx.execute(
+                "UPDATE companion_voice_batches SET state='superseded',updated_at=?2 WHERE id=?1",
+                params![id, now_ms()],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
     }
     tx.execute("UPDATE companion_voice_batches SET state='dispatching',updates=?3,updated_at=?2 WHERE id=?1 AND state='pending'",params![id,now_ms(),serde_json::to_string(&commands)?])?;
     for command in &commands {
@@ -327,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_answer_becomes_context_after_correction_without_losing_independent_answers() {
+    fn newer_delegation_does_not_prove_an_awaited_answer_was_replaced() {
         {
             let f = fixture();
             let old_at = now_ms() - 6000;
@@ -364,17 +349,8 @@ mod tests {
             f.s.db.lock().unwrap().execute("UPDATE companion_surfaces SET user_speaking=0,updated_at=?2,playback=?3 WHERE call_id=?1",params![f.call,now_ms(),json!({"state":"ready","floor":"open"}).to_string()]).unwrap();
             let batch = take_ready(&f.s, &f.call).unwrap().unwrap();
             let commands = batch["commands"].as_array().unwrap();
-            assert_eq!(commands.len(), 2);
-            assert!(commands.iter().all(|c| c["channel"] == "thinking"));
-            assert!(
-                commands[0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("earlier question")
-            );
-            assert_eq!(commands[1]["content"], answer["content"]);
-            assert_eq!(commands[1]["event_id"], answer["event_id"]);
-            assert_eq!(commands[1]["delegation_id"], "earlier");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0], answer);
             assert!(
                 commands
                     .iter()

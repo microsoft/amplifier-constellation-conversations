@@ -1692,6 +1692,78 @@ fn permission_notice(s: &AppState, id: &str, room: &str) -> Result<()> {
     }
     Ok(())
 }
+/// A call-local receipt lets voice answer whether an answer has returned without
+/// inventing external progress or asking the backend the same question again.
+/// Only one stable fact per admitted source; poll time is not a new revision.
+pub(crate) fn pending_context_valid(db: &Connection, call: &str, did: &str) -> Result<bool> {
+    if crate::companion_history::private_identity(db, call)?.is_none() {
+        return Ok(false);
+    }
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM companion_calls c
+         JOIN companion_delegations x ON x.call_id=c.id AND x.id=?2 AND x.state='dispatched'
+         JOIN messages source ON source.id=x.message_id AND source.conversation_id=c.conversation_id
+             AND source.role='user' AND source.actor=c.owner AND source.created_at>=c.created_at
+         JOIN input_deliveries d ON d.message_id=source.id AND d.conversation_id=c.conversation_id AND d.agent_id=c.agent_id
+         WHERE c.id=?1 AND c.state IN ('connecting','connected')
+             AND d.state IN ('received','promptRequired','preparing','offering','submitted','received_remote','remoteQueued','incorporated')
+             AND (d.target_turn IS NULL OR EXISTS(SELECT 1 FROM messages target WHERE target.id=d.target_turn
+                 AND target.conversation_id=c.conversation_id AND target.agent_id=c.agent_id
+                 AND target.role='assistant' AND target.status='streaming')))",
+        params![call,did], |r|r.get(0),
+    )?)
+}
+fn pending_context_key(did: &str) -> String {
+    format!("request-pending-{}", auth::digest(did))
+}
+fn pending_context_content(db: &Connection, call: &str, did: &str) -> Result<Option<String>> {
+    if !pending_context_valid(db, call, did)? || did.len() > 160 {
+        return Ok(None);
+    }
+    let (source, label) = db.query_row(
+        "SELECT message_id,request_text FROM companion_delegations WHERE call_id=?1 AND id=?2",
+        params![call, did],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+    )?;
+    let mut content = format!(
+        "Request {source} is saved in this call. No matching completed answer has been recorded yet. This receipt does not establish external execution or progress."
+    );
+    if let Some(label) = label.filter(|text| !text.trim().is_empty()) {
+        let detail = format!(" Caller request: {}", serde_json::to_string(&label)?);
+        if content.len() + detail.len() <= 480 {
+            content.push_str(&detail);
+        }
+    }
+    Ok((content.len() <= 480).then_some(content))
+}
+pub(crate) fn pending_context_matches(
+    db: &Connection,
+    call: &str,
+    did: &str,
+    content: &str,
+) -> Result<bool> {
+    Ok(pending_context_content(db, call, did)?.as_deref() == Some(content))
+}
+fn pending_context(s: &AppState, call: &str, did: &str) -> Result<()> {
+    let key = pending_context_key(did);
+    let (content, existing) = {
+        let db = s.db.lock().unwrap();
+        (pending_context_content(&db, call, did)?, db.query_row("SELECT updates FROM companion_voice_batches WHERE call_id=?1 AND semantic_key=?2 LIMIT 1",params![call,key],|r|r.get::<_,String>(0)).optional()?)
+    };
+    if let Some(existing) = existing {
+        let existing: Value = serde_json::from_str(&existing)?;
+        if existing[0]["content"].as_str() != content.as_deref() {
+            crate::companion_delivery::supersede_pending(s, call, &key)?;
+        }
+        // An admitted source is immutable. Changed source data does not grant
+        // a replacement append under the same provider event identity.
+        return Ok(());
+    }
+    if let Some(content) = content {
+        queue_append(s, call, "thinking", Some(did), &content, &key)?;
+    }
+    Ok(())
+}
 /// Reconcile accepted work without replaying input. After media closes this
 /// observer records terminal facts only: no dispatch, waiting narration or
 /// context appends. An incorporated source requires its exact target terminal.
@@ -1721,6 +1793,9 @@ fn observe_results(s: &AppState, id: &str, room: &str, live: bool) -> Result<()>
             "SELECT d.state,m.status,m.text,m.id FROM input_deliveries d JOIN companion_calls c ON c.id=?2 AND c.agent_id=d.agent_id AND c.conversation_id=d.conversation_id LEFT JOIN messages m ON m.id=d.target_turn AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id AND m.role='assistant' WHERE d.message_id=?1",
             params![mid,id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
         ).optional()?;
+        if live {
+            pending_context(s, id, &did)?;
+        }
         if let Some((delivery, status, text, result_message)) = result {
             if ["completed", "incorporated"].contains(&delivery.as_str())
                 && status.as_deref() == Some("complete")
@@ -1993,6 +2068,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let delegation = links.last().map(|(did, _, _)| did.clone());
         for (did, source_id, receipt) in &links {
+            tx.execute("UPDATE companion_voice_batches SET state='superseded',updated_at=?3 WHERE call_id=?1 AND semantic_key=?2 AND state='pending'",params![id,pending_context_key(did),now_ms()])?;
             tx.execute("UPDATE companion_delegations SET state='completed' WHERE call_id=?1 AND id=?2 AND state='dispatched'", params![id,did])?;
             insert_event(
                 &tx,
@@ -2065,7 +2141,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
             })
             .count();
         if has_text || image_count > 0 {
-            if !late && text.len() <= 480 && image_count == 0 {
+            if text.len() <= 480 && image_count == 0 {
                 queue_append(
                     s,
                     id,
@@ -2094,7 +2170,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                 let mut appends = vec![("thinking", header)];
                 for (i, part) in parts.iter().enumerate() {
                     appends.push((
-                        if !late && image_count == 0 && i + 1 == parts.len() {
+                        if image_count == 0 && i + 1 == parts.len() {
                             "commentary"
                         } else {
                             "thinking"
@@ -2107,7 +2183,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                         "Result {message} published {image_count} image(s) in shared space. {} At publication time, board membership was not yet confirmed. Image decoding, human attention and task completion are separate, unconfirmed facts.",
                         if present_image { "The images were offered to the current board." } else { "The images were retained in call history." },
                     )));
-                    if !late {
+                    {
                         appends.push((
                             "commentary",
                             if image_count == 1 {
@@ -2143,6 +2219,9 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
     Ok(())
 }
 fn settle(s: &AppState, id: &str, did: &str, state: &str, message: &str) -> Result<()> {
+    if state != "dispatched" {
+        crate::companion_delivery::supersede_pending(s, id, &pending_context_key(did))?;
+    }
     s.db.lock().unwrap().execute(
         "UPDATE companion_delegations SET state=?3 WHERE call_id=?1 AND id=?2",
         params![id, did, state],
@@ -2176,6 +2255,10 @@ fn settle(s: &AppState, id: &str, did: &str, state: &str, message: &str) -> Resu
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "companion_pending_tests.rs"]
+mod pending_tests;
 
 #[cfg(test)]
 #[path = "companion_peer_results_tests.rs"]
