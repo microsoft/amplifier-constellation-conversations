@@ -1606,3 +1606,186 @@ async fn evidence_read_selectors_validate_at_http_boundary_without_effects_or_au
     }
     assert!(effects(&f).is_empty());
 }
+
+#[tokio::test]
+async fn huddle_native_permissions_bind_installed_identity_and_active_source_with_status_only_after_close()
+ {
+    let f = fixture();
+    let c = call(&f);
+    let (did, mid, _) = delegation(&f, &c, "user");
+    companion_tools::record_mcp_port(&f.s, &c.id, 34567).unwrap();
+    let installed = json!({"id":"coach-game","agent_id":"coach","label":"Coach","connection_id":"game","service":"minecraft","conversation_id":"constellation","namespace":"family","local_agent_id":"default","enabled":true});
+    f.s.db.lock().unwrap().execute("INSERT INTO huddle_installations(id,definition,token_hash) VALUES('coach-game',?1,'fixture-token')", [installed.to_string()]).unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let ensure = json!({"installation_id":"coach-game","request_id":request_id,"delegation_id":did,"title":"Plan review","purpose":"Compare the caller's plan.","peer_installation_ids":[]});
+    let (created_status, saved_room) = request(
+        &f,
+        &c,
+        "POST",
+        "huddles/ensure",
+        Some(ensure.clone()),
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(created_status, StatusCode::OK, "{saved_room}");
+    let room = saved_room["id"].as_str().unwrap().to_owned();
+    let status =
+        json!({"installation_id":"coach-game","request_id":request_id,"operation":"ensure"});
+    let post = json!({"installation_id":"coach-game","huddle_id":room,"request_id":request_id,"delegation_id":did,"text":"A bounded coordination message.","kind":"message","target_agent_ids":[]});
+    let check = |tool: &str, args: Value, injected| {
+        companion_tools::permission_once(
+            &f.s,
+            &c.room,
+            "owner",
+            "default",
+            injected,
+            &native_permission(tool, args),
+        )
+        .unwrap()
+    };
+    for (tool, args) in [
+        ("companion_huddles", json!({})),
+        ("companion_huddles", json!({"installation_id":"coach-game"})),
+        ("companion_huddle_ensure", ensure.clone()),
+        (
+            "companion_huddle_read",
+            json!({"installation_id":"coach-game","huddle_id":room}),
+        ),
+        ("companion_huddle_post", post.clone()),
+        ("companion_huddle_status", status.clone()),
+    ] {
+        assert_eq!(
+            check(tool, args.clone(), true).unwrap()["outcome"]["optionId"],
+            "single",
+            "{tool}"
+        );
+        assert!(check(tool, args, false).is_none());
+    }
+    // A fresh delegation in the same call can continue its existing huddle.
+    let (later_did, _, _) = delegation_named(&f, &c, "user", "same-call-correction");
+    let mut later_post = post.clone();
+    later_post["delegation_id"] = json!(later_did);
+    assert_eq!(
+        check("companion_huddle_post", later_post, true).unwrap()["outcome"]["optionId"],
+        "single"
+    );
+
+    // A separate valid call may inspect that installation's history, but its
+    // current human request cannot write back to the first call's destination.
+    let other_call = call(&f);
+    let (other_did, _, _) = delegation_named(&f, &other_call, "user", "other-call-request");
+    companion_tools::record_mcp_port(&f.s, &other_call.id, 34568).unwrap();
+    let other_check = |tool: &str, args: Value| {
+        companion_tools::permission_once(
+            &f.s,
+            &other_call.room,
+            "owner",
+            "default",
+            true,
+            &native_permission(tool, args),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    assert_eq!(
+        other_check(
+            "companion_huddle_read",
+            json!({"installation_id":"coach-game","huddle_id":room})
+        )["outcome"]["optionId"],
+        "single"
+    );
+    for kind in ["message", "outcome"] {
+        let mut foreign_post = post.clone();
+        foreign_post["delegation_id"] = json!(other_did);
+        foreign_post["kind"] = json!(kind);
+        if kind == "outcome" {
+            foreign_post["outcome"] = json!({"kind":"result","evidence":[]});
+        }
+        assert_eq!(
+            other_check("companion_huddle_post", foreign_post)["outcome"]["optionId"],
+            "no",
+            "{kind}"
+        );
+    }
+    let mut forged = ensure.clone();
+    forged["origin"] = json!({"actor":"owner"});
+    assert!(check("companion_huddle_ensure", forged, true).is_none());
+    let mut other = ensure.clone();
+    other["installation_id"] = json!("other-world");
+    assert_eq!(
+        check("companion_huddle_ensure", other, true).unwrap()["outcome"]["optionId"],
+        "no"
+    );
+    let mut other = ensure.clone();
+    other["delegation_id"] = json!("other-delegation");
+    assert_eq!(
+        check("companion_huddle_ensure", other, true).unwrap()["outcome"]["optionId"],
+        "no"
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM input_authority WHERE message_id=?1", [&mid])
+        .unwrap();
+    assert_eq!(
+        check("companion_huddle_ensure", ensure.clone(), true).unwrap()["outcome"]["optionId"],
+        "no"
+    );
+    assert_eq!(
+        check("companion_huddle_post", post.clone(), true).unwrap()["outcome"]["optionId"],
+        "no"
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    assert_eq!(
+        check("companion_huddle_status", status, true).unwrap()["outcome"]["optionId"],
+        "single"
+    );
+    for (tool, args) in [
+        ("companion_huddles", json!({})),
+        ("companion_huddle_ensure", ensure),
+        ("companion_huddle_post", post),
+    ] {
+        assert_eq!(
+            check(tool, args, true).unwrap(),
+            agent_conversations::permissions::cancelled()
+        );
+    }
+    assert!(effects(&f).is_empty());
+    let created: i64 =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM huddles", [], |r| r.get(0))
+            .unwrap();
+    assert_eq!(
+        created, 1,
+        "permission checks must not create an extra room"
+    );
+    let db = f.s.db.lock().unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM huddle_posts", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM companion_events", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM companion_voice_batches", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
