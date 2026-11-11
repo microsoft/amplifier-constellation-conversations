@@ -19,6 +19,9 @@ async function pixels(locator){return locator.evaluate(node=>{
 });}
 async function reveal(page,locator){
  for(let n=0;n<8;n++){
+  // Details toggles and wheel events settle in presentation frames. A missing
+  // scroll route before that boundary is not proof that content is clipped.
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   if(await pixels(locator))return;
   const move=await locator.evaluate(node=>{
    const target=node.getBoundingClientRect();
@@ -37,7 +40,7 @@ async function reveal(page,locator){
     }
    }return null;
   });
-  if(!move)break;await page.mouse.move(move.x,move.y);await page.mouse.wheel(0,move.delta);await page.waitForTimeout(60);
+  if(!move)continue;await page.mouse.move(move.x,move.y);await page.mouse.wheel(0,move.delta);
  }
  assert(await pixels(locator),'Content/control must be reachable inside all clips and unoccluded by normal scrolling');
 }
@@ -85,5 +88,21 @@ for(const width of [390,1280])test(`Companion huddle controls and History use no
   assert.deepEqual(await page.evaluate(()=>[fixture.sends,fixture.preferences,fixture.peer===originalPeer,fixture.audio===document.querySelector('#remote-audio')]),[0,0,true,true]);
   assert.equal(await page.locator('#board-items').innerHTML(),board);assert.deepEqual(requests,[]);
   assert.equal(await page.evaluate(()=>[document.body,document.querySelector('.shared-panel'),document.getElementById('call-screen')].every(node=>node.scrollTop===0)),true,'No hidden ancestor was scrolled to manufacture visibility');
+ }finally{await browser.close();}
+});
+
+
+test('layout observation waits for presentation but never accepts a persistent cover', async () => {
+ const browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE||undefined,args:['--no-sandbox']});
+ try {
+  const page=await browser.newPage();
+  await page.setContent('<button id="control">Inspect</button><div id="cover" style="position:fixed;inset:0;background:white;z-index:1"></div>');
+  // A details toggle can return before its new content has been painted. Model
+  // that boundary with a cover removed by presentation, not a wall-clock sleep.
+  await page.evaluate(()=>requestAnimationFrame(()=>requestAnimationFrame(()=>document.getElementById('cover').remove())));
+  await reveal(page,page.locator('#control'));
+  assert(await pixels(page.locator('#control')));
+  await page.evaluate(()=>{const cover=document.createElement('div');cover.style='position:fixed;inset:0;background:white;z-index:1';document.body.append(cover);});
+  await assert.rejects(reveal(page,page.locator('#control')),/reachable inside all clips and unoccluded/);
  }finally{await browser.close();}
 });
