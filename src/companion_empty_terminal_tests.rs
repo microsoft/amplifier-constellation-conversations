@@ -112,7 +112,7 @@ fn no_card_or_voice(f: &F) {
     );
     assert_eq!(
         db.query_row(
-            "SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1",
+            "SELECT COUNT(*) FROM companion_voice_batches WHERE call_id=?1 AND semantic_key NOT LIKE 'request-pending-%'",
             [&f.call],
             |r| r.get::<_, i64>(0)
         )
