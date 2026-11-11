@@ -290,6 +290,24 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(attachments::download).delete(attachments::remove),
         )
         .route("/api/v1/conversations", get(list).post(create))
+        .route(
+            "/api/v1/huddle-installations",
+            get(crate::huddle_auto::installations),
+        )
+        .route(
+            "/api/v1/huddle-installations/{id}",
+            axum::routing::put(crate::huddle_auto::install),
+        )
+        .route("/api/v1/huddles/roster", get(crate::huddle_auto::roster))
+        .route(
+            "/api/v1/huddles/discovery",
+            get(crate::huddle_auto::discovery),
+        )
+        .route("/api/v1/huddles/ensure", post(crate::huddle_auto::ensure))
+        .route(
+            "/api/v1/huddles/ensure/{request}",
+            get(crate::huddle_auto::ensure_status),
+        )
         .route("/api/v1/huddles", post(crate::huddles::create_external))
         .route(
             "/api/v1/conversations/{id}/huddles",
@@ -377,6 +395,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .post(context::issue_credential)
                 .delete(context::revoke_credential),
         )
+        .merge(crate::companion_tools::huddles::routes())
         .layer(DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), headers))
         .with_state(state)

@@ -10,8 +10,10 @@ The service supports explicitly allowed local users, private conversations, and 
 
 [Observable huddles](docs/huddles.md) keep routine agent coordination available
 for inspection while meaningful results return to the original request. External
-participants keep their existing sessions; inspection and follow preferences do
-not grant work authority or start another agent.
+participants keep their existing sessions. With installation-owned connections
+configured, agents create or reuse a huddle and invite known peers through their
+existing tools; people do not prepare rooms. Inspection and follow preferences
+do not grant work authority or start another agent.
 
 ## Companion preview
 

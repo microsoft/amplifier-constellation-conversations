@@ -18,7 +18,7 @@ use std::sync::Arc;
 pub const MAX_TEXT: usize = 6000;
 pub fn capabilities() -> Value {
     json!({"version":1,"external_participants":true,"read":true,"post":true,
-        "post_status":true,"outcomes":true,"quiet_follow":true,
+        "post_status":true,"outcomes":true,"quiet_follow":true,"automatic":1,
         "max_text_bytes":MAX_TEXT,"max_evidence_items":8,"max_metadata_bytes":8000,"max_page_items":100})
 }
 pub fn migrate(db: &Connection) -> anyhow::Result<()> {
@@ -103,7 +103,7 @@ pub enum Origin {
         actor: OriginActor,
     },
 }
-fn origin_valid(o: &Origin) -> bool {
+pub(crate) fn origin_valid(o: &Origin) -> bool {
     match o {
         Origin::Conversation { .. } => true,
         Origin::External {
@@ -133,7 +133,12 @@ fn origin_valid(o: &Origin) -> bool {
         }
     }
 }
-fn parent_source(db: &Connection, parent: &str, source: &str, actor: &str) -> ApiResult<Origin> {
+pub(crate) fn parent_source(
+    db: &Connection,
+    parent: &str,
+    source: &str,
+    actor: &str,
+) -> ApiResult<Origin> {
     let row: Option<(String,i64)> = db.query_row("SELECT text,created_at FROM messages WHERE id=?1 AND conversation_id=?2 AND actor=?3 AND role='user' AND status='complete'",params![source,parent,actor],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let (body, at) =
         row.ok_or_else(|| ApiError::bad("Use your original saved request in this conversation"))?;
@@ -277,13 +282,17 @@ pub async fn create_external(
     ))
 }
 #[derive(Clone)]
-struct Participant {
+pub(crate) struct Participant {
     agent: String,
     connection: String,
     label: String,
     token_hash: String,
+    installation: Option<crate::huddle_auto::Installation>,
 }
 fn participant(s: &AppState, h: &HeaderMap, room: &str) -> ApiResult<Participant> {
+    if let Ok(installation) = crate::huddle_auto::authenticate(s, h) {
+        return installed_participant(s, &installation, room);
+    }
     let token = h
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -297,7 +306,39 @@ fn participant(s: &AppState, h: &HeaderMap, room: &str) -> ApiResult<Participant
         connection,
         label,
         token_hash,
+        installation: None,
     })
+}
+pub(crate) fn installed_participant(
+    s: &AppState,
+    installation: &crate::huddle_auto::Installation,
+    room: &str,
+) -> ApiResult<Participant> {
+    let db = s.db.lock().unwrap();
+    crate::huddle_auto::current(&db, installation)?;
+    let row:Option<(String,String)>=db.query_row("SELECT p.label,p.token_hash FROM huddle_participants p JOIN huddle_auto_members m ON m.room_id=p.room_id JOIN huddle_installations i ON i.id=m.installation_id WHERE m.room_id=?1 AND m.installation_id=?2 AND m.revoked=0 AND p.agent_id=?3 AND p.connection_id=?4",params![room,installation.id,installation.agent_id,installation.connection_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (label, token_hash) = row.ok_or_else(ApiError::forbidden)?;
+    Ok(Participant {
+        agent: installation.agent_id.clone(),
+        connection: installation.connection_id.clone(),
+        label,
+        token_hash,
+        installation: Some(installation.clone()),
+    })
+}
+fn participant_current(db: &Connection, room: &str, p: &Participant) -> ApiResult<()> {
+    let permitted:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM huddle_participants WHERE room_id=?1 AND agent_id=?2 AND connection_id=?3 AND token_hash=?4)",params![room,p.agent,p.connection,p.token_hash],|r|r.get(0))?;
+    if !permitted {
+        return Err(ApiError::unauthorized());
+    }
+    if let Some(i) = &p.installation {
+        crate::huddle_auto::current(db, i)?;
+        let active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM huddle_auto_members WHERE room_id=?1 AND installation_id=?2 AND revoked=0)",params![room,i.id],|r|r.get(0))?;
+        if !active {
+            return Err(ApiError::forbidden());
+        }
+    }
+    Ok(())
 }
 fn reader(
     s: &AppState,
@@ -401,7 +442,7 @@ fn descriptor(
     value["outcomes"] = json!(outcomes(s, room)?);
     Ok(value)
 }
-fn summary(
+pub(crate) fn summary(
     s: &AppState,
     room: &str,
     human: Option<&str>,
@@ -450,6 +491,14 @@ pub async fn read(
 ) -> ApiResult<Json<Value>> {
     let (human, p) = reader(&s, &h, &room)?;
     Ok(Json(descriptor(&s, &room, human.as_deref(), p.as_ref())?))
+}
+pub fn read_for_installation(
+    s: &AppState,
+    installation: &crate::huddle_auto::Installation,
+    room: &str,
+) -> ApiResult<Value> {
+    let p = installed_participant(s, installation, room)?;
+    descriptor(s, room, None, Some(&p))
 }
 pub async fn list(
     State(s): State<Arc<AppState>>,
@@ -500,8 +549,9 @@ pub async fn enroll(
     }
     let token = auth::random_token();
     {
-        let db = s.db.lock().unwrap();
-        let count: i64 = db.query_row(
+        let mut db = s.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM huddle_participants WHERE room_id=?1 AND agent_id<>?2",
             params![room, body.agent_id],
             |r| r.get(0),
@@ -509,11 +559,15 @@ pub async fn enroll(
         if count >= 8 {
             return Err(ApiError::bad("A huddle supports up to eight participants"));
         }
-        db.execute("INSERT INTO huddle_participants(room_id,agent_id,label,connection_id,token_hash) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(room_id,agent_id) DO UPDATE SET label=excluded.label,connection_id=excluded.connection_id,token_hash=excluded.token_hash",params![room,body.agent_id,body.label,body.connection_id,auth::digest(&token)])?;
-        db.execute(
+        // Explicit per-room replacement must not leave an older installation
+        // credential authorized under the newly enrolled participant's identity.
+        tx.execute("UPDATE huddle_auto_members SET revoked=1 WHERE room_id=?1 AND installation_id IN (SELECT id FROM huddle_installations WHERE json_extract(definition,'$.agent_id')=?2)",params![room,body.agent_id])?;
+        tx.execute("INSERT INTO huddle_participants(room_id,agent_id,label,connection_id,token_hash) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(room_id,agent_id) DO UPDATE SET label=excluded.label,connection_id=excluded.connection_id,token_hash=excluded.token_hash",params![room,body.agent_id,body.label,body.connection_id,auth::digest(&token)])?;
+        tx.execute(
             "UPDATE huddles SET revision=revision+1 WHERE room_id=?1",
             [&room],
         )?;
+        tx.commit()?;
     }
     s.changed();
     Ok(Json(
@@ -527,15 +581,18 @@ pub async fn revoke(
 ) -> ApiResult<Json<Value>> {
     let p = auth::check(&s, &h, "chat", true)?;
     s.require_owner(&room, &p)?;
-    let db = s.db.lock().unwrap();
-    db.execute(
+    let mut db = s.db.lock().unwrap();
+    let tx = db.transaction()?;
+    tx.execute("UPDATE huddle_auto_members SET revoked=1 WHERE room_id=?1 AND installation_id IN (SELECT id FROM huddle_installations WHERE json_extract(definition,'$.agent_id')=?2)",params![room,agent])?;
+    tx.execute(
         "DELETE FROM huddle_participants WHERE room_id=?1 AND agent_id=?2",
         params![room, agent],
     )?;
-    db.execute(
+    tx.execute(
         "UPDATE huddles SET revision=revision+1 WHERE room_id=?1",
         [&room],
     )?;
+    tx.commit()?;
     drop(db);
     s.changed();
     Ok(Json(json!({"revoked":true})))
@@ -597,8 +654,8 @@ pub async fn set_state(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Page {
-    after: Option<i64>,
-    limit: Option<usize>,
+    pub after: Option<i64>,
+    pub limit: Option<usize>,
 }
 pub async fn messages(
     State(s): State<Arc<AppState>>,
@@ -607,6 +664,30 @@ pub async fn messages(
     Query(page): Query<Page>,
 ) -> ApiResult<Json<Value>> {
     let (human, p) = reader(&s, &h, &room)?;
+    Ok(Json(messages_inner(
+        &s,
+        &room,
+        human.as_deref(),
+        p.as_ref(),
+        page,
+    )?))
+}
+pub fn messages_for_installation(
+    s: &AppState,
+    installation: &crate::huddle_auto::Installation,
+    room: &str,
+    page: Page,
+) -> ApiResult<Value> {
+    let p = installed_participant(s, installation, room)?;
+    messages_inner(s, room, None, Some(&p), page)
+}
+fn messages_inner(
+    s: &AppState,
+    room: &str,
+    human: Option<&str>,
+    p: Option<&Participant>,
+    page: Page,
+) -> ApiResult<Value> {
     let after = page.after.unwrap_or(0);
     let limit = page.limit.unwrap_or(50).clamp(1, 100);
     if after < 0 {
@@ -634,10 +715,10 @@ pub async fn messages(
         row["outcome"] = post["outcome"].clone();
     }
     let next = rows.last().and_then(|r| r["seq"].as_i64()).unwrap_or(after);
-    let d = summary(&s, &room, human.as_deref(), p.as_ref())?;
-    Ok(Json(
+    let d = summary(s, room, human, p)?;
+    Ok(
         json!({"version":1,"items":rows,"next_cursor":next,"has_more":more,"coverage":{"after":after,"through":next,"complete_through_cursor":true},"state":d["state"],"revision":d["revision"]}),
-    ))
+    )
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -762,15 +843,41 @@ pub async fn post(
     Json(body): Json<Post>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let actor = participant(&s, &h, &room)?;
+    let (status, value) = post_inner(&s, &room, actor, body, |_| Ok(()))?;
+    Ok((status, Json(value)))
+}
+pub fn post_for_installation(
+    s: &AppState,
+    installation: &crate::huddle_auto::Installation,
+    room: &str,
+    body: Post,
+) -> ApiResult<Value> {
+    post_for_installation_guarded(s, installation, room, body, |_| Ok(()))
+}
+pub fn post_for_installation_guarded(
+    s: &AppState,
+    installation: &crate::huddle_auto::Installation,
+    room: &str,
+    body: Post,
+    guard: impl FnOnce(&Connection) -> ApiResult<()>,
+) -> ApiResult<Value> {
+    let p = installed_participant(s, installation, room)?;
+    Ok(post_inner(s, room, p, body, guard)?.1)
+}
+fn post_inner(
+    s: &AppState,
+    room: &str,
+    actor: Participant,
+    body: Post,
+    guard: impl FnOnce(&Connection) -> ApiResult<()>,
+) -> ApiResult<(StatusCode, Value)> {
     validate_post(&body)?;
     let payload = serde_json::to_string(&body).map_err(anyhow::Error::from)?;
     let receipt = {
         let mut db = s.db.lock().unwrap();
         let tx = db.transaction()?;
-        let permitted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM huddle_participants WHERE room_id=?1 AND agent_id=?2 AND connection_id=?3 AND token_hash=?4)",params![room,actor.agent,actor.connection,actor.token_hash],|r|r.get(0))?;
-        if !permitted {
-            return Err(ApiError::unauthorized());
-        }
+        guard(&tx)?;
+        participant_current(&tx, room, &actor)?;
         if let Some((old_room, old_agent, old_payload, receipt)) = tx
             .query_row(
                 "SELECT room_id,agent_id,payload,receipt FROM huddle_posts WHERE message_id=?1",
@@ -796,9 +903,9 @@ pub async fn post(
                     "This request_id already identifies a different post",
                 ));
             }
-            return Ok((StatusCode::OK, Json(saved)));
+            return Ok((StatusCode::OK, saved));
         }
-        check_open(&tx, &room)?;
+        check_open(&tx, room)?;
         let existing: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1)",
             [&body.request_id],
@@ -832,7 +939,7 @@ pub async fn post(
             parent_return(
                 &tx,
                 &origin,
-                &room,
+                room,
                 &actor,
                 &body,
                 &format!(
@@ -856,7 +963,7 @@ pub async fn post(
             receipt["return"] = if let Some(row) =
                 outcome_for_parent(&tx, conversation_id, &owner.id, &body.request_id)?
             {
-                crate::companion_huddles::record_return(&s, &tx, &row)?
+                crate::companion_huddles::record_return(s, &tx, &row)?
             } else {
                 json!({"state":"blocked","delivery":"companion_owned","reason":"original_request_or_private_audience_changed"})
             };
@@ -877,7 +984,7 @@ pub async fn post(
         receipt
     };
     s.changed();
-    Ok((StatusCode::CREATED, Json(receipt)))
+    Ok((StatusCode::CREATED, receipt))
 }
 pub async fn post_status(
     State(s): State<Arc<AppState>>,
@@ -885,6 +992,23 @@ pub async fn post_status(
     Path((room, request)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
     let actor = participant(&s, &h, &room)?;
+    Ok(Json(post_status_inner(&s, &room, &request, &actor)?))
+}
+pub fn post_status_for_installation(
+    s: &AppState,
+    installation: &crate::huddle_auto::Installation,
+    room: &str,
+    request: &str,
+) -> ApiResult<Value> {
+    let p = installed_participant(s, installation, room)?;
+    post_status_inner(s, room, request, &p)
+}
+fn post_status_inner(
+    s: &AppState,
+    room: &str,
+    request: &str,
+    actor: &Participant,
+) -> ApiResult<Value> {
     let raw: Option<String> = s
         .db
         .lock()
@@ -895,7 +1019,5 @@ pub async fn post_status(
             |r| r.get(0),
         )
         .optional()?;
-    Ok(Json(
-        serde_json::from_str(&raw.ok_or_else(ApiError::missing)?).map_err(anyhow::Error::from)?,
-    ))
+    Ok(serde_json::from_str(&raw.ok_or_else(ApiError::missing)?).map_err(anyhow::Error::from)?)
 }
