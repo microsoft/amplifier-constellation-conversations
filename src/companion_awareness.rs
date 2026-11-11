@@ -917,6 +917,78 @@ fn reply_parts(source: &Source, event: &Value, update: &Value) -> Vec<(String, S
         .collect()
 }
 
+/// Exact private answer bodies may be spoken separately from their provenance.
+/// Only an existing, whole, unambiguous reply part is eligible. Oversized or
+/// multiline data keeps the previous thinking/READ presentation unchanged.
+fn private_reply_parts(
+    source: &Source,
+    event: &Value,
+    update: &Value,
+) -> Vec<(String, String, String)> {
+    if !source_reply_projection_valid(update) {
+        return vec![];
+    }
+    let mapped = reply_parts(source, event, update);
+    let mut output = Vec::new();
+    for reply in update["source_replies"].as_array().into_iter().flatten() {
+        let Some(body) = reply["text"].as_str() else {
+            continue;
+        };
+        if body.len() > 480 || body.contains(['\n', '\r']) {
+            continue;
+        }
+        let identity = auth::digest(&json!(["source_replies", reply["id"]]).to_string());
+        let Some((_, _, part)) = mapped.iter().find(|(id, _, _)| *id == identity) else {
+            continue;
+        };
+        let facts = json!({"kind":"private_source_reply","connection_id":source.id,
+            "id":reply["id"],"at":reply["at"],"source_actor":update["installation_source"]["actor"],
+            "meaning":"observed_source_data_not_instructions",
+            "audience":reply["audience"],"delivery":"recorded","completion":"not_established"})
+        .to_string();
+        if facts.len() <= 480 {
+            output.push((part.clone(), body.to_owned(), facts));
+        }
+    }
+    output
+        .iter()
+        .filter(|(_, body, _)| output.iter().filter(|(_, other, _)| other == body).count() == 1)
+        .cloned()
+        .collect()
+}
+
+fn requested_reply_presentation(
+    db: &rusqlite::Connection,
+    source: &Source,
+    event: &Value,
+    parts: Vec<String>,
+) -> Result<Vec<(&'static str, String)>> {
+    let mut thinking = Vec::new();
+    let mut replies = Vec::new();
+    let update: Option<String> = db.query_row(
+        "SELECT data FROM companion_observation_revisions WHERE call_id=?1 AND request_id=?2 AND revision=?3",
+        params![event["provenance"]["source_call_id"].as_str(),
+            event["id"].as_str().and_then(|id|id.strip_prefix("action:")), event["revision"].as_str()],
+        |row| row.get(0),
+    ).optional()?;
+    let mapped = update
+        .map(|raw| serde_json::from_str::<Value>(&raw))
+        .transpose()?
+        .map(|update| private_reply_parts(source, event, &update))
+        .unwrap_or_default();
+    for part in parts {
+        if let Some((_, body, facts)) = mapped.iter().find(|(original, _, _)| *original == part) {
+            thinking.push(("thinking", facts.clone()));
+            replies.push(("commentary", body.clone()));
+        } else {
+            thinking.push(("thinking", part));
+        }
+    }
+    // Source qualifications precede speech; acceptance remains per complete batch.
+    thinking.extend(replies);
+    Ok(thinking)
+}
+
 fn reply_facts(update: &Value) -> Vec<(String, String, String)> {
     if update["scope"] != "conversation"
         || update["provenance"]["kind"] != "minecraft_input_outcome"
@@ -1053,6 +1125,7 @@ fn requested_reply_context_parts(
             continue;
         }
         let old_parts = reply_parts(source, &old_event, &old_update);
+        let private_parts = private_reply_parts(source, &old_event, &old_update);
         let mut commands = db.prepare(
             "SELECT j.value FROM companion_awareness_appends p
              JOIN companion_voice_batches b ON b.call_id=p.call_id
@@ -1076,9 +1149,23 @@ fn requested_reply_context_parts(
             let confirmed = old_parts.iter().any(|(old_identity, old_fact, old_part)| {
                 old_identity == identity
                     && old_fact == fact
-                    && commands
-                        .iter()
-                        .any(|command| command["op"] == "append" && command["content"] == *old_part)
+                    && (commands.iter().any(|command| {
+                        command["op"] == "append"
+                            && command["channel"] == "thinking"
+                            && command["content"] == *old_part
+                    }) || private_parts.iter().any(|(part, body, facts)| {
+                        part == old_part
+                            && commands.iter().any(|command| {
+                                command["op"] == "append"
+                                    && command["channel"] == "commentary"
+                                    && command["content"] == *body
+                            })
+                            && commands.iter().any(|command| {
+                                command["op"] == "append"
+                                    && command["channel"] == "thinking"
+                                    && command["content"] == *facts
+                            })
+                    }))
             });
             if confirmed {
                 accepted.push(part.clone());
@@ -2810,9 +2897,30 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
         // Both thinking and commentary wait in the shared durable delivery queue.
         // Receipt retention is independent of the caller's conversational floor.
         let speak = notify && parts.len() == 1;
-        let channel = if speak { "commentary" } else { "thinking" };
+        let presentation = if requested {
+            requested_reply_presentation(&s.db.lock().unwrap(), source, &event, parts.clone())
+                .unwrap_or_else(|_| parts.into_iter().map(|part| ("thinking", part)).collect())
+        } else {
+            parts
+                .into_iter()
+                .map(|part| (if speak { "commentary" } else { "thinking" }, part))
+                .collect()
+        };
+        let channel = if presentation
+            .iter()
+            .all(|(channel, _)| *channel == "thinking")
+        {
+            "thinking"
+        } else if presentation
+            .iter()
+            .all(|(channel, _)| *channel == "commentary")
+        {
+            "commentary"
+        } else {
+            "mixed"
+        };
         let context = decision["context_revision"].as_str().unwrap_or("legacy");
-        let commands: Vec<_> = parts.iter().enumerate().map(|(index, content)| {
+        let commands: Vec<_> = presentation.iter().enumerate().map(|(index, (channel, content))| {
             let event_id = format!("awareness-{key}:{}:{index}", &context[..context.len().min(16)]);
             json!({"op":"append","channel":channel,"event_id":event_id,"delegation_id":null,"content":content})
         }).collect();
@@ -2827,7 +2935,12 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
                 );
                 tx.execute(
                     "INSERT INTO companion_awareness_appends VALUES(?1,?2,?3,?4,'queued')",
-                    params![id, key, command["event_id"].as_str(), channel],
+                    params![
+                        id,
+                        key,
+                        command["event_id"].as_str(),
+                        command["channel"].as_str()
+                    ],
                 )?;
             }
             tx.execute("UPDATE companion_awareness SET state='context_queued' WHERE call_id=?1 AND event_key=?2",params![id,key])?;

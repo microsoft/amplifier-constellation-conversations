@@ -641,12 +641,27 @@ bounded polls so newer requests cannot permanently hide older unresolved ones.
 
 An outcome for an already requested action is a result, not optional ambient
 news. A validated saved observation bound to its original caller, request and
-connection enters quiet context without a relevance-model decision. It still
-waits for the conversational floor and passes the same private-audience, source,
-revision and call checks. Arbitrary observer text cannot claim this route by
+connection enters context without a relevance-model decision. Its status and
+qualifications stay quiet. An exact private source reply can be offered as speech,
+with its recorded-only provenance supplied first. Only a whole, unambiguous reply
+that fits the existing append bound takes this route; other facts remain in quiet
+context and full history. It still waits for the conversational floor and passes
+the same private-audience, source, revision and call checks. Arbitrary observer text cannot claim this route by
 labeling itself an action result. A result receipt does not establish fulfillment
 or require a spoken interruption. Waiting behind a long human explanation does
 not erase a bound result; its original timestamp remains explicit.
+
+A backend answer linked to an external action whose receipt remains submitting,
+queued, accepted, or unknown is supplied as context, not automatic action-result
+speech. This checks every input incorporated into that exact backend turn. The
+whole answer, including independent compound facts, remains in its original card
+and history; automatic speech of those independent facts is not guaranteed.
+Definite helper failure/completion and image-publication handling are unchanged.
+Recorded source replies are not independent proof of physical completion or
+hearing. Previously accepted whole replies, including older thinking-only
+presentations, are not offered again merely to change their speech channel;
+existing unknown append batches are not resent. A genuinely new source revision
+may still contain a reply whose earlier context acceptance was unproven.
 
 Full relevant facts are retained as shared cards and supplied with their actor,
 connection, scope and original time. Long facts use numbered source-data parts,
