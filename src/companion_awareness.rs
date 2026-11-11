@@ -2443,7 +2443,7 @@ fn decision_policy(decision: &Value) -> Option<(&'static str, bool)> {
         } else if relevant >= 0.85 && proactive >= 0.90 {
             ("notify", "relevant_proactive", "ready", true)
         } else if relevant >= 0.85 {
-            ("quiet", "relevant_context", "ready", false)
+            ("quiet", "relevant_context", "retained", false)
         } else {
             ("quiet", "uncertain_relevance", "retained", false)
         };
@@ -2468,16 +2468,20 @@ fn decision_policy(decision: &Value) -> Option<(&'static str, bool)> {
         return Some(("ignored", false));
     }
     if decision["reason"] == "low_confidence"
-        || confidence < 0.6
-        || choice == "ignore"
-        || (choice == "quiet" && presentation != "quiet")
+        || presentation != "notify"
+        || choice != "notify"
+        || confidence < 0.8
+        || selected < 0.8
     {
         return Some(("retained", false));
     }
-    Some((
-        "ready",
-        presentation == "notify" && choice == "notify" && confidence >= 0.8 && selected >= 0.8,
-    ))
+    Some(("ready", true))
+}
+
+fn proactive_notice(decision: &Value) -> bool {
+    decision["status"] == "decided"
+        && decision["model"] == "gpt-6-luna"
+        && decision_policy(decision).is_some_and(|(_, notify)| notify)
 }
 
 fn ambient_relevance(event: &Value) -> bool {
@@ -2722,7 +2726,10 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
         decision["context_revision"] = json!(context_revision);
         let state = {
             let db = s.db.lock().unwrap();
-            let state = if valid && human_context_revision(&db, id)? != context_revision {
+            let state = if valid
+                && policy.is_some_and(|(_, notify)| notify)
+                && human_context_revision(&db, id)? != context_revision
+            {
                 "pending"
             } else if valid {
                 policy.unwrap().0
@@ -2747,8 +2754,8 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
             )?;
         }
     }
-    // A quiet-context append still may inform future speech. Never call it a
-    // privacy boundary or claim either append acceptance or playback completion.
+    // Eligible ambient and requested context may inform speech. Append acceptance
+    // is not playback completion; quiet ambient evidence stays local.
     if active(s, id)?.is_none()
         || auth::check(s, h, "chat", false).is_err()
         || config(s)?.is_none_or(|(_, f)| f != fingerprint)
@@ -2762,19 +2769,7 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
     if let Some((key, data, decision)) = ready {
         let event: Value = serde_json::from_str(&data)?;
         let decision: Value = serde_json::from_str(&decision)?;
-        {
-            let db = s.db.lock().unwrap();
-            if ambient_relevance(&event)
-                && decision["context_revision"].as_str()
-                    != Some(human_context_revision(&db, id)?.as_str())
-            {
-                db.execute("UPDATE companion_awareness SET state='pending' WHERE call_id=?1 AND event_key=?2 AND state='ready'",params![id,key])?;
-                return Ok(());
-            }
-        }
-        let notify = decision["status"] == "decided"
-            && decision["model"] == "gpt-6-luna"
-            && decision_policy(&decision).is_some_and(|(_, notify)| notify);
+        let notify = proactive_notice(&decision);
         let connection: String = s.db.lock().unwrap().query_row(
             "SELECT connection_id FROM companion_awareness WHERE call_id=?1 AND event_key=?2",
             params![id, key],
@@ -2799,6 +2794,25 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
                 params![id, key, if requested { "withdrawn" } else { "stale" }],
             )?;
             return Ok(());
+        }
+        if !requested && !notify {
+            // Quiet/later advice retains evidence locally. Thinking can be
+            // spoken by Live, so it is not a silent delivery alternative.
+            s.db.lock().unwrap().execute(
+                "UPDATE companion_awareness SET state='retained' WHERE call_id=?1 AND event_key=?2 AND state='ready'",
+                params![id,key],
+            )?;
+            return Ok(());
+        }
+        {
+            let db = s.db.lock().unwrap();
+            if !requested
+                && decision["context_revision"].as_str()
+                    != Some(human_context_revision(&db, id)?.as_str())
+            {
+                db.execute("UPDATE companion_awareness SET state='pending' WHERE call_id=?1 AND event_key=?2 AND state='ready'",params![id,key])?;
+                return Ok(());
+            }
         }
         let context = if requested {
             requested_reply_context_parts(&s.db.lock().unwrap(), id, source, &event, &fingerprint)
@@ -2926,10 +2940,17 @@ pub(crate) fn presentation_allowed(
             .map(|raw| serde_json::from_str(&raw))
             .transpose()?
             .unwrap_or(Value::Null);
-        if decision["reason"] == "bound_requested_outcome"
-            && (decision["status"] != "not_requested"
-                || !requested_outcome_bound(db, call, source, &event)?)
-        {
+        let requested = decision["reason"] == "bound_requested_outcome"
+            && decision["status"] == "not_requested"
+            && requested_outcome_bound(db, call, source, &event)?;
+        if decision["reason"] == "bound_requested_outcome" && !requested {
+            return Ok(false);
+        }
+        if !requested && !proactive_notice(&decision) {
+            // Only an unsent batch reaches this guard. Preserve exact updates
+            // and raw decisions; the delivery queue withdraws the batch itself.
+            db.execute("UPDATE companion_awareness SET state='retained' WHERE call_id=?1 AND event_key=?2 AND state='context_queued'",params![call,key])?;
+            db.execute("UPDATE companion_awareness_appends SET state='withdrawn' WHERE call_id=?1 AND event_key=?2 AND state='queued'",params![call,key])?;
             return Ok(false);
         }
         if ambient_relevance(&event)

@@ -512,7 +512,7 @@ function renderEvent(call, event) {
   } else if (event.kind === 'surface_command') {
     executeSurface(call, data);
   } else if (event.kind === 'action_observation') {
-    $('connection-status').textContent = connectionObservationText(data);
+    $('connection-status').textContent = connectionObservationText(data, call);
     $('connection-status').hidden = false;
   } else if (event.kind === 'upload' && typeof data.upload_id === 'string') {
     renderShareEvent(call, data);
@@ -539,14 +539,15 @@ function renderEvent(call, event) {
     call.providerCloseReason = typeof data.reason === 'string' ? data.reason : '';
   }
 }
-function connectionObservationText(data) {
+function connectionObservationText(data, call) {
   const observation = data.observation || {}, state = observation.state, label = typeof data.label === 'string' && data.label ? data.label : 'The connection';
   if (observation.scope === 'conversation') {
     const outcome = inputOutcomeDetails(observation);
     if (outcome) {
-      const wording = ({admitted:'The game connector admitted this request.',settled:'The game turn ended.',interrupted:'The game turn was interrupted.'})[state]
-        || (observation.outcome_reason === 'not_retained' ? 'A retained handling record is not available for this request.' : 'Game handling remains unconfirmed.');
-      return `${label}: ${wording}${outcome.blocker ? ' A blocker was reported; details are in Context.' : ''}${outcome.responses.length ? ' Public replies from the same turn are in Context.' : ''} The result of this request is not confirmed.`;
+      const wording = ({admitted:'Request received.',settled:'Request handling ended.',interrupted:'Request handling was interrupted.'})[state]
+        || (observation.outcome_reason === 'not_retained' ? 'A retained handling record is not available for this request.' : 'Request handling is unconfirmed.');
+      const reply = recordedPrivateReply(observation, call) ? 'Agent reply recorded.' : 'The result of this request is not confirmed by this report.';
+      return `${label}: ${wording}${outcome.blocker ? ' A blocker was reported; details are in Context.' : ''}${outcome.responses.length ? ' Public replies from the same turn are in Context.' : ''} ${reply}`;
     }
     const wording = ({admitted:'The game connector admitted your request; forwarding to the agent is not confirmed.',settled:'The conversation turn ended; a reply and work outcome are not confirmed.',interrupted:'Conversation handling was interrupted; the outcome is unconfirmed.'})[state]
       || (state === 'replied' && observation.conversation?.reply_verified === true ? 'The agent replied. A reply does not confirm task acceptance or resumed work.' : 'Conversation handling remains unconfirmed.');
@@ -566,9 +567,37 @@ function inputOutcomeDetails(observation) {
   return {blocker:typeof observation.conversation?.blocked_reason === 'string' ? observation.conversation.blocked_reason.slice(0,1000) : '',
     responses:(Array.isArray(observation.responses) ? observation.responses : []).filter(response=>response && response.audience === 'public' && typeof response.text === 'string').slice(0,8)};
 }
-function connectionObservationContent(data) {
+function recordedPrivateReply(observation, call) {
+  // The server validates the source against the submitted action. This UI label
+  // also requires the negotiated recorded-reply shape and this call's audience;
+  // arbitrary text, an ended turn, or a public same-turn reply is insufficient.
+  const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && keys.every(key=>Object.hasOwn(value,key));
+  const field = (value, max=160) => typeof value === 'string' && value.trim().length > 0
+    && new TextEncoder().encode(value).length <= max && !/[\u0000-\u001f]/.test(value);
+  const source = observation.installation_source, capability = observation.source_replies_capability;
+  const audience = source?.audience, replies = observation.source_replies;
+  if (!call || !inputOutcomeDetails(observation)
+      || !exact(source,['caller','version','request_id','call_id','intent_id','revision','occurred_at','actor','audience'])
+      || source.version !== 1 || source.request_id !== observation.request_id || !field(source.request_id)
+      || source.call_id !== call.id || !field(source.intent_id) || !field(source.revision) || !contextTime(source.occurred_at)
+      || ![source.actor,source.caller].every(actor=>exact(actor,['id','label']) && field(actor.id) && field(actor.label))
+      || !exact(audience,['kind','experience','id']) || audience.kind !== 'private' || audience.experience !== 'companion' || audience.id !== call.conversationId
+      || observation.private_game_responses_included !== false
+      || !['single_source','shared_turn','not_established'].includes(observation.domain_response_association)
+      || !exact(capability,['version','max_items','max_text_bytes']) || capability.version !== 1 || capability.max_items !== 32 || capability.max_text_bytes !== 12000
+      || !Number.isSafeInteger(observation.source_replies_omitted) || observation.source_replies_omitted < 0
+      || (Object.hasOwn(observation,'domain_source_replies_omitted') && typeof observation.domain_source_replies_omitted !== 'boolean')
+      || !Array.isArray(replies) || replies.length < 1 || replies.length > 8) return false;
+  return replies.every((reply,index)=>exact(reply,['id','at','audience','delivery','text']) && field(reply.id)
+    && replies.slice(0,index).every(previous=>previous.id !== reply.id) && contextTime(reply.at)
+    && exact(reply.audience,['kind','experience','id']) && ['kind','experience','id'].every(key=>reply.audience[key] === audience[key])
+    && reply.delivery === 'recorded' && typeof reply.text === 'string' && reply.text.trim().length > 0
+    && new TextEncoder().encode(reply.text).length <= 12000);
+}
+function connectionObservationContent(data, call) {
   const observation = data.observation || {}, outcome = inputOutcomeDetails(observation);
-  let content = connectionObservationText(data);
+  let content = connectionObservationText(data, call);
   if (!outcome) return content;
   if (outcome.blocker) content += `\n\nReported blocker: ${outcome.blocker}`;
   if (outcome.responses.length) {
@@ -671,7 +700,7 @@ function renderContextEvent(call, event) {
     const observation = data.observation || {};
     contextReceipt(call, `action:${text(observation.request_id) || text(data.request_id) || event.seq}`, {
       title:text(data.label) || 'Connection request',status:'Connection report',source:text(data.label) || 'Connected service',
-      sourceAt:observation.observed_at,content:connectionObservationContent(data),
+      sourceAt:observation.observed_at,content:connectionObservationContent(data, call),
       note:'This report is separate from voice delivery and from what was spoken.'
     }, event);
   }

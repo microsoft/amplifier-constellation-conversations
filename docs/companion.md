@@ -626,12 +626,17 @@ IDs/text preserve an explicit selection when a long agent answer fills the recen
 transcript; omission counts remain explicit. Decisions receive no credentials and grant no action
 permission. The host records intent before each event/context decision, deduplicates
 immutable revisions, disables retries, and keeps uncertain outcomes uncertain.
-Raw provider probabilities remain in the receipt. The declared pilot policy admits
-quiet context at relevance probability 0.85 or above; a proactive notice also
-requires proactive probability 0.90 or above. Relevance at or below 0.20 is ignored;
-intermediate estimates retain evidence without adding voice context. The host
-validates the assessment and its derived disposition independently. Older
-configured choice helpers retain their conservative confidence checks.
+Raw provider probabilities remain in the receipt. The declared pilot policy
+requires relevance probability 0.85 or above and proactive probability 0.90 or
+above before sending an unsolicited Live update. Relevant `quiet` or `later`
+advice retains the evidence locally for cards and authenticated reads; it does
+not append to Live as thinking. Thinking can influence speech and is not a silent
+transport. Relevance at or below 0.20 is ignored; intermediate estimates also
+retain evidence without adding voice context. The host validates the assessment
+and its derived disposition independently. Older configured choice helpers must
+also select eligible `notify` advice with their existing conservative confidence
+checks. Quiet/later is not a promise of automatic later delivery: a new source
+revision receives its own decision, and explicit reads can retrieve saved facts.
 Provider failure, refusal, and invalid output also retain evidence without adding
 it to the speaking model's context. At most two facts are evaluated
 per worker cycle. Durable source history has
@@ -664,8 +669,8 @@ presentations, are not offered again merely to change their speech channel;
 existing unknown append batches are not resent. A genuinely new source revision
 may still contain a reply whose earlier context acceptance was unproven.
 
-Full relevant facts are retained as shared cards and supplied with their actor,
-connection, scope and original time. Long facts use numbered source-data parts,
+Full relevant facts are retained as shared cards. Eligible proactive updates are
+supplied with their actor, connection, scope and original time. Long facts use numbered source-data parts,
 not clipped summaries or opaque retrieval pointers. For a shared connection ID,
 use the same user-facing label in action and awareness configuration so the caller's
 selected name also identifies background observations. Labels are presentation
@@ -677,8 +682,11 @@ Both observation context and spoken notices wait for the shared conversational f
 fresh authenticated browser activity, available playback, and a gap after the
 latest human transcript. Ambient relevance is evaluated against that current
 context and checked again before dispatch. A newer human context withdraws an
-unsent ambient batch; a known completed decision can be reconsidered for the new
-context, but an uncertain decision or append is never replayed. These checks are
+unsent proactive batch; a known completed proactive decision can be reconsidered
+for the new context, but retained quiet advice is not automatically rescheduled.
+An uncertain decision or append is never replayed. Existing unsent quiet batches
+are withdrawn before transport with their exact commands retained; dispatched,
+accepted and unknown history is not rewritten. These checks are
 presentation heuristics, not proof that speech played or a human turn ended. An unavailable
 observer does not block the others. Model scores are pilot thresholds, not
 calibrated accuracy or a delivery guarantee.
