@@ -3798,6 +3798,27 @@ fn fresh_voice_fixture(f: &Fixture, call: &Value, delegation: &str, offset: i64)
     created
 }
 
+fn assert_early_voice_admission(
+    f: &Fixture,
+    call: &Value,
+    delegation: &str,
+    original_delegation: &str,
+    created: i64,
+) {
+    // Only admission through an already active steering connection records this
+    // deadline and binding. The time when this observer reads a subprocess frame
+    // says nothing about when admission happened on a loaded runner.
+    let (not_before, steering_target, steering_session, original_target, original_session):
+        (i64, String, String, String, String) = f.s.db.lock().unwrap().query_row(
+        "SELECT i.ordinary_not_before,i.steering_target_turn,i.steering_session_id,original.target_turn,original.session_id FROM companion_delegations d JOIN input_deliveries i ON i.message_id=d.message_id JOIN companion_delegations first ON first.call_id=d.call_id AND first.id=?3 JOIN input_deliveries original ON original.message_id=first.message_id WHERE d.call_id=?1 AND d.id=?2",
+        rusqlite::params![call["id"].as_str().unwrap(), delegation, original_delegation],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ).unwrap();
+    assert_eq!(not_before, created + 2000);
+    assert_eq!(steering_target, original_target);
+    assert_eq!(steering_session, original_session);
+}
+
 #[tokio::test]
 async fn observed_continuation_uses_actual_active_steering_before_grace_and_links_one_answer() {
     let f = fixture("quiet");
@@ -3823,10 +3844,10 @@ async fn observed_continuation_uses_actual_active_steering_before_grace_and_link
     );
     let created = fresh_voice_fixture(&f, &call, "constraint-request", 700);
     companion_frame(&f, "_session/steering", 1).await;
-    assert!(
-        now_ms() < created + 2000,
-        "Observed continuation waited past its active steering window"
-    );
+    // The subprocess may already have received the input before a loaded test
+    // runner gets to inspect it. Keep the original turn open across that delay.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_early_voice_admission(&f, &call, "constraint-request", "opening-request", created);
     let frames = companion_acp_frames(&f);
     let steering = frames
         .iter()
@@ -3894,10 +3915,7 @@ async fn continuation_prompt_required_waits_original_deadline_before_plain_fallb
     );
     let created = fresh_voice_fixture(&f, &call, "next-request", 700);
     companion_frame(&f, "_session/steering", 1).await;
-    assert!(
-        now_ms() < created + 2000,
-        "Continuation did not use the active window"
-    );
+    assert_early_voice_admission(&f, &call, "next-request", "initial-request", created);
     companion_frame(&f, "session/prompt", 2).await;
     let (not_before, target_started, mode): (i64, i64, String) = f.s.db.lock().unwrap().query_row(
         "SELECT i.ordinary_not_before,m.created_at,i.mode FROM companion_delegations d JOIN input_deliveries i ON i.message_id=d.message_id JOIN messages m ON m.id=i.target_turn WHERE d.call_id=?1 AND d.id='next-request'",
