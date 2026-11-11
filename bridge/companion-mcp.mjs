@@ -135,7 +135,7 @@ function buildServer(config,stopSignal) {
   server.registerTool('companion_huddle_post',{
     description:'Send routine coordination and unchanged agreement as message; send a meaningful result, progress, blocker or decision as outcome with evidence. Once accepted for return to the original caller, do not repeat the outcome text in a separate final reply; report a real return failure or blocker. Use the current delegation_id and a huddle returning to this conversation. A follow-up can reuse it while retaining its source and original destination. A report is not independent verification. Keep request_id for status after an uncertain reply.',
     inputSchema:z.object({installation_id:HUDDLE_ID,huddle_id:UUID,delegation_id:HUDDLE_DELEGATION,request_id:UUID,text:huddleText(6000),
-      target_agent_ids:z.array(HUDDLE_ID).max(8).refine(ids=>new Set(ids).size===ids.length),kind:z.enum(['message','outcome']),outcome:HUDDLE_OUTCOME.optional()}).strict()
+      target_agent_ids:z.array(HUDDLE_ID).max(8).refine(ids=>new Set(ids).size===ids.length).describe('Agents to notify. When replying to a participant awaiting your answer, include that message’s agent_id from huddle read. An empty list saves room discussion without requesting participant continuation.'),kind:z.enum(['message','outcome']),outcome:HUDDLE_OUTCOME.optional()}).strict()
       .refine(value=>value.kind==='outcome'?value.outcome!==undefined:value.outcome===undefined),
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },({huddle_id,...body})=>call(`huddles/${huddle_id}/posts`,'POST',body));
