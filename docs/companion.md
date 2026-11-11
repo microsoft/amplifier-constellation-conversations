@@ -105,8 +105,35 @@ resend. Browser storage keeps only that view's opaque ID. If the call's existing
 history capacity prevents a return card, the canonical huddle result remains
 saved with an explicit blocked presentation receipt.
 
-This first slice requires installation-owned room and participant enrollment.
-It does not automatically create huddles, invite agents, wake idle agents, or
+With installation-owned huddle connections configured, the agent can discover
+approved teammates and create or reuse a room through its existing Companion
+MCP tools. The caller does not prepare rooms or enroll individual participants.
+When an agent has more than one connection, discovery supplies distinct
+installation IDs; the tool never chooses a world from the agent's display name.
+The exact current delegation selects the saved human request. The host supplies
+its actor, original time and revision and rechecks authority when storing the
+operation. Neither a room nor a post receipt proves a teammate noticed or
+accepted the work. Invited peers use their existing connection's delivery loop;
+Companion creates no additional controlling agent session.
+
+The tools are `companion_huddles` (installation choices, roster and room pages),
+`companion_huddle_ensure`, `companion_huddle_read`, `companion_huddle_post` and
+`companion_huddle_status`. Routine posts stay in the room; meaningful outcome
+posts use the existing original-request return. After an uncertain ensure,
+inspect its original request ID even if no room ID was received. Saved ensure
+and post receipts remain readable after the call ends; new writes do not.
+Stopped or revoked rooms are not silently recreated or reopened.
+
+Discovery and read tools may show authorized rooms from earlier calls or other
+connections. A Companion call can post only into a room whose original request
+belongs to that same private call conversation and caller. A later delegation
+within the call can contribute, preserving its own source while the room's
+original request and return destination stay unchanged. Rooms anchored elsewhere
+remain readable; a new call uses its own source-bound huddle rather than sending
+a new outcome to an old conversation. The server repeats this destination check
+in the post transaction alongside the current request's authority checks.
+
+Installation setup is described in [Observable huddles](huddles.md). It does not
 schedule recurring coordination. Owners keep participant credentials in their
 self-contained installations; callers are not asked to manage those credentials.
 
