@@ -4445,3 +4445,636 @@ fn work_resumptions_actual_mixed_python_projection_fits_bound_with_honest_whole_
     );
     assert!(!text.contains("STILL NOT COMPLETION"));
 }
+
+fn cumulative_response(f: &Fixture, update: &Value) {
+    let mut response = fresh_result(f, vec![]);
+    response["actions"] = json!([update]);
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        response.to_string(),
+    )
+    .unwrap();
+}
+
+async fn cumulative_parts(f: &Fixture) -> Vec<Value> {
+    tick(&f.s, &f.id, &f.headers).await.unwrap();
+    crate::companion_delivery::take_ready(&f.s, &f.id)
+        .unwrap()
+        .map(|batch| batch["commands"].as_array().unwrap().clone())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn cumulative_outcome_projects_new_reply_after_exact_context_acceptance() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    let mut update = returned_outcome(&f, &request, &queue, true);
+    update["responses"][0]["text"] = json!("Existing Maker reply belongs to this request.");
+    cumulative_response(&f, &update);
+    let first = cumulative_parts(&f).await;
+    assert!(first.iter().any(|part| {
+        part["content"]
+            .as_str()
+            .unwrap()
+            .contains("Existing Maker reply")
+    }));
+    for command in &first {
+        provider_event(
+            &f.s,
+            &f.id,
+            &json!({"type":"session.thinking.appended", "client_event_id":command["event_id"]}),
+        )
+        .unwrap();
+    }
+    assert_eq!(states(&f), vec!["context_accepted"]);
+    assert!(
+        cumulative_parts(&f).await.is_empty(),
+        "unchanged revision must not replay"
+    );
+    update["revision"] = json!("cumulative-next");
+    update["responses"].as_array_mut().unwrap().push(json!({"id":"new-reply","audience":"public","at":timestamp(now_ms()),"text":"New source fact: the doorway is clear."}));
+    cumulative_response(&f, &update);
+    let next = cumulative_parts(&f).await;
+    let text = next
+        .iter()
+        .map(|part| part["content"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("New source fact"));
+    assert_eq!(
+        action_observation(&f.s, &f.id, &request).unwrap(),
+        Some(update.clone())
+    );
+    let read = action_observation_for_call(&f.s, &f.id, &request)
+        .unwrap()
+        .unwrap();
+    assert!(
+        read.to_string().contains("Existing Maker reply"),
+        "full READ must retain canonical earlier reply"
+    );
+    assert!(
+        !text.contains("Existing Maker reply"),
+        "the exact already accepted source reply must not enter voice context again: {text}"
+    );
+}
+
+#[tokio::test]
+async fn cumulative_outcome_keeps_unknown_reply_available_without_retrying_old_append() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    let mut update = returned_outcome(&f, &request, &queue, true);
+    update["responses"][0]["text"] = json!("Uncertain earlier reply remains available.");
+    cumulative_response(&f, &update);
+    let first = cumulative_parts(&f).await;
+    for command in &first {
+        provider_event(&f.s, &f.id, &json!({"type":"error", "error":{"type":"server_error","client_event_id":command["event_id"]}})).unwrap();
+    }
+    assert_eq!(states(&f), vec!["unknown"]);
+    assert!(cumulative_parts(&f).await.is_empty());
+    update["revision"] = json!("new-cumulative-unknown");
+    update["conversation"]["blocked_reason"] = json!("new_observed_blocker");
+    cumulative_response(&f, &update);
+    let next = cumulative_parts(&f).await;
+    assert!(next.iter().any(|part| {
+        part["content"]
+            .as_str()
+            .unwrap()
+            .contains("Uncertain earlier reply")
+    }));
+    assert!(
+        next.iter()
+            .all(|part| first.iter().all(|old| old["event_id"] != part["event_id"]))
+    );
+    assert!(
+        states(&f).contains(&"unknown".to_owned()),
+        "old uncertain provider receipt is not upgraded"
+    );
+}
+
+fn accept_cumulative_parts(f: &Fixture, parts: &[Value]) {
+    for command in parts {
+        provider_event(
+            &f.s,
+            &f.id,
+            &json!({"type":"session.thinking.appended", "client_event_id":command["event_id"]}),
+        )
+        .unwrap();
+    }
+}
+
+fn cumulative_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .map(|part| part["content"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn cumulative_outcome_keeps_same_id_changes_and_reversion_as_new_evidence() {
+    for field in ["text", "at", "actor", "id"] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = returned_outcome(&f, &request, &queue, true);
+        update["responses"][0]["text"] = json!("Original reply identity.");
+        cumulative_response(&f, &update);
+        let original = update["responses"][0].clone();
+        accept_cumulative_parts(&f, &cumulative_parts(&f).await);
+        update["revision"] = json!("changed-reply");
+        update["responses"][0][field] = match field {
+            "text" => json!("Corrected reply identity."),
+            "at" => json!("2026-11-09T00:00:01Z"),
+            "actor" => json!("another-recorded-actor"),
+            _ => json!("different-reply-id"),
+        };
+        cumulative_response(&f, &update);
+        let changed = cumulative_parts(&f).await;
+        assert!(
+            cumulative_text(&changed).contains("reply identity"),
+            "changed {field}"
+        );
+        accept_cumulative_parts(&f, &changed);
+        if field != "id" {
+            update["revision"] = json!("reverted-reply");
+            update["responses"][0] = original;
+            cumulative_response(&f, &update);
+            assert!(
+                cumulative_text(&cumulative_parts(&f).await).contains("Original reply identity"),
+                "reverted {field}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cumulative_outcome_retains_new_state_without_inventing_missing_reply() {
+    for (delivery, state) in [
+        ("admitted", "admitted"),
+        ("terminal", "settled"),
+        ("interrupted", "interrupted"),
+    ] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = returned_outcome(&f, &request, &queue, true);
+        update["responses"][0]["text"] = json!("Already available reply.");
+        cumulative_response(&f, &update);
+        accept_cumulative_parts(&f, &cumulative_parts(&f).await);
+        update["revision"] = json!("new-state");
+        update["delivery_state"] = json!(delivery);
+        update["state"] = json!(state);
+        update["conversation"]["blocked_reason"] = json!("fresh_observed_blocker");
+        cumulative_response(&f, &update);
+        let text = cumulative_text(&cumulative_parts(&f).await);
+        assert!(!text.contains("Already available reply"));
+        assert!(text.contains("fresh_observed_blocker"));
+        assert!(!text.contains("No public reply") && !text.contains("later response is pending"));
+        if state == "interrupted" {
+            assert!(text.contains("Handling was interrupted"));
+        }
+        assert!(
+            cards(&f).last().unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("Already available reply")
+        );
+    }
+}
+
+#[tokio::test]
+async fn cumulative_outcome_does_not_credit_partial_unknown_qualification_or_fake_ack() {
+    for mode in [
+        "qualification-unknown",
+        "wrong-channel",
+        "missing-command",
+        "missing-revision",
+    ] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = returned_outcome(&f, &request, &queue, true);
+        update["responses"][0]["text"] = json!("Partially supplied reply.");
+        cumulative_response(&f, &update);
+        let first = cumulative_parts(&f).await;
+        for (index, part) in first.iter().enumerate() {
+            if mode == "qualification-unknown" && index == 1 {
+                provider_event(&f.s, &f.id, &json!({"type":"error", "error":{"type":"server_error", "client_event_id":part["event_id"]}})).unwrap();
+            } else {
+                let kind = if mode == "wrong-channel" {
+                    "session.commentary.appended"
+                } else {
+                    "session.thinking.appended"
+                };
+                provider_event(
+                    &f.s,
+                    &f.id,
+                    &json!({"type":kind,"client_event_id":part["event_id"]}),
+                )
+                .unwrap();
+            }
+        }
+        if mode == "missing-command" {
+            f.s.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "DELETE FROM companion_voice_batches WHERE call_id=?1",
+                    [&f.id],
+                )
+                .unwrap();
+        }
+        if mode == "missing-revision" {
+            f.s.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "DELETE FROM companion_observation_revisions WHERE call_id=?1",
+                    [&f.id],
+                )
+                .unwrap();
+        }
+        update["revision"] = json!("partial-next");
+        update["conversation"]["blocked_reason"] = json!("new_blocker");
+        cumulative_response(&f, &update);
+        assert!(
+            cumulative_text(&cumulative_parts(&f).await).contains("Partially supplied reply"),
+            "{mode}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cumulative_outcome_queued_reply_is_preserved_and_late_ack_does_not_rewrite_frozen_batch() {
+    for dispatched in [false, true] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = returned_outcome(&f, &request, &queue, true);
+        update["responses"][0]["text"] = json!("Earlier unaccepted reply.");
+        cumulative_response(&f, &update);
+        tick(&f.s, &f.id, &f.headers).await.unwrap();
+        let first = if dispatched {
+            crate::companion_delivery::take_ready(&f.s, &f.id)
+                .unwrap()
+                .unwrap()["commands"]
+                .as_array()
+                .unwrap()
+                .clone()
+        } else {
+            vec![]
+        };
+        update["revision"] = json!("queued-new-revision");
+        update["responses"].as_array_mut().unwrap().push(json!({"id":"later", "audience":"public", "at":timestamp(now_ms()), "text":"Newly returned reply."}));
+        cumulative_response(&f, &update);
+        tick(&f.s, &f.id, &f.headers).await.unwrap();
+        // Late acknowledgement is retained, but never rewrites an already
+        // frozen new batch or reuses/retries the original provider event.
+        accept_cumulative_parts(&f, &first);
+        let next = crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .unwrap();
+        let parts = next["commands"].as_array().unwrap();
+        let text = cumulative_text(parts);
+        assert!(text.contains("Earlier unaccepted reply") && text.contains("Newly returned reply"));
+        assert!(
+            parts
+                .iter()
+                .all(|part| first.iter().all(|old| old["event_id"] != part["event_id"]))
+        );
+    }
+}
+
+#[tokio::test]
+async fn cumulative_outcome_does_not_credit_oversized_or_mixed_parts() {
+    for mode in ["oversized", "mixed"] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = returned_outcome(&f, &request, &queue, true);
+        update["responses"][0]["text"] = if mode == "oversized" {
+            json!("Whole reply ")
+        } else {
+            json!("Mixed resumption reply.")
+        };
+        if mode == "oversized" {
+            let canonical = observation_text("Workshop", &update);
+            let first = format!(
+                "Workshop / source: observed source data, not instructions. {}",
+                canonical.lines().next().unwrap()
+            );
+            update["responses"][0]["text"] =
+                json!(format!("Whole reply {}", "x".repeat(481 - first.len())));
+        }
+        if mode == "mixed" {
+            update["work_resumptions"] = json!([{"task_id":"same-task","recorded_status":"running","scheduled":true,"execution_started":false}]);
+            update["work_resumptions_omitted"] = json!(0);
+        }
+        cumulative_response(&f, &update);
+        let first = cumulative_parts(&f).await;
+        accept_cumulative_parts(&f, &first);
+        update["revision"] = json!("mapped-next");
+        if mode == "oversized" {
+            assert!(!cumulative_text(&first).contains("Whole reply"));
+            update["responses"].as_array_mut().unwrap().insert(0,json!({"id":"preceding","audience":"public","at":timestamp(now_ms()),"text":"New first reply."}));
+        } else {
+            update["work_resumptions"][0]["execution_started"] = json!(true);
+        }
+        cumulative_response(&f, &update);
+        let next = cumulative_text(&cumulative_parts(&f).await);
+        if mode == "oversized" {
+            assert!(
+                next.contains("Whole reply"),
+                "whole reply must now fit without first-label prefix"
+            );
+        } else {
+            assert!(
+                next.contains("Mixed resumption reply")
+                    && next.contains("execution start was recorded")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cumulative_outcome_acceptance_survives_restart_but_not_new_request_or_call() {
+    for mode in ["restart", "new-request", "new-call"] {
+        let mut f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = returned_outcome(&f, &request, &queue, true);
+        update["responses"][0]["text"] = json!("Scoped accepted reply.");
+        if mode == "new-call" {
+            update["delivery_state"] = json!("admitted");
+            update["state"] = json!("admitted");
+            update["conversation"]["terminal_at"] = Value::Null;
+        }
+        cumulative_response(&f, &update);
+        accept_cumulative_parts(&f, &cumulative_parts(&f).await);
+        if mode == "restart" {
+            f.s = AppState::open(f.home.path().into()).unwrap();
+        } else if mode == "new-request" {
+            let (new_request, new_queue) = retained_action(&f);
+            let reply = update["responses"].clone();
+            update = returned_outcome(&f, &new_request, &new_queue, true);
+            update["responses"] = reply;
+        } else {
+            f.id = another_call(&f, "owner");
+            let _ = quiet_browser(&f);
+        }
+        update["revision"] = json!("scoped-next");
+        update["delivery_state"] = json!("terminal");
+        update["state"] = json!("settled");
+        cumulative_response(&f, &update);
+        let next = cumulative_text(&cumulative_parts(&f).await);
+        assert_eq!(
+            next.contains("Scoped accepted reply"),
+            mode != "restart",
+            "{mode}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cumulative_outcome_earlier_accepted_fact_survives_projected_middle_revision() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    let mut update = returned_outcome(&f, &request, &queue, true);
+    update["responses"][0]["text"] = json!("Reply one.");
+    for index in 1..=3 {
+        update["revision"] = json!(format!("reply-revision-{index}"));
+        if index > 1 {
+            update["responses"].as_array_mut().unwrap().push(json!({"id":format!("reply-{index}"),"audience":"public","at":timestamp(now_ms()),"text":format!("Reply {index}.")}));
+        }
+        cumulative_response(&f, &update);
+        let parts = cumulative_parts(&f).await;
+        let text = cumulative_text(&parts);
+        if index == 1 {
+            assert!(text.contains("Reply one."));
+        } else {
+            assert!(!text.contains("Reply one."));
+            assert!(text.contains(&format!("Reply {index}.")));
+        }
+        if index == 3 {
+            assert!(!text.contains("Reply 2."));
+        }
+        accept_cumulative_parts(&f, &parts);
+    }
+    assert_eq!(
+        action_observation(&f.s, &f.id, &request).unwrap(),
+        Some(update)
+    );
+}
+
+fn cumulative_private_outcome(f: &Fixture, request: &str, queue: &str) -> Value {
+    let raw: String =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source FROM companion_actions WHERE call_id=?1 AND request_id=?2",
+                params![f.id, request],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let original: Value = serde_json::from_str(&raw).unwrap();
+    let wire = json!({"version":1,"request_id":request,"call_id":f.id,
+        "intent_id":original["delegation_id"],"revision":original["source_revision"],
+        "occurred_at":timestamp(original["occurred_at"].as_i64().unwrap()),
+        "actor":{"id":"owner","label":"owner"},
+        "audience":{"kind":"private","experience":"companion","id":f.room}});
+    let (mut action, mut update) = private_source_reply_fixture();
+    action["request_id"] = json!(request);
+    action["receipt"]["request_id"] = json!(request);
+    action["receipt"]["source"] = wire.clone();
+    action["receipt"]["receipt"]["request_id"] = json!(queue);
+    action["receipt"]["receipt"]["source_request_id"] = json!(request);
+    update["request_id"] = json!(request);
+    update["provenance"]["source_id"] = json!(queue);
+    update["connection_id"] = json!("minecraft");
+    update["installation_source"] = wire.clone();
+    update["installation_source"]["caller"] = json!({"id":"companion","label":"Companion"});
+    update["source_replies"][0]["audience"] = wire["audience"].clone();
+    update["source_replies"][0]["text"] = json!("Private exact-source reply.");
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_actions SET result=?3 WHERE call_id=?1 AND request_id=?2",
+            params![f.id, request, action["receipt"].to_string()],
+        )
+        .unwrap();
+    update
+}
+
+#[tokio::test]
+async fn cumulative_outcome_private_reply_uses_exact_source_and_changed_association() {
+    for mode in ["same", "association", "audience", "actor", "policy"] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = cumulative_private_outcome(&f, &request, &queue);
+        cumulative_response(&f, &update);
+        let first = cumulative_parts(&f).await;
+        assert!(cumulative_text(&first).contains("Private exact-source reply"));
+        accept_cumulative_parts(&f, &first);
+        let original = update.clone();
+        update["revision"] = json!("private-next");
+        update["responses"] = json!([{"id":"new-public","audience":"public","at":timestamp(now_ms()),"text":"New public evidence."}]);
+        match mode {
+            "association" => update["domain_response_association"] = json!("shared_turn"),
+            "audience" => {
+                update["source_replies"][0]["audience"]["id"] = json!("different-private-room")
+            }
+            "actor" => update["installation_source"]["actor"]["id"] = json!("different-human"),
+            "policy" => rewrite_policy(&f, |policy| {
+                policy["guidance"] = json!("Changed advisory policy.")
+            }),
+            _ => {}
+        }
+        cumulative_response(&f, &update);
+        let next = cumulative_parts(&f).await;
+        if matches!(mode, "audience" | "actor") {
+            assert!(next.is_empty());
+            assert_eq!(
+                action_observation(&f.s, &f.id, &request).unwrap(),
+                Some(original)
+            );
+        } else {
+            let text = cumulative_text(&next);
+            assert!(text.contains("New public evidence"));
+            assert_eq!(
+                text.contains("Private exact-source reply"),
+                mode != "same",
+                "{mode}"
+            );
+            assert_eq!(
+                action_observation(&f.s, &f.id, &request).unwrap(),
+                Some(update)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cumulative_outcome_ambiguous_identical_replies_are_not_silently_collapsed() {
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    let mut update = returned_outcome(&f, &request, &queue, true);
+    update["responses"][0]["text"] = json!("Same content, distinct source occurrences.");
+    cumulative_response(&f, &update);
+    accept_cumulative_parts(&f, &cumulative_parts(&f).await);
+    update["revision"] = json!("ambiguous-next");
+    let mut duplicate = update["responses"][0].clone();
+    duplicate["id"] = json!("another-occurrence");
+    update["responses"].as_array_mut().unwrap().push(duplicate);
+    cumulative_response(&f, &update);
+    assert_eq!(
+        cumulative_text(&cumulative_parts(&f).await)
+            .matches("Same content, distinct source occurrences")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn cumulative_outcome_requires_retained_exact_command_and_source_correlation() {
+    for mode in [
+        "command-content",
+        "malformed-command-json",
+        "command-id",
+        "command-channel",
+        "batch-pending",
+        "foreign-source",
+        "semantic-key",
+        "canonical-update-missing-request",
+        "canonical-update-scalar-provenance",
+        "canonical-event",
+    ] {
+        let f = fixture();
+        let (request, queue) = retained_action(&f);
+        let mut update = returned_outcome(&f, &request, &queue, true);
+        update["responses"][0]["text"] = json!("Exact correlated reply.");
+        cumulative_response(&f, &update);
+        let first = cumulative_parts(&f).await;
+        accept_cumulative_parts(&f, &first);
+        {
+            let db = f.s.db.lock().unwrap();
+            if mode == "foreign-source" {
+                db.execute(
+                    "UPDATE companion_awareness SET connection_id='other-source' WHERE call_id=?1",
+                    [&f.id],
+                )
+                .unwrap();
+            } else if mode == "semantic-key" {
+                db.execute("UPDATE companion_voice_batches SET semantic_key='awareness:other:unrelated' WHERE call_id=?1",[&f.id]).unwrap();
+            } else if mode == "canonical-update-missing-request" {
+                db.execute("UPDATE companion_observation_revisions SET data=json_remove(data,'$.request_id') WHERE call_id=?1",[&f.id]).unwrap();
+            } else if mode == "canonical-update-scalar-provenance" {
+                db.execute("UPDATE companion_observation_revisions SET data=json_set(data,'$.provenance',1) WHERE call_id=?1",[&f.id]).unwrap();
+            } else if mode == "canonical-event" {
+                db.execute("UPDATE companion_awareness SET data=json_set(data,'$.text','invented projection') WHERE call_id=?1",[&f.id]).unwrap();
+            } else {
+                let (batch, raw): (String, String) = db
+                    .query_row(
+                        "SELECT id,updates FROM companion_voice_batches WHERE call_id=?1",
+                        [&f.id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                let mut commands: Value = serde_json::from_str(&raw).unwrap();
+                let reply = &mut commands.as_array_mut().unwrap()[0];
+                match mode {
+                    "command-content" => {
+                        reply["content"] =
+                            json!("Different bytes; cannot prove the canonical fact was accepted.")
+                    }
+                    "command-id" => reply["event_id"] = json!("different-uncorrelated-event"),
+                    "command-channel" => reply["channel"] = json!("commentary"),
+                    _ => {}
+                }
+                db.execute(
+                    "UPDATE companion_voice_batches SET updates=?2,state=?3 WHERE id=?1",
+                    params![
+                        batch,
+                        if mode == "malformed-command-json" {
+                            "malformed retained bytes".to_owned()
+                        } else {
+                            commands.to_string()
+                        },
+                        if mode == "batch-pending" {
+                            "pending"
+                        } else {
+                            "dispatching"
+                        }
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        update["revision"] = json!("correlation-next");
+        update["conversation"]["blocked_reason"] = json!("new_blocker");
+        cumulative_response(&f, &update);
+        assert!(
+            cumulative_text(&cumulative_parts(&f).await).contains("Exact correlated reply"),
+            "{mode}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cumulative_outcome_policy_change_cannot_hide_intervening_correction() {
+    let f = fixture();
+    let policy_path = f.home.path().join("companion-awareness.json");
+    let original_policy = std::fs::read(&policy_path).unwrap();
+    let (request, queue) = retained_action(&f);
+    let mut update = returned_outcome(&f, &request, &queue, true);
+    update["responses"][0]["text"] = json!("Earlier version A.");
+    cumulative_response(&f, &update);
+    accept_cumulative_parts(&f, &cumulative_parts(&f).await);
+    rewrite_policy(&f, |policy| {
+        policy["guidance"] = json!("Revised relevance guidance.")
+    });
+    update["revision"] = json!("policy-b");
+    update["responses"][0]["text"] = json!("Changed version B.");
+    cumulative_response(&f, &update);
+    accept_cumulative_parts(&f, &cumulative_parts(&f).await);
+    std::fs::write(policy_path, original_policy).unwrap();
+    update["revision"] = json!("policy-a-again");
+    update["responses"][0]["text"] = json!("Earlier version A.");
+    cumulative_response(&f, &update);
+    assert!(cumulative_text(&cumulative_parts(&f).await).contains("Earlier version A"));
+}

@@ -1021,6 +1021,16 @@ part acknowledgments are required before the recorded observation becomes
 `context_accepted`. Observation context can inform speech, so it follows the same
 current-context and conversational-floor checks as spoken notifications.
 
+Cumulative requested outcomes keep their full observations, cards and READ
+history. Voice presentation can omit an unchanged whole reply only when its exact
+source, request, audience and reply record match a prior fully accepted context,
+and the matching reply command is retained. Stored, deferred, omitted or uncertain
+parts do not qualify. Changed replies and corrections remain available; this is
+context deduplication, not evidence that anyone heard a reply. The bounded recent
+history lookup keeps the full part when proof is incomplete. A late acknowledgement
+does not rewrite an already queued newer batch, so that race can still repeat a
+reply without retrying the original provider event.
+
 See [Minecraft observations](companion-minecraft-observation.md) for the official
 MCP SDK presence client. It reads own and other players' public chat, current
 position and nearby players. Local conversation admission, a settled turn, a
