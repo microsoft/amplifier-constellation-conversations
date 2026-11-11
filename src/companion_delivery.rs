@@ -1,5 +1,6 @@
 //! Receiving a result and making it available to the speaking model are
-//! different events. Persist complete updates while the caller has the floor.
+//! different events. Persist speech updates while the caller has the floor.
+//! Only the exact call-local pending receipt can supply quiet awareness then.
 //! Audio activity is a presentation hint, never a completed turn or authority.
 use crate::{
     auth,
@@ -121,17 +122,55 @@ pub(crate) fn floor_open_in(db: &Connection, call: &str) -> Result<bool> {
     Ok(now_ms() - last_user >= 1200)
 }
 
+/// Quiet receipt context does not request speech. It may cross known ongoing
+/// speech or a recent transcript, but missing/stale playback evidence still
+/// defers it. Suppression is the normal browser state while the caller speaks.
+fn quiet_context_ready_in(db: &Connection, call: &str) -> Result<bool> {
+    type Surface = (Option<bool>, Option<bool>, i64, Option<String>);
+    let surface: Option<Surface> = db.query_row("SELECT user_speaking,agent_speaking,updated_at,playback FROM companion_surfaces WHERE call_id=?1", [call], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    let Some((Some(_), Some(_), at, Some(playback))) = surface else {
+        return Ok(false);
+    };
+    if !(0..=5000).contains(&(now_ms() - at)) {
+        return Ok(false);
+    }
+    let p: Value = serde_json::from_str(&playback)?;
+    Ok(matches!(p["state"].as_str(), Some("ready" | "suppressed"))
+        && matches!(p["floor"].as_str(), Some("open" | "user")))
+}
+
 pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     let mut db = s.db.lock().unwrap();
     let tx = db.transaction()?;
-    if !floor_open_in(&tx, call)? {
+    let speech_ready = floor_open_in(&tx, call)?;
+    if !speech_ready && !quiet_context_ready_in(&tx, call)? {
         return Ok(None);
     }
-    let row: Option<(String,String)>=tx.query_row("SELECT id,updates FROM companion_voice_batches WHERE call_id=?1 AND state='pending' ORDER BY created_at,rowid LIMIT 1",[call],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    let Some((id, raw)) = row else {
+    // When speech is held, select the oldest eligible quiet receipt without
+    // consuming or reordering the held speech batches. The bounded durable
+    // queue and the existing serialized bridge writer still own delivery.
+    let rows = {
+        let mut q = tx.prepare("SELECT id,semantic_key,updates FROM companion_voice_batches WHERE call_id=?1 AND state='pending' ORDER BY created_at,rowid")?;
+        q.query_map([call], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut selected = None;
+    for (id, semantic_key, raw) in rows {
+        let commands: Vec<Value> = serde_json::from_str(&raw)?;
+        if speech_ready || crate::companion::is_pending_context_batch(&semantic_key, &commands) {
+            selected = Some((id, commands));
+            break;
+        }
+    }
+    let Some((id, commands)) = selected else {
         return Ok(None);
     };
-    let commands: Vec<Value> = serde_json::from_str(&raw)?;
     let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND state IN ('connecting','connected'))", [call], |r|r.get(0))?;
     if !active
         || crate::companion_history::private_identity(&tx, call)?.is_none()

@@ -1,0 +1,195 @@
+{
+  "provenance": "Actual minecraft-observe projection of combined_row synthetic maximums; source binding uses retained real disposable private-source producer fixture. No services or models.",
+  "action": {
+    "request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+    "receipt": {
+      "request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+      "scope": "private_installation_input",
+      "state": "queued",
+      "protocol": "installation_inputs.v1",
+      "caller_id": "companion",
+      "source": {
+        "version": 1,
+        "request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+        "call_id": "disposable-companion-call",
+        "intent_id": "disposable-companion-intent",
+        "revision": "494a44c0d722179668679ce2738fc22f33c9749c435dd20ccbe41eab4e40e632",
+        "occurred_at": "2026-11-11T05:39:04.385Z",
+        "actor": {
+          "id": "fixture-authenticated-human",
+          "label": "fixture-authenticated-human"
+        },
+        "audience": {
+          "kind": "private",
+          "experience": "companion",
+          "id": "disposable-companion-room"
+        }
+      },
+      "receipt": {
+        "queued": true,
+        "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+        "source_request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+        "received_at": "2026-11-11T05:39:04.410Z",
+        "duplicate": false
+      }
+    }
+  },
+  "observation": {
+    "request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+    "connection_id": "minecraft:fixture",
+    "state": "settled",
+    "scope": "conversation",
+    "verified": false,
+    "audience": {
+      "kind": "private",
+      "experience": "installation_control",
+      "connection_id": "minecraft:fixture"
+    },
+    "provenance": {
+      "kind": "minecraft_input_outcome",
+      "source_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+      "version": 1,
+      "completion": "not_established",
+      "authority": false
+    },
+    "fulfillment": "not_established",
+    "reason": "source_bound_input_outcome",
+    "receipt": {
+      "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7"
+    },
+    "delivery_state": "terminal",
+    "conversation": {
+      "admitted_at": "2026-11-11T05:39:04.411Z",
+      "terminal_at": "2026-11-11T05:39:04.434Z",
+      "admission_layer": "minecraft_input_outcome",
+      "conversation_only": true,
+      "turn_task_id": null,
+      "blocked_reason": null,
+      "host_forwarding_verified": false,
+      "local_turn_settled": true,
+      "interrupted": false,
+      "reply_verified": false,
+      "task_acceptance_verified": false
+    },
+    "responses": [
+      {
+        "id": "public-full",
+        "at": "2026-11-11T05:39:04.434Z",
+        "text": "Public record. pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+        "audience": "public"
+      }
+    ],
+    "responses_omitted": 0,
+    "private_responses_withheld": 0,
+    "response_association": "same_turn_source_set_not_individual_fulfillment",
+    "task_authorizations": [],
+    "work_resumptions": [
+      {
+        "task_id": "0界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "1界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "2界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "3界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "4界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "5界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "6界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "7界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "8界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      },
+      {
+        "task_id": "9界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "recorded_status": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        "scheduled": true,
+        "execution_started": false
+      }
+    ],
+    "work_resumptions_omitted": 6,
+    "domain_work_resumptions_omitted": true,
+    "domain_response_association": "single_source",
+    "installation_source": {
+      "caller": {
+        "id": "companion",
+        "label": "Companion"
+      },
+      "version": 1,
+      "request_id": "669cdddb-5fe7-4b7b-a9f8-014ca1686996",
+      "call_id": "disposable-companion-call",
+      "intent_id": "disposable-companion-intent",
+      "revision": "494a44c0d722179668679ce2738fc22f33c9749c435dd20ccbe41eab4e40e632",
+      "occurred_at": "2026-11-11T05:39:04.385Z",
+      "actor": {
+        "id": "fixture-authenticated-human",
+        "label": "fixture-authenticated-human"
+      },
+      "audience": {
+        "kind": "private",
+        "experience": "companion",
+        "id": "disposable-companion-room"
+      }
+    },
+    "private_game_responses_included": false,
+    "source_replies": [
+      {
+        "id": "private-short",
+        "at": "2026-11-11T05:39:04.411Z",
+        "text": "The request was recorded, not confirmed heard.",
+        "audience": {
+          "kind": "private",
+          "experience": "companion",
+          "id": "disposable-companion-room"
+        },
+        "delivery": "recorded"
+      }
+    ],
+    "source_replies_omitted": 1,
+    "source_replies_capability": {
+      "version": 1,
+      "max_items": 32,
+      "max_text_bytes": 12000
+    },
+    "revision": "1cbc6ab96f0dcae26694a87e8bb48b24bb7b083f76a61461017c7be8005f5158",
+    "observed_at": "2026-11-11T05:39:04.434Z"
+  }
+}
