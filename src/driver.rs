@@ -1112,9 +1112,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
             if output.trim().is_empty() && has_media {
                 output = "Generated media.".into();
             }
-            if participation == "ambient"
-                && (output.trim().is_empty() || output.trim() == "[[PASS]]")
-            {
+            if participation == "ambient" && output.trim() == "[[PASS]]" {
                 state
                     .db
                     .lock()
@@ -1122,10 +1120,11 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                     .execute("DELETE FROM messages WHERE id=?1", [&message_id])?;
                 state.audit("turn.passed",Some(&conversation),json!({"agent_id":agent_id,"label":agent.label,"reason":"No contribution needed for this group message"}))?;
             } else {
-                ensure!(
-                    !output.trim().is_empty(),
-                    "The agent completed without a reply"
-                );
+                // A successful ACP terminal can follow tool-only work or an
+                // intentional silent turn. Keep its exact target and text so
+                // delivery can settle without inventing speech or fulfillment.
+                // Errors, missing terminals and unresolved callbacks above
+                // remain uncertain regardless of any visible output.
                 state.update_message(&message_id, &output, "complete")?;
                 state.audit(
                     "turn.completed",

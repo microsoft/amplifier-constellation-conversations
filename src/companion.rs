@@ -2188,6 +2188,10 @@ fn settle(s: &AppState, id: &str, did: &str, state: &str, message: &str) -> Resu
 mod peer_results_tests;
 
 #[cfg(test)]
+#[path = "companion_empty_terminal_tests.rs"]
+mod empty_terminal_tests;
+
+#[cfg(test)]
 mod deadline_tests {
     use super::*;
 
