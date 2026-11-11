@@ -815,7 +815,7 @@ pub async fn view(
     h: HeaderMap,
     Json(v): Json<View>,
 ) -> ApiResult<Json<Value>> {
-    let (owner, agent, room) = crate::companion_tools::authorize(&s, &id, &h)?;
+    let (owner, agent, room) = crate::companion_tools::authorize_effect(&s, &id, &h)?;
     if !valid_view(&v) {
         return Err(ApiError::bad(
             "Choose one bounded surface action and an operation UUID",
@@ -840,7 +840,7 @@ pub async fn capture(
     h: HeaderMap,
     Json(c): Json<Capture>,
 ) -> ApiResult<Json<Value>> {
-    let (owner, agent, room) = crate::companion_tools::authorize(&s, &id, &h)?;
+    let (owner, agent, room) = crate::companion_tools::authorize_effect(&s, &id, &h)?;
     if !valid_identity(&c.operation_id, &c.delegation_id) {
         return Err(ApiError::bad(
             "Use an operation UUID and the exact active delegation",
@@ -862,7 +862,7 @@ pub async fn hangup(
     h: HeaderMap,
     Json(request): Json<Hangup>,
 ) -> ApiResult<Json<Value>> {
-    let (owner, agent, room) = crate::companion_tools::authorize(&s, &id, &h)?;
+    let (owner, agent, room) = crate::companion_tools::authorize_effect(&s, &id, &h)?;
     if !valid_identity(&request.operation_id, &request.delegation_id) {
         return Err(ApiError::bad(
             "Use an operation UUID and the exact active delegation",
@@ -889,7 +889,7 @@ pub async fn feedback(
     h: HeaderMap,
     Json(request): Json<Feedback>,
 ) -> ApiResult<Json<Value>> {
-    let (owner, agent, room) = crate::companion_tools::authorize(&s, &id, &h)?;
+    let (owner, agent, room) = crate::companion_tools::authorize_effect(&s, &id, &h)?;
     if !valid_feedback(&request) {
         return Err(ApiError::bad(
             "Use an operation UUID, the exact active delegation, and 1–4000 UTF-8 bytes of feedback",

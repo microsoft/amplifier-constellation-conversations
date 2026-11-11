@@ -164,10 +164,22 @@ pub fn permission_once(
     let cfg = config(s).ok();
     // A disconnected listener does not erase this injected server's ownership.
     // Recognize its retained grant before deciding whether it can still run.
-    let call:Option<(String,String,Option<i64>)>=s.db.lock().unwrap().query_row("SELECT c.id,c.state,g.port FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.owner=?2 AND c.agent_id=?3",params![room,actor,agent],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let Some((call, state, port)) = call else {
+    let call:Option<(String,String,Option<i64>,String)>=s.db.lock().unwrap().query_row("SELECT c.id,c.state,g.port,c.owner FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.conversation_id=?1 AND c.agent_id=?2",params![room,agent],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    let Some((call, state, port, owner)) = call else {
         return Ok(None);
     };
+    let quiet_peer =
+        crate::huddle_delivery::active_quiet_peer_turn(&s.db.lock().unwrap(), &call, room, agent)?;
+    let valid_peer = if quiet_peer || actor != owner {
+        crate::huddle_delivery::active_peer_actor(&s.db.lock().unwrap(), &call, room, agent, actor)?
+    } else {
+        false
+    };
+    if actor != owner && !quiet_peer && !valid_peer {
+        // Unrelated actors still use their own permission routing, even when
+        // this call has ended. Revoked or unknown peer turns remain classified.
+        return Ok(None);
+    }
     if !crate::companion::room_identity_valid(s, room)?
         || s.agent(agent)?
             .is_none_or(|a| a.mcp_servers.iter().any(|m| m["name"] == "companion"))
@@ -255,6 +267,28 @@ pub fn permission_once(
             "tools_disabled"
         });
     }
+    // A quiet peer continuation retains its actual author. Its original human
+    // request is separate provenance, not permission for that peer to start
+    // actions, alter the shared surface, end the call or enroll new teammates.
+    if (quiet_peer || actor != owner)
+        && (!valid_peer
+            || (quiet_peer
+                && !matches!(
+                    raw.tool.as_str(),
+                    "companion_huddles"
+                        | "companion_huddle_read"
+                        | "companion_huddle_post"
+                        | "companion_huddle_status"
+                        | "companion_connections"
+                        | "companion_observations"
+                        | "companion_connection_status"
+                        | "companion_shared"
+                        | "companion_action_status"
+                        | "companion_surface_status"
+                )))
+    {
+        return deny("peer_continuation_not_authorized");
+    }
     let cfg = cfg.unwrap();
     let permitted = match raw.tool.as_str() {
         "companion_huddles"
@@ -262,7 +296,7 @@ pub fn permission_once(
         | "companion_huddle_read"
         | "companion_huddle_post"
         | "companion_huddle_status" => {
-            huddles::permission_valid(s, &call, actor, agent, room, &raw.tool, &raw.arguments)?
+            huddles::permission_valid(s, &call, &owner, agent, room, &raw.tool, &raw.arguments)?
         }
         "companion_view"
         | "companion_capture"
@@ -271,7 +305,7 @@ pub fn permission_once(
         | "companion_feedback" => crate::companion_surface::permission_valid(
             s,
             &call,
-            actor,
+            &owner,
             agent,
             room,
             &raw.tool,
@@ -295,9 +329,9 @@ pub fn permission_once(
             {
                 return deny("connection_not_configured");
             }
-            let source:Option<String>=s.db.lock().unwrap().query_row("SELECT d.message_id FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id=?2 AND d.state='dispatched' AND m.role='user' AND m.actor=?3 AND m.conversation_id=?4 AND EXISTS(SELECT 1 FROM input_deliveries i WHERE i.message_id=m.id AND i.state IN ('submitted','received_remote','incorporated'))",params![call,action.delegation_id,actor,room],|r|r.get(0)).optional()?;
+            let source:Option<String>=s.db.lock().unwrap().query_row("SELECT d.message_id FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id=?2 AND d.state='dispatched' AND m.role='user' AND m.actor=?3 AND m.conversation_id=?4 AND EXISTS(SELECT 1 FROM input_deliveries i WHERE i.message_id=m.id AND i.state IN ('submitted','received_remote','incorporated'))",params![call,action.delegation_id,owner,room],|r|r.get(0)).optional()?;
             match source {
-                Some(source) => crate::delivery::authorized(s, &source, actor)?,
+                Some(source) => crate::delivery::authorized(s, &source, &owner)?,
                 None => false,
             }
         }
@@ -331,6 +365,25 @@ pub(crate) fn authorize(
     h: &HeaderMap,
 ) -> ApiResult<(String, String, String)> {
     authorize_scope(s, id, h, false)
+}
+/// A peer continuation can inspect existing context and contribute to its
+/// discussion. It cannot borrow the call credential for a new human-directed
+/// effect. Enforce this at the HTTP boundary too, independent of ACP callbacks.
+pub(crate) fn authorize_effect(
+    s: &AppState,
+    id: &str,
+    h: &HeaderMap,
+) -> ApiResult<(String, String, String)> {
+    let identity = authorize(s, id, h)?;
+    if crate::huddle_delivery::active_quiet_peer_turn(
+        &s.db.lock().unwrap(),
+        id,
+        &identity.2,
+        &identity.1,
+    )? {
+        return Err(ApiError::forbidden());
+    }
+    Ok(identity)
 }
 /// Saved receipts retain their exact call credential and endpoint identity after
 /// media ends. This does not authorize live observations or new effects.
@@ -617,7 +670,7 @@ pub async fn action(
     h: HeaderMap,
     Json(a): Json<Action>,
 ) -> ApiResult<Json<Value>> {
-    let (owner, agent, room) = authorize(&s, &id, &h)?;
+    let (owner, agent, room) = authorize_effect(&s, &id, &h)?;
     if !valid_action(&a) {
         return Err(ApiError::bad(
             "Use a UUID request_id, the exact delegation_id and a bounded explicit instruction",
@@ -800,7 +853,7 @@ pub async fn show(
     h: HeaderMap,
     Json(v): Json<Show>,
 ) -> ApiResult<Json<Value>> {
-    let (_, _, room) = authorize(&s, &id, &h)?;
+    let (_, agent, room) = authorize_effect(&s, &id, &h)?;
     if !valid_show(&v) {
         return Err(ApiError::bad("Unsupported shared artifact"));
     }
@@ -815,10 +868,15 @@ pub async fn show(
     if count >= 128 {
         return Err(ApiError::bad("Shared space reached its artifact limit"));
     }
-    s.db.lock().unwrap().execute(
+    let db = s.db.lock().unwrap();
+    if crate::huddle_delivery::active_quiet_peer_turn(&db, &id, &room, &agent)? {
+        return Err(ApiError::forbidden());
+    }
+    db.execute(
         "INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'card',?3,?4)",
         params![id, eid, data.to_string(), now_ms()],
     )?;
+    drop(db);
     s.changed();
     Ok(Json(
         json!({"state":"saved","presentation":"requested_current","event_id":eid,"card_id":s.db.lock().unwrap().query_row("SELECT seq FROM companion_events WHERE call_id=?1 AND event_key=?2",params![id,eid],|r|r.get::<_,i64>(0))?.to_string(),"note":"Saved in this call and offered to the limited whiteboard. Pinned or currently read items can keep it in history; companion_surface_status reports current board IDs. Saved does not prove displayed, opened, played or watched."}),
@@ -868,3 +926,7 @@ pub async fn shared(
         json!({"items":items,"shown":shown,"note":"Availability is not image understanding; ask through the existing attachment path."}),
     ))
 }
+
+#[cfg(test)]
+#[path = "companion_peer_authority_tests.rs"]
+mod peer_authority_tests;

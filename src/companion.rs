@@ -1799,11 +1799,26 @@ fn observe_results(s: &AppState, id: &str, room: &str, live: bool) -> Result<()>
     // Observe their settled public answer too, never streaming/private output.
     let results = {
         let db = s.db.lock().unwrap();
-        let mut q=db.prepare("SELECT DISTINCT m.id,m.text FROM messages m JOIN input_deliveries d ON d.target_turn=m.id JOIN companion_calls c ON c.id=?2 AND c.conversation_id=d.conversation_id AND c.agent_id=d.agent_id WHERE m.conversation_id=?1 AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id AND m.role='assistant' AND m.status='complete' AND d.state IN ('completed','incorporated') AND NOT EXISTS(SELECT 1 FROM companion_delegations x JOIN input_deliveries dx ON dx.message_id=x.message_id WHERE x.call_id=?2 AND dx.target_turn=m.id) AND NOT EXISTS(SELECT 1 FROM companion_events e WHERE e.call_id=?2 AND e.event_key='result:'||m.id) ORDER BY m.seq LIMIT 16")?;
-        q.query_map(params![room, id], |r| {
+        let mut q=db.prepare("SELECT DISTINCT m.id,m.text FROM messages m JOIN input_deliveries d ON d.target_turn=m.id JOIN companion_calls c ON c.id=?2 AND c.conversation_id=d.conversation_id AND c.agent_id=d.agent_id WHERE m.conversation_id=?1 AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id AND m.role='assistant' AND m.status='complete' AND d.state IN ('completed','incorporated') AND NOT EXISTS(SELECT 1 FROM companion_delegations x JOIN input_deliveries dx ON dx.message_id=x.message_id WHERE x.call_id=?2 AND dx.target_turn=m.id) AND NOT EXISTS(SELECT 1 FROM companion_events e WHERE e.call_id=?2 AND e.event_key='result:'||m.id) ORDER BY m.seq")?;
+        let rows = q.query_map(params![room, id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            let (message, text) = row?;
+            // A peer continuation is an internal coordination turn. Its
+            // assistant text is not a requested voice answer; an explicit
+            // huddle outcome uses the separate qualified return path below.
+            // Apply the batch bound after filtering so quiet turns cannot
+            // hide a later human-requested result.
+            if !crate::huddle_delivery::quiet_turn(&db, &message)? {
+                results.push((message, text));
+                if results.len() == 16 {
+                    break;
+                }
+            }
+        }
+        results
     };
     for (message, text) in results {
         publish_result(s, id, room, &message, &text)?;
@@ -1931,6 +1946,12 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
     let (fresh, late, request_id, attachments, present_image, delegation, linked) = {
         let mut db = s.db.lock().unwrap();
         let tx = db.transaction()?;
+        // Keep this guard at publication as well as observation: neither a
+        // direct caller nor a later polling path may promote routine peer
+        // continuation text into automatic speech or a result card.
+        if crate::huddle_delivery::quiet_turn(&tx, message)? {
+            return Ok(());
+        }
         // A current incorporated follow-up may share a result with an older
         // blocked prompt. Relevance follows the newest successful source; all
         // source/target links remain separately recorded below.
@@ -2161,6 +2182,10 @@ fn settle(s: &AppState, id: &str, did: &str, state: &str, message: &str) -> Resu
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "companion_peer_results_tests.rs"]
+mod peer_results_tests;
 
 #[cfg(test)]
 mod deadline_tests {

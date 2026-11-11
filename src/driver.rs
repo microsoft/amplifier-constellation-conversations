@@ -667,6 +667,16 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     }
     let prior:Option<(String,i64)>=state.db.lock().unwrap().query_row("SELECT session_id,last_seq FROM room_agents WHERE conversation_id=?1 AND agent_id=?2 AND endpoint=?3 AND session_id IS NOT NULL",params![conversation,agent_id,endpoint],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let last_seq = prior.as_ref().map(|p| p.1).unwrap_or(0);
+    let peer_session =
+        crate::huddle_delivery::expected_session(&state.db.lock().unwrap(), &user_message)?;
+    if let Some((expected_session, expected_endpoint)) = &peer_session {
+        ensure!(
+            restore_method.is_some()
+                && prior.as_ref().is_some_and(|p| &p.0 == expected_session)
+                && &endpoint == expected_endpoint,
+            "Peer continuation requires its original existing session and endpoint"
+        );
+    }
     let prior = prior.map(|p| p.0).zip(restore_method);
     let acknowledgments = crate::delivery::pending_ack(&state, &conversation, &agent_id)?;
     for ack in &acknowledgments {
@@ -837,7 +847,11 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         Some(&conversation),
         json!({"resumed":loaded,"agent_info":init["agentInfo"],"agent_id":agent_id,"participation":participation}),
     )?;
-    let prompt = if loaded && !shared {
+    let peer_prompt =
+        crate::huddle_delivery::prompt(&state.db.lock().unwrap(), &user_message, &user_text)?;
+    let prompt = if let Some(peer) = peer_prompt {
+        peer
+    } else if loaded && !shared {
         user_text.clone()
     } else {
         let history: Vec<Value> =

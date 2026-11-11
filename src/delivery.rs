@@ -109,6 +109,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
             ))?;
         }
     }
+    crate::huddle_delivery::migrate(db)?;
     // No retry follows a crash after transmission. Keep the session binding and
     // source text so its owner can inspect the outcome before proceeding.
     db.execute("UPDATE input_deliveries SET state=CASE WHEN state='preparing' THEN 'notAccepted' ELSE 'unknown' END,updated_at=?1 WHERE state IN ('preparing','offering','submitted','received_remote','remoteQueued') OR (state='incorporated' AND target_turn IN (SELECT id FROM messages WHERE status='streaming'))",[now_ms()])?;
@@ -135,11 +136,29 @@ fn input(db: &Connection, id: &str) -> Result<Input> {
         .collect::<rusqlite::Result<_>>()?;
     Ok(i)
 }
-fn pending(db: &Connection, room: &str, agent: Option<&str>) -> Result<Option<Input>> {
-    db.execute("UPDATE input_deliveries SET state='cancelled',updated_at=?2 WHERE conversation_id=?1 AND state IN ('received','promptRequired') AND (NOT EXISTS(SELECT 1 FROM room_members r JOIN messages m ON m.actor=r.username WHERE r.conversation_id=input_deliveries.conversation_id AND m.id=input_deliveries.message_id) OR NOT EXISTS(SELECT 1 FROM room_agents WHERE conversation_id=input_deliveries.conversation_id AND agent_id=input_deliveries.agent_id))",params![room,now_ms()])?;
-    // An uncertain earlier input blocks only this agent in this conversation.
-    let id:Option<String>=db.query_row("SELECT d.id FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.conversation_id=?1 AND (?2 IS NULL OR d.agent_id=?2) AND d.state IN ('received','promptRequired') AND EXISTS(SELECT 1 FROM room_members WHERE conversation_id=d.conversation_id AND username=m.actor) AND EXISTS(SELECT 1 FROM room_agents WHERE conversation_id=d.conversation_id AND agent_id=d.agent_id) AND NOT EXISTS(SELECT 1 FROM input_deliveries x WHERE x.conversation_id=d.conversation_id AND x.agent_id=d.agent_id AND x.state IN ('unknown','notAccepted')) ORDER BY d.sequence LIMIT 1",params![room,agent],|r|r.get(0)).optional()?;
-    id.map(|id| input(db, &id)).transpose()
+fn pending(
+    db: &Connection,
+    room: &str,
+    agent: Option<&str>,
+    include_peers: bool,
+) -> Result<Option<Input>> {
+    db.execute("UPDATE input_deliveries SET state='cancelled',updated_at=?2 WHERE conversation_id=?1 AND state IN ('received','promptRequired') AND NOT EXISTS(SELECT 1 FROM huddle_peer_deliveries p WHERE p.input_id=input_deliveries.id) AND (NOT EXISTS(SELECT 1 FROM room_members r JOIN messages m ON m.actor=r.username WHERE r.conversation_id=input_deliveries.conversation_id AND m.id=input_deliveries.message_id) OR NOT EXISTS(SELECT 1 FROM room_agents WHERE conversation_id=input_deliveries.conversation_id AND agent_id=input_deliveries.agent_id))",params![room,now_ms()])?;
+    loop {
+        // An uncertain earlier input blocks only this agent in this conversation.
+        let id:Option<String>=db.query_row("SELECT d.id FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.conversation_id=?1 AND (?2 IS NULL OR d.agent_id=?2) AND d.state IN ('received','promptRequired') AND (?3 OR NOT EXISTS(SELECT 1 FROM huddle_peer_deliveries p WHERE p.input_id=d.id)) AND (EXISTS(SELECT 1 FROM room_members WHERE conversation_id=d.conversation_id AND username=m.actor) OR EXISTS(SELECT 1 FROM huddle_peer_deliveries p WHERE p.input_id=d.id)) AND EXISTS(SELECT 1 FROM room_agents WHERE conversation_id=d.conversation_id AND agent_id=d.agent_id) AND NOT EXISTS(SELECT 1 FROM input_deliveries x WHERE x.conversation_id=d.conversation_id AND x.agent_id=d.agent_id AND x.state IN ('unknown','notAccepted')) ORDER BY d.sequence LIMIT 1",params![room,agent,include_peers],|r|r.get(0)).optional()?;
+        if let Some(id) = id {
+            let input = input(db, &id)?;
+            if input.participation == "peer" && !crate::huddle_delivery::valid_input(db, &id)? {
+                db.execute(
+                    "UPDATE input_deliveries SET state='cancelled',updated_at=?2 WHERE id=?1",
+                    params![id, now_ms()],
+                )?;
+                continue;
+            }
+            return Ok(Some(input));
+        }
+        return Ok(None);
+    }
 }
 fn delivery_window(
     db: &Connection,
@@ -148,7 +167,7 @@ fn delivery_window(
     Ok(db.query_row("SELECT ordinary_not_before,steering_target_turn,steering_session_id FROM input_deliveries WHERE id=?1", [&input.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)
 }
 pub fn next(db: &Connection, room: &str, agent: Option<&str>) -> Result<Option<Input>> {
-    let Some(input) = pending(db, room, agent)? else {
+    let Some(input) = pending(db, room, agent, true)? else {
         return Ok(None);
     };
     Ok((delivery_window(db, &input)?.0 <= now_ms()).then_some(input))
@@ -160,16 +179,19 @@ pub(crate) fn next_steering(
     target: &str,
     session: &str,
 ) -> Result<Option<Input>> {
-    let Some(input) = pending(db, room, Some(agent))? else {
+    let Some(input) = pending(db, room, Some(agent), false)? else {
         return Ok(None);
     };
+    if input.participation == "peer" {
+        return Ok(None);
+    }
     let (not_before, bound_target, bound_session) = delivery_window(db, &input)?;
     Ok((not_before <= now_ms()
         || (bound_target.as_deref() == Some(target) && bound_session.as_deref() == Some(session)))
     .then_some(input))
 }
 fn deferred_until(db: &Connection, room: &str) -> Result<Option<i64>> {
-    let Some(input) = pending(db, room, None)? else {
+    let Some(input) = pending(db, room, None, true)? else {
         return Ok(None);
     };
     let at = delivery_window(db, &input)?.0;
@@ -454,6 +476,13 @@ pub fn safe_history(state: &AppState, room: &str, agent: &str, trigger: i64) -> 
         .collect())
 }
 pub fn check_owner(state: &AppState, input: &Input) -> Result<()> {
+    if input.participation == "peer" {
+        ensure!(
+            crate::huddle_delivery::valid_input(&state.db.lock().unwrap(), &input.id)?,
+            "Peer source or original recipient changed"
+        );
+        return Ok(());
+    }
     ensure!(
         state.member(&input.room, &input.actor)?,
         "The source author is no longer a room member"
@@ -481,6 +510,11 @@ pub(crate) fn authorized_in(
     message_id: &str,
     actor: &str,
 ) -> Result<bool> {
+    if let Some((original, owner)) =
+        crate::huddle_delivery::original_authority(db, message_id, actor)?
+    {
+        return Ok(!original.is_empty() && authorized_in(state, db, &original, &owner)?);
+    }
     let row: Option<(Option<String>, Option<String>)> = db
         .query_row(
             "SELECT browser_hash,token_hash FROM input_authority WHERE message_id=?1",

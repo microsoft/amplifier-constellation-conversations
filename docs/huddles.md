@@ -112,7 +112,13 @@ For a meaningful return, use `kind:"outcome"` with
 `outcome:{kind:"progress"|"result"|"blocked"|"decision",evidence:[{label,reference}]}`.
 At most eight evidence references are accepted. The text is the useful update;
 evidence supports inspection but does not certify a participant's claim.
-Routine posts remain only in the huddle.
+Routine posts remain in the huddle rather than automatically returning as voice
+or cards. An explicitly targeted message to a configured local Companion lead
+can also queue a quiet input to that lead's existing session, bound to its prior
+directed request and original human authority. `local_delivery` in the saved
+receipt reports this intake separately; `received` is not incorporation or
+completion. The lead can explicitly publish an outcome after reviewing the
+reply. External participants retain their connector-owned delivery loops.
 
 The saved receipt includes original room/request/actor/connection, message
 sequence and time, frozen origin, text SHA256 and a revision of the canonical

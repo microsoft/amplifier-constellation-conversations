@@ -133,6 +133,22 @@ remain readable; a new call uses its own source-bound huddle rather than sending
 a new outcome to an old conversation. The server repeats this destination check
 in the post transaction alongside the current request's authority checks.
 
+An explicitly targeted peer reply can quietly continue the local lead's existing
+native session after its initial request turn finishes. The host requires a
+prior directed request, the original caller's retained authority, current room
+membership and the same call, endpoint and session. It stores the peer's actual
+post and author separately from the original human request; it creates no human
+message or new delegation. Broadcasts and membership alone do not schedule work.
+
+This continuation may inspect existing context and discuss the original request.
+It cannot create new huddles, start domain actions, change the whiteboard or end
+the call. Routine final text remains quiet; an explicit outcome uses the normal
+return path. A successfully incorporated human correction retains the ordinary
+human-authorized path; a queued, rejected or unknown correction grants nothing.
+Unknown delivery is never retried automatically. Later same-room human requests
+keep their own source records; a peer post without `source` does not establish
+which later message it answers.
+
 Installation setup is described in [Observable huddles](huddles.md). It does not
 schedule recurring coordination. Owners keep participant credentials in their
 self-contained installations; callers are not asked to manage those credentials.
