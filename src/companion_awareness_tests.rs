@@ -2644,7 +2644,7 @@ async fn requested_status_pairs_actual_presence_and_public_message_with_their_so
     presence["actor"] = json!("Jarvis");
     presence["provenance"] = json!({"kind":"minecraft_public_presence","authority":false});
     presence["text"] = json!(json!({"position":{"x":104.5,"y":64,"z":-112.3},"ready":true,"busy":false,"turn_active":false,
-        "players":[{"name":"Coach","position":{"x":105,"y":64,"z":-112},"distance_blocks":0.6},{"name":"Rook","position":null}],"players_omitted":0}).to_string());
+        "meaning":"Observed position and activity flags; not proof of current work or request fulfillment.","players":[{"name":"Coach","position":{"x":105,"y":64,"z":-112},"distance_blocks":0.6},{"name":"Rook","position":null}],"players_omitted":0}).to_string());
     let mut task = source_event();
     task["id"] = json!("selected-world-assignment");
     task["kind"] = json!("task_observation");
@@ -2661,7 +2661,13 @@ async fn requested_status_pairs_actual_presence_and_public_message_with_their_so
     message["actor"] = json!("Jarvis");
     message["occurred_at"] = json!(observed);
     message["text"] = json!("Automated Companion QA: hello from Constellation.");
-    fresh_result(&f, vec![task, message, presence]);
+    let mut canonical = fresh_result(&f, vec![task, message, presence]);
+    canonical["coverage"]["verified_completion_supported"] = json!(false);
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        canonical.to_string(),
+    )
+    .unwrap();
     let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
         .await
         .unwrap();
@@ -2690,6 +2696,7 @@ async fn requested_status_pairs_actual_presence_and_public_message_with_their_so
     assert!(physical.contains("presence snapshot observed"));
     assert!(physical.contains("(104.5, 64, -112.3)"));
     assert!(physical.contains("turn_active=false"));
+    assert!(physical.contains("not proof of current work or request fulfillment"));
     assert!(physical.contains("Coach: 0.6 blocks away"));
     assert!(physical.contains("Rook: position unobserved"));
     assert!(!physical.contains("assignment"));
@@ -2710,7 +2717,20 @@ async fn requested_status_pairs_actual_presence_and_public_message_with_their_so
         .join("\n");
     assert!(!all.contains("not proof of a recent action"));
     assert!(!all.contains("No action or independent verification was established"));
+    assert!(
+        commands[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("verified_completion_supported=false")
+    );
     assert_eq!(read.response["reports"], original_reports);
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &std::fs::read(f.home.path().join("observer-result.json")).unwrap()
+        )
+        .unwrap(),
+        canonical
+    );
     assert!(calls(&f, "decision").is_empty());
     assert!(calls(&f, "observer").len() == 1);
 }
@@ -3419,7 +3439,7 @@ async fn current_status_and_preserved_voice_context_exclude_history_without_reda
     presence["occurred_at"] = json!(observed);
     presence["provenance"] = json!({"kind":"minecraft_public_presence"});
     presence["text"] = json!(
-        json!({"position":{"x":10,"y":64,"z":-20},"ready":true,"busy":false,"turn_active":false})
+        json!({"position":{"x":10,"y":64,"z":-20},"ready":true,"busy":false,"turn_active":false,"meaning":"Observed position and activity flags; not proof of current work or request fulfillment."})
             .to_string()
     );
     let mut history = source_event();
@@ -3429,6 +3449,7 @@ async fn current_status_and_preserved_voice_context_exclude_history_without_reda
     private["audience"] = json!({"kind":"private","owner":"someone-else"});
     let mut source = fresh_result(&f, vec![history, private, task.clone(), presence.clone()]);
     source["coverage"]["omitted_events"] = json!(7);
+    source["coverage"]["verified_completion_supported"] = json!(false);
     std::fs::write(
         f.home.path().join("observer-result.json"),
         source.to_string(),
@@ -3463,6 +3484,8 @@ async fn current_status_and_preserved_voice_context_exclude_history_without_reda
     );
     assert_eq!(response["omitted"], 0);
     assert_eq!(response["coverage"]["omitted_events"], 7);
+    assert_eq!(response["coverage"]["verified_completion_supported"], false);
+    let original_response = response.clone();
     assert_eq!(response["presence"], json!({}));
     assert!(!response.to_string().contains("not-for-model"));
     assert!(!response.to_string().contains("Historical peer audit"));
@@ -3478,6 +3501,9 @@ async fn current_status_and_preserved_voice_context_exclude_history_without_reda
     assert!(text.contains(&format!("progress.at {old}")));
     assert!(text.contains("progress report about 4 hours old at read"));
     assert!(text.contains("1 report(s) excluded by selection"));
+    assert!(text.contains("not proof of current work or request fulfillment"));
+    assert!(text.contains("verified_completion_supported=false"));
+    assert_eq!(read.response, original_response);
     assert!(!text.contains("Historical peer audit"));
     assert_eq!(
         calls(&f, "observer"),
@@ -3770,4 +3796,137 @@ async fn empty_current_read_withdraws_only_unsent_same_source_qualifiers() {
     );
     assert!(calls(&f, "decision").is_empty());
     assert!(cards(&f).is_empty());
+}
+
+#[tokio::test]
+async fn requested_status_qualifications_survive_long_labels_and_player_lists() {
+    for view in [StatusView::Current, StatusView::Reports] {
+        let f = fixture();
+        rewrite_policy(&f, |v| {
+            v["agents"]["default"][0]["label"] = json!("Workshop".repeat(10))
+        });
+        let mut event = source_event();
+        event["id"] = json!("selected-presence");
+        event["revision"] = json!("original-presence-revision");
+        event["kind"] = json!("presence_observation");
+        event["actor"] = json!("Jarvis");
+        event["provenance"] = json!({"kind":"minecraft_public_presence","authority":false});
+        event["text"] = json!(json!({
+            "meaning":"Observed position and activity flags; not proof of current work or request fulfillment.",
+            "position":{"x":-313.16,"y":73,"z":68.52},
+            "ready":true,"busy":false,"turn_active":false,
+            "players":(0..10).map(|i| json!({"name":format!("{i}{}", "p".repeat(120)),"distance_blocks":2.5})).collect::<Vec<_>>(),
+            "players_omitted":999
+        }).to_string());
+        let mut source = fresh_result(&f, vec![event.clone()]);
+        source["coverage"]["verified_completion_supported"] = json!(false);
+        source["coverage"]["work_completion_supported"] = json!(false);
+        let canonical = source.to_string();
+        std::fs::write(f.home.path().join("observer-result.json"), &canonical).unwrap();
+        let read = super::connection_status(&f.s, &f.id, "minecraft", view)
+            .await
+            .unwrap();
+        let original = read.response.clone();
+        assert_eq!(original["reports"][0]["text"], event["text"]);
+        preserve_requested_status(&f.s, &f.id, &read).unwrap();
+        let _rx = quiet_browser(&f);
+        let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .unwrap();
+        let commands = batch["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(
+            commands
+                .iter()
+                .all(|c| c["content"].as_str().unwrap().len() <= 480)
+        );
+        let presence = commands[0]["content"].as_str().unwrap();
+        assert!(presence.contains("not proof of current work or request fulfillment"));
+        assert!(presence.contains("player detail(s) omitted"));
+        let coverage = commands[1]["content"].as_str().unwrap();
+        assert!(coverage.contains("verified_completion_supported=false"));
+        assert!(coverage.contains("work_completion_supported=false"));
+        assert_eq!(read.response, original);
+        assert_eq!(
+            std::fs::read_to_string(f.home.path().join("observer-result.json")).unwrap(),
+            canonical
+        );
+        let db = f.s.db.lock().unwrap();
+        let mut statement = db
+            .prepare("SELECT data FROM companion_awareness WHERE call_id=?1")
+            .unwrap();
+        let projected = statement
+            .query_map([&f.id], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(projected.len(), 2);
+        for data in projected {
+            let data: Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(data["provenance"]["report_id"], event["id"]);
+            assert_eq!(data["provenance"]["report_revision"], event["revision"]);
+            assert_eq!(data["occurred_at"], event["occurred_at"]);
+            assert_eq!(data["audience"], event["audience"]);
+            assert_eq!(data["actor"], event["actor"]);
+        }
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(statement);
+        drop(db);
+        assert!(calls(&f, "decision").is_empty());
+        assert_eq!(calls(&f, "observer").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn requested_status_completion_coverage_preserves_only_explicit_false() {
+    for value in [
+        None,
+        Some(Value::Null),
+        Some(json!(true)),
+        Some(json!(false)),
+        Some(json!("false")),
+    ] {
+        let f = fixture();
+        let mut source = fresh_result(&f, vec![source_event()]);
+        if let Some(value) = &value {
+            source["coverage"]["verified_completion_supported"] = value.clone();
+            source["coverage"]["work_completion_supported"] = value.clone();
+        }
+        std::fs::write(
+            f.home.path().join("observer-result.json"),
+            source.to_string(),
+        )
+        .unwrap();
+        let read = super::connection_status(&f.s, &f.id, "minecraft", StatusView::Reports)
+            .await
+            .unwrap();
+        let original = read.response.clone();
+        preserve_requested_status(&f.s, &f.id, &read).unwrap();
+        let _rx = quiet_browser(&f);
+        let batch = crate::companion_delivery::take_ready(&f.s, &f.id)
+            .unwrap()
+            .unwrap();
+        let commands = batch["commands"].as_array().unwrap();
+        let text = commands.last().unwrap()["content"].as_str().unwrap();
+        for key in ["verified_completion_supported", "work_completion_supported"] {
+            assert_eq!(
+                text.contains(&format!("{key}=false")),
+                value == Some(json!(false))
+            );
+            assert!(!text.contains(&format!("{key}=true")));
+        }
+        assert!(
+            !commands[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("not proof of current work or request fulfillment")
+        );
+        assert_eq!(read.response, original);
+        assert!(calls(&f, "decision").is_empty());
+    }
 }
