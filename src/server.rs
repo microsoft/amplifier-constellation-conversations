@@ -395,6 +395,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .post(context::issue_credential)
                 .delete(context::revoke_credential),
         )
+        .merge(crate::companion_tools::huddles::routes())
         .layer(DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), headers))
         .with_state(state)
