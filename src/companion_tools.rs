@@ -20,6 +20,9 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, process::Stdio, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "companion_huddle_tools.rs"]
+pub mod huddles;
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -107,6 +110,11 @@ struct NativeMcpPermission {
 }
 fn own_tool_shape_valid(tool: &str, args: &Value) -> bool {
     match tool {
+        "companion_huddles"
+        | "companion_huddle_ensure"
+        | "companion_huddle_read"
+        | "companion_huddle_post"
+        | "companion_huddle_status" => huddles::permission_shape_valid(tool, args),
         "companion_view"
         | "companion_capture"
         | "companion_surface_status"
@@ -237,8 +245,9 @@ pub fn permission_once(
         return deny("transport_unavailable");
     }
     let inactive = !matches!(state.as_str(), "connecting" | "connected");
-    let saved_receipt = raw.tool == "companion_surface_status"
-        && crate::companion_surface::terminal_status_shape_valid(&raw.arguments);
+    let saved_receipt = (raw.tool == "companion_surface_status"
+        && crate::companion_surface::terminal_status_shape_valid(&raw.arguments))
+        || raw.tool == "companion_huddle_status";
     if (inactive && !saved_receipt) || cfg.as_ref().is_none_or(|cfg| !cfg.enabled) {
         return deny(if inactive {
             "call_inactive"
@@ -248,6 +257,13 @@ pub fn permission_once(
     }
     let cfg = cfg.unwrap();
     let permitted = match raw.tool.as_str() {
+        "companion_huddles"
+        | "companion_huddle_ensure"
+        | "companion_huddle_read"
+        | "companion_huddle_post"
+        | "companion_huddle_status" => {
+            huddles::permission_valid(s, &call, actor, agent, room, &raw.tool, &raw.arguments)?
+        }
         "companion_view"
         | "companion_capture"
         | "companion_surface_status"
@@ -388,13 +404,18 @@ pub async fn mcp(
         let allowed = match value["method"].as_str() {
             Some("initialize" | "notifications/initialized" | "tools/list" | "ping") => true,
             Some("tools/call") => {
-                value["params"]["name"] == "companion_surface_status"
+                (value["params"]["name"] == "companion_surface_status"
                     && crate::companion_surface::terminal_status_shape_valid(
                         &value["params"]
                             .get("arguments")
                             .cloned()
                             .unwrap_or_else(|| json!({})),
-                    )
+                    ))
+                    || (value["params"]["name"] == "companion_huddle_status"
+                        && huddles::permission_shape_valid(
+                            "companion_huddle_status",
+                            &value["params"]["arguments"],
+                        ))
             }
             _ => false,
         };
@@ -456,13 +477,18 @@ pub(crate) fn read_catalog(s: &AppState, id: &str) -> Result<Option<Value>> {
         return Ok(None);
     }
     let sources = crate::companion_awareness::status_sources(s, id)?;
-    if sources.is_empty() {
+    let coordination = huddles::catalog(s, id)?;
+    if sources.is_empty() && coordination.is_none() {
         return Ok(None);
     }
-    Ok(Some(json!({
+    let mut catalog = json!({
         "observed_at":now_ms(),
         "observation_sources":sources
-    })))
+    });
+    if let Some(coordination) = coordination {
+        catalog["huddles"] = coordination;
+    }
+    Ok(Some(catalog))
 }
 
 pub async fn connections(
