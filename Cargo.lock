@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "agent-conversations"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "amplifier-acp-connection",
  "anyhow",
