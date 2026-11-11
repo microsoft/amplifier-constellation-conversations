@@ -909,20 +909,19 @@ helper flags. Exclusion does not prove that history is absent; missing facts do
 not prove inactivity. Omitted `view` (or `"reports"`) preserves the existing
 current-plus-history response.
 
-Before returning that explicit read, the host also queues a bounded set of source
-qualifiers directly as thinking context. Up to four whole report facts preserve
-original report time and observation time; current assignment snapshots also keep
-`progress.at` separate from assignment status. A coverage note states omissions
-and that missing reports do not establish inactivity or independent verification.
-Only the selected report set can supply those qualifiers, so a current-only read
-cannot reintroduce historical chat through this separate context path. A successful
-empty current-only read also withdraws only that source’s still-unsent qualifier
-batch; already dispatched context, source receipts, and unrelated results remain.
-This protects the original qualifications if a reasoning model omits them while
-summarizing. The same private caller, configured source, audience and current
-policy are revalidated before delivery, and the normal conversational floor still
-applies. These facts grant no speech or action authority, invoke no decision model,
-and never convert a queued input or running assignment into completed work.
+The full qualified result returns to the backend that requested the read and stays
+in its canonical tool history. Polling does not create a second Live context or
+speech stream. The ordinary backend answer and independently source-bound action
+outcomes remain separate presentation paths. Historical qualifier records and
+already queued or uncertain batches are preserved; new reads do not replay or
+rewrite them. Private caller, source and policy checks still apply after each
+in-flight read, including failed or empty reads.
+
+Pure input queue/admission bookkeeping stays in its original receipt and card,
+without an unsolicited Live update. Meaningful source replies, recorded blockers,
+interruptions, unknown outcomes, task authority and resumption facts retain their
+existing qualifications. Turn scope and ordinary handling-ended bookkeeping are
+not standalone progress or completion announcements.
 
 ### Coherent speech and bounded presentation
 

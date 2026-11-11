@@ -494,6 +494,45 @@ fn requested_outcome_bound(
     )
 }
 
+/// Only known queue/admission bookkeeping can be retained without a Live
+/// update. Uncertainty, blockers, source replies and authority facts are not it.
+fn input_bookkeeping_only(update: &Value) -> bool {
+    update["scope"] == "conversation"
+        && update["provenance"]["kind"] == "minecraft_input_outcome"
+        && update["provenance"]["version"] == 1
+        && matches!(
+            update["delivery_state"].as_str(),
+            Some("queued" | "admitted")
+        )
+        && update["conversation"]["blocked_reason"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        && [
+            "responses",
+            "source_replies",
+            "task_authorizations",
+            "work_resumptions",
+        ]
+        .iter()
+        .all(|key| update[*key].as_array().is_none_or(Vec::is_empty))
+        && [
+            "responses_omitted",
+            "source_replies_omitted",
+            "private_responses_withheld",
+            "work_resumptions_omitted",
+        ]
+        .iter()
+        .all(|key| update[*key].as_u64().unwrap_or(0) == 0)
+        && [
+            "domain_responses_omitted",
+            "domain_source_replies_omitted",
+            "domain_private_responses_withheld",
+            "domain_work_resumptions_omitted",
+        ]
+        .iter()
+        .all(|key| update[*key] != true)
+}
+
 fn preserve_requested_outcome(
     s: &AppState,
     destination: &str,
@@ -524,7 +563,13 @@ fn preserve_requested_outcome(
     if !live || !requested_outcome_bound(&tx, destination, source, &event)? {
         return Ok(false);
     }
-    let changed = tx.execute("UPDATE companion_awareness SET state='ready',decision=?3 WHERE call_id=?1 AND event_key=?2 AND state='observed'",params![destination,key,json!({"status":"not_requested","reason":"bound_requested_outcome"}).to_string()])? == 1;
+    let bookkeeping = input_bookkeeping_only(update);
+    let decision = if bookkeeping {
+        json!({"status":"retained","reason":"input_delivery_bookkeeping"})
+    } else {
+        json!({"status":"not_requested","reason":"bound_requested_outcome"})
+    };
+    let changed = tx.execute("UPDATE companion_awareness SET state=?3,decision=?4 WHERE call_id=?1 AND event_key=?2 AND state='observed'",params![destination,key,if bookkeeping {"observed"} else {"ready"},decision.to_string()])? == 1;
     if changed {
         // Keep the full attributed receipt visible in call history even though
         // optional ambient judgment and proactive speech are not requested.
@@ -971,11 +1016,31 @@ fn requested_reply_presentation(
             event["id"].as_str().and_then(|id|id.strip_prefix("action:")), event["revision"].as_str()],
         |row| row.get(0),
     ).optional()?;
-    let mapped = update
+    let update = update
         .map(|raw| serde_json::from_str::<Value>(&raw))
-        .transpose()?
-        .map(|update| private_reply_parts(source, event, &update))
+        .transpose()?;
+    if update.as_ref().is_some_and(input_bookkeeping_only) {
+        return Ok(vec![]);
+    }
+    let mapped = update
+        .as_ref()
+        .map(|update| private_reply_parts(source, event, update))
         .unwrap_or_default();
+    let parts = if let Some(update) = &update {
+        let full = context_parts(source, event, "");
+        let mut presented = event.clone();
+        presented["text"] = json!(observation_text_for_presentation(
+            &source.label,
+            update,
+            true
+        ));
+        context_parts(source, &presented, "")
+            .into_iter()
+            .filter(|part| !full.contains(part) || parts.contains(part))
+            .collect()
+    } else {
+        parts
+    };
     for part in parts {
         if let Some((_, body, facts)) = mapped.iter().find(|(original, _, _)| *original == part) {
             thinking.push(("thinking", facts.clone()));
@@ -1340,13 +1405,6 @@ pub(crate) fn status_sources(s: &AppState, id: &str) -> Result<Vec<Value>> {
         .collect())
 }
 
-/// The binding stays inside the host; it is not helper-provided metadata or an
-/// extra wire capability. Tool authorization is checked again before presentation.
-pub(crate) struct ConnectionStatusRead {
-    pub(crate) response: Value,
-    binding: Option<StatusReadBinding>,
-}
-
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StatusView {
@@ -1354,15 +1412,6 @@ pub(crate) enum StatusView {
     Reports,
     Current,
 }
-struct StatusReadBinding {
-    call_id: String,
-    source: Source,
-    policy: String,
-    owner: String,
-    agent: String,
-    room: String,
-}
-
 /// Fresh bounded read through one already-configured observation helper. Never
 /// run a decision/action helper, advance background cursors, or present context.
 pub(crate) async fn connection_status(
@@ -1370,11 +1419,8 @@ pub(crate) async fn connection_status(
     id: &str,
     connection: &str,
     view: StatusView,
-) -> Result<ConnectionStatusRead> {
-    let empty = |status: &str| ConnectionStatusRead {
-        response: json!({"connection_id":connection,"status":status,"reports":[],"presence":{},"coverage":{"bounded":true,"gap":true},"queried_at":now_ms(),"read_only":true,"authority":false,"note":"This read established no current facts. Missing reports do not establish inactivity; no action was submitted."}),
-        binding: None,
-    };
+) -> Result<Value> {
+    let empty = |status: &str| json!({"connection_id":connection,"status":status,"reports":[],"presence":{},"coverage":{"bounded":true,"gap":true},"queried_at":now_ms(),"read_only":true,"authority":false,"note":"This read established no current facts. Missing reports do not establish inactivity; no action was submitted."});
     let Some((owner, agent, room, _)) = active(s, id)? else {
         anyhow::bail!("Active private call required")
     };
@@ -1512,319 +1558,7 @@ pub(crate) async fn connection_status(
             "Fresh typed snapshots only; progress keeps its original time. Excluded reports remain available in the reports view. Missing current facts mean unknown, not inactivity."
         );
     }
-    Ok(ConnectionStatusRead {
-        response,
-        binding: Some(StatusReadBinding {
-            call_id: id.to_owned(),
-            source: source.clone(),
-            policy: fingerprint,
-            owner,
-            agent,
-            room,
-        }),
-    })
-}
-
-/// Preserve essential source qualifications independently of the reasoning
-/// model's summary. A requested read is context, never a request to speak or act.
-pub(crate) fn preserve_requested_status(
-    s: &AppState,
-    id: &str,
-    read: &ConnectionStatusRead,
-) -> Result<()> {
-    let Some(binding) = &read.binding else {
-        return Ok(());
-    };
-    ensure!(
-        binding.call_id == id
-            && active(s, id)?.is_some_and(|(owner, agent, room, _)| {
-                owner == binding.owner && agent == binding.agent && room == binding.room
-            })
-            && config(s)?.is_some_and(|(_, policy)| policy == binding.policy),
-        "Requested observation access changed"
-    );
-    let reports = read.response["reports"].as_array().unwrap();
-    if reports.is_empty() {
-        if read.response["selection"]["view"] == "current" {
-            // Withdraw only this source's unsent qualifiers; never erase delivered
-            // context or fabricate a source observation for an empty selection.
-            crate::companion_delivery::supersede_pending(
-                s,
-                id,
-                &format!("requested-status:{}", binding.source.id),
-            )?;
-        }
-        return Ok(());
-    }
-    let source = &binding.source;
-    let mut selected: Vec<_> = reports.iter().collect();
-    // Physical presence and assignment state are separate current facts. Keep
-    // both ahead of historical chat without refreshing a progress report.
-    selected.sort_by_key(
-        |report| match report["attribution"]["snapshot_kind"].as_str() {
-            Some("presence") => 0,
-            Some("assignment") => 1,
-            _ => 2,
-        },
-    );
-    let mut facts = Vec::new();
-    for report in selected {
-        if facts.len() == 4 {
-            break;
-        }
-        let Some(text) = requested_report_qualifier(source, report, &read.response) else {
-            continue;
-        };
-        if text.len() <= 480 {
-            facts.push((report, text, false));
-        }
-    }
-    let omitted = reports.len() - facts.len();
-    let mut coverage = if read.response["selection"]["view"] == "current" {
-        format!(
-            "{}: current read {}; source observation {}. {} report(s) excluded by selection; {} selected report(s) omitted here and {} by the response bound. Source coverage is bounded; missing current facts mean unknown.",
-            source.label,
-            read.response["queried_at"],
-            read.response["source_observed_at"].as_str().unwrap(),
-            read.response["selection"]["excluded_reports"],
-            omitted,
-            read.response["omitted"],
-        )
-    } else {
-        format!(
-            "{}: status read at {}; source observation {}. The timestamped facts above are source observations. History is bounded/incomplete; missing reports do not prove inactivity. {} whole report(s) and {} source report(s) omitted here. This read changes no work authority.",
-            source.label,
-            read.response["queried_at"],
-            read.response["source_observed_at"].as_str().unwrap(),
-            omitted,
-            read.response["omitted"],
-        )
-    };
-    // These are source capability limits, not evidence that an action failed
-    // or never happened. Missing/null/true values establish no such limit.
-    let unsupported: Vec<_> = ["verified_completion_supported", "work_completion_supported"]
-        .iter()
-        .filter(|key| read.response["coverage"][**key].as_bool() == Some(false))
-        .map(|key| format!("{key}=false"))
-        .collect();
-    if !unsupported.is_empty() {
-        coverage.push_str(&format!(" Source coverage: {}.", unsupported.join("; ")));
-    }
-    // The bounded note is mandatory: never silently cut a timestamp or qualifier.
-    ensure!(
-        coverage.len() <= 480,
-        "Requested status qualifications exceed context bound"
-    );
-    facts.push((&reports[0], coverage, true));
-    let mut commands = Vec::new();
-    for (report, content, summary) in facts {
-        let event_id = format!(
-            "requested-status:{}",
-            auth::digest(&json!([source.id, report["id"], summary]).to_string())
-        );
-        let revision = auth::digest(
-            &json!([
-                report,
-                read.response["queried_at"],
-                read.response["source_observed_at"],
-                content
-            ])
-            .to_string(),
-        );
-        // Retain the exact authorized audience and source-time association. The
-        // application constructs these fields from the filtered read, not from
-        // arbitrary helper provenance or the backend's eventual prose.
-        let event = json!({
-            "id":event_id,"revision":revision,"kind":"requested_status_qualifier",
-            "text":content,"occurred_at":report["attribution"]["occurred_at"],
-            "observed_at":read.response["source_observed_at"],
-            "actor":report["attribution"]["actor"],"audience":report["attribution"]["audience"],
-            "provenance":{"kind":"companion_requested_connection_status","read_only":true,
-                "report_id":report["id"],"report_revision":report["revision"],
-                "attribution":report["attribution"],"queried_at":read.response["queried_at"],
-                "coverage_note":summary,"authority":false}
-        });
-        ensure!(
-            event_valid(&event) && source.audiences.contains(&event["audience"]),
-            "Invalid requested status qualification"
-        );
-        record_source_event(s, id, source, &event, &binding.policy, false)?;
-        let key = event_key(&source.id, &event);
-        let append_id = format!("awareness-{key}");
-        {
-            let db = s.db.lock().unwrap();
-            db.execute("INSERT OR IGNORE INTO companion_awareness_appends VALUES(?1,?2,?3,'thinking','queued')", params![id,key,append_id])?;
-            db.execute("UPDATE companion_awareness SET state='context_queued',append_channel='thinking' WHERE call_id=?1 AND event_key=?2 AND state='observed'",params![id,key])?;
-        }
-        commands.push(json!({"op":"append","channel":"thinking","event_id":append_id,"delegation_id":null,"content":content}));
-    }
-    // Later reads replace only an unsent qualifier batch for this same source.
-    // Independent backend answers and action outcomes keep their own identities.
-    crate::companion_delivery::enqueue_batch(
-        s,
-        id,
-        &format!("requested-status:{}", source.id),
-        commands,
-    )?;
-    Ok(())
-}
-
-// Age is a deterministic qualification of the original source time at this read,
-// not a new observation. Keep exact timestamps beside the human-readable form.
-fn source_age_at_read(timestamp: &Value, read_at: &Value) -> String {
-    let source_at = observed_time(timestamp).or_else(|| {
-        timestamp.as_i64().filter(|at| {
-            *at > 0
-                && time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(*at) * 1_000_000)
-                    .is_ok()
-        })
-    });
-    let Some((source_at, read_at)) = source_at.zip(read_at.as_i64().filter(|at| *at > 0)) else {
-        return "age unknown at read".into();
-    };
-    let Some(age) = read_at.checked_sub(source_at).filter(|age| *age >= 0) else {
-        return "future-dated relative to this read; age unknown".into();
-    };
-    let (amount, unit) = if age >= 86_400_000 {
-        (age / 86_400_000, "day")
-    } else if age >= 3_600_000 {
-        (age / 3_600_000, "hour")
-    } else if age >= 60_000 {
-        (age / 60_000, "minute")
-    } else {
-        return "less than a minute old at read".into();
-    };
-    format!(
-        "about {amount} {unit}{} old at read",
-        if amount == 1 { "" } else { "s" }
-    )
-}
-
-fn requested_report_qualifier(source: &Source, report: &Value, response: &Value) -> Option<String> {
-    let attribution = &report["attribution"];
-    let actor = attribution["actor"].as_str().unwrap_or("source");
-    let occurred = attribution["occurred_at"].as_str().unwrap();
-    let observed = attribution["observed_at"]
-        .as_str()
-        .unwrap_or_else(|| response["source_observed_at"].as_str().unwrap());
-    if attribution["snapshot_kind"] == "presence"
-        && let Ok(presence) = serde_json::from_str::<Value>(report["text"].as_str().unwrap())
-    {
-        let position = &presence["position"];
-        let position = if ["x", "y", "z"].iter().all(|key| {
-            position[*key]
-                .as_f64()
-                .is_some_and(|n| n.is_finite() && n.abs() <= 30_000_000.0)
-        }) {
-            format!("({}, {}, {})", position["x"], position["y"], position["z"])
-        } else {
-            "not reported".into()
-        };
-        let flags: Vec<_> = ["ready", "busy", "turn_active"]
-            .iter()
-            .filter_map(|key| {
-                presence[*key]
-                    .as_bool()
-                    .map(|value| format!("{key}={value}"))
-            })
-            .collect();
-        let age = source_age_at_read(&attribution["occurred_at"], &response["queried_at"]);
-        let mut text = format!(
-            "{} / {actor}: presence snapshot observed {occurred} ({age}); read at {observed}; position {position}; {}.",
-            source.label,
-            flags.join(", ")
-        );
-        // Preserve the typed source's observation scope before allocating any
-        // optional player detail. Position/activity does not settle a request.
-        text.push_str(
-            " Observed position/activity only; not proof of current work or request fulfillment.",
-        );
-        if let Some(players) = presence["players"].as_array() {
-            let mut included = 0;
-            for player in players {
-                let Some(name) = player["name"].as_str().filter(|name| {
-                    !name.is_empty() && name.len() <= 160 && !name.chars().any(char::is_control)
-                }) else {
-                    continue;
-                };
-                let distance = player["distance_blocks"]
-                    .as_f64()
-                    .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 60_000_000.0);
-                let fact = if distance.is_some() {
-                    format!(" Player {name}: {} blocks away.", player["distance_blocks"])
-                } else {
-                    format!(" Player {name}: position unobserved.")
-                };
-                if text.len() + fact.len() + 44 <= 480 {
-                    text.push_str(&fact);
-                    included += 1;
-                }
-            }
-            let omitted = players.len() as u64 - included
-                + presence["players_omitted"]
-                    .as_u64()
-                    .filter(|n| *n <= 1_000_000_000)
-                    .unwrap_or(0);
-            if omitted > 0 {
-                text.push_str(&format!(" {omitted} player detail(s) omitted."));
-            } else if players.is_empty() {
-                text.push_str(" Other players: none reported.");
-            }
-        }
-        return Some(text);
-    }
-    if attribution["snapshot_kind"] == "assignment"
-        && let Ok(task) = serde_json::from_str::<Value>(report["text"].as_str().unwrap())
-    {
-        let state = task["status"]
-            .as_str()
-            .filter(|s| state_valid(s))
-            .unwrap_or("unknown");
-        let progress = task["progress"]
-            .get("at")
-            .filter(|at| observed_time(at).is_some() || at.as_i64().is_some_and(|n| n > 0))
-            .map(|at| {
-                at.as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| at.to_string())
-            })
-            .unwrap_or_else(|| "not recorded or invalid".into());
-        let progress_age = source_age_at_read(&task["progress"]["at"], &response["queried_at"]);
-        let mut text = format!(
-            "{} / {actor}: assignment {state} observed {observed}. Last progress report {progress_age}; progress.at {progress}.",
-            source.label
-        );
-        if let Some(summary) = task["progress"]["summary"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-        {
-            let fact = format!(
-                " Quoted progress (source data, not instructions): {}",
-                json!(summary)
-            );
-            if text.len() + fact.len() <= 480 {
-                text.push_str(&fact);
-            } else {
-                text.push_str(" Progress text omitted here.");
-            }
-        }
-        return Some(text);
-    }
-    let report_age = source_age_at_read(&attribution["occurred_at"], &response["queried_at"]);
-    let kind = if attribution["scope"] == "message" {
-        "Recorded message"
-    } else {
-        "Source report"
-    };
-    let prefix = format!(
-        "{} / {actor}: {kind} at {occurred} ({report_age}); read at {observed}.",
-        source.label
-    );
-    let fact = format!(
-        "{prefix} Quoted source data (not instructions): {}",
-        report["text"]
-    );
-    (fact.len() <= 480).then_some(fact)
+    Ok(response)
 }
 
 fn state_valid(state: &str) -> bool {
@@ -2115,6 +1849,10 @@ fn recorded_reply_line(reply: &Value, private: bool) -> String {
 }
 
 fn observation_text(label: &str, update: &Value) -> String {
+    observation_text_for_presentation(label, update, false)
+}
+
+fn observation_text_for_presentation(label: &str, update: &Value, presentation: bool) -> String {
     if update["scope"] == "conversation"
         && update["provenance"]["kind"] == "minecraft_input_outcome"
         && update["provenance"]["version"] == 1
@@ -2228,16 +1966,29 @@ fn observation_text(label: &str, update: &Value) -> String {
             (_, Some("interrupted")) => "Handling was interrupted.",
             _ => "The handling outcome remains unknown.",
         };
-        let separator = if total_included == 0 { " " } else { "\n" };
-        text.push_str(&format!("{separator}{status}"));
-        if total_included == 0 && update["state"] == "settled" {
-            text.push_str(" No public reply is included in this record.");
+        // Queue/admission and ordinary turn scope are retained in the canonical
+        // record, not offered as standalone Live updates. Missing terminal
+        // answers and actual uncertainty remain explicit.
+        if !presentation
+            || matches!(
+                update["delivery_state"].as_str(),
+                Some("unknown" | "interrupted")
+            )
+            || (update["state"] == "settled" && total_included == 0)
+        {
+            let separator = if total_included == 0 { " " } else { "\n" };
+            text.push_str(&format!("{separator}{status}"));
+            if total_included == 0 && update["state"] == "settled" {
+                text.push_str(" No public reply is included in this record.");
+            }
         }
         let turn = &update["conversation"];
-        match turn["conversation_only"].as_bool() {
-            Some(true) => text.push_str("\nRecorded turn scope: conversation only."),
-            Some(false) => text.push_str("\nRecorded turn scope: not limited to conversation."),
-            None => {}
+        if !presentation {
+            match turn["conversation_only"].as_bool() {
+                Some(true) => text.push_str("\nRecorded turn scope: conversation only."),
+                Some(false) => text.push_str("\nRecorded turn scope: not limited to conversation."),
+                None => {}
+            }
         }
         if let Some(reason) = turn["blocked_reason"]
             .as_str()
@@ -2293,6 +2044,12 @@ fn observation_text(label: &str, update: &Value) -> String {
                 text.push_str("\nUnrelated private game response content was withheld; it is not evidence available to this call.");
             } else {
                 text.push_str("\nPrivate response content was withheld; it is not evidence available to this call.");
+            }
+        }
+        if presentation {
+            let prefix = format!("{label}:\n");
+            if let Some(rest) = text.strip_prefix(&prefix) {
+                text = format!("{label}: {rest}");
             }
         }
         return text;
@@ -2906,6 +2663,10 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
                 .map(|part| (if speak { "commentary" } else { "thinking" }, part))
                 .collect()
         };
+        if presentation.is_empty() {
+            s.db.lock().unwrap().execute("UPDATE companion_awareness SET state='observed',decision=?3 WHERE call_id=?1 AND event_key=?2 AND state='ready'",params![id,key,json!({"status":"retained","reason":"input_delivery_bookkeeping"}).to_string()])?;
+            return Ok(());
+        }
         let channel = if presentation
             .iter()
             .all(|(channel, _)| *channel == "thinking")

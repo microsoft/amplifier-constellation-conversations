@@ -649,10 +649,9 @@ pub async fn connection_status(
         crate::companion_awareness::connection_status(&s, &id, &query.connection_id, query.view)
             .await?;
     authorize(&s, &id, &h)?;
-    // Preserve original source qualifiers before a backend can paraphrase them.
-    // This queues context only; the ordinary floor and policy checks still apply.
-    crate::companion_awareness::preserve_requested_status(&s, &id, &read)?;
-    Ok(Json(read.response))
+    // This qualified tool result belongs to the backend that requested it.
+    // Polling is not a second, unsolicited Live presentation stream.
+    Ok(Json(read))
 }
 
 #[derive(Deserialize)]
