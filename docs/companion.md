@@ -757,6 +757,16 @@ call can continue that lookup after revalidating owner, agent, endpoint, observe
 policy and original audience. No new action, model call or retry is performed by
 this observer. Older actions without the binding are not retroactively adopted.
 
+Minecraft outcomes may include optional `work_resumptions` from the original
+request: task ID, recorded status, `scheduled`, and `execution_started`. Companion
+retains those exact bounded facts through the existing caller/source binding.
+Scheduling is not execution, a saved start is not completion, and neither is a
+fresh activity check. Missing or omitted evidence stays unknown. Empty additive
+evidence does not reannounce an unchanged reply; real changes use the existing
+semantic revision and polling deduplication. Whole-record omissions are explicit,
+and the original source retains the full record. Reading this evidence never
+resumes, renews, or replays work.
+
 Native permissions outside the narrowly validated Companion tool policy appear
 as single-request choices on the call screen. They are still actor- and
 conversation-bound; the voice model does not approve arbitrary native tools.

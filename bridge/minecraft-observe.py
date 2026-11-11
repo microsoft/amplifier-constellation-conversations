@@ -389,6 +389,17 @@ def validate_outcome(row):
                 or len(response["text"].encode()) > 4000):
             raise ValueError("invalid_outcome_response")
         response_ids.add(response["id"])
+    if "work_resumptions" in row:
+        resumptions = row["work_resumptions"]
+        if (not isinstance(resumptions, list) or len(resumptions) > 16
+                or any(not isinstance(item, dict)
+                       or set(item) != {"task_id", "recorded_status", "scheduled", "execution_started"}
+                       or not valid_id(item["task_id"]) or not valid_id(item["recorded_status"])
+                       or type(item["scheduled"]) is not bool or type(item["execution_started"]) is not bool
+                       for item in resumptions)):
+            raise ValueError("invalid_work_resumptions")
+    if "work_resumptions_omitted" in row and type(row["work_resumptions_omitted"]) is not bool:
+        raise ValueError("invalid_work_resumption_coverage")
     for authorization in row["task_authorizations"]:
         if (not isinstance(authorization, dict) or authorization.get("operation") not in ["accept", "amend"]
                 or not valid_id(authorization.get("task_id")) or type(authorization.get("authority_revision")) is not int
@@ -444,7 +455,24 @@ def outcome_observation(action, connection, observed_at, outcomes, availability)
     if row.get("reason") == "not_retained_or_not_authorized":
         return action_observation(action, connection, observed_at, scope="conversation", fulfillment="not_established",
                                   reason="source_outcome_not_retained_or_not_authorized", receipt={"request_id": queued})
-    responses, response_bytes, omitted = [], 0, 0
+    # Keep scheduling facts ahead of potentially long replies, sharing the
+    # existing projection budget. Empty/no-omission evidence normalizes to
+    # absence so adding optional support cannot repeat an unchanged reply.
+    # Neither case asserts that no resumption happened.
+    resumption_evidence, resumption_bytes = {}, 0
+    if row.get("work_resumptions"):
+        resumptions, resumption_omitted = [], 0
+        for item in row["work_resumptions"]:
+            size = len(encoded(item))
+            if resumption_bytes + size > 4000:
+                resumption_omitted += 1
+                continue
+            resumptions.append(dict(item))
+            resumption_bytes += size
+        resumption_evidence.update(work_resumptions=resumptions, work_resumptions_omitted=resumption_omitted)
+    if row.get("work_resumptions_omitted") is True:
+        resumption_evidence["domain_work_resumptions_omitted"] = True
+    responses, response_bytes, omitted = [], resumption_bytes, 0
     private_count = 0
     for response in row["responses"]:
         if response["audience"] == "private":
@@ -464,6 +492,7 @@ def outcome_observation(action, connection, observed_at, outcomes, availability)
     # Domain omissions are booleans, not counts. Keep them separate from the
     # records this observer itself withheld and never invent a retained total.
     domain_evidence = {"domain_" + flag: row[flag] for flag in ["private_responses_withheld", "responses_omitted"] if flag in row}
+    domain_evidence.update(resumption_evidence)
     if "source_ids" in row:
         domain_evidence["source_ids"] = row["source_ids"]
     if is_scoped(action):

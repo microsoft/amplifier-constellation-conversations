@@ -1,0 +1,79 @@
+{
+  "producer": {
+    "commit": "d9ebc8144be137ba65f841962061c65786d5a3f8",
+    "file": "input-outcomes.cjs",
+    "sha256": "22e074553672fd5917b48e3e0d7a3ff73daa0b244847bba1c59669f72461643e",
+    "method": "actual exported query with disposable synthetic state; no server/model/effects"
+  },
+  "input": {
+    "input_outcomes": [
+      {
+        "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+        "delivery": "terminal",
+        "admitted_at": "2026-11-11T05:39:04.411Z",
+        "terminal_at": "2026-11-11T05:39:04.434Z",
+        "conversation_only": true,
+        "turn_task_id": null,
+        "blocked_reason": null,
+        "responses": [],
+        "task_authorizations": [],
+        "work_resumptions": [],
+        "completion": "not_established"
+      }
+    ],
+    "work_resumptions": [
+      {
+        "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+        "source": {
+          "id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7"
+        },
+        "task_id": "10000000-0000-4000-8000-000000000001",
+        "result": {
+          "task_id": "10000000-0000-4000-8000-000000000001",
+          "status": "running",
+          "scheduled": true,
+          "execution_started": false
+        }
+      },
+      {
+        "request_id": "another-source",
+        "source": {
+          "id": "another-source"
+        },
+        "task_id": "unrelated-private-task",
+        "result": {
+          "task_id": "unrelated-private-task",
+          "status": "running",
+          "scheduled": true,
+          "execution_started": true
+        }
+      }
+    ]
+  },
+  "response": {
+    "version": 1,
+    "observed_at": "2026-11-11T05:40:00.000Z",
+    "outcomes": [
+      {
+        "request_id": "06a694bb-9b31-4ab7-9497-f1b494f81ff7",
+        "delivery": "terminal",
+        "admitted_at": "2026-11-11T05:39:04.411Z",
+        "terminal_at": "2026-11-11T05:39:04.434Z",
+        "conversation_only": true,
+        "turn_task_id": null,
+        "blocked_reason": null,
+        "responses": [],
+        "task_authorizations": [],
+        "work_resumptions": [
+          {
+            "task_id": "10000000-0000-4000-8000-000000000001",
+            "recorded_status": "running",
+            "scheduled": true,
+            "execution_started": false
+          }
+        ],
+        "completion": "not_established"
+      }
+    ]
+  }
+}

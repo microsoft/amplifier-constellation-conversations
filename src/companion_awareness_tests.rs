@@ -4269,3 +4269,179 @@ async fn requested_status_completion_coverage_preserves_only_explicit_false() {
         assert!(calls(&f, "decision").is_empty());
     }
 }
+
+fn work_resumption_fixture() -> (Value, Value) {
+    let (action, mut update) = private_source_reply_fixture();
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../bridge/test/fixtures/minecraft-work-resumption.json"
+    ))
+    .unwrap();
+    update["work_resumptions"] = fixture["response"]["outcomes"][0]["work_resumptions"].clone();
+    update["work_resumptions_omitted"] = json!(0);
+    (action, update)
+}
+
+#[test]
+fn work_resumptions_preserve_recorded_scheduling_without_claiming_execution() {
+    let (action, mut update) = work_resumption_fixture();
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    let text = observation_text("Workshop", &update);
+    assert!(text.contains("scheduled"));
+    assert!(text.contains("execution had not started in that record"));
+    assert!(text.contains(update["work_resumptions"][0]["task_id"].as_str().unwrap()));
+    assert!(!text.contains("work completed"));
+    update["work_resumptions"][0]["execution_started"] = json!(true);
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    let text = observation_text("Workshop", &update);
+    assert!(text.contains("execution start was recorded"));
+    assert!(!text.contains("resumed execution is not established"));
+    assert!(text.contains("completion is not established"));
+    assert_eq!(update["verified"], false);
+}
+
+#[test]
+fn work_resumptions_reject_malformed_and_non_outcome_projections() {
+    let (action, update) = work_resumption_fixture();
+    for bad in [
+        Value::Null,
+        json!({}),
+        json!(true),
+        json!(vec![update["work_resumptions"][0].clone(); 17]),
+    ] {
+        let mut next = update.clone();
+        next["work_resumptions"] = bad;
+        assert!(!observation_valid(&next, std::slice::from_ref(&action)));
+    }
+    for (key, value) in [
+        ("task_id", Value::Null),
+        ("task_id", json!("")),
+        ("recorded_status", json!("x".repeat(161))),
+        ("scheduled", json!(1)),
+        ("execution_started", Value::Null),
+        ("execution_started", json!(0)),
+        ("extra", json!("unexpected")),
+    ] {
+        let mut next = update.clone();
+        next["work_resumptions"][0][key] = value;
+        assert!(
+            !observation_valid(&next, std::slice::from_ref(&action)),
+            "{key}"
+        );
+    }
+    for (key, value) in [
+        ("domain_work_resumptions_omitted", json!(1)),
+        ("work_resumptions_omitted", json!(true)),
+    ] {
+        let mut next = update.clone();
+        next[key] = value;
+        assert!(
+            !observation_valid(&next, std::slice::from_ref(&action)),
+            "{key}"
+        );
+    }
+    let mut unscoped = outcome_update("unknown", "unknown", Value::Null);
+    unscoped["provenance"]["kind"] = json!("minecraft_observation");
+    unscoped["work_resumptions"] = update["work_resumptions"].clone();
+    assert!(!observation_valid(
+        &unscoped,
+        &[json!({"request_id":"original-call-request"})]
+    ));
+    for key in ["call_id", "revision", "actor", "audience", "caller"] {
+        let mut next = update.clone();
+        next["installation_source"][key] = json!("another");
+        assert!(
+            !observation_valid(&next, std::slice::from_ref(&action)),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn work_resumptions_optional_unknown_and_whole_omission_remain_truthful() {
+    let (action, original) = private_source_reply_fixture();
+    assert!(observation_valid(&original, std::slice::from_ref(&action)));
+    assert!(!observation_text("Workshop", &original).contains("Recorded resumption"));
+    let mut update = outcome_update("unknown", "unknown", Value::Null);
+    update["domain_work_resumptions_omitted"] = json!(true);
+    assert!(observation_valid(
+        &update,
+        &[json!({"request_id":"original-call-request"})]
+    ));
+    let text = observation_text("Workshop", &update);
+    assert!(text.contains("resumption evidence is incomplete"));
+    assert!(text.contains("outcome remains unknown"));
+    assert!(!text.contains("execution had not started"));
+}
+
+#[test]
+fn work_resumptions_changed_facts_retained_once_and_poll_time_deduplicated() {
+    let f = fixture();
+    let source = config(&f.s).unwrap().unwrap().0.agents["default"][0].clone();
+    let (_, mut update) = work_resumption_fixture();
+    assert!(save_observation(&f.s, &f.id, &source, &update).unwrap());
+    update["observed_at"] = json!(timestamp(now_ms() + 1000));
+    assert!(!save_observation(&f.s, &f.id, &source, &update).unwrap());
+    update["work_resumptions"][0]["execution_started"] = json!(true);
+    assert!(save_observation(&f.s, &f.id, &source, &update).is_err());
+    update["revision"] = json!("changed-resumption-fact");
+    assert!(save_observation(&f.s, &f.id, &source, &update).unwrap());
+    assert!(!save_observation(&f.s, &f.id, &source, &update).unwrap());
+    let saved = action_observation(&f.s, &f.id, update["request_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved["work_resumptions"], update["work_resumptions"]);
+    assert_eq!(saved["installation_source"], update["installation_source"]);
+}
+
+#[test]
+fn work_resumptions_announcement_keeps_whole_records_and_marks_omissions() {
+    let (action, mut update) = work_resumption_fixture();
+    update["work_resumptions"] = json!(
+        (0..16)
+            .map(|index| json!({
+                "task_id":format!("{index}{}", "界".repeat(50)),
+                "recorded_status":"界".repeat(50),
+                "scheduled":true,"execution_started":false
+            }))
+            .collect::<Vec<_>>()
+    );
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    let text = observation_text("Workshop", &update);
+    let count = text.matches("Recorded resumption for task").count();
+    assert!(count > 0 && count < 16);
+    assert_eq!(
+        count,
+        text.matches("execution had not started in that record")
+            .count()
+    );
+    assert!(text.contains("resumption evidence is incomplete"));
+    assert!(text.contains("not a current activity check"));
+    assert!(!text.contains("No resumption"));
+}
+
+#[test]
+fn work_resumptions_actual_mixed_python_projection_fits_bound_with_honest_whole_omissions() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../bridge/test/fixtures/minecraft-work-resumption-projection.json"
+    ))
+    .unwrap();
+    let update = &fixture["observation"];
+    assert!(observation_valid(
+        update,
+        std::slice::from_ref(&fixture["action"])
+    ));
+    assert!(update.to_string().len() <= 16000);
+    assert_eq!(update["responses"].as_array().unwrap().len(), 1);
+    assert_eq!(update["source_replies"].as_array().unwrap().len(), 1);
+    assert_eq!(update["source_replies_omitted"], 1);
+    assert!(update["work_resumptions_omitted"].as_u64().unwrap() > 0);
+    assert_eq!(update["domain_work_resumptions_omitted"], true);
+    let text = observation_text("Workshop", update);
+    assert!(text.contains("not a current activity check"));
+    assert!(text.contains("resumption evidence is incomplete"));
+    assert!(
+        text.contains("Some returned private replies are not included here")
+            || text.contains("available private reply record is incomplete")
+    );
+    assert!(!text.contains("STILL NOT COMPLETION"));
+}

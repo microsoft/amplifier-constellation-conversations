@@ -1590,6 +1590,52 @@ fn input_outcome_valid(v: &Value) -> bool {
         && source_reply_projection_valid(v)
 }
 
+const WORK_RESUMPTION_FIELDS: [&str; 3] = [
+    "work_resumptions",
+    "work_resumptions_omitted",
+    "domain_work_resumptions_omitted",
+];
+
+fn work_resumption_projection_valid(v: &Value) -> bool {
+    if !WORK_RESUMPTION_FIELDS
+        .iter()
+        .any(|key| v.get(key).is_some())
+    {
+        return true;
+    }
+    // These are historical source-bound results, not today's task or authority.
+    // The existing action/queue/caller checks still bind their original source.
+    if v["provenance"]["kind"] != "minecraft_input_outcome"
+        || v["scope"] != "conversation"
+        || !v
+            .get("domain_work_resumptions_omitted")
+            .is_none_or(Value::is_boolean)
+    {
+        return false;
+    }
+    let Some(rows) = v.get("work_resumptions") else {
+        return v.get("work_resumptions_omitted").is_none();
+    };
+    let field = |value: &Value| {
+        value.as_str().is_some_and(|text| {
+            !text.is_empty() && text.len() <= 160 && !text.chars().any(|c| c < ' ')
+        })
+    };
+    rows.as_array().is_some_and(|rows| {
+        rows.len() <= 16
+            && v["work_resumptions_omitted"]
+                .as_u64()
+                .is_some_and(|n| n <= 16 - rows.len() as u64)
+            && rows.iter().all(|row| {
+                row.as_object().is_some_and(|fields| fields.len() == 4)
+                    && field(&row["task_id"])
+                    && field(&row["recorded_status"])
+                    && row["scheduled"].is_boolean()
+                    && row["execution_started"].is_boolean()
+            })
+    })
+}
+
 const SOURCE_REPLY_FIELDS: [&str; 4] = [
     "source_replies",
     "source_replies_capability",
@@ -1748,6 +1794,7 @@ fn observation_valid(v: &Value, known: &[Value]) -> bool {
         && ["task", "message_delivery", "conversation"].contains(&v["scope"].as_str().unwrap_or(""))
         && observed_time(&v["observed_at"]).is_some()
         && v["provenance"].is_object()
+        && work_resumption_projection_valid(v)
         && (v["provenance"]["kind"] != "minecraft_input_outcome" || input_outcome_valid(v))
         && v.to_string().len() <= 16000
         && (v["state"] != "completed" || v["scope"] == "message_delivery")
@@ -1764,6 +1811,49 @@ fn observation_text(label: &str, update: &Value) -> String {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let mut text = format!("{label}:");
+        let mut execution_recorded = false;
+        if work_resumption_projection_valid(update) {
+            let resumptions = update["work_resumptions"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            execution_recorded = resumptions
+                .iter()
+                .any(|row| row["execution_started"] == true);
+            let mut retained = 0;
+            // Prefer these small, exact facts to repeating a long prior reply.
+            // Never truncate a record so its execution qualification disappears.
+            for row in resumptions {
+                let scheduled = if row["scheduled"] == true {
+                    "work was scheduled"
+                } else {
+                    "work was not scheduled in that record"
+                };
+                let execution = if row["execution_started"] == true {
+                    "execution start was recorded"
+                } else {
+                    "execution had not started in that record"
+                };
+                let next = format!(
+                    "\nRecorded resumption for task {}: recorded status {}; {scheduled}; {execution}.",
+                    row["task_id"], row["recorded_status"]
+                );
+                if text.len() + next.len() > 2400 {
+                    continue;
+                }
+                text.push_str(&next);
+                retained += 1;
+            }
+            if retained > 0 {
+                text.push_str("\nThese are saved resumption facts, not a current activity check or proof of task completion.");
+            }
+            if retained < resumptions.len()
+                || update["work_resumptions_omitted"].as_u64().unwrap_or(0) > 0
+                || update["domain_work_resumptions_omitted"] == true
+            {
+                text.push_str("\nThe available resumption evidence is incomplete; omitted records do not establish a negative outcome.");
+            }
+        }
         let mut included = 0;
         for reply in replies {
             // The normal ingestion path validates the original source and
@@ -1863,7 +1953,11 @@ fn observation_text(label: &str, update: &Value) -> String {
             }
         }
         if total_included > 0 {
-            text.push_str("\nThe recorded reply is established; broader task completion or resumed execution is not established by this receipt.");
+            if execution_recorded {
+                text.push_str("\nThe recorded reply is established; broader task completion is not established by this receipt.");
+            } else {
+                text.push_str("\nThe recorded reply is established; broader task completion or resumed execution is not established by this receipt.");
+            }
         }
         if included < replies.len() {
             text.push_str(
