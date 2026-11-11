@@ -683,11 +683,14 @@ observer does not block the others. Model scores are pilot thresholds, not
 calibrated accuracy or a delivery guarantee.
 
 `companion_observations` reads only this call's saved, currently authorized facts.
-Each delegated backend request includes a fresh, compact catalog of the current
-caller's configured read sources when its Companion tools are installed. The
-same rows appear in `companion_connections.observation_sources`: exact
-`connection_id`, label, and literal arguments for saved observations, current
-snapshots, and source reports. These IDs belong to Companion, independently of
+Each delegated backend request includes a fresh, compact connection catalog when
+its Companion tools are installed. The inline catalog and `companion_connections`
+use the same projection: this agent's configured action `connections`, their exact
+request/status tool names and required fields, plus the caller's authorized
+`observation_sources`. Read routes retain exact `connection_id`, label and literal
+arguments for saved observations, current snapshots and source reports. A read
+operation is labeled read-only; that is not a restriction on the whole connection.
+Action and read enrollment remain independent, including action-only installs. These IDs belong to Companion, independently of
 Instance context-provider IDs. The catalog runs no helper or model and proves
 neither availability nor action authority. Tool execution rechecks access;
 omitting the status view still selects reports for existing clients.

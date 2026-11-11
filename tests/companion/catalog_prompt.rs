@@ -6,7 +6,7 @@ async fn actual_delegation_contains_authorized_executable_read_catalog_and_exact
     let f = fixture("delegate");
     std::fs::write(
         f.home.path().join("companion-actions.json"),
-        json!({"enabled":true,"agents":{}}).to_string(),
+        json!({"enabled":true,"agents":{"default":[{"id":"minecraft-home","label":"Home","description":"Configured Home action route.","command":["/not-executed/private-action-secret"]}],"another-agent":[{"id":"another-agent-action","label":"Other","description":"Hidden.","command":["/not-executed/private-action-secret"]}]}}).to_string(),
     )
     .unwrap();
     std::fs::write(
@@ -34,19 +34,30 @@ async fn actual_delegation_contains_authorized_executable_read_catalog_and_exact
         "SELECT m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='delegate-1'",
         [id], |r| r.get(0),
     ).unwrap();
-    let marker =
-        "Configured Companion read catalog (routing metadata; current facts require a read): ";
+    let marker = "Configured Companion connection catalog (configured routes; current facts require a read): ";
     assert_eq!(saved.matches(marker).count(), 1);
     let catalog: Value = serde_json::Deserializer::from_str(saved.split_once(marker).unwrap().1)
         .into_iter::<Value>()
         .next()
         .unwrap()
         .unwrap();
+    assert_eq!(catalog["connections"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["connections"][0]["id"], "minecraft-home");
+    assert_eq!(
+        catalog["action_tools"]["request"]["tool"],
+        "companion_request_action"
+    );
+    assert_eq!(
+        catalog["action_tools"]["status"]["tool"],
+        "companion_action_status"
+    );
     let rows = catalog["observation_sources"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     for connection in ["minecraft-constellation", "minecraft-home"] {
         let row = rows.iter().find(|row| row["id"] == connection).unwrap();
         assert_eq!(row["connection_id"], connection);
+        assert!(row.get("read_only").is_none());
+        assert_eq!(row["reads"]["current"]["read_only"], true);
         assert_eq!(
             row["reads"]["current"]["tool"],
             "companion_connection_status"
@@ -70,6 +81,8 @@ async fn actual_delegation_contains_authorized_executable_read_catalog_and_exact
         "another-agent-world",
         "private-observer-secret",
         "private-decision-secret",
+        "private-action-secret",
+        "another-agent-action",
     ] {
         assert!(
             !saved.contains(private),
@@ -125,7 +138,7 @@ async fn disabled_call_tools_do_not_advertise_an_executable_catalog() {
         "SELECT m.text FROM companion_delegations d JOIN messages m ON m.id=d.message_id WHERE d.call_id=?1 AND d.id='delegate-1'",
         [id], |r| r.get(0),
     ).unwrap();
-    assert!(!saved.contains("Configured Companion read catalog (routing metadata;"));
+    assert!(!saved.contains("Configured Companion connection catalog (configured routes;"));
     assert_eq!(
         current_human_segments(&saved)[0]["text"],
         "Please inspect the supplied test context and report it."
