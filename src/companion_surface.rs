@@ -106,55 +106,135 @@ pub(crate) fn current_capabilities(
     )
 }
 
-/// Capture the actual initialize result for this exact call and selected agent.
-/// The fixed control updates the voice's knowledge without asking it to speak.
-/// A recorded control or provider acknowledgment is not proof of spoken output.
+/// A handshake observation is evidence even if session setup later fails. It is
+/// not permission to interrupt the call with a capability announcement.
+pub(crate) struct CapabilityObservation {
+    call: String,
+    image: Option<bool>,
+    observed_at: i64,
+    revision: String,
+}
+
+fn stored_capability(db: &Connection, call: &str) -> Result<Option<CapabilityObservation>> {
+    type Row = (Option<bool>, i64, Option<String>);
+    let row: Option<Row> = db.query_row("SELECT image_input,observed_at,(SELECT event_key FROM companion_events e WHERE e.call_id=x.call_id AND e.kind='context_supplied' AND json_extract(e.data,'$.id')='current_call_capabilities' ORDER BY e.seq DESC LIMIT 1) FROM companion_surface_capabilities x WHERE x.call_id=?1",[call],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    Ok(row.and_then(|(image, observed_at, revision)| {
+        revision.map(|revision| CapabilityObservation {
+            call: call.into(),
+            image,
+            observed_at,
+            revision,
+        })
+    }))
+}
+
 pub(crate) fn record_capabilities(
     s: &AppState,
     room: &str,
     agent: &str,
     capabilities: &Value,
-) -> Result<()> {
+) -> Result<Vec<CapabilityObservation>> {
+    record_capabilities_at(s, room, agent, capabilities, now_ms())
+}
+fn record_capabilities_at(
+    s: &AppState,
+    room: &str,
+    agent: &str,
+    capabilities: &Value,
+    at: i64,
+) -> Result<Vec<CapabilityObservation>> {
     let image = capabilities["promptCapabilities"]["image"].as_bool();
-    let mut updates = Vec::new();
-    {
-        let mut db = s.db.lock().unwrap();
-        let tx = db.transaction()?;
-        let calls = tx.prepare("SELECT id FROM companion_calls WHERE conversation_id=?1 AND agent_id=?2 AND state IN ('connecting','connected')")?
-            .query_map(params![room,agent], |r|r.get::<_,String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for call in calls {
-            if crate::companion_history::private_identity(&tx, &call)?.is_none() {
-                continue;
-            }
-            let old: Option<Option<bool>> = tx
-                .query_row(
-                    "SELECT image_input FROM companion_surface_capabilities WHERE call_id=?1",
-                    [&call],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if old == Some(image) {
-                continue;
-            }
-            let at = now_ms();
-            let event = format!("image-capability-{}", uuid::Uuid::new_v4());
-            tx.execute("INSERT INTO companion_surface_capabilities(call_id,image_input,observed_at) VALUES(?1,?2,?3) ON CONFLICT(call_id) DO UPDATE SET image_input=excluded.image_input,observed_at=excluded.observed_at",params![call,image,at])?;
-            let facts = json!({"image_input":image,"observed_at":at,"source":"acp_initialize"});
-            tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'context_supplied',?3,?4)",params![call,format!("{event}:observed"),json!({"id":"current_call_capabilities","title":"Current call image capability","target":"voice","state":"observed","content":facts.to_string(),"source_label":"This call's actual ACP initialize"}).to_string(),at])?;
-            updates.push((call, event));
+    let mut observations = Vec::new();
+    let mut db = s.db.lock().unwrap();
+    let tx = db.transaction()?;
+    let calls=tx.prepare("SELECT id FROM companion_calls WHERE conversation_id=?1 AND agent_id=?2 AND state IN ('connecting','connected')")?
+        .query_map(params![room,agent],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for call in calls {
+        if crate::companion_history::private_identity(&tx, &call)?.is_none() {
+            continue;
         }
-        tx.commit()?;
+        if let Some(old) = stored_capability(&tx, &call)?.filter(|old| old.image == image) {
+            observations.push(old);
+            continue;
+        }
+        let revision = format!("image-capability-{}:observed", uuid::Uuid::new_v4());
+        tx.execute("INSERT INTO companion_surface_capabilities(call_id,image_input,observed_at) VALUES(?1,?2,?3) ON CONFLICT(call_id) DO UPDATE SET image_input=excluded.image_input,observed_at=excluded.observed_at",params![call,image,at])?;
+        let facts = json!({"image_input":image,"observed_at":at,"source":"acp_initialize"});
+        tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'context_supplied',?3,?4)",params![call,revision,json!({"id":"current_call_capabilities","title":"Current call image capability","target":"voice","state":"observed","content":facts.to_string(),"source_label":"This call's actual ACP initialize"}).to_string(),at])?;
+        // A newer observation invalidates only an unsent capability fact,
+        // even when the newer session setup subsequently fails.
+        tx.execute("UPDATE companion_voice_batches SET state='superseded',updated_at=?2 WHERE call_id=?1 AND semantic_key='current-call-capabilities' AND state='pending'",params![call,at])?;
+        observations.push(CapabilityObservation {
+            call,
+            image,
+            observed_at: at,
+            revision,
+        });
     }
-    for (call, event) in updates {
-        crate::companion::instruction(
+    tx.commit()?;
+    Ok(observations)
+}
+
+/// Only successful setup makes the observed capability useful to this call.
+/// Supply facts through quiet context, never a session-wide speech instruction.
+/// Provider acceptance still does not establish inspection or caller hearing.
+pub(crate) fn publish_capabilities(
+    s: &AppState,
+    observations: &[CapabilityObservation],
+) -> Result<()> {
+    for observation in observations {
+        let valid = {
+            let db = s.db.lock().unwrap();
+            crate::companion_history::private_identity(&db,&observation.call)?.is_some()
+                && db.query_row("SELECT EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND state IN ('connecting','connected'))",[&observation.call],|r|r.get::<_,bool>(0))?
+                && stored_capability(&db,&observation.call)?.is_some_and(|current|current.revision==observation.revision && current.image==observation.image && current.observed_at==observation.observed_at)
+        };
+        if !valid {
+            continue;
+        }
+        crate::companion_delivery::enqueue_batch(
             s,
-            &call,
-            &event,
-            crate::companion_identity::image_capability_instruction(image),
+            &observation.call,
+            "current-call-capabilities",
+            vec![capability_context(observation)],
         )?;
     }
     Ok(())
+}
+
+fn capability_context(observation: &CapabilityObservation) -> Value {
+    let content=json!({"kind":"current_call_capabilities","image_input":observation.image,"observed_at":observation.observed_at,"source":"acp_initialize","image_delivery_or_inspection":"not_established_by_capability"}).to_string();
+    // The raw event identity distinguishes genuine changes at the same clock
+    // value without inventing a newer observed_at or replaying an old batch.
+    let event = format!(
+        "image-capability-context-{}",
+        auth::digest(&json!([observation.call, observation.revision]).to_string())
+    );
+    json!({"op":"append","channel":"thinking","event_id":event,"delegation_id":null,"content":content})
+}
+
+/// A later handshake may supersede an update while setup/queuing is in flight.
+/// Recheck only this exact capability fact at the existing transport boundary.
+pub(crate) fn capability_presentation_allowed(
+    db: &Connection,
+    call: &str,
+    commands: &[Value],
+) -> Result<bool> {
+    for command in commands {
+        if !command["event_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("image-capability-context-"))
+        {
+            continue;
+        }
+        if stored_capability(db, call)?
+            .as_ref()
+            .is_none_or(|observation| *command != capability_context(observation))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Deserialize)]
@@ -1418,8 +1498,22 @@ mod acceptance_tests {
         assert_eq!(ready["commands"][0]["event_id"], "board:empty");
     }
 
+    fn capability_batches(f: &Fixture) -> Vec<(String, Value)> {
+        let db = f.state.db.lock().unwrap();
+        let mut q = db.prepare("SELECT state,updates FROM companion_voice_batches WHERE call_id=?1 AND semantic_key='current-call-capabilities' ORDER BY rowid").unwrap();
+        q.query_map([&f.call], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .map(|row| {
+            let (state, raw) = row.unwrap();
+            (state, serde_json::from_str(&raw).unwrap())
+        })
+        .collect()
+    }
+
     #[test]
-    fn negotiated_image_capability_is_current_call_scoped_and_idempotent() {
+    fn negotiated_image_capability_is_raw_until_setup_then_quiet_and_idempotent() {
         let f = fixture();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         crate::companion::test_control(&f.state, &f.call, tx);
@@ -1427,55 +1521,107 @@ mod acceptance_tests {
             current_capabilities(&f.state, &f.call, &f.room, "default").unwrap(),
             json!({"image_input":null,"observed_at":null,"source":"not_yet_observed"})
         );
-        // The wrong agent or room cannot seed this call's negotiated state.
-        record_capabilities(
-            &f.state,
-            &f.room,
-            "another-agent",
-            &json!({"promptCapabilities":{"image":true}}),
-        )
-        .unwrap();
-        record_capabilities(
-            &f.state,
-            "another-room",
-            "default",
-            &json!({"promptCapabilities":{"image":true}}),
-        )
-        .unwrap();
-        assert!(rx.try_recv().is_err());
-        for image in [false, true, false] {
-            record_capabilities(
+        for (room, agent) in [(&f.room[..], "another-agent"), ("another-room", "default")] {
+            assert!(
+                record_capabilities(
+                    &f.state,
+                    room,
+                    agent,
+                    &json!({"promptCapabilities":{"image":true}})
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        for (index, image) in [false, true, false].into_iter().enumerate() {
+            let observations = record_capabilities_at(
                 &f.state,
                 &f.room,
                 "default",
                 &json!({"promptCapabilities":{"image":image},"private_field":"never copied"}),
+                1794384364503,
             )
             .unwrap();
             let observed = current_capabilities(&f.state, &f.call, &f.room, "default").unwrap();
             assert_eq!(observed["image_input"], image);
-            assert_eq!(observed["source"], "acp_initialize");
-            let control = rx.try_recv().unwrap();
-            assert_eq!(control["channel"], "instructions");
             assert_eq!(
-                control["content"],
-                crate::companion_identity::image_capability_instruction(Some(image))
+                observed["observed_at"], 1794384364503_i64,
+                "same-clock changes keep actual observation time"
             );
-            assert!(!control.to_string().contains("never copied"));
-            record_capabilities(
+            assert_eq!(observed["source"], "acp_initialize");
+            assert!(
+                rx.try_recv().is_err(),
+                "handshake must not interrupt speech"
+            );
+            assert!(
+                capability_batches(&f)
+                    .iter()
+                    .all(|(state, _)| state != "pending")
+            );
+            publish_capabilities(&f.state, &observations).unwrap();
+            let batches = capability_batches(&f);
+            assert_eq!(batches.len(), index + 1);
+            let commands = batches.last().unwrap().1.as_array().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["channel"], "thinking");
+            let facts: Value =
+                serde_json::from_str(commands[0]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(facts["image_input"], image);
+            assert_eq!(
+                facts["image_delivery_or_inspection"],
+                "not_established_by_capability"
+            );
+            assert!(!commands[0].to_string().contains("never copied"));
+            assert!(commands[0]["content"].as_str().unwrap().len() <= 480);
+            let repeated = record_capabilities(
                 &f.state,
                 &f.room,
                 "default",
                 &json!({"promptCapabilities":{"image":image}}),
             )
             .unwrap();
+            publish_capabilities(&f.state, &repeated).unwrap();
+            assert_eq!(
+                capability_batches(&f).len(),
+                index + 1,
+                "same observed revision must not repeat context"
+            );
             assert!(
                 rx.try_recv().is_err(),
-                "repeated initialize must not repeat the capability control"
+                "capability facts use the durable queue, never instructions"
             );
         }
-        assert!(current_capabilities(&f.state,&f.call,&f.room,"another-agent").unwrap()["image_input"].is_null());
-        assert!(current_capabilities(&f.state,&f.call,"another-room","default").unwrap()["image_input"].is_null());
-        assert!(current_capabilities(&f.state,"another-call",&f.room,"default").unwrap()["image_input"].is_null());
+        for (call, room, agent) in [
+            (&f.call[..], &f.room[..], "another-agent"),
+            (&f.call, "another-room", "default"),
+            ("another-call", &f.room, "default"),
+        ] {
+            assert!(
+                current_capabilities(&f.state, call, room, agent).unwrap()["image_input"].is_null()
+            );
+        }
+    }
+
+    #[test]
+    fn absent_or_malformed_capability_stays_unknown_and_changed_call_is_ignored() {
+        let f = fixture();
+        let observations = record_capabilities(&f.state, &f.room, "default", &json!({})).unwrap();
+        let observed = current_capabilities(&f.state, &f.call, &f.room, "default").unwrap();
+        assert!(observed["image_input"].is_null());
+        assert_eq!(observed["source"], "acp_initialize");
+        publish_capabilities(&f.state, &observations).unwrap();
+        let malformed = record_capabilities(
+            &f.state,
+            &f.room,
+            "default",
+            &json!({"promptCapabilities":{"image":"true"}}),
+        )
+        .unwrap();
+        publish_capabilities(&f.state, &malformed).unwrap();
+        assert_eq!(capability_batches(&f).len(), 1);
+        let commands = capability_batches(&f)[0].1.clone();
+        let facts: Value = serde_json::from_str(commands[0]["content"].as_str().unwrap()).unwrap();
+        assert!(facts["image_input"].is_null());
         f.state
             .db
             .lock()
@@ -1486,43 +1632,17 @@ mod acceptance_tests {
             )
             .unwrap();
         assert!(
-            current_capabilities(&f.state, &f.call, &f.room, "default").unwrap()["image_input"]
-                .is_null()
+            record_capabilities(
+                &f.state,
+                &f.room,
+                "default",
+                &json!({"promptCapabilities":{"image":true}})
+            )
+            .unwrap()
+            .is_empty()
         );
-        record_capabilities(
-            &f.state,
-            &f.room,
-            "default",
-            &json!({"promptCapabilities":{"image":true}}),
-        )
-        .unwrap();
-        assert!(
-            rx.try_recv().is_err(),
-            "changed endpoint must not receive stale capability updates"
-        );
-    }
-
-    #[test]
-    fn absent_or_malformed_image_capability_stays_unknown_and_closed_calls_are_ignored() {
-        let f = fixture();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        crate::companion::test_control(&f.state, &f.call, tx);
-        record_capabilities(&f.state, &f.room, "default", &json!({})).unwrap();
-        let observed = current_capabilities(&f.state, &f.call, &f.room, "default").unwrap();
-        assert!(observed["image_input"].is_null());
-        assert_eq!(observed["source"], "acp_initialize");
-        assert_eq!(
-            rx.try_recv().unwrap()["content"],
-            crate::companion_identity::image_capability_instruction(None)
-        );
-        record_capabilities(
-            &f.state,
-            &f.room,
-            "default",
-            &json!({"promptCapabilities":{"image":"true"}}),
-        )
-        .unwrap();
-        assert!(rx.try_recv().is_err());
+        publish_capabilities(&f.state, &observations).unwrap();
+        assert_eq!(capability_batches(&f).len(), 1);
         f.state
             .db
             .lock()
@@ -1532,18 +1652,114 @@ mod acceptance_tests {
                 [&f.call],
             )
             .unwrap();
-        record_capabilities(
+        publish_capabilities(&f.state, &observations).unwrap();
+        assert_eq!(capability_batches(&f).len(), 1);
+        assert_eq!(
+            current_capabilities(&f.state, &f.call, &f.room, "default").unwrap()["source"],
+            "not_yet_observed"
+        );
+    }
+
+    #[test]
+    fn failed_setup_observation_can_later_publish_once_but_stale_capability_cannot() {
+        let f = fixture();
+        let first = record_capabilities(
             &f.state,
             &f.room,
             "default",
             &json!({"promptCapabilities":{"image":true}}),
         )
         .unwrap();
-        assert!(rx.try_recv().is_err());
-        assert_eq!(
-            current_capabilities(&f.state, &f.call, &f.room, "default").unwrap()["source"],
-            "not_yet_observed"
+        assert!(
+            capability_batches(&f).is_empty(),
+            "failed setup leaves only raw evidence"
         );
+        let repeated = record_capabilities(
+            &f.state,
+            &f.room,
+            "default",
+            &json!({"promptCapabilities":{"image":true}}),
+        )
+        .unwrap();
+        publish_capabilities(&f.state, &repeated).unwrap();
+        publish_capabilities(&f.state, &first).unwrap();
+        assert_eq!(
+            capability_batches(&f).len(),
+            1,
+            "later successful setup can publish the retained observation once"
+        );
+        let stale = capability_batches(&f)[0].1.clone();
+        let newer = record_capabilities(
+            &f.state,
+            &f.room,
+            "default",
+            &json!({"promptCapabilities":{"image":false}}),
+        )
+        .unwrap();
+        assert_eq!(capability_batches(&f)[0].0, "superseded");
+        publish_capabilities(&f.state, &first).unwrap();
+        assert_eq!(capability_batches(&f).len(), 1);
+        let db = f.state.db.lock().unwrap();
+        assert!(!capability_presentation_allowed(&db, &f.call, stale.as_array().unwrap()).unwrap());
+        assert!(capability_presentation_allowed(&db,&f.call,&[json!({"event_id":"unrelated","channel":"commentary","content":"Independent answer"})]).unwrap());
+        drop(db);
+        publish_capabilities(&f.state, &newer).unwrap();
+        let current = capability_batches(&f).last().unwrap().1.clone();
+        let db = f.state.db.lock().unwrap();
+        assert!(
+            capability_presentation_allowed(&db, &f.call, current.as_array().unwrap()).unwrap()
+        );
+        let mut changed = current.clone();
+        changed[0]["channel"] = json!("commentary");
+        assert!(
+            !capability_presentation_allowed(&db, &f.call, changed.as_array().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn sent_or_unknown_capability_context_is_not_replayed_or_erased() {
+        for state in ["sent", "unknown"] {
+            let f = fixture();
+            let first = record_capabilities(
+                &f.state,
+                &f.room,
+                "default",
+                &json!({"promptCapabilities":{"image":true}}),
+            )
+            .unwrap();
+            publish_capabilities(&f.state, &first).unwrap();
+            f.state
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE companion_voice_batches SET state=?2 WHERE call_id=?1",
+                    params![f.call, state],
+                )
+                .unwrap();
+            let same = record_capabilities(
+                &f.state,
+                &f.room,
+                "default",
+                &json!({"promptCapabilities":{"image":true}}),
+            )
+            .unwrap();
+            publish_capabilities(&f.state, &same).unwrap();
+            assert_eq!(capability_batches(&f).len(), 1);
+            assert_eq!(capability_batches(&f)[0].0, state);
+            let changed = record_capabilities(
+                &f.state,
+                &f.room,
+                "default",
+                &json!({"promptCapabilities":{"image":false}}),
+            )
+            .unwrap();
+            publish_capabilities(&f.state, &changed).unwrap();
+            let rows = capability_batches(&f);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, state);
+            assert_eq!(rows[1].0, "pending");
+        }
     }
 
     #[test]

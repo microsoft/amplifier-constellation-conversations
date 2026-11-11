@@ -177,6 +177,7 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
         || !crate::companion_awareness::presentation_allowed(s, &tx, call, &commands)?
         || !crate::companion_huddles::presentation_allowed(s, &tx, call, &commands)?
         || !crate::companion_surface::board_presentation_allowed(&tx, call, &commands)?
+        || !crate::companion_surface::capability_presentation_allowed(&tx, call, &commands)?
     {
         tx.execute(
             "UPDATE companion_voice_batches SET state='withdrawn',updated_at=?2 WHERE id=?1",

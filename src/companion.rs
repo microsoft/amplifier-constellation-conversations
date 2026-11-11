@@ -1805,15 +1805,15 @@ fn observe_results(s: &AppState, id: &str, room: &str, live: bool) -> Result<()>
     )?;
     let blockers = crate::delivery::blockers(s, room, &agent)?;
     for (did, mid, at) in pending {
-        type DeliveryResult = (String, Option<String>, Option<String>, Option<String>);
+        type DeliveryResult = (String, Option<String>, Option<String>, Option<String>, bool);
         let result: Option<DeliveryResult> = s.db.lock().unwrap().query_row(
-            "SELECT d.state,m.status,m.text,m.id FROM input_deliveries d JOIN companion_calls c ON c.id=?2 AND c.agent_id=d.agent_id AND c.conversation_id=d.conversation_id LEFT JOIN messages m ON m.id=d.target_turn AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id AND m.role='assistant' WHERE d.message_id=?1",
-            params![mid,id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+            "SELECT d.state,m.status,m.text,m.id,(d.state='notAccepted' AND COALESCE(d.mode,'')='prompt' AND COALESCE(d.session_id,'')='' AND COALESCE(d.endpoint,'')='' AND d.receipt IS NULL AND COALESCE(m.status,'')='interrupted' AND COALESCE(m.text,'')='') FROM input_deliveries d JOIN companion_calls c ON c.id=?2 AND c.agent_id=d.agent_id AND c.conversation_id=d.conversation_id LEFT JOIN messages m ON m.id=d.target_turn AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id AND m.role='assistant' WHERE d.message_id=?1",
+            params![mid,id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
         ).optional()?;
         if live {
             pending_context(s, id, &did)?;
         }
-        if let Some((delivery, status, text, result_message)) = result {
+        if let Some((delivery, status, text, result_message, not_started)) = result {
             if ["completed", "incorporated"].contains(&delivery.as_str())
                 && status.as_deref() == Some("complete")
             {
@@ -1825,6 +1825,14 @@ fn observe_results(s: &AppState, id: &str, room: &str, live: bool) -> Result<()>
                         .as_deref()
                         .context("Missing settled result")?,
                     &text.unwrap_or_default(),
+                )?;
+            } else if not_started {
+                settle(
+                    s,
+                    id,
+                    &did,
+                    "failed",
+                    "The agent could not start this request. It was not sent for execution and has not been retried. This does not change earlier work.",
                 )?;
             } else if ["unknown", "notAccepted", "cancelled"].contains(&delivery.as_str())
                 || status.as_deref() == Some("interrupted")

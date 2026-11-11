@@ -634,7 +634,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         init["protocolVersion"] == 1,
         "Unsupported ACP protocol version"
     );
-    crate::companion_surface::record_capabilities(
+    let capability_observations = crate::companion_surface::record_capabilities(
         &state,
         &conversation,
         &agent_id,
@@ -745,6 +745,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
     let mut forms = crate::elicitation::Callbacks::default();
     let _callback_lifetime = CallbackLifetime(callbacks.clone());
     crate::companion_identity::record(&state, &conversation, &init, &setup)?;
+    crate::companion_surface::publish_capabilities(&state, &capability_observations)?;
     // Explicit reconciliation never resubmits the source input. Native engines
     // also need their saved uncertain receipt acknowledged before another prompt.
     for crate::delivery::Acknowledgment {
