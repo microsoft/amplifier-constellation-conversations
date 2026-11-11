@@ -226,3 +226,6 @@ try {
   checks.push('390px inspection, targeting, send and cleanup fit the viewport while leaving call controls intact; no browser exceptions.');
   console.log(JSON.stringify({passed:checks.length,checks,models:0,providerCalls:0,playwrightModule:process.env.PLAYWRIGHT_MODULE||'playwright',screenshots:screenshotDirectory?[join(screenshotDirectory,'huddles-desktop.png'),join(screenshotDirectory,'huddles-phone-390.png')]:[]},null,2));
 } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}
+
+// The widget must also fit the actual fixed-height Companion call layout.
+await import('./companion-huddle-layout-browser.mjs');

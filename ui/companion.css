@@ -1390,3 +1390,6 @@ video.shared-media,audio.shared-media {width:100%}
 .linked-huddles {border:1px solid #d3ddd8;border-radius:12px;padding:12px;margin:12px 0;min-width:0}
 .linked-huddles>summary {cursor:pointer;font-weight:600;min-height:32px;align-content:center}
 .linked-huddles[open] .huddles {margin-top:12px}
+/* Long discussion and composer content stays reachable inside a fixed call. */
+.call-active .linked-huddles[open] {min-height:0;overflow-y:auto;overscroll-behavior:contain}
+.call-active .linked-huddles[open]>summary {position:sticky;top:0;z-index:1;background:var(--paper)}
