@@ -946,12 +946,10 @@ for line in sys.stdin:
         })
         .unwrap();
     assert_eq!(pending["channel"], "thinking");
-    assert!(
-        pending["content"]
-            .as_str()
-            .unwrap()
-            .contains("No matching completed answer")
-    );
+    let pending_fact: Value = serde_json::from_str(pending["content"].as_str().unwrap()).unwrap();
+    assert_eq!(pending_fact["kind"], "call_request_status");
+    assert_eq!(pending_fact["answer"], "pending");
+    assert_eq!(pending_fact["external_execution"], "unknown");
     assert!(appends.iter().all(|c| c["channel"] != "instructions"));
     for capability in capabilities {
         assert_eq!(capability["channel"], "thinking");
@@ -3691,12 +3689,12 @@ async fn quiet_pending_reaches_bridge_during_continuing_input_but_answer_waits_f
     assert_eq!(pending[0]["channel"], "thinking");
     assert_eq!(pending[0]["event_id"], event_id);
     assert_eq!(pending[0]["delegation_id"], "pending-source");
-    assert!(
-        pending[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("No matching completed answer")
-    );
+    let pending_fact: Value =
+        serde_json::from_str(pending[0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(pending_fact["kind"], "call_request_status");
+    assert_eq!(pending_fact["answer"], "pending");
+    assert_eq!(pending_fact["external_execution"], "unknown");
+    assert_eq!(pending_fact["request_id"], "pending-source");
     f.s.db
         .lock()
         .unwrap()

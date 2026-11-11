@@ -980,10 +980,16 @@ was played. Historical content without a retained receipt remains unknown.
 
 At delegation receipt the host sends the documented empty thinking append to
 cancel a pending automatic acknowledgment. After durable intake, one quiet,
-source-bound receipt records that the request is saved and its matching answer
-has not returned. It does not claim execution or external progress. Unchanged
-polls do not add announcements; a terminal result withdraws only that request's
-unsent pending context. Accepted or unknown deliveries stay in the audit.
+source-bound fact records the pending answer and unknown external execution as
+compact JSON, rather than ready-to-speak receipt prose. Its source ID and stable
+request revision bind the exact original request; a short caller-request label
+is included whole when it fits the existing 480-byte budget. No polling clock
+creates a new revision. This supports an explicit status question without
+requesting another acknowledgment or establishing external progress. Unchanged
+polls do not add context; a terminal result withdraws only that request's unsent
+pending fact. Previously retained prose stays byte-exact under the same event
+identity and current source checks; it is not replaced by a second typed fact.
+Accepted or unknown deliveries stay in the audit and are never replayed.
 
 This exact singleton `thinking` receipt may reach voice while the caller or agent
 is speaking, or just after a human transcript, so a request's saved status need
