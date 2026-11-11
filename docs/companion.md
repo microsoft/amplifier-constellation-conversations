@@ -250,6 +250,11 @@ loss, revoked access, Stop/hangup, and actual provider closure still end calls.
 automatically; removing the local cutoff does not override provider limits or
 turn a provider `expired` event into a successful ongoing session.
 
+A rejected request with an empty, unbound pre-submission delivery is reported as
+not started. The original source remains saved and consumed, and is not retried.
+Submitted, bound, or receipted interruptions retain their uncertain outcome;
+failing to start a new request says nothing about earlier work.
+
 ## Sharing, capabilities, and receipts
 
 Sharing reports separate facts:
@@ -277,9 +282,11 @@ For the native Constellation runtime, `provider.native.image_input` controls the
 enabled image path. An omitted or disabled setting can make an image-capable model
 advertise `image: false`; that flag alone does not establish the model's abilities.
 The voice starts with image inspection support **unknown**. Its current-call
-capability is learned from the actual selected backend's ACP initialization and
-sent as a quiet capability update. A previous call's settings, static profile,
-camera permission, or installed tools do not establish support for this call.
+capability is learned from the actual selected backend's ACP initialization. The
+raw observation is retained even if session setup fails. After successful setup,
+it is supplied once per observed revision as factual thinking context through the
+normal delivery queue, not as a speech-interrupting instruction. A previous
+call's settings, static profile, camera permission, or installed tools do not establish support for this call.
 An explicit `image: false` means the voice must not promise photo inspection;
 files can still be saved or displayed. `image: true` enables the inspection path,
 but does not prove that any particular image was delivered or understood.

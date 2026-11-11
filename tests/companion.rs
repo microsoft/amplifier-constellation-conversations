@@ -922,7 +922,18 @@ for line in sys.stdin:
         .iter()
         .filter(|v| v["op"] == "append")
         .collect::<Vec<_>>();
-    assert_eq!(appends.len(), 3);
+    // Capability facts now respect the normal floor and may remain unsent at
+    // hangup; they must never interrupt speech or reopen a closed call.
+    let capabilities: Vec<_> = appends
+        .iter()
+        .filter(|c| {
+            c["event_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("image-capability-context-"))
+        })
+        .collect();
+    assert!(capabilities.len() <= 1);
+    assert_eq!(appends.len() - capabilities.len(), 2);
     assert_eq!(appends[0]["channel"], "thinking");
     assert!(appends[0]["content"].as_str().unwrap().is_empty());
     let pending = appends
@@ -941,16 +952,12 @@ for line in sys.stdin:
             .unwrap()
             .contains("No matching completed answer")
     );
-    let capability = appends
-        .iter()
-        .find(|c| c["channel"] == "instructions")
-        .unwrap();
-    assert!(
-        capability["content"]
-            .as_str()
-            .unwrap()
-            .contains("remains unknown after its handshake")
-    );
+    assert!(appends.iter().all(|c| c["channel"] != "instructions"));
+    for capability in capabilities {
+        assert_eq!(capability["channel"], "thinking");
+        let facts: Value = serde_json::from_str(capability["content"].as_str().unwrap()).unwrap();
+        assert!(facts["image_input"].is_null());
+    }
     assert_eq!(
         std::fs::read_to_string(f.home.path().join("bridge-starts")).unwrap(),
         "start\n"
@@ -2048,12 +2055,14 @@ async fn capture_image_delivery_uses_actual_initialized_acp_capability_not_stati
             1,
             "one actual capability control, independent of tool installation"
         );
-        assert_eq!(controls[0]["channel"], "instructions");
-        assert!(controls[0]["content"].as_str().unwrap().contains(if image {
-            "advertised image input support"
-        } else {
-            "image input is unsupported"
-        }));
+        assert_eq!(controls[0]["channel"], "thinking");
+        let facts: Value = serde_json::from_str(controls[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(facts["image_input"], image);
+        assert_eq!(facts["source"], "acp_initialize");
+        assert_eq!(
+            facts["image_delivery_or_inspection"],
+            "not_established_by_capability"
+        );
 
         let (actual,at):(bool,i64)=f.s.db.lock().unwrap().query_row("SELECT image_input,observed_at FROM companion_surface_capabilities WHERE call_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(actual, image);
