@@ -3622,6 +3622,132 @@ async fn settled_image_publication_receipt_accompanies_unmodified_backend_answer
 }
 
 #[tokio::test]
+async fn quiet_pending_reaches_bridge_during_continuing_input_but_answer_waits_for_floor() {
+    let f = fixture("quiet");
+    f.browser_refresh.store(false, Ordering::SeqCst);
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    let cookie = auth::cookie_name(&f.s);
+    let open = available_browser_surface(&f.browser_id);
+    let mut speaking = open.clone();
+    speaking["user_speaking"] = json!(true);
+    speaking["playback"]["floor"] = json!("user");
+    assert_eq!(
+        post_browser_surface(&f.app, &cookie, id, speaking.clone()).await,
+        StatusCode::OK
+    );
+    terminal_fixture(&f, &call, "pending-target", "streaming");
+    settlement_source(
+        &f,
+        &call,
+        "pending-source",
+        "incorporated",
+        "pending-target",
+    );
+    let event_id = format!("request-pending-{}", auth::digest("pending-source"));
+    let mut accepted = false;
+    for index in 0..80 {
+        assert_eq!(
+            post_browser_surface(&f.app, &cookie, id, speaking.clone()).await,
+            StatusCode::OK
+        );
+        speech_fixture(
+            &f,
+            &call,
+            &format!("continuing-{index}"),
+            "user",
+            index * 100,
+            "I am still explaining.",
+        );
+        accepted=f.s.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND kind='context_delivery' AND json_extract(data,'$.state')='accepted' AND json_extract(data,'$.event_id')=?2)",rusqlite::params![id,event_id],|r|r.get(0)).unwrap();
+        if accepted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        accepted,
+        "Canonical quiet receipt must not wait for a transcript pause"
+    );
+    let appends = || -> Vec<Value> {
+        std::fs::read_to_string(f.home.path().join("bridge-commands"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|v| v["op"] == "append")
+            .collect()
+    };
+    let pending = appends();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["channel"], "thinking");
+    assert_eq!(pending[0]["event_id"], event_id);
+    assert_eq!(pending[0]["delegation_id"], "pending-source");
+    assert!(
+        pending[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("No matching completed answer")
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET status='complete' WHERE id='pending-target'",
+            [],
+        )
+        .unwrap();
+    wait_delegation(&f, &call, "pending-source", "completed").await;
+    // Keep supplying authenticated speech activity and fresh input after the
+    // terminal result. The same exception must not leak its spoken answer.
+    for index in 0..8 {
+        assert_eq!(
+            post_browser_surface(&f.app, &cookie, id, speaking.clone()).await,
+            StatusCode::OK
+        );
+        speech_fixture(
+            &f,
+            &call,
+            &format!("after-result-{index}"),
+            "user",
+            10000 + index * 100,
+            "And one more detail.",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(appends(), pending);
+    }
+    assert_eq!(
+        post_browser_surface(&f.app, &cookie, id, open).await,
+        StatusCode::OK
+    );
+    for _ in 0..80 {
+        if appends().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let delivered = appends();
+    assert_eq!(delivered.len(), 2);
+    assert_eq!(delivered[0], pending[0]);
+    assert_eq!(delivered[1]["channel"], "commentary");
+    assert_eq!(delivered[1]["content"], "One settled answer");
+    assert_eq!(delivered[1]["delegation_id"], "pending-source");
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM input_deliveries", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(
+        !f.home.path().join("acp.jsonl").exists(),
+        "Context delivery never creates more backend work"
+    );
+    end(&f, id).await;
+}
+
+#[tokio::test]
 async fn tools_disabled_browser_floor_defers_saved_result_until_fresh_open_without_replaying_work()
 {
     let f = fixture("quiet");

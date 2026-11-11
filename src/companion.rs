@@ -1716,6 +1716,23 @@ pub(crate) fn pending_context_valid(db: &Connection, call: &str, did: &str) -> R
 fn pending_context_key(did: &str) -> String {
     format!("request-pending-{}", auth::digest(did))
 }
+/// Identify only the singleton receipt emitted by `pending_context`. This is
+/// not a validity check: dispatch must still match the current private source.
+pub(crate) fn is_pending_context_batch(semantic_key: &str, commands: &[Value]) -> bool {
+    let [command] = commands else {
+        return false;
+    };
+    let (Some(did), Some(content)) = (
+        command["delegation_id"].as_str(),
+        command["content"].as_str(),
+    ) else {
+        return false;
+    };
+    let key = pending_context_key(did);
+    semantic_key == key
+        && *command
+            == json!({"op":"append","channel":"thinking","delegation_id":did,"event_id":key,"content":content})
+}
 fn pending_context_content(db: &Connection, call: &str, did: &str) -> Result<Option<String>> {
     if !pending_context_valid(db, call, did)? || did.len() > 160 {
         return Ok(None);

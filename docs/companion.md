@@ -650,7 +650,7 @@ metadata; the stable connection ID and caller/source binding establish identity.
 Each provider append stays
 below its transport bound; all matching receipts are needed to mark the whole
 observation accepted. A missing part means the source must not be summarized.
-Both quiet context and spoken notices wait for the shared conversational floor:
+Both observation context and spoken notices wait for the shared conversational floor:
 fresh authenticated browser activity, available playback, and a gap after the
 latest human transcript. Ambient relevance is evaluated against that current
 context and checked again before dispatch. A newer human context withdraws an
@@ -737,6 +737,8 @@ The final dispatch rechecks private-room membership, endpoint identity and sourc
 policy. A process interruption during dispatch leaves delivery unknown rather
 than replaying it. Queue pressure keeps the canonical result available without
 disconnecting the call. Provider append acknowledgment does not prove playback.
+The call-local pending receipt described below is the only quiet batch that may
+cross an occupied floor; result and observation batches keep these checks.
 
 The browser preserves short listening cues but suppresses sustained overlapping
 agent speech when the caller takes the floor. Muted audio is consumed and discarded,
@@ -966,6 +968,22 @@ has not returned. It does not claim execution or external progress. Unchanged
 polls do not add announcements; a terminal result withdraws only that request's
 unsent pending context. Accepted or unknown deliveries stay in the audit.
 
+This exact singleton `thinking` receipt may reach voice while the caller or agent
+is speaking, or just after a human transcript, so a request's saved status need
+not wait for silence. The host still requires fresh, known browser/playback
+evidence and rechecks the exact private source, request text, event identity and
+absence of a terminal answer at the durable dispatch claim. Missing or stale
+evidence holds it. A terminal before claim supersedes it; a terminal after claim
+follows it through the same serialized writer. Unknown delivery is never retried.
+
+While speech is held, the oldest eligible receipt may pass older held speech
+batches; speech batches keep their order and their floor checks. No other thinking
+context, mixed batch, commentary or instruction gains this exception. This uses
+the existing `thinking.append` behavior, which does not request speech but can
+inform later speech and cancels pending automatic delegation acknowledgments.
+Provider acceptance proves neither immediate model use nor silence. Earlier
+awareness does not guarantee the model will avoid another delegation.
+
 Independent answers remain eligible when newer questions arrive. Chronology
 alone does not mean cancellation or replacement; the conversational floor still
 defers delivery while the caller speaks. Image-board placement retains its own
@@ -977,7 +995,7 @@ agent identity is shared. A long observation
 is delivered as numbered source-data parts, preserving its full qualifiers; it no
 longer requires a second reasoning turn merely to retrieve its text. All matching
 part acknowledgments are required before the recorded observation becomes
-`context_accepted`. Quiet context can inform speech, so it follows the same
+`context_accepted`. Observation context can inform speech, so it follows the same
 current-context and conversational-floor checks as spoken notifications.
 
 See [Minecraft observations](companion-minecraft-observation.md) for the official
