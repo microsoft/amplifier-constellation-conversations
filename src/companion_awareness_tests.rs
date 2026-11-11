@@ -190,14 +190,14 @@ async fn fresh_status_reads_only_fixed_source_and_projects_current_access_withou
         "not_configured"
     );
     assert_eq!(calls(&f, "observer").len(), 1);
-    assert_eq!(
-        status_sources(&f.s, &f.id)
-            .unwrap()
-            .iter()
-            .map(|source| json!({"id":source["id"],"label":source["label"],"read_only":source["read_only"]}))
-            .collect::<Vec<_>>(),
-        vec![json!({"id":"minecraft","label":"Workshop","read_only":true})]
-    );
+    let sources = status_sources(&f.s, &f.id).unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["id"], "minecraft");
+    assert_eq!(sources[0]["label"], "Workshop");
+    assert!(sources[0].get("read_only").is_none());
+    for read in sources[0]["reads"].as_object().unwrap().values() {
+        assert_eq!(read["read_only"], true);
+    }
     rewrite_policy(&f, |v| {
         v["agents"]["default"][0]["owners"] = json!(["other"])
     });

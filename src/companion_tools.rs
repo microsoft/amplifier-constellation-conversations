@@ -515,29 +515,63 @@ pub async fn mcp(
     }
     Ok((status, [("content-type", "application/json")], data).into_response())
 }
+/// A shared, side-effect-free projection for both inline and explicit discovery.
+/// These are configured routes, not current capability or action authority.
+fn connection_catalog(s: &AppState, id: &str, agent: &str, c: &Config) -> Result<Value> {
+    let connections: Vec<_> = c
+        .agents
+        .get(agent)
+        .into_iter()
+        .flatten()
+        .map(|x| json!({"id":x.id,"label":x.label,"description":x.description}))
+        .collect();
+    let has_actions = !connections.is_empty();
+    let mut catalog = json!({
+        "connections":connections,
+        "observation_sources":crate::companion_awareness::status_sources(s,id)?,
+        "policy":"Connections are installation-configured action routes; observation_sources describe read operations only. Configuration alone proves neither current availability nor action authority. Actions require the caller's explicit request. Submission is not completion. Unknown sends must not be retried."
+    });
+    if has_actions {
+        catalog["action_tools"] = json!({
+            "request":{"tool":"companion_request_action","required_arguments":["connection_id","delegation_id","instruction","request_id"]},
+            "status":{"tool":"companion_action_status","required_arguments":["request_id"]}
+        });
+    }
+    Ok(catalog)
+}
+
 /// Routing metadata for this call's installed tools, never a source observation.
 /// The same filtered rows are returned by discovery; no helper is invoked here.
 pub(crate) fn read_catalog(s: &AppState, id: &str) -> Result<Option<Value>> {
-    if !config(s)?.enabled {
+    let c = config(s)?;
+    if !c.enabled {
         return Ok(None);
     }
-    let installed: bool = s.db.lock().unwrap().query_row(
-        "SELECT EXISTS(SELECT 1 FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.id=?1 AND c.state IN ('connecting','connected') AND g.port IS NOT NULL)",
-        [id],
-        |r| r.get(0),
-    )?;
-    if !installed {
+    // Keep the existing current private-call boundary even when only action
+    // routes are configured and there are no observation rows to check it.
+    let installed: Option<(String,String)> = s.db.lock().unwrap().query_row(
+        "SELECT c.agent_id,c.conversation_id FROM companion_calls c JOIN companion_tool_grants g ON g.call_id=c.id WHERE c.id=?1 AND c.state IN ('connecting','connected') AND c.heartbeat_at>?2 AND g.port IS NOT NULL",
+        params![id,now_ms()-30_000],
+        |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional()?;
+    let Some((agent, room)) = installed else {
+        return Ok(None);
+    };
+    if !crate::companion::room_identity_valid(s, &room)? {
         return Ok(None);
     }
-    let sources = crate::companion_awareness::status_sources(s, id)?;
+    let mut catalog = connection_catalog(s, id, &agent, &c)?;
     let coordination = huddles::catalog(s, id)?;
-    if sources.is_empty() && coordination.is_none() {
+    if catalog["connections"].as_array().unwrap().is_empty()
+        && catalog["observation_sources"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        && coordination.is_none()
+    {
         return Ok(None);
     }
-    let mut catalog = json!({
-        "observed_at":now_ms(),
-        "observation_sources":sources
-    });
+    catalog["observed_at"] = json!(now_ms());
     if let Some(coordination) = coordination {
         catalog["huddles"] = coordination;
     }
@@ -551,9 +585,7 @@ pub async fn connections(
 ) -> ApiResult<Json<Value>> {
     let (_, agent, _) = authorize(&s, &id, &h)?;
     let c = config(&s)?;
-    Ok(Json(
-        json!({"connections":c.agents.get(&agent).into_iter().flatten().map(|x|json!({"id":x.id,"label":x.label,"description":x.description})).collect::<Vec<_>>(),"observation_sources":crate::companion_awareness::status_sources(&s,&id)?,"policy":"Configured observation sources support a fresh read with companion_connection_status. Configuration alone does not prove availability. Actions require the caller's explicit request. Submission is not completion. Unknown sends must not be retried."}),
-    ))
+    Ok(Json(connection_catalog(&s, &id, &agent, &c)?))
 }
 /// Saved connection observations require no new platform action or native MCP
 /// permission. The observer independently enforces current owner/audience policy.

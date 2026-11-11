@@ -77,15 +77,15 @@ async fn catalog_and_discovery_share_exact_owner_scoped_read_arguments_without_q
         assert_eq!(source["id"], expected_id);
         assert_eq!(
             source["reads"]["saved"],
-            json!({"tool":"companion_observations","arguments":{"connection_id":expected_id}})
+            json!({"tool":"companion_observations","read_only":true,"arguments":{"connection_id":expected_id}})
         );
         assert_eq!(
             source["reads"]["current"],
-            json!({"tool":"companion_connection_status","arguments":{"connection_id":expected_id,"view":"current"}})
+            json!({"tool":"companion_connection_status","read_only":true,"arguments":{"connection_id":expected_id,"view":"current"}})
         );
         assert_eq!(
             source["reads"]["reports"],
-            json!({"tool":"companion_connection_status","arguments":{"connection_id":expected_id,"view":"reports"}})
+            json!({"tool":"companion_connection_status","read_only":true,"arguments":{"connection_id":expected_id,"view":"reports"}})
         );
         assert!(source.get("availability").is_none());
         assert!(source.get("authority").is_none());
@@ -271,6 +271,197 @@ fn catalog_refreshes_configuration_and_requires_current_installed_private_scope(
                 .is_none(),
             "{guard}"
         );
+        assert!(calls(&f, "observer").is_empty());
+        assert!(calls(&f, "decision").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn injected_catalog_and_discovery_include_same_configured_action_routes() {
+    let f = fixture();
+    let token = installed_tools(&f);
+    std::fs::write(f.home.path().join("companion-actions.json"), json!({"enabled":true,"agents":{
+        "default":[{"id":"minecraft","label":"Workshop","description":"Configured game connection.","command":["/not-executed/private-action-command","private-credential-path"]}],
+        "other-agent":[{"id":"other-agent-action","label":"Private other","description":"Hidden.","command":["/not-executed/other-action"]}]
+    }}).to_string()).unwrap();
+    let catalog = crate::companion_tools::read_catalog(&f.s, &f.id)
+        .unwrap()
+        .unwrap();
+    let (status, discovered) = get(&f, &token, "connections").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        catalog["connections"], discovered["connections"],
+        "A populated read catalog must not hide independently configured action routes"
+    );
+    assert_eq!(catalog["connections"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["connections"][0]["id"], "minecraft");
+    assert_eq!(catalog["action_tools"], discovered["action_tools"]);
+    assert_eq!(
+        catalog["action_tools"]["request"]["tool"],
+        "companion_request_action"
+    );
+    assert_eq!(
+        catalog["action_tools"]["status"]["tool"],
+        "companion_action_status"
+    );
+    for private in [
+        "other-agent-action",
+        "private-action-command",
+        "private-credential-path",
+        &token,
+    ] {
+        assert!(!catalog.to_string().contains(private));
+        assert!(!discovered.to_string().contains(private));
+    }
+    assert!(calls(&f, "observer").is_empty());
+    assert!(calls(&f, "decision").is_empty());
+    assert_eq!(
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn action_catalog_keeps_action_and_read_enrollment_independent() {
+    for mode in ["action-only", "read-only", "revoked-action", "revoked-read"] {
+        let f = fixture();
+        let token = installed_tools(&f);
+        let mut actions = json!({"enabled":true,"agents":{"default":[{"id":"minecraft","label":"Workshop","description":"Configured route, availability unknown.","command":["/not-executed/action"]}]}});
+        std::fs::write(
+            f.home.path().join("companion-actions.json"),
+            actions.to_string(),
+        )
+        .unwrap();
+        let initial = crate::companion_tools::read_catalog(&f.s, &f.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial["connections"].as_array().unwrap().len(), 1);
+        match mode {
+            "action-only" => rewrite_policy(&f, |p| p["enabled"] = json!(false)),
+            "revoked-read" => rewrite_policy(&f, |p| {
+                p["agents"]["default"][0]["owners"] = json!(["other"])
+            }),
+            _ => {
+                actions["agents"]["default"] = json!([]);
+                std::fs::write(
+                    f.home.path().join("companion-actions.json"),
+                    actions.to_string(),
+                )
+                .unwrap();
+            }
+        }
+        let catalog = crate::companion_tools::read_catalog(&f.s, &f.id)
+            .unwrap()
+            .unwrap();
+        let (status, discovered) = get(&f, &token, "connections").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalog["connections"], discovered["connections"]);
+        assert_eq!(
+            catalog["observation_sources"],
+            discovered["observation_sources"]
+        );
+        assert_eq!(catalog["action_tools"], discovered["action_tools"]);
+        let has_actions = matches!(mode, "action-only" | "revoked-read");
+        assert_eq!(
+            !catalog["connections"].as_array().unwrap().is_empty(),
+            has_actions,
+            "{mode}"
+        );
+        assert_eq!(catalog.get("action_tools").is_some(), has_actions, "{mode}");
+        assert_eq!(
+            catalog["observation_sources"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            has_actions,
+            "{mode}"
+        );
+        for source in catalog["observation_sources"].as_array().unwrap() {
+            assert!(
+                source.get("read_only").is_none(),
+                "A source itself is not labeled read-only"
+            );
+            for read in source["reads"].as_object().unwrap().values() {
+                assert_eq!(read["read_only"], true);
+            }
+        }
+        assert!(catalog.get("available").is_none());
+        assert!(catalog.get("authority").is_none());
+        assert!(calls(&f, "observer").is_empty());
+        assert!(calls(&f, "decision").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn action_only_catalog_preserves_installed_private_scope_guards() {
+    for mode in [
+        "disabled",
+        "missing-listener",
+        "closed",
+        "private-room",
+        "stale-heartbeat",
+    ] {
+        let f = fixture();
+        let token = installed_tools(&f);
+        std::fs::write(f.home.path().join("companion-actions.json"),json!({"enabled":true,"agents":{"default":[{"id":"minecraft","label":"Workshop","description":"Configured route.","command":["/not-executed/action"]}]}}).to_string()).unwrap();
+        rewrite_policy(&f, |p| p["enabled"] = json!(false));
+        assert!(
+            crate::companion_tools::read_catalog(&f.s, &f.id)
+                .unwrap()
+                .is_some()
+        );
+        match mode {
+            "disabled" => std::fs::write(
+                f.home.path().join("companion-actions.json"),
+                r#"{"enabled":false}"#,
+            )
+            .unwrap(),
+            "missing-listener" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE companion_tool_grants SET port=NULL", [])
+                    .unwrap();
+            }
+            "closed" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE companion_calls SET state='closed'", [])
+                    .unwrap();
+            }
+            "private-room" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO room_members VALUES(?1,'other','member',?2)",
+                        params![f.room, now_ms()],
+                    )
+                    .unwrap();
+            }
+            _ => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE companion_calls SET heartbeat_at=0", [])
+                    .unwrap();
+            }
+        }
+        assert!(
+            crate::companion_tools::read_catalog(&f.s, &f.id)
+                .unwrap()
+                .is_none(),
+            "{mode}"
+        );
+        if matches!(mode, "disabled" | "closed" | "private-room") {
+            assert_ne!(get(&f, &token, "connections").await.0, StatusCode::OK);
+        }
         assert!(calls(&f, "observer").is_empty());
         assert!(calls(&f, "decision").is_empty());
     }

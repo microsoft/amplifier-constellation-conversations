@@ -9,9 +9,9 @@ import {startCompanionMcp} from '../companion-mcp.mjs';
 test('catalog read arguments remain executable and schema identifies the correct namespace and view',async t=>{
   const callId=randomUUID(),token='private-catalog-fixture-token',connection_id='world:Workshop / east';
   const reads={
-    saved:{tool:'companion_observations',arguments:{connection_id}},
-    current:{tool:'companion_connection_status',arguments:{connection_id,view:'current'}},
-    reports:{tool:'companion_connection_status',arguments:{connection_id,view:'reports'}},
+    saved:{tool:'companion_observations',read_only:true,arguments:{connection_id}},
+    current:{tool:'companion_connection_status',read_only:true,arguments:{connection_id,view:'current'}},
+    reports:{tool:'companion_connection_status',read_only:true,arguments:{connection_id,view:'reports'}},
   };
   const paths=[];
   const api=createServer((req,res)=>{
@@ -19,7 +19,7 @@ test('catalog read arguments remain executable and schema identifies the correct
     assert.equal(req.headers.authorization,`Bearer ${token}`);
     res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify(req.url.endsWith('/connections')?{
-      connections:[],observation_sources:[{id:connection_id,connection_id,label:'Workshop',read_only:true,reads}],
+      connections:[],observation_sources:[{id:connection_id,connection_id,label:'Workshop',reads}],
     }:{status:'fixture_read'}));
   });
   await new Promise(resolve=>api.listen(0,'127.0.0.1',resolve));
@@ -28,6 +28,15 @@ test('catalog read arguments remain executable and schema identifies the correct
   t.after(async()=>{await client.close();await bridge.close();await new Promise(resolve=>{api.close(resolve);api.closeAllConnections();});});
   await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${bridge.port}/mcp`),{requestInit:{headers:{Authorization:`Bearer ${token}`}}}));
   const {tools}=await client.listTools();
+  const request=tools.find(tool=>tool.name==='companion_request_action');
+  assert.ok(request,'The same frozen MCP bridge advertises the action tool alongside reads');
+  assert.deepEqual([...request.inputSchema.required].sort(),['connection_id','delegation_id','instruction','request_id']);
+  assert.equal(request.annotations.readOnlyHint,false);
+  const actionStatus=tools.find(tool=>tool.name==='companion_action_status');
+  assert.ok(actionStatus);
+  assert.deepEqual(actionStatus.inputSchema.required,['request_id']);
+  assert.equal(actionStatus.annotations.readOnlyHint,true);
+  assert.equal(paths.length,0,'SDK tools/list does not submit or query any connection');
   for(const name of ['companion_observations','companion_connection_status']){
     const tool=tools.find(tool=>tool.name===name);
     assert.match(tool.inputSchema.properties.connection_id.description,/Exact Companion connection_id/);
