@@ -1733,7 +1733,12 @@ pub(crate) fn is_pending_context_batch(semantic_key: &str, commands: &[Value]) -
         && *command
             == json!({"op":"append","channel":"thinking","delegation_id":did,"event_id":key,"content":content})
 }
-fn pending_context_content(db: &Connection, call: &str, did: &str) -> Result<Option<String>> {
+fn pending_context_content(
+    db: &Connection,
+    call: &str,
+    did: &str,
+    legacy: bool,
+) -> Result<Option<String>> {
     if !pending_context_valid(db, call, did)? || did.len() > 160 {
         return Ok(None);
     }
@@ -1742,15 +1747,30 @@ fn pending_context_content(db: &Connection, call: &str, did: &str) -> Result<Opt
         params![call, did],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
     )?;
-    let mut content = format!(
-        "Request {source} is saved in this call. No matching completed answer has been recorded yet. This receipt does not establish external execution or progress."
-    );
+    if legacy {
+        // Validate an already retained receipt without rewriting or reissuing
+        // its provider event. New receipts use facts rather than speech prose.
+        let mut content = format!(
+            "Request {source} is saved in this call. No matching completed answer has been recorded yet. This receipt does not establish external execution or progress."
+        );
+        if let Some(label) = label.filter(|text| !text.trim().is_empty()) {
+            let detail = format!(" Caller request: {}", serde_json::to_string(&label)?);
+            if content.len() + detail.len() <= 480 {
+                content.push_str(&detail);
+            }
+        }
+        return Ok((content.len() <= 480).then_some(content));
+    }
+    let revision = auth::digest(&serde_json::to_string(&(&source, &label))?);
+    let mut facts = json!({"kind":"call_request_status","request_id":source,
+        "request_revision":revision,"answer":"pending","external_execution":"unknown"});
     if let Some(label) = label.filter(|text| !text.trim().is_empty()) {
-        let detail = format!(" Caller request: {}", serde_json::to_string(&label)?);
-        if content.len() + detail.len() <= 480 {
-            content.push_str(&detail);
+        facts["caller_request"] = json!(label);
+        if facts.to_string().len() > 480 {
+            facts.as_object_mut().unwrap().remove("caller_request");
         }
     }
+    let content = facts.to_string();
     Ok((content.len() <= 480).then_some(content))
 }
 pub(crate) fn pending_context_matches(
@@ -1759,17 +1779,26 @@ pub(crate) fn pending_context_matches(
     did: &str,
     content: &str,
 ) -> Result<bool> {
-    Ok(pending_context_content(db, call, did)?.as_deref() == Some(content))
+    Ok(
+        pending_context_content(db, call, did, false)?.as_deref() == Some(content)
+            || pending_context_content(db, call, did, true)?.as_deref() == Some(content),
+    )
 }
 fn pending_context(s: &AppState, call: &str, did: &str) -> Result<()> {
     let key = pending_context_key(did);
     let (content, existing) = {
         let db = s.db.lock().unwrap();
-        (pending_context_content(&db, call, did)?, db.query_row("SELECT updates FROM companion_voice_batches WHERE call_id=?1 AND semantic_key=?2 LIMIT 1",params![call,key],|r|r.get::<_,String>(0)).optional()?)
+        (pending_context_content(&db, call, did, false)?, db.query_row("SELECT updates FROM companion_voice_batches WHERE call_id=?1 AND semantic_key=?2 LIMIT 1",params![call,key],|r|r.get::<_,String>(0)).optional()?)
     };
     if let Some(existing) = existing {
         let existing: Value = serde_json::from_str(&existing)?;
-        if existing[0]["content"].as_str() != content.as_deref() {
+        let unchanged = pending_context_matches(
+            &s.db.lock().unwrap(),
+            call,
+            did,
+            existing[0]["content"].as_str().unwrap_or(""),
+        )?;
+        if !unchanged {
             crate::companion_delivery::supersede_pending(s, call, &key)?;
         }
         // An admitted source is immutable. Changed source data does not grant

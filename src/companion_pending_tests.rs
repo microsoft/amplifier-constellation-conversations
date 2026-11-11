@@ -117,9 +117,14 @@ fn one_quiet_pending_receipt_survives_polling_without_more_work() {
     assert_eq!(rows[0].2[0]["channel"], "thinking");
     assert_eq!(rows[0].2[0]["delegation_id"], "shelf");
     let text = rows[0].2[0]["content"].as_str().unwrap();
-    assert!(text.contains("Request shelf is saved"));
-    assert!(text.contains("How wide is the shelf?"));
-    assert!(text.contains("does not establish external execution or progress"));
+    let facts: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        facts,
+        json!({"kind":"call_request_status","request_id":"shelf",
+        "request_revision":auth::digest(&serde_json::to_string(&("shelf",Some("How wide is the shelf?"))).unwrap()),
+        "answer":"pending","external_execution":"unknown","caller_request":"How wide is the shelf?"})
+    );
+    assert!(text.len() <= 480);
     // Provider-facing identity is stable, and no additional task is admitted.
     let batch = crate::companion_delivery::take_ready(&f.s, &f.call)
         .unwrap()
@@ -147,6 +152,216 @@ fn one_quiet_pending_receipt_survives_polling_without_more_work() {
             .unwrap(),
         1
     );
+}
+#[test]
+fn typed_pending_fact_preserves_whole_label_and_revision_within_existing_budget() {
+    for label in [
+        None,
+        Some("".into()),
+        Some("A quoted \"request\"\nwith 界".into()),
+        Some("界".repeat(200)),
+    ] {
+        let f = fixture();
+        request(&f, "shelf", "submitted");
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE companion_delegations SET request_text=?1 WHERE id='shelf'",
+                params![label],
+            )
+            .unwrap();
+        pending_context(&f.s, &f.call, "shelf").unwrap();
+        let rows = batches(&f);
+        let text = rows[0].2[0]["content"].as_str().unwrap();
+        let facts: Value = serde_json::from_str(text).unwrap();
+        assert!(text.len() <= 480);
+        assert_eq!(facts["request_id"], "shelf");
+        assert_eq!(facts["answer"], "pending");
+        assert_eq!(facts["external_execution"], "unknown");
+        assert_eq!(
+            facts["request_revision"],
+            auth::digest(&serde_json::to_string(&("shelf", &label)).unwrap())
+        );
+        if label
+            .as_ref()
+            .is_some_and(|s| !s.is_empty() && s.len() < 100)
+        {
+            assert_eq!(facts["caller_request"], label.as_deref().unwrap());
+        } else {
+            assert!(facts.get("caller_request").is_none());
+        }
+        // An omitted label remains bound in the stable revision, not shortened
+        // into a different request or silently reused after a source change.
+        if label.as_ref().is_some_and(|s| s.len() > 480) {
+            f.s.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE companion_delegations SET request_text=?1 WHERE id='shelf'",
+                    ["別".repeat(200)],
+                )
+                .unwrap();
+            assert!(
+                crate::companion_delivery::take_ready(&f.s, &f.call)
+                    .unwrap()
+                    .is_none()
+            );
+            pending_context(&f.s, &f.call, "shelf").unwrap();
+            assert_eq!(batches(&f).len(), 1);
+            assert_eq!(batches(&f)[0].1, "superseded");
+            assert_eq!(batches(&f)[0].2, rows[0].2);
+        }
+    }
+}
+
+fn legacy_pending_receipt(f: &Fixture) -> String {
+    let text = "Request shelf is saved in this call. No matching completed answer has been recorded yet. This receipt does not establish external execution or progress. Caller request: \"How wide is the shelf?\"";
+    queue_append(
+        &f.s,
+        &f.call,
+        "thinking",
+        Some("shelf"),
+        text,
+        &pending_context_key("shelf"),
+    )
+    .unwrap();
+    text.into()
+}
+
+#[test]
+fn retained_legacy_pending_fact_is_never_reformatted_replaced_or_replayed() {
+    for state in ["pending", "sent", "unknown", "dispatching"] {
+        let f = fixture();
+        request(&f, "shelf", "submitted");
+        let text = legacy_pending_receipt(&f);
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE companion_voice_batches SET state=?1", [state])
+            .unwrap();
+        let retained = batches(&f)[0].2.clone();
+        // Existing dispatches lose acknowledgment on process recovery; neither
+        // that uncertainty nor a format upgrade permits a replacement append.
+        if state == "dispatching" {
+            crate::companion_delivery::migrate(&f.s.db.lock().unwrap()).unwrap();
+        }
+        for _ in 0..10 {
+            pending_context(&f.s, &f.call, "shelf").unwrap();
+        }
+        assert_eq!(batches(&f).len(), 1);
+        assert_eq!(batches(&f)[0].2, retained);
+        user_floor(&f);
+        let ready = crate::companion_delivery::take_ready(&f.s, &f.call).unwrap();
+        if state == "pending" {
+            let ready = ready.unwrap();
+            assert_eq!(ready["commands"][0]["content"], text);
+            assert_eq!(ready["commands"][0]["channel"], "thinking");
+            crate::companion_delivery::sent(&f.s, &f.call, ready["batch_id"].as_str().unwrap())
+                .unwrap();
+        } else {
+            assert!(ready.is_none());
+        }
+        for _ in 0..10 {
+            pending_context(&f.s, &f.call, "shelf").unwrap();
+        }
+        assert!(
+            crate::companion_delivery::take_ready(&f.s, &f.call)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(batches(&f).len(), 1);
+        assert_eq!(batches(&f)[0].2, retained);
+        assert_eq!(
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM input_deliveries", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn legacy_receipt_cannot_bypass_current_source_or_terminal_validation() {
+    for change in ["label", "actor", "terminal"] {
+        let f = fixture();
+        request(&f, "shelf", "submitted");
+        legacy_pending_receipt(&f);
+        let old = batches(&f)[0].2.clone();
+        match change {
+            "label" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_delegations SET request_text='Different question'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "actor" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE messages SET actor='other'", [])
+                    .unwrap();
+            }
+            "terminal" => {
+                completed(&f, "shelf", "The shelf is 137 cm wide.");
+            }
+            _ => unreachable!(),
+        }
+        user_floor(&f);
+        assert!(
+            crate::companion_delivery::take_ready(&f.s, &f.call)
+                .unwrap()
+                .is_none()
+        );
+        pending_context(&f.s, &f.call, "shelf").unwrap();
+        assert_eq!(batches(&f).len(), 1);
+        assert_eq!(batches(&f)[0].1, "superseded");
+        assert_eq!(batches(&f)[0].2, old);
+    }
+}
+
+#[test]
+fn typed_pending_fields_cannot_be_relabelled_or_promoted_to_execution() {
+    for (key, value) in [
+        ("request_id", json!("other")),
+        ("request_revision", json!("new")),
+        ("answer", json!("complete")),
+        ("external_execution", json!(true)),
+        ("caller_request", json!("Different question")),
+        ("kind", json!("progress")),
+    ] {
+        let f = fixture();
+        request(&f, "shelf", "submitted");
+        pending_context(&f.s, &f.call, "shelf").unwrap();
+        let mut updates = batches(&f)[0].2.clone();
+        let mut content: Value =
+            serde_json::from_str(updates[0]["content"].as_str().unwrap()).unwrap();
+        content[key] = value;
+        updates[0]["content"] = json!(content.to_string());
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE companion_voice_batches SET updates=?1",
+                [updates.to_string()],
+            )
+            .unwrap();
+        user_floor(&f);
+        assert!(
+            crate::companion_delivery::take_ready(&f.s, &f.call)
+                .unwrap()
+                .is_none(),
+            "{key}"
+        );
+        assert_eq!(batches(&f)[0].1, "superseded");
+    }
 }
 #[test]
 fn terminal_arriving_under_user_floor_retires_unsent_pending_but_preserves_answer() {
