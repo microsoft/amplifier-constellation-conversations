@@ -1,5 +1,9 @@
 # Constellation Companion (preview)
 
+This document defines the call service and describes its reference web client.
+The [component vision](VISION.md) gives the broader intent; current screens are
+developer, administrator and reference access, not a prescribed future product UX.
+
 Companion is a foreground web voice experience for an existing ACP agent. Open
 `/companion`, choose a saved contact, and start a call. One person calls one agent
 at a time. It is the same agent identity, with a new private conversation and
@@ -234,7 +238,9 @@ provider has actually been registered and made reachable by the agent. With fals
 call transcripts remain local and relevant speech accompanies explicit delegation
 over ordinary ACP. The agent retains access to already authorized sources. This
 flag says nothing about whether its other Slack or Minecraft context is available.
-Automatic subscriptions to activity in other experiences are not enabled here.
+Activity subscriptions use the separate optional
+[observer policy](#read-only-observers); transcript registration does not enable
+them.
 
 Serve behind trusted HTTPS, including on phones. The host's normal PAM login
 protects browser access. Opening the page does not grant microphone consent, and
@@ -244,7 +250,7 @@ apply. Screen locking or switching apps may interrupt audio; background operatio
 is not guaranteed. Silent or muted provider sessions may still incur charges.
 `max_call_seconds` is an optional positive integer. Omit it or set it to `null`
 for no local duration cutoff; an explicit value still closes the call when that
-many seconds have elapsed, without the former 30-minute ceiling. Browser heartbeat
+many seconds have elapsed. Browser heartbeat
 loss, revoked access, Stop/hangup, and actual provider closure still end calls.
 [GPT-Live manages long conversations](https://developers.openai.com/api/docs/guides/live-conversations)
 automatically; removing the local cutoff does not override provider limits or
@@ -380,8 +386,9 @@ When enabled, the per-call bridge uses the official MCP SDK to expose
 `companion_hangup`, and `companion_feedback`. Conversations supplies the descriptor
 through ordinary ACP `mcpServers`; the agent must advertise HTTP MCP support.
 These tools apply only to the private call and selected agent. They do not merge
-sessions, imply write authority from context access, or require a shared
-Constellation provisioning or identity service.
+sessions or imply write authority from context access. Installation ownership
+follows the shared
+[self-contained installation agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/family.v1-candidate.md#self-contained-installation-baseline).
 
 The backend must be able to reach Conversations' public HTTPS address from its own
 network namespace. A working browser connection does not prove that route. For a
@@ -465,7 +472,7 @@ original `delegation_id` (a provider ID of 1–160 characters), and a UUID `requ
 Optional `kind` is `auto`, `link`, `image`, or `video` for a URL, and `note` for text.
 Saving a card is neither platform publication nor evidence that it was displayed.
 
-## Validation and remaining boundaries
+## Validation and scope
 
 `npm test --prefix bridge` checks provider controls, official MCP transport,
 fixed call authority, safe error results, and closure. Rust tests cover ownership,
@@ -478,9 +485,8 @@ call, physical phone, real model image acceptance, or platform action completion
 record those checks separately.
 
 No group media, continuous camera streaming, or voice inside Slack/Minecraft is
-enabled here. A future local speech provider can reuse these call and delivery
-boundaries without changing ACP runtime ownership. Background awareness remains
-separate from an instruction to speak or authority to act.
+enabled here. Background awareness remains separate from an instruction to speak
+or authority to act.
 
 Official provider references: [Live](https://developers.openai.com/api/docs/guides/live),
 [delegation](https://developers.openai.com/api/docs/guides/live-delegation),

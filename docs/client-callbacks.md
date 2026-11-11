@@ -1,7 +1,7 @@
 # Optional local ACP callbacks
 
 Each registered agent can optionally use this web experience's standard ACP
-filesystem and terminal callbacks. Existing installations advertise neither.
+filesystem and terminal callbacks. Both are disabled by default.
 These are tools on the **experience's machine**, not a translation of paths on a
 remote agent's machine. Agent-owned tools keep their own policy.
 
@@ -103,7 +103,7 @@ room/person/agent audience checks, exact receipt matching, changed payloads,
 foreign sessions/turns, expiry, file bounds, private installation boundaries,
 symlink/hard-link/FIFO refusal and a pinned root replaced after opening.
 
-Five integration tests run a real independent ACP process through the driver:
+Integration tests run a real independent ACP process through the driver:
 write/read callbacks wait for the correct human, another human cannot approve,
 cancellation removes pending approval without writing, and an unlisted room
 member removes capabilities from the actual initialize handshake. Creation/load
@@ -119,5 +119,4 @@ cargo test --lib client_callbacks -- --ignored
 This explicit test executes real bubblewrap, proves the service directory and
 host `/etc` are absent, checks that outbound networking is unavailable, checks
 output truncation and verifies that timeouts kill a child before it can write a
-late file. It passed on agent-host. It is intentionally not treated as a macOS or
-Windows terminal test. No live user's callback policy was enabled by these tests.
+late file. It is intentionally not treated as a macOS or Windows terminal test.
