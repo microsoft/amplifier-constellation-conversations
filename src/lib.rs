@@ -21,6 +21,7 @@ pub mod driver;
 pub mod elicitation;
 pub mod error;
 pub mod huddle_auto;
+pub mod huddle_delivery;
 pub mod huddles;
 pub mod imports;
 pub mod permissions;

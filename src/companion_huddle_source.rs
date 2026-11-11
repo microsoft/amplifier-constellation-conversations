@@ -55,6 +55,65 @@ pub(super) fn resolve_in(
     crate::huddles::parent_source(db, parent, &source, owner)
 }
 
+/// An admitted peer reply can continue its existing discussion after the
+/// caller's original turn completes. It is not another human delegation and
+/// cannot authorize creating rooms or changing their membership. The delivery
+/// binding supplies the room and recipient, never a model-provided authority.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_post_in(
+    s: &AppState,
+    db: &Connection,
+    call: &str,
+    owner: &str,
+    agent: &str,
+    parent: &str,
+    delegation: &str,
+    room: &str,
+    installation: &str,
+) -> ApiResult<Origin> {
+    if let Ok(origin) = resolve_in(s, db, call, owner, agent, parent, delegation) {
+        return Ok(origin);
+    }
+    let identity =
+        crate::companion_history::private_identity(db, call)?.ok_or_else(ApiError::forbidden)?;
+    if identity.owner != owner || identity.agent != agent || identity.room != parent {
+        return Err(ApiError::forbidden());
+    }
+    let source: Option<String> = db
+        .query_row(
+            "SELECT d.message_id FROM companion_delegations d
+         JOIN companion_calls c ON c.id=d.call_id JOIN messages m ON m.id=d.message_id
+         WHERE d.call_id=?1 AND d.id=?2 AND d.state IN ('dispatched','completed')
+           AND c.owner=?3 AND c.agent_id=?4 AND c.conversation_id=?5
+           AND c.state IN ('connecting','connected')
+           AND m.conversation_id=?5 AND m.actor=?3 AND m.role='user' AND m.status='complete'
+           AND EXISTS(SELECT 1 FROM input_deliveries i WHERE i.message_id=m.id
+             AND i.conversation_id=?5 AND i.agent_id=?4 AND i.state='completed')",
+            params![call, delegation, owner, agent, parent],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let source = source.ok_or_else(|| {
+        ApiError::bad("An active caller request or admitted peer continuation is required")
+    })?;
+    if !crate::huddle_delivery::active_source(
+        s,
+        db,
+        call,
+        parent,
+        agent,
+        &source,
+        room,
+        installation,
+    )? || !crate::delivery::authorized_in(s, db, &source, owner)?
+    {
+        return Err(ApiError::forbidden());
+    }
+    crate::companion_awareness::original_human_source_time(db, call, delegation)
+        .map_err(|_| ApiError::bad("The original human source cannot be verified"))?;
+    crate::huddles::parent_source(db, parent, &source, owner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +428,96 @@ mod tests {
         ] {
             assert!(resolve_in(&f.s, &db, call, owner, agent, parent, &r.delegation).is_err());
         }
+    }
+
+    #[test]
+    fn completed_human_request_without_active_bound_peer_cannot_post_or_ensure_again() {
+        let f = fixture();
+        let r = request(&f, "completed", "Original request", "completed");
+        let db = f.s.db.lock().unwrap();
+        db.execute(
+            "UPDATE companion_delegations SET state='completed' WHERE id=?1",
+            [&r.delegation],
+        )
+        .unwrap();
+        assert!(
+            resolve_in(
+                &f.s,
+                &db,
+                &f.call,
+                "owner",
+                "default",
+                &f.parent,
+                &r.delegation
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_post_in(
+                &f.s,
+                &db,
+                &f.call,
+                "owner",
+                "default",
+                &f.parent,
+                &r.delegation,
+                "unrelated-room",
+                "unrelated-installation"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT state FROM companion_delegations WHERE id=?1",
+                [&r.delegation],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "completed"
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM huddle_peer_deliveries", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn post_resolver_keeps_current_human_source_and_rejects_changed_speech() {
+        let f = fixture();
+        let r = request(&f, "current", "Exact original request", "submitted");
+        let db = f.s.db.lock().unwrap();
+        assert_eq!(
+            resolve_post_in(
+                &f.s,
+                &db,
+                &f.call,
+                "owner",
+                "default",
+                &f.parent,
+                &r.delegation,
+                "room",
+                "installation"
+            )
+            .unwrap(),
+            expected(&f, &r)
+        );
+        db.execute("UPDATE companion_delegations SET source=json_set(source,'$.fragments[0].text','Changed human text') WHERE id=?1", [&r.delegation]).unwrap();
+        assert!(
+            resolve_post_in(
+                &f.s,
+                &db,
+                &f.call,
+                "owner",
+                "default",
+                &f.parent,
+                &r.delegation,
+                "room",
+                "installation"
+            )
+            .is_err()
+        );
     }
 
     #[test]

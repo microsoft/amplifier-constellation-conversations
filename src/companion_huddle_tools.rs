@@ -329,16 +329,23 @@ pub(crate) fn permission_valid(
     }
     if ["companion_huddle_ensure", "companion_huddle_post"].contains(&tool) {
         let db = s.db.lock().unwrap();
-        let source_valid = source::resolve_in(
-            s,
-            &db,
-            call,
-            owner,
-            agent,
-            parent,
-            args["delegation_id"].as_str().unwrap(),
-        )
-        .is_ok();
+        let delegation = args["delegation_id"].as_str().unwrap();
+        let source_valid = if tool == "companion_huddle_post" {
+            source::resolve_post_in(
+                s,
+                &db,
+                call,
+                owner,
+                agent,
+                parent,
+                delegation,
+                args["huddle_id"].as_str().unwrap(),
+                selected,
+            )
+            .is_ok()
+        } else {
+            source::resolve_in(s, &db, call, owner, agent, parent, delegation).is_ok()
+        };
         return Ok(source_valid
             && (tool != "companion_huddle_post"
                 || same_parent(&db, args["huddle_id"].as_str().unwrap(), parent, owner)?));
@@ -476,7 +483,7 @@ pub async fn post_message(
     }
     let (owner, agent, parent) = super::authorize(&s, &call, &h)?;
     let selected = installation(&s, &owner, &agent, &body.installation_id)?;
-    let origin = source::resolve_in(
+    let origin = source::resolve_post_in(
         &s,
         &s.db.lock().unwrap(),
         &call,
@@ -484,6 +491,8 @@ pub async fn post_message(
         &agent,
         &parent,
         &body.delegation_id,
+        &room,
+        &body.installation_id,
     )?;
     let crate::huddles::Origin::Conversation {
         message_id,
@@ -508,8 +517,17 @@ pub async fn post_message(
         &room,
         post,
         |db| {
-            if source::resolve_in(&s, db, &call, &owner, &agent, &parent, &body.delegation_id)?
-                != origin
+            if source::resolve_post_in(
+                &s,
+                db,
+                &call,
+                &owner,
+                &agent,
+                &parent,
+                &body.delegation_id,
+                &room,
+                &body.installation_id,
+            )? != origin
             {
                 return Err(ApiError::forbidden());
             }

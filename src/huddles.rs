@@ -843,11 +843,13 @@ pub async fn post(
     Json(body): Json<Post>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let actor = participant(&s, &h, &room)?;
+    let request = body.request_id.clone();
     let (status, value) = post_inner(&s, &room, actor, body, |_| Ok(()))?;
+    crate::huddle_delivery::launch(&s, &request)?;
     Ok((status, Json(value)))
 }
 pub fn post_for_installation(
-    s: &AppState,
+    s: &Arc<AppState>,
     installation: &crate::huddle_auto::Installation,
     room: &str,
     body: Post,
@@ -855,14 +857,17 @@ pub fn post_for_installation(
     post_for_installation_guarded(s, installation, room, body, |_| Ok(()))
 }
 pub fn post_for_installation_guarded(
-    s: &AppState,
+    s: &Arc<AppState>,
     installation: &crate::huddle_auto::Installation,
     room: &str,
     body: Post,
     guard: impl FnOnce(&Connection) -> ApiResult<()>,
 ) -> ApiResult<Value> {
     let p = installed_participant(s, installation, room)?;
-    Ok(post_inner(s, room, p, body, guard)?.1)
+    let request = body.request_id.clone();
+    let result = post_inner(s, room, p, body, guard)?.1;
+    crate::huddle_delivery::launch(s, &request)?;
+    Ok(result)
 }
 fn post_inner(
     s: &AppState,
@@ -967,6 +972,14 @@ fn post_inner(
             } else {
                 json!({"state":"blocked","delivery":"companion_owned","reason":"original_request_or_private_audience_changed"})
             };
+            tx.execute(
+                "UPDATE huddle_posts SET receipt=?2 WHERE message_id=?1",
+                params![body.request_id, receipt.to_string()],
+            )?;
+        }
+        let local = crate::huddle_delivery::enqueue(s, &tx, &body.request_id)?;
+        if local.as_array().is_some_and(|items| !items.is_empty()) {
+            receipt["local_delivery"] = local;
             tx.execute(
                 "UPDATE huddle_posts SET receipt=?2 WHERE message_id=?1",
                 params![body.request_id, receipt.to_string()],
