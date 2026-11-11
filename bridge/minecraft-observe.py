@@ -295,7 +295,8 @@ def read_scoped_outcomes(exchange, actions, client):
         originals = [scoped_original(action) for action in actions]
         if len({row[0] for row in originals}) != len(originals) or any(row[2] != client["caller_id"] for row in originals):
             raise ValueError("scoped_caller_mismatch")
-        if not source_contract.source_capability(exchange("GET", "/source-capabilities", None, client["token"])):
+        capability = exchange("GET", "/source-capabilities", None, client["token"])
+        if not source_contract.source_capability(capability):
             raise ValueError("scoped_capability_unavailable")
         expected = {queue: source for queue, source, _ in originals}
         snapshot = exchange("POST", "/source-outcomes", {"version": 1, "requests": [
@@ -325,12 +326,36 @@ def read_scoped_outcomes(exchange, actions, client):
             validate_outcome(row)
             if any(reply["audience"] != "public" for reply in row["responses"]):
                 raise ValueError("scoped_private_response")
+            # Public game packets keep their original contract. This separate
+            # extension is only for the exact credential-bound private source.
+            if source_contract.source_replies_capability(capability.get("source_replies")):
+                validate_source_replies(row, expected[row["request_id"]])
+                row = {**row, "source_replies_capability": capability["source_replies"]}
+            elif any(key in row for key in ["source_replies", "source_replies_omitted", "source_replies_capability"]):
+                raise ValueError("unnegotiated_source_replies")
             outcomes[row["request_id"]] = row
         return "available", outcomes
     except Exception:
         # A scoped lookup must never broaden to owner /input-outcomes or today's
         # task when the token, capability or complete source does not match.
         return "unavailable", {}
+
+
+def validate_source_replies(row, source):
+    replies = row.get("source_replies")
+    if (not isinstance(replies, list) or len(replies) > 32
+            or "source_replies_omitted" in row and type(row["source_replies_omitted"]) is not bool):
+        raise ValueError("invalid_source_replies")
+    ids = set()
+    for reply in replies:
+        if (not isinstance(reply, dict) or set(reply) != {"id", "at", "text", "audience", "delivery"}
+                or not valid_id(reply["id"])
+                or reply["id"] in ids or not valid_time(reply["at"])
+                or reply["audience"] != source["audience"] or reply["delivery"] != "recorded"
+                or not isinstance(reply["text"], str) or not reply["text"].strip()
+                or len(reply["text"].encode()) > 12000):
+            raise ValueError("invalid_source_reply")
+        ids.add(reply["id"])
 
 
 def validate_outcome(row):
@@ -445,6 +470,21 @@ def outcome_observation(action, connection, observed_at, outcomes, availability)
         domain_evidence["domain_response_association"] = row["response_association"]
         domain_evidence["installation_source"] = row["source"]
         domain_evidence["private_game_responses_included"] = False
+        if source_contract.source_replies_capability(row.get("source_replies_capability")):
+            # Share the existing reply projection budget and retain whole
+            # records only; never drop the end of a reply's qualification.
+            private_replies, private_omitted = [], 0
+            for reply in row["source_replies"]:
+                size = len(encoded(reply))
+                if len(private_replies) >= 8 or response_bytes + size > 8000:
+                    private_omitted += 1
+                    continue
+                private_replies.append(reply)
+                response_bytes += size
+            domain_evidence.update(source_replies=private_replies, source_replies_omitted=private_omitted,
+                                   source_replies_capability=row["source_replies_capability"])
+            if "source_replies_omitted" in row:
+                domain_evidence["domain_source_replies_omitted"] = row["source_replies_omitted"]
     if row.get("reason") in ["not_retained", "terminal_not_retained"]:
         domain_evidence["outcome_reason"] = row["reason"]
     return action_observation(action, connection, observed_at, state, scope="conversation", fulfillment="not_established",

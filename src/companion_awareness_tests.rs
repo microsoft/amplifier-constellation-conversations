@@ -2509,6 +2509,345 @@ fn scoped_outcome_requires_exact_original_actor_audience_and_source_receipt() {
     assert!(observation_valid(&update, &[action]));
 }
 
+fn private_source_reply_fixture() -> (Value, Value) {
+    // Actual disposable cd747a1 producer output, using Companion source_envelope.
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../bridge/test/fixtures/minecraft-private-source-reply.json"
+    ))
+    .unwrap();
+    let source = &fixture["input"]["source"];
+    let row = &fixture["response"]["outcomes"][0];
+    let action = json!({"request_id":source["request_id"],"receipt":{
+        "request_id":source["request_id"],"scope":"private_installation_input","state":"queued",
+        "protocol":"installation_inputs.v1","caller_id":"companion","source":source,
+        "receipt":fixture["receipt"]}});
+    let mut update = outcome_update("terminal", "settled", json!(true));
+    update["request_id"] = source["request_id"].clone();
+    update["provenance"]["source_id"] = row["request_id"].clone();
+    update["installation_source"] = row["source"].clone();
+    update["domain_response_association"] = row["response_association"].clone();
+    update["private_game_responses_included"] = json!(false);
+    update["source_replies"] = row["source_replies"].clone();
+    update["source_replies_capability"] = fixture["capability"]["source_replies"].clone();
+    update["source_replies_omitted"] = json!(0);
+    (action, update)
+}
+
+#[test]
+fn private_source_reply_is_exactly_bound_recorded_evidence_not_hearing_or_completion() {
+    let (action, update) = private_source_reply_fixture();
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    let text = observation_text("Workshop", &update);
+    assert!(text.contains("Recorded reply for this private conversation"));
+    assert!(text.contains(update["source_replies"][0]["text"].as_str().unwrap()));
+    assert!(text.contains("does not establish that it was spoken, heard, or acted on"));
+    assert!(!text.contains("No public reply"));
+    assert_eq!(update["fulfillment"], "not_established");
+    assert_eq!(update["verified"], false);
+    assert_eq!(update["responses"], json!([]));
+    assert_eq!(update["private_game_responses_included"], false);
+}
+
+#[test]
+fn private_source_replies_require_capability_original_source_audience_and_unique_ids() {
+    let (action, update) = private_source_reply_fixture();
+    for field in [
+        "source_replies_capability",
+        "installation_source",
+        "source_replies_omitted",
+    ] {
+        let mut bad = update.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        assert!(
+            !observation_valid(&bad, std::slice::from_ref(&action)),
+            "{field}"
+        );
+    }
+    for (field, value) in [
+        ("version", json!(true)),
+        ("version", json!(1.0)),
+        ("max_items", json!(32.0)),
+        ("max_text_bytes", json!(12000.0)),
+        ("version", json!(2)),
+        ("max_items", json!(33)),
+    ] {
+        let mut bad = update.clone();
+        bad["source_replies_capability"][field] = value;
+        assert!(
+            !observation_valid(&bad, std::slice::from_ref(&action)),
+            "{field}"
+        );
+    }
+    for (field, value) in [
+        (
+            "audience",
+            json!({"kind":"private","experience":"companion","id":"other-room"}),
+        ),
+        (
+            "audience",
+            json!({"kind":"private","experience":"voice","id":"disposable-companion-room"}),
+        ),
+        ("audience", json!("private")),
+        ("delivery", json!("heard")),
+        ("id", json!("invalid\nidentity")),
+        ("at", json!("yesterday")),
+    ] {
+        let mut bad = update.clone();
+        bad["source_replies"][0][field] = value;
+        assert!(
+            !observation_valid(&bad, std::slice::from_ref(&action)),
+            "{field}"
+        );
+    }
+    for (field, value) in [
+        ("caller", json!({"id":"other","label":"Other"})),
+        ("revision", json!("other-source")),
+        ("call_id", json!("other-call")),
+    ] {
+        let mut bad = update.clone();
+        bad["installation_source"][field] = value;
+        assert!(
+            !observation_valid(&bad, std::slice::from_ref(&action)),
+            "{field}"
+        );
+    }
+    let mut duplicate = update.clone();
+    duplicate["source_replies"]
+        .as_array_mut()
+        .unwrap()
+        .push(update["source_replies"][0].clone());
+    assert!(!observation_valid(
+        &duplicate,
+        std::slice::from_ref(&action)
+    ));
+    let mut legacy = action.clone();
+    legacy["receipt"] = json!({});
+    assert!(!observation_valid(&update, &[legacy]));
+    let mut unrelated = update.clone();
+    unrelated["provenance"]["kind"] = json!("minecraft_observation");
+    assert!(!observation_valid(&unrelated, &[action]));
+    for field in SOURCE_REPLY_FIELDS {
+        let mut alone = outcome_update("terminal", "settled", json!(true));
+        alone[field] = update[field].clone();
+        let legacy = json!({"request_id":alone["request_id"],"receipt":{}});
+        assert!(
+            !observation_valid(&alone, std::slice::from_ref(&legacy)),
+            "{field}"
+        );
+        alone["provenance"]["kind"] = json!("minecraft_observation");
+        assert!(!observation_valid(&alone, &[legacy]), "{field}");
+    }
+}
+
+#[test]
+fn private_source_reply_does_not_relax_public_validation_and_preserves_coverage_types() {
+    let (action, mut update) = private_source_reply_fixture();
+    update["domain_source_replies_omitted"] = json!(true);
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    assert!(observation_text("Workshop", &update).contains("private reply record is incomplete"));
+    update["domain_private_responses_withheld"] = json!(true);
+    let rendered = observation_text("Workshop", &update);
+    assert!(rendered.contains("Recorded reply for this private conversation"));
+    assert!(rendered.contains("Unrelated private game response content was withheld"));
+    assert!(!rendered.contains("\nPrivate response content was withheld"));
+    for (field, value) in [
+        ("domain_source_replies_omitted", json!(1)),
+        ("source_replies_omitted", json!(true)),
+    ] {
+        let mut bad = update.clone();
+        bad[field] = value;
+        assert!(
+            !observation_valid(&bad, std::slice::from_ref(&action)),
+            "{field}"
+        );
+    }
+    update["responses"] = json!([{"id":"public","at":"2026-11-11T05:39:04.411Z",
+        "audience":"private","text":"unrelated private game message"}]);
+    assert!(!observation_valid(&update, &[action]));
+    assert!(!observation_text("Workshop", &update).contains("unrelated private game message"));
+}
+
+#[test]
+fn private_source_reply_announcement_omits_whole_multibyte_reply_with_qualification() {
+    let (action, mut update) = private_source_reply_fixture();
+    update["source_replies"][0]["text"] = json!(format!("{} not completion", "界".repeat(1100)));
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    let text = observation_text("Workshop", &update);
+    assert!(!text.contains("界"));
+    assert!(text.contains("Some returned private replies are not included here"));
+    assert!(!text.contains("Recorded reply for this private conversation"));
+    update["source_replies"][0]["text"] = json!("界".repeat(4001));
+    assert!(!observation_valid(&update, &[action]));
+}
+
+#[test]
+fn private_source_reply_retention_deduplicates_same_revision_and_preserves_original_time() {
+    let f = fixture();
+    let source = config(&f.s).unwrap().unwrap().0.agents["default"][0].clone();
+    let (action, update) = private_source_reply_fixture();
+    assert!(observation_valid(&update, std::slice::from_ref(&action)));
+    assert!(save_observation(&f.s, &f.id, &source, &update).unwrap());
+    let mut later = update.clone();
+    later["observed_at"] = json!(timestamp(now_ms() + 1000));
+    assert!(!save_observation(&f.s, &f.id, &source, &later).unwrap());
+    let db = f.s.db.lock().unwrap();
+    let raw: String = db
+        .query_row(
+            "SELECT data FROM companion_observations WHERE call_id=?1 AND request_id=?2",
+            params![f.id, update["request_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let saved: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(saved["source_replies"], update["source_replies"]);
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM companion_observation_revisions WHERE call_id=?1",
+            [&f.id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    later["source_replies"][0]["text"] = json!("changed same revision");
+    assert!(save_observation(&f.s, &f.id, &source, &later).is_err());
+}
+
+#[tokio::test]
+async fn private_source_reply_follows_enrolled_original_action_and_survives_reload_without_resend()
+{
+    let f = fixture();
+    let (request, queue) = retained_action(&f);
+    let raw: String =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source FROM companion_actions WHERE call_id=?1 AND request_id=?2",
+                params![f.id, request],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let original: Value = serde_json::from_str(&raw).unwrap();
+    let wire = json!({"version":1,"request_id":request,"call_id":f.id,
+        "intent_id":original["delegation_id"],"revision":original["source_revision"],
+        "occurred_at":timestamp(original["occurred_at"].as_i64().unwrap()),
+        "actor":{"id":"owner","label":"owner"},
+        "audience":{"kind":"private","experience":"companion","id":f.room}});
+    let (mut action, mut update) = private_source_reply_fixture();
+    action["request_id"] = json!(request);
+    action["receipt"]["request_id"] = json!(request);
+    action["receipt"]["source"] = wire.clone();
+    action["receipt"]["receipt"]["request_id"] = json!(queue);
+    action["receipt"]["receipt"]["source_request_id"] = json!(request);
+    update["request_id"] = json!(request);
+    update["provenance"]["source_id"] = json!(queue);
+    update["connection_id"] = json!("minecraft");
+    update["installation_source"] = wire.clone();
+    update["installation_source"]["caller"] = json!({"id":"companion","label":"Companion"});
+    update["source_replies"][0]["audience"] = wire["audience"].clone();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_actions SET result=?3 WHERE call_id=?1 AND request_id=?2",
+            params![f.id, request, action["receipt"].to_string()],
+        )
+        .unwrap();
+    let mut response = fresh_result(&f, vec![]);
+    response["actions"] = json!([update.clone()]);
+    std::fs::write(
+        f.home.path().join("observer-result.json"),
+        response.to_string(),
+    )
+    .unwrap();
+    run(&f).await.unwrap();
+    assert_eq!(
+        action_observation(&f.s, &f.id, &request).unwrap(),
+        Some(update.clone())
+    );
+    assert_eq!(cards(&f).len(), 1);
+    assert!(
+        cards(&f)[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Recorded reply for this private conversation")
+    );
+    assert!(calls(&f, "decision").is_empty());
+    let restarted = AppState::open(f.home.path().into()).unwrap();
+    let (configuration, fingerprint) = config(&restarted).unwrap().unwrap();
+    let source = &configuration.agents["default"][0];
+    assert_eq!(
+        tracked_actions(&restarted, &f.id, source, false)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!save_observation(&restarted, &f.id, source, &update).unwrap());
+    assert!(
+        !preserve_requested_outcome(&restarted, &f.id, &f.id, source, &update, &fingerprint)
+            .unwrap()
+    );
+    let other = another_call(&f, "other");
+    assert!(
+        tracked_actions(&restarted, &other, source, false)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !preserve_requested_outcome(&restarted, &other, &f.id, source, &update, &fingerprint)
+            .unwrap()
+    );
+    let db = restarted.db.lock().unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM companion_actions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let retained: String = db
+        .query_row(
+            "SELECT result FROM companion_actions WHERE call_id=?1 AND request_id=?2",
+            params![f.id, request],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&retained).unwrap(),
+        action["receipt"]
+    );
+    drop(db);
+    for (field, value) in [
+        ("call_id", json!(other)),
+        ("actor", json!("other")),
+        ("conversation_id", json!("another-room")),
+    ] {
+        let mut changed = original.clone();
+        changed[field] = value;
+        restarted
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE companion_actions SET source=?2 WHERE request_id=?1",
+                params![request, changed.to_string()],
+            )
+            .unwrap();
+        assert!(
+            tracked_actions(&restarted, &f.id, source, false)
+                .unwrap()
+                .is_empty(),
+            "{field}"
+        );
+        assert!(
+            !preserve_requested_outcome(&restarted, &f.id, &f.id, source, &update, &fingerprint)
+                .unwrap(),
+            "{field}"
+        );
+    }
+}
+
 #[test]
 fn retained_action_time_uses_exact_original_fragments_not_later_delegation() {
     let f = fixture();
