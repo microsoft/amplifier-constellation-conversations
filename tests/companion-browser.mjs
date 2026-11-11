@@ -450,7 +450,7 @@ try {
   const retainedOutcome=page.locator('.context-entry').filter({hasText:'Minecraft retained request'});
   const unknownOutcome=page.locator('.context-entry').filter({hasText:'Minecraft unretained request'});
   await wait(async()=>await retainedOutcome.count()===1&&await unknownOutcome.count()===1,'mixed game outcomes did not stay separate');
-  assert.match(await retainedOutcome.textContent(),/The game turn ended/);
+  assert.match(await retainedOutcome.textContent(),/Request handling ended/);
   assert.match(await retainedOutcome.textContent(),/I inspected the entrance; the path is clear/);
   assert.match(await retainedOutcome.textContent(),/Private response text was withheld from this report/);
   assert.match(await retainedOutcome.textContent(),/Some replies are not included in this report/);
@@ -461,6 +461,45 @@ try {
   assert.doesNotMatch(await unknownOutcome.textContent(),/The game turn ended|I inspected the entrance|Private response text was withheld|Some replies are not included|task accepted|completed successfully/);
   assert.equal(await page.locator('#caption-text').innerText(),unchangedCaption);
   checks.push('mixed retained and unknown game outcomes remain separate; nullable turn scope and domain omission flags never invent counts, retrievability, private text or individual fulfillment');
+  const privateReplyText = 'Back at the starting block. Both legs are recorded in the source reply; this label is not independent verification.';
+  const privateAudience = {kind:'private',experience:'companion',id:'room-coach'};
+  const privateOutcome = {...domainOutcomeBase,request_id:'private-request-1',state:'settled',delivery_state:'terminal',
+    conversation:{conversation_only:true,reply_verified:false},responses:[],private_game_responses_included:false,domain_response_association:'single_source',
+    installation_source:{version:1,request_id:'private-request-1',call_id:'call-1',intent_id:'intent-1',revision:'revision-1',occurred_at:originalAt,
+      actor:{id:'fixture-user',label:'Fixture user'},caller:{id:'companion',label:'Companion'},audience:privateAudience},
+    source_replies_capability:{version:1,max_items:32,max_text_bytes:12000},source_replies_omitted:0,
+    source_replies:[{id:'private-source-reply-1',at:originalAt,audience:privateAudience,delivery:'recorded',text:privateReplyText}]};
+  emit('action_observation',{label:'Recorded private reply',observation:privateOutcome});
+  await wait(async()=>/Agent reply recorded/.test(await page.locator('#connection-status').innerText()),'valid private source reply was ignored');
+  assert.match(await page.locator('#connection-status').innerText(),/Request handling ended/);
+  assert.doesNotMatch(await page.locator('#connection-status').innerText(),/not confirmed|completed|verified|walked|Back at/);
+  assert.match(await page.locator('.context-entry').filter({hasText:'Recorded private reply'}).textContent(),/Agent reply recorded/);
+  for (const [label,change] of [
+    ['missing reply',v=>delete v.source_replies], ['empty reply',v=>v.source_replies=[]],
+    ['untyped capability',v=>delete v.source_replies_capability], ['unknown delivery',v=>v.source_replies[0].delivery='unknown'],
+    ['wrong call',v=>v.installation_source.call_id='another-call'], ['wrong request',v=>v.installation_source.request_id='another-request'],
+    ['wrong audience',v=>v.source_replies[0].audience={...privateAudience,id:'another-room'}],
+    ['public audience',v=>v.source_replies[0].audience='public'], ['malformed reply time',v=>v.source_replies[0].at=null],
+    ['duplicate reply',v=>v.source_replies.push(structuredClone(v.source_replies[0]))]
+  ]) {
+    const observation=structuredClone(privateOutcome);change(observation);
+    emit('action_observation',{label,observation});
+    await wait(async()=>(await page.locator('#connection-status').innerText()).startsWith(label+':'),`${label} status absent`);
+    assert.doesNotMatch(await page.locator('#connection-status').innerText(),/Agent reply recorded/);
+    assert.match(await page.locator('#connection-status').innerText(),/result of this request is not confirmed by this report/);
+  }
+  for (const [state,expected] of [['admitted',/Request received/],['unknown',/Request handling is unconfirmed/],['interrupted',/Request handling was interrupted/]]) {
+    emit('action_observation',{label:state,observation:{...privateOutcome,state,conversation:{blocked_reason:'The activity grant expired; no further action was taken.'}}});
+    await wait(async()=>(await page.locator('#connection-status').innerText()).startsWith(state+':'),`${state} reply status absent`);
+    assert.match(await page.locator('#connection-status').innerText(),expected);
+    assert.match(await page.locator('#connection-status').innerText(),/Agent reply recorded/);
+    assert.match(await page.locator('#connection-status').innerText(),/A blocker was reported/);
+    assert.doesNotMatch(await page.locator('#connection-status').innerText(),/success|completed|result.*confirmed/);
+    assert.match(await page.locator('.context-entry').filter({hasText:'activity grant expired'}).textContent(),/no further action was taken/);
+  }
+  assert.equal(privateOutcome.source_replies[0].text,privateReplyText);
+  assert.equal(await page.locator('#caption-text').innerText(),unchangedCaption);
+  checks.push('only a typed recorded private reply bound to this request, call and audience gets the recorded-reply label; missing, malformed, unknown and public records do not; blockers and interruption remain independent of reply receipt');
   emit('action_observation',{label:'Slack',observation:{request_id:'slack-request-1',scope:'message_delivery',state:'completed',verified:false}});
   await wait(async()=>/Message delivery is unconfirmed/.test(await page.locator('#connection-status').innerText()),'unverified delivery was presented as confirmed');
   emit('action_observation',{label:'Slack',observation:{request_id:'slack-request-1',scope:'message_delivery',state:'completed',verified:true}});
@@ -822,6 +861,29 @@ try {
     if(process.env.COMPANION_SCREENSHOT)await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-whiteboard-mobile.png'),fullPage:true});
     await page.setViewportSize({width:1280,height:900});
     checks.push('an intentional plain-text note stays visible on the phone beside reachable paste, file-sharing and call controls');
+  }
+  {
+    const fullSourceText = ['Original source reply — first retained detail.', ...Array.from({length:16},(_,i)=>`Source detail ${i+1}: the full recorded observation remains available without shortening or moving it onto the whiteboard.`), 'Final qualifier: this is a recorded reply, not independent proof of an effect.'].join('\n\n');
+    emit('card',{title:'Full private source reply',awareness_id:'full-private-reply',text:fullSourceText,source:{actor:'Coach',occurred_at:originalAt},observed_only:true});
+    const sourceCard=page.locator('.output-card').filter({has:page.getByRole('heading',{name:/Full private source reply/,includeHidden:true})});
+    await wait(async()=>await sourceCard.count()===1,'full source reply card absent');
+    await page.locator('#space-tab').click();
+    if(!await page.locator('#board-history').evaluate(node=>node.open))await page.locator('#board-history > summary').click();
+    await page.setViewportSize({width:390,height:844});
+    assert.equal((await sourceCard.locator('.card-answer').innerText()).trim(),fullSourceText);
+    const paragraphs=sourceCard.locator('.card-answer p');
+    assert.equal(await paragraphs.count(),18);
+    for (const edge of [paragraphs.first(),paragraphs.last()]) {
+      await edge.scrollIntoViewIfNeeded();
+      const bounds=await edge.boundingBox(),panel=await page.locator('#space-panel').boundingBox();
+      assert(bounds.y>=panel.y && bounds.y+bounds.height<=panel.y+panel.height,'source reply edge cannot be reached by ordinary scrolling');
+      const hangup=await page.locator('#hangup').boundingBox();assert(hangup.y>=0&&hangup.y+hangup.height<=844);
+    }
+    assert.equal(await page.locator('#board-items .output-card').filter({hasText:'Original source reply'}).count(),0);
+    assert(await page.evaluate(()=>document.documentElement.scrollHeight<=innerHeight&&document.documentElement.scrollWidth<=innerWidth));
+    assert.equal((await sourceCard.locator('.card-answer').innerText()).trim(),fullSourceText);
+    await page.setViewportSize({width:1280,height:900});
+    checks.push('full private source card text remains unchanged in History; first and final qualification paragraphs are reachable by ordinary phone-size scrolling while call controls stay visible');
   }
   const permission={id:randomUUID(),conversation_id:'room-coach',agent:'Coach',expires_at:Date.now()+60000,tool_call:{title:'Check Minecraft status',rawInput:{command:'<img src=x onerror="window.permissionInjected=true">'}},options:[{optionId:'always',name:'Always',kind:'allow_always'},{optionId:'once',name:'Read basic status',kind:'allow_once'},{optionId:'detail',name:'Read detailed status',kind:'allow_once'},{optionId:'no',name:'Reject once',kind:'reject_once'}]};
   permissions.set(permission.id,permission);
