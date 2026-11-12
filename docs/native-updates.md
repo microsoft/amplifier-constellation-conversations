@@ -76,6 +76,14 @@ acknowledgement permits only idempotent restoration. Database migrations must
 remain backward compatible with the retained version; reverting a database
 snapshot to discard newly arrived work is never a rollback mechanism.
 
+Mutable lifecycle journals, installation receipts and Windows process-exit
+receipts use protected data publication. Existing readers retain their opened
+snapshot while new readers see the replacement. Windows readers must permit
+delete sharing; denied sharing and read-only destinations still fail. A flush
+error after publication leaves the outcome uncertain and requires inspection of
+the retained transaction. Executable replacement, directory publication and
+create-only ownership records retain their existing rules.
+
 ## Optional existing updater enrollment
 
 An installation owner supplies a protected absolute JSON configuration. This is
