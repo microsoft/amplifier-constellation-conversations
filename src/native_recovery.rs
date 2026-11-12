@@ -839,6 +839,18 @@ mod tests {
                 .unwrap(),
         );
         signed.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        assert_eq!(
+            request(
+                state.clone(),
+                "POST",
+                "/api/v1/companion/update/cleanup",
+                signed.clone(),
+                "{}"
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
         let payload=json!({"request_id":uuid::Uuid::new_v4().to_string(),"operation_id":uuid::Uuid::new_v4().to_string(),"action":"resume"}).to_string();
         assert_eq!(
             request(

@@ -27,6 +27,7 @@ use std::{
 const DIRECTORY: &str = "native-browser-update";
 const LEDGER: &str = "control.json";
 const MAX_LEDGER_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HISTORY_BYTES: usize = MAX_LEDGER_BYTES + 1024;
 pub(crate) const WORKER_LOCK: &str = "native-browser-worker.lock";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,7 +125,7 @@ struct Operation {
     state: OperationState,
     outcome: Option<String>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ledger {
     schema: u32,
@@ -215,11 +216,183 @@ fn load(home: &Path) -> Result<Ledger> {
     );
     Ok(value)
 }
+fn history_path(home: &Path, kind: &str, id: &str) -> Result<PathBuf> {
+    uuid(id)?;
+    ensure!(
+        matches!(kind, "operations" | "requests" | "checks" | "transactions"),
+        "Invalid retained record kind"
+    );
+    Ok(home
+        .join(DIRECTORY)
+        .join("history")
+        .join(kind)
+        .join(format!("{id}.json")))
+}
+fn history_read<T: serde::de::DeserializeOwned>(
+    home: &Path,
+    installation: &str,
+    kind: &str,
+    id: &str,
+) -> Result<Option<T>> {
+    let path = history_path(home, kind, id)?;
+    for directory in [
+        home.join(DIRECTORY),
+        home.join(DIRECTORY).join("history"),
+        path.parent().unwrap().to_owned(),
+    ] {
+        if !directory.exists() && !directory.is_symlink() {
+            return Ok(None);
+        }
+        ordinary(&directory, true)?;
+    }
+    if !path.exists() && !path.is_symlink() {
+        return Ok(None);
+    }
+    ensure!(
+        ordinary(&path, false)?.len() <= MAX_HISTORY_BYTES as u64,
+        "Retained control record exceeds its bound"
+    );
+    let bytes = fs::read(&path)?;
+    ensure!(
+        bytes.len() <= MAX_HISTORY_BYTES,
+        "Retained control record exceeds its bound"
+    );
+    let envelope: Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        envelope["schema"] == 1
+            && envelope["installation_id"] == installation
+            && envelope["id"] == id,
+        "Retained control record identity changed"
+    );
+    Ok(Some(serde_json::from_value(envelope["value"].clone())?))
+}
+fn history_write<T: Serialize>(
+    home: &Path,
+    installation: &str,
+    kind: &str,
+    id: &str,
+    value: &T,
+) -> Result<()> {
+    let path = history_path(home, kind, id)?;
+    let bytes = serde_json::to_vec(
+        &json!({"schema":1,"installation_id":installation,"id":id,"value":value}),
+    )?;
+    ensure!(
+        bytes.len() <= MAX_HISTORY_BYTES,
+        "Retained control record exceeds its bound"
+    );
+    for directory in [
+        home.join(DIRECTORY),
+        home.join(DIRECTORY).join("history"),
+        path.parent().unwrap().to_owned(),
+    ] {
+        amplifier_native_platform::private_dir(&directory)?;
+    }
+    if path.exists() || path.is_symlink() {
+        ensure!(
+            ordinary(&path, false)?.len() == bytes.len() as u64 && fs::read(&path)? == bytes,
+            "Immutable retained control record differs; no history was overwritten"
+        );
+        // A previous publication may have been interrupted before the active
+        // ledger was committed. Reconfirm exact bytes and durability first.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?
+            .sync_all()?;
+        #[cfg(unix)]
+        fs::File::open(path.parent().unwrap())?.sync_all()?;
+        return Ok(());
+    }
+    amplifier_native_platform::private_create(&path, &bytes)
+}
+fn verified_terminal(operation: &Operation) -> bool {
+    terminal(operation)
+        && operation
+            .outcome
+            .as_deref()
+            .is_some_and(|outcome| matches!(outcome, "unchanged" | "applied" | "rolled_back"))
+}
+fn get_request(home: &Path, ledger: &Ledger, id: &str) -> Result<Option<RequestRecord>> {
+    if let Some(value) = ledger.requests.get(id) {
+        return Ok(Some(value.clone()));
+    }
+    history_read(home, &ledger.installation_id, "requests", id)
+}
+fn get_operation(home: &Path, ledger: &Ledger, id: &str) -> Result<Option<Operation>> {
+    if let Some(value) = ledger.operations.get(id) {
+        return Ok(Some(value.clone()));
+    }
+    archived_operation(home, &ledger.installation_id, id)
+}
+fn archived_operation(home: &Path, installation: &str, id: &str) -> Result<Option<Operation>> {
+    let value: Option<Operation> = history_read(home, installation, "operations", id)?;
+    if let Some(value) = &value {
+        ensure!(
+            value.id == id && verified_terminal(value),
+            "Archived operation is not a verified terminal record"
+        );
+    }
+    Ok(value)
+}
+fn get_check(home: &Path, ledger: &Ledger, id: &str) -> Result<Option<CheckedPackage>> {
+    if let Some(value) = ledger.checks.get(id) {
+        return Ok(Some(value.clone()));
+    }
+    let value: Option<CheckedPackage> = history_read(home, &ledger.installation_id, "checks", id)?;
+    if let Some(value) = &value {
+        ensure!(value.id == id, "Archived check identity changed");
+    }
+    Ok(value)
+}
+fn compact(home: &Path, value: &Ledger) -> Result<Ledger> {
+    let mut active = value.clone();
+    let completed: Vec<String> = value
+        .operations
+        .values()
+        .filter(|operation| {
+            value.current_operation.as_deref() != Some(&operation.id)
+                && verified_terminal(operation)
+        })
+        .map(|operation| operation.id.clone())
+        .collect();
+    for id in completed {
+        let operation = &value.operations[&id];
+        history_write(home, &value.installation_id, "operations", &id, operation)?;
+        history_write(
+            home,
+            &value.installation_id,
+            "transactions",
+            &operation.transaction_id,
+            &json!({"operation_id":id,"transaction_id":operation.transaction_id}),
+        )?;
+        for (request_id, record) in value
+            .requests
+            .iter()
+            .filter(|(_, record)| record.operation_id == id)
+        {
+            history_write(home, &value.installation_id, "requests", request_id, record)?;
+            active.requests.remove(request_id);
+        }
+        active.operations.remove(&id);
+    }
+    for (id, check) in &value.checks {
+        if value.current_check.as_deref() != Some(id) {
+            history_write(home, &value.installation_id, "checks", id, check)?;
+            active.checks.remove(id);
+        }
+    }
+    Ok(active)
+}
 fn save(home: &Path, value: &Ledger) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
+    // Immutable history is durable before publishing the smaller active ledger.
+    // A crash between these writes leaves identical duplicate records, never a
+    // missing old request or permission to allocate its transaction again.
+    let active = compact(home, value)?;
+    let bytes = serde_json::to_vec(&active)?;
     ensure!(
         bytes.len() <= MAX_LEDGER_BYTES,
-        "Retained update control history exceeds its bound"
+        "Unresolved update control state exceeds its bound"
     );
     amplifier_native_platform::private_dir(&home.join(DIRECTORY))?;
     amplifier_native_platform::private_write_data(&home.join(DIRECTORY).join(LEDGER), &bytes)
@@ -431,17 +604,19 @@ pub(crate) fn status(
     let enrolled = home.join("native-update-owner.json").exists();
     let journal = native_update::recovery_snapshot(home)?;
     let active = worker_active(home)?;
-    let record = request_id.and_then(|id| ledger.requests.get(id));
-    let selected = if let Some(request) = record {
+    let record = request_id
+        .map(|id| get_request(home, &ledger, id))
+        .transpose()?
+        .flatten();
+    let selected_value = if let Some(request) = &record {
         Some(
-            ledger
-                .operations
-                .get(&request.operation_id)
+            get_operation(home, &ledger, &request.operation_id)?
                 .context("Missing requested operation")?,
         )
     } else {
-        current_operation(&ledger)?
+        current_operation(&ledger)?.cloned()
     };
+    let selected = selected_value.as_ref();
     let foreign_pending = record.is_none()
         && journal.as_ref().is_some_and(|j| {
             j.phase != "restored" && selected.is_none_or(|op| op.transaction_id != j.transaction)
@@ -501,7 +676,7 @@ pub(crate) fn status(
         });
     let request = request_id.map(|id| {
         json!({"id":id,"state":if record.is_some() { "recorded" } else { "not_recorded" },
-        "operation_id":record.map(|r| &r.operation_id)})
+        "operation_id":record.as_ref().map(|r| &r.operation_id)})
     });
     Ok(
         json!({"supported":true,"owner":if enrolled { "enrolled" } else { "standalone" },"mode":mode,
@@ -558,8 +733,8 @@ pub(crate) fn check(
     status(home, "normal", None, launch)
 }
 
-fn duplicate(ledger: &Ledger, id: &str, payload: &RequestPayload) -> ApiResult<bool> {
-    if let Some(previous) = ledger.requests.get(id) {
+fn duplicate(home: &Path, ledger: &Ledger, id: &str, payload: &RequestPayload) -> ApiResult<bool> {
+    if let Some(previous) = get_request(home, ledger, id)? {
         if &previous.payload != payload {
             return Err(conflict(
                 "This request ID already names a different immutable request",
@@ -619,11 +794,11 @@ pub(crate) fn apply(
     let operation = {
         let _guard = native_update::lock(home, "native-update.lock")?;
         let mut ledger = load(home)?;
-        if duplicate(&ledger, &input.request_id, &payload)? {
+        if duplicate(home, &ledger, &input.request_id, &payload)? {
             drop(_guard);
             return status(home, "normal", Some(&input.request_id), launch);
         }
-        if ledger.operations.contains_key(&input.request_id) {
+        if get_operation(home, &ledger, &input.request_id)?.is_some() {
             return Err(conflict(
                 "This identifier already names a retained operation",
             ));
@@ -641,10 +816,8 @@ pub(crate) fn apply(
                 "A retained native transaction needs recovery first",
             ));
         }
-        let checked = ledger
-            .checks
-            .get(&input.check_id)
-            .context("Checked package is unavailable")?;
+        let checked =
+            get_check(home, &ledger, &input.check_id)?.context("Checked package is unavailable")?;
         native_update::validate_frozen_plan(home, &checked.plan)?;
         if checked.plan["available"] != true {
             return Err(conflict("That complete bundle is already selected"));
@@ -703,7 +876,7 @@ pub(crate) fn recover(
     let operation = {
         let _guard = native_update::lock(home, "native-update.lock")?;
         let mut ledger = load(home)?;
-        if duplicate(&ledger, &input.request_id, &payload)? {
+        if duplicate(home, &ledger, &input.request_id, &payload)? {
             drop(_guard);
             return status(home, mode, Some(&input.request_id), launch);
         }
@@ -723,32 +896,51 @@ pub(crate) fn recover(
                 return Err(conflict("A different browser operation remains unresolved"));
             }
         }
-        let mut operation = if let Some(existing) = ledger.operations.get(&input.operation_id) {
-            existing.clone()
-        } else {
-            let journal = journal
-                .as_ref()
-                .filter(|j| j.transaction == input.operation_id && j.standalone)
-                .context("No matching standalone transaction can be recovered")?;
-            Operation {
-                id: journal.transaction.clone(),
-                request_id: None,
-                transaction_id: journal.transaction.clone(),
-                kind: OperationKind::Existing,
-                previous_transaction: None,
-                plan: Value::Null,
-                helper: native_update::recovery_package(home)?,
-                attempt: Attempt {
-                    id: input.request_id.clone(),
-                    action: Some(input.action),
-                    claimed: false,
-                    handoff_nonce: auth::random_token(),
-                    launch: None,
-                },
-                state: OperationState::Unknown,
-                outcome: None,
-            }
-        };
+        let mut operation =
+            if let Some(existing) = get_operation(home, &ledger, &input.operation_id)? {
+                existing
+            } else {
+                // Transaction UUIDs are foreign-adoption identifiers only when
+                // no browser operation already owns that transaction.
+                if ledger
+                    .operations
+                    .values()
+                    .any(|operation| operation.transaction_id == input.operation_id)
+                    || history_read::<Value>(
+                        home,
+                        &ledger.installation_id,
+                        "transactions",
+                        &input.operation_id,
+                    )?
+                    .is_some()
+                {
+                    return Err(conflict(
+                        "Use the retained browser operation ID for this transaction",
+                    ));
+                }
+                let journal = journal
+                    .as_ref()
+                    .filter(|j| j.transaction == input.operation_id && j.standalone)
+                    .context("No matching standalone transaction can be recovered")?;
+                Operation {
+                    id: journal.transaction.clone(),
+                    request_id: None,
+                    transaction_id: journal.transaction.clone(),
+                    kind: OperationKind::Existing,
+                    previous_transaction: None,
+                    plan: Value::Null,
+                    helper: native_update::recovery_package(home)?,
+                    attempt: Attempt {
+                        id: input.request_id.clone(),
+                        action: Some(input.action),
+                        claimed: false,
+                        handoff_nonce: auth::random_token(),
+                        launch: None,
+                    },
+                    state: OperationState::Unknown,
+                    outcome: None,
+                }
+            };
         let matching = journal
             .as_ref()
             .filter(|j| j.transaction == operation.transaction_id);
@@ -772,7 +964,7 @@ pub(crate) fn recover(
                 if input.action != RecoveryAction::Rollback || journal.direction != "applied" {
                     return Err(conflict("This operation is already settled"));
                 }
-                if ledger.operations.contains_key(&input.request_id) {
+                if get_operation(home, &ledger, &input.request_id)?.is_some() {
                     return Err(conflict(
                         "This identifier already names a retained operation",
                     ));
@@ -1099,23 +1291,65 @@ pub(crate) fn owns_pending_transaction(home: &Path, transaction: &str) -> Result
 /// A cleanup snapshot contains only identities with a terminal verified native
 /// outcome. Private plans, package paths and startup nonces remain in the ledger.
 pub(crate) struct CleanupAuthority {
+    pub(crate) home: PathBuf,
+    pub(crate) installation_id: String,
     pub(crate) workers: std::collections::BTreeSet<(String, String)>,
     pub(crate) transactions: std::collections::BTreeSet<String>,
     pub current_settled: bool,
 }
 impl CleanupAuthority {
-    pub fn worker(&self, operation: &str, attempt: &str) -> bool {
-        self.workers
+    pub fn worker(&self, operation: &str, attempt: &str) -> Result<bool> {
+        if self
+            .workers
             .contains(&(operation.to_owned(), attempt.to_owned()))
+        {
+            return Ok(true);
+        }
+        let Some(operation) = archived_operation(&self.home, &self.installation_id, operation)?
+        else {
+            return Ok(false);
+        };
+        let request: Option<RequestRecord> =
+            history_read(&self.home, &self.installation_id, "requests", attempt)?;
+        Ok(request.is_some_and(|request| {
+            request.operation_id == operation.id && request.attempt_id == attempt
+        }))
     }
-    pub fn replacement(&self, transaction: &str) -> bool {
-        self.transactions.contains(transaction)
+    pub fn replacement(&self, transaction: &str) -> Result<bool> {
+        if self.transactions.contains(transaction) {
+            return Ok(true);
+        }
+        let Some(index): Option<Value> = history_read(
+            &self.home,
+            &self.installation_id,
+            "transactions",
+            transaction,
+        )?
+        else {
+            return Ok(false);
+        };
+        ensure!(
+            index["transaction_id"] == transaction,
+            "Archived transaction identity changed"
+        );
+        let id = index["operation_id"]
+            .as_str()
+            .context("Missing archived operation identity")?;
+        let operation = archived_operation(&self.home, &self.installation_id, id)?
+            .context("Missing archived terminal operation")?;
+        ensure!(
+            operation.transaction_id == transaction,
+            "Archived operation transaction changed"
+        );
+        Ok(true)
     }
 }
 pub(crate) fn cleanup_authority(home: &Path) -> Result<CleanupAuthority> {
     let ledger = load(home)?;
     let journal = native_update::recovery_snapshot(home)?;
     let mut authority = CleanupAuthority {
+        home: home.to_owned(),
+        installation_id: ledger.installation_id.clone(),
         workers: Default::default(),
         transactions: Default::default(),
         current_settled: ledger.current_operation.is_none(),
@@ -1123,11 +1357,7 @@ pub(crate) fn cleanup_authority(home: &Path) -> Result<CleanupAuthority> {
     for original in ledger.operations.values() {
         let mut operation = original.clone();
         settle(&mut operation, journal.as_ref());
-        let verified = terminal(&operation)
-            && operation
-                .outcome
-                .as_deref()
-                .is_some_and(|outcome| matches!(outcome, "unchanged" | "applied" | "rolled_back"));
+        let verified = verified_terminal(&operation);
         if ledger.current_operation.as_deref() == Some(&operation.id) {
             authority.current_settled = verified;
         }
@@ -1704,6 +1934,321 @@ mod tests {
         );
         assert_eq!(launch.calls.load(Ordering::SeqCst), calls);
     }
+
+    fn completed_record(fixture: &Fixture, request: &str, check: &str) -> Operation {
+        let ledger = load(&fixture.home).unwrap();
+        let checked = ledger.checks.get(check).unwrap();
+        Operation {
+            id: request.into(),
+            request_id: Some(request.into()),
+            transaction_id: id(),
+            kind: OperationKind::Apply,
+            previous_transaction: None,
+            plan: checked.plan.clone(),
+            helper: checked.helper.clone(),
+            attempt: Attempt {
+                id: request.into(),
+                action: None,
+                claimed: true,
+                handoff_nonce: "private archive nonce".into(),
+                launch: None,
+            },
+            state: OperationState::Completed,
+            outcome: Some("applied".into()),
+        }
+    }
+
+    #[test]
+    fn owned_transaction_alias_is_rejected_before_archival_and_canonical_rollback_still_works() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let checked = fixture.check(&launch);
+        let operation = id();
+        let accepted = apply(
+            &fixture.home,
+            ApplyInput {
+                request_id: operation.clone(),
+                check_id: checked,
+            },
+            &launch,
+        )
+        .unwrap();
+        let tx = accepted["operation"]["transaction_id"].as_str().unwrap();
+        journal(&fixture.home, tx, "restored");
+        let mut ledger = load(&fixture.home).unwrap();
+        settle_current(&fixture.home, &mut ledger).unwrap();
+        save(&fixture.home, &ledger).unwrap();
+        let before = fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap();
+        let calls = launch.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            recover(
+                &fixture.home,
+                "normal",
+                RecoverInput {
+                    request_id: id(),
+                    operation_id: tx.into(),
+                    action: RecoveryAction::Rollback
+                },
+                &launch
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap(),
+            before
+        );
+        assert!(!fixture.home.join(DIRECTORY).join("history").exists());
+        assert_eq!(launch.calls.load(Ordering::SeqCst), calls);
+        let accepted = recover(
+            &fixture.home,
+            "normal",
+            RecoverInput {
+                request_id: id(),
+                operation_id: operation.clone(),
+                action: RecoveryAction::Rollback,
+            },
+            &launch,
+        )
+        .unwrap();
+        assert_ne!(accepted["operation"]["transaction_id"], tx);
+        let active = load(&fixture.home).unwrap();
+        assert_eq!(
+            get_operation(&fixture.home, &active, &operation)
+                .unwrap()
+                .unwrap()
+                .transaction_id,
+            tx
+        );
+    }
+    #[test]
+    fn malformed_or_nonterminal_archives_never_grant_request_or_cleanup_authority() {
+        let fixture = Fixture::new();
+        let checked = fixture.check(&LostReply::default());
+        let request = id();
+        let operation = completed_record(&fixture, &request, &checked);
+        let ledger = load(&fixture.home).unwrap();
+        history_write(
+            &fixture.home,
+            &ledger.installation_id,
+            "operations",
+            &request,
+            &operation,
+        )
+        .unwrap();
+        let path = history_path(&fixture.home, "operations", &request).unwrap();
+        let valid = fs::read(&path).unwrap();
+        for field in ["installation_id", "id"] {
+            let mut corrupt: Value = serde_json::from_slice(&valid).unwrap();
+            corrupt[field] = json!(id());
+            fs::write(&path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+            assert!(archived_operation(&fixture.home, &ledger.installation_id, &request).is_err());
+        }
+        let mut corrupt: Value = serde_json::from_slice(&valid).unwrap();
+        corrupt["value"]["state"] = json!("unknown");
+        fs::write(&path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+        assert!(archived_operation(&fixture.home, &ledger.installation_id, &request).is_err());
+        corrupt["value"]["state"] = json!("completed");
+        corrupt["value"]["outcome"] = Value::Null;
+        fs::write(&path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+        assert!(
+            cleanup_authority(&fixture.home)
+                .unwrap()
+                .worker(&request, &request)
+                .is_err()
+        );
+        fs::write(&path, b"not-json").unwrap();
+        assert!(get_operation(&fixture.home, &ledger, &request).is_err());
+    }
+    #[test]
+    fn completed_history_can_exceed_active_limit_without_losing_old_request_authority() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let checked = fixture.check(&launch);
+        let old = id();
+        let mut ledger = load(&fixture.home).unwrap();
+        let mut old_operation = completed_record(&fixture, &old, &checked);
+        old_operation.plan["retained_fixture"] = json!("x".repeat(128 * 1024));
+        let old_tx = old_operation.transaction_id.clone();
+        for n in 0..40 {
+            let request = if n == 0 { old.clone() } else { id() };
+            let mut operation = old_operation.clone();
+            operation.id = request.clone();
+            operation.request_id = Some(request.clone());
+            operation.attempt.id = request.clone();
+            if n != 0 {
+                operation.transaction_id = id();
+            }
+            ledger.requests.insert(
+                request.clone(),
+                RequestRecord {
+                    payload: RequestPayload::Apply {
+                        check_id: checked.clone(),
+                    },
+                    operation_id: request.clone(),
+                    attempt_id: request.clone(),
+                },
+            );
+            ledger.operations.insert(request, operation);
+        }
+        let pending = id();
+        let mut unknown = completed_record(&fixture, &pending, &checked);
+        unknown.state = OperationState::Unknown;
+        unknown.outcome = None;
+        ledger.operations.insert(pending.clone(), unknown);
+        ledger.current_operation = Some(pending.clone());
+        assert!(serde_json::to_vec(&ledger).unwrap().len() > MAX_LEDGER_BYTES);
+        save(&fixture.home, &ledger).unwrap();
+        let active = load(&fixture.home).unwrap();
+        assert_eq!(active.operations.len(), 1);
+        assert_eq!(active.operations[&pending].state, OperationState::Unknown);
+        assert!(
+            fs::metadata(fixture.home.join(DIRECTORY).join(LEDGER))
+                .unwrap()
+                .len()
+                < MAX_LEDGER_BYTES as u64
+        );
+        let historical = status(&fixture.home, "normal", Some(&old), &launch).unwrap();
+        assert_eq!(historical["request"]["state"], "recorded");
+        assert_eq!(historical["operation"]["transaction_id"], old_tx);
+        assert_eq!(historical["actions"]["apply"], false);
+        let repeated = apply(
+            &fixture.home,
+            ApplyInput {
+                request_id: old.clone(),
+                check_id: checked.clone(),
+            },
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(repeated["operation"]["transaction_id"], old_tx);
+        assert_eq!(launch.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            apply(
+                &fixture.home,
+                ApplyInput {
+                    request_id: old.clone(),
+                    check_id: id()
+                },
+                &launch
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        let authority = cleanup_authority(&fixture.home).unwrap();
+        assert!(authority.worker(&old, &old).unwrap());
+        assert!(authority.replacement(&old_tx).unwrap());
+        assert!(!authority.current_settled);
+    }
+    #[test]
+    fn crash_before_active_publication_reuses_exact_immutable_archive_bytes() {
+        let fixture = Fixture::new();
+        let checked = fixture.check(&LostReply::default());
+        let old = id();
+        let operation = completed_record(&fixture, &old, &checked);
+        let mut ledger = load(&fixture.home).unwrap();
+        ledger.current_operation = Some(old.clone());
+        ledger.operations.insert(old.clone(), operation.clone());
+        ledger.requests.insert(
+            old.clone(),
+            RequestRecord {
+                payload: RequestPayload::Apply {
+                    check_id: checked.clone(),
+                },
+                operation_id: old.clone(),
+                attempt_id: old.clone(),
+            },
+        );
+        save(&fixture.home, &ledger).unwrap();
+        let before = fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap();
+        let next = id();
+        let mut pending = completed_record(&fixture, &next, &checked);
+        pending.state = OperationState::Accepted;
+        pending.outcome = None;
+        ledger.operations.insert(next.clone(), pending);
+        ledger.current_operation = Some(next);
+        compact(&fixture.home, &ledger).unwrap();
+        let path = history_path(&fixture.home, "operations", &old).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap(),
+            before
+        );
+        compact(&fixture.home, &ledger).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        save(&fixture.home, &ledger).unwrap();
+        let active = load(&fixture.home).unwrap();
+        assert!(!active.operations.contains_key(&old));
+        assert!(!active.requests.contains_key(&old));
+        assert_eq!(
+            get_operation(&fixture.home, &active, &old)
+                .unwrap()
+                .unwrap()
+                .transaction_id,
+            operation.transaction_id
+        );
+        assert_eq!(
+            get_request(&fixture.home, &active, &old)
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            old
+        );
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    #[test]
+    fn mismatched_existing_archive_never_overwrites_history_or_active_ledger() {
+        let fixture = Fixture::new();
+        let checked = fixture.check(&LostReply::default());
+        let old = id();
+        let mut ledger = load(&fixture.home).unwrap();
+        ledger
+            .operations
+            .insert(old.clone(), completed_record(&fixture, &old, &checked));
+        let before = fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap();
+        compact(&fixture.home, &ledger).unwrap();
+        let path = history_path(&fixture.home, "operations", &old).unwrap();
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["value"]["outcome"] = json!("rolled_back");
+        let changed = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &changed).unwrap();
+        assert!(save(&fixture.home, &ledger).is_err());
+        assert_eq!(fs::read(&path).unwrap(), changed);
+        assert_eq!(
+            fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap(),
+            before
+        );
+    }
+    #[test]
+    fn archived_check_remains_valid_and_idempotent_without_loading_history_scan() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let old = fixture.check(&launch);
+        let latest = fixture.check(&launch);
+        assert_ne!(old, latest);
+        let ledger = load(&fixture.home).unwrap();
+        assert_eq!(ledger.checks.len(), 1);
+        assert!(!ledger.checks.contains_key(&old));
+        assert!(
+            history_path(&fixture.home, "checks", &old)
+                .unwrap()
+                .is_file()
+        );
+        let request = id();
+        let input = ApplyInput {
+            request_id: request,
+            check_id: old,
+        };
+        let first = apply(&fixture.home, input.clone(), &launch).unwrap();
+        let repeated = apply(&fixture.home, input, &launch).unwrap();
+        assert_eq!(
+            first["operation"]["transaction_id"],
+            repeated["operation"]["transaction_id"]
+        );
+        assert_eq!(launch.calls.load(Ordering::SeqCst), 1);
+    }
     #[test]
     fn cleanup_authority_requires_verified_terminal_outcome_and_known_attempts() {
         let fixture = Fixture::new();
@@ -1733,22 +2278,27 @@ mod tests {
         )
         .unwrap();
         let pending = cleanup_authority(&fixture.home).unwrap();
-        assert!(!pending.worker(&first, &first));
-        assert!(!pending.replacement(tx));
+        assert!(!pending.worker(&first, &first).unwrap());
+        assert!(!pending.replacement(tx).unwrap());
         assert!(!pending.current_settled);
         journal(&fixture.home, tx, "restored");
         let settled = cleanup_authority(&fixture.home).unwrap();
-        assert!(settled.worker(&first, &first));
-        assert!(settled.worker(&first, &second));
-        assert!(!settled.worker(&first, &id()));
-        assert!(settled.replacement(tx));
+        assert!(settled.worker(&first, &first).unwrap());
+        assert!(settled.worker(&first, &second).unwrap());
+        assert!(!settled.worker(&first, &id()).unwrap());
+        assert!(settled.replacement(tx).unwrap());
         assert!(settled.current_settled);
         let mut ledger = load(&fixture.home).unwrap();
         let operation = ledger.operations.get_mut(&first).unwrap();
         operation.state = OperationState::Failed;
         operation.outcome = None;
         save(&fixture.home, &ledger).unwrap();
-        assert!(!cleanup_authority(&fixture.home).unwrap().replacement(tx));
+        assert!(
+            !cleanup_authority(&fixture.home)
+                .unwrap()
+                .replacement(tx)
+                .unwrap()
+        );
     }
     #[test]
     fn unavailable_or_enrolled_never_records_or_dispatches_new_request() {

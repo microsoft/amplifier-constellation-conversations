@@ -64,6 +64,7 @@ restricted recovery page uses your existing account and offers only the recovery
 actions allowed by the saved transaction. It does not open ordinary calls, create
 an agent session, or resume uncertain work. Restoring an earlier app package keeps
 the current account, contacts, conversations and work records.
+Earlier update receipts remain available after later updates.
 
 ## Qualification limits
 

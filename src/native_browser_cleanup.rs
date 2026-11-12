@@ -67,7 +67,10 @@ fn identity(value: &LaunchIdentity) -> Value {
         }
     }
 }
-fn allowed(authority: &native_browser_update::CleanupAuthority, value: &LaunchIdentity) -> bool {
+fn allowed(
+    authority: &native_browser_update::CleanupAuthority,
+    value: &LaunchIdentity,
+) -> Result<bool> {
     match value {
         LaunchIdentity::Worker { operation, attempt } => authority.worker(operation, attempt),
         LaunchIdentity::Replacement { transaction } => authority.replacement(transaction),
@@ -120,7 +123,7 @@ fn execute(
         row["observed_active"] = Value::Null;
         row["profile_matches"] = Value::Null;
         row["absent"] = Value::Null;
-        if !allowed(authority, &launch.identity) {
+        if !allowed(authority, &launch.identity)? {
             row["state"] = json!("refused");
             row["code"] = json!("operation_not_verified_terminal");
         } else {
@@ -281,6 +284,8 @@ mod tests {
         }
         fn authority(&self) -> native_browser_update::CleanupAuthority {
             native_browser_update::CleanupAuthority {
+                home: self.home.clone(),
+                installation_id: Config::load(&self.home).unwrap().id,
                 workers: [(self.operation.clone(), self.attempt.clone())].into(),
                 transactions: [self.transaction.clone()].into(),
                 current_settled: true,
