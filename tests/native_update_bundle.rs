@@ -278,6 +278,60 @@ async fn prepare(f: &Fixture, operation: &str) -> String {
     tx
 }
 
+#[cfg(unix)]
+#[test]
+fn bootstrap_finishes_execute_permission_after_interrupted_binary_publication() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let installed =
+        amplifier_native_platform::installed_binary(&native_bundle::APPLICATION, &f.home);
+    let binary = fs::read(&installed).unwrap();
+    let companion = fs::read(f.home.join("companion.json")).unwrap();
+    // Reproduce the durable state between private_write's atomic publication
+    // (mode 0600) and write_binary's chmod, before the baseline receipt exists.
+    fs::remove_file(f.home.join("native-installation.json")).unwrap();
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        native_update::bootstrap(&f.home, &f.baseline_package()).unwrap(),
+        f.original
+    );
+    assert_eq!(fs::read(&installed).unwrap(), binary);
+    assert_eq!(
+        fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(fs::read(f.home.join("companion.json")).unwrap(), companion);
+    f.selected(&f.original["package"]);
+    f.retained();
+    assert!(!f.home.join("native-update-owner.json").exists());
+    assert!(!f.home.join("native-update.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_does_not_make_changed_existing_bytes_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let installed =
+        amplifier_native_platform::installed_binary(&native_bundle::APPLICATION, &f.home);
+    let companion = fs::read(f.home.join("companion.json")).unwrap();
+    fs::remove_file(f.home.join("native-installation.json")).unwrap();
+    fs::write(&installed, b"different existing application").unwrap();
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(native_update::bootstrap(&f.home, &f.baseline_package()).is_err());
+    assert_eq!(
+        fs::read(&installed).unwrap(),
+        b"different existing application"
+    );
+    assert_eq!(
+        fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!f.home.join("native-installation.json").exists());
+    assert_eq!(fs::read(f.home.join("companion.json")).unwrap(), companion);
+    f.retained();
+}
+
 #[test]
 fn bootstrap_is_idempotent_after_complete_and_lost_installation_receipt() {
     let f = Fixture::new();
