@@ -1,6 +1,6 @@
 use agent_conversations::{
     config::{self, Agent, Config},
-    credentials, driver, native_bundle, platform, server,
+    credentials, driver, native_bundle, native_update, native_update_protocol, platform, server,
     state::AppState,
 };
 use anyhow::{Context, Result, ensure};
@@ -71,6 +71,25 @@ enum Action {
         tls_ca: Option<PathBuf>,
     },
     Serve,
+    #[command(hide = true)]
+    ServeUpdate {
+        transaction: String,
+        nonce: String,
+    },
+    /// Retain, update or recover this complete installation without agent work.
+    NativeUpdate {
+        #[command(subcommand)]
+        action: NativeUpdateAction,
+    },
+    /// Fixed installation-owned update-provider/lifecycle integration.
+    NativeUpdateProtocol {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        mode: String,
+        #[arg(long)]
+        action: String,
+    },
     Status,
     Probe,
     /// Manage independently scoped transcript-sharing connections.
@@ -108,6 +127,32 @@ enum BundleAction {
     Install {
         #[arg(long)]
         path: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum NativeUpdateAction {
+    /// Restore the retained previous bundle through a new idle transaction.
+    Rollback {
+        transaction: String,
+    },
+    Bootstrap {
+        #[arg(long)]
+        package: PathBuf,
+    },
+    Plan {
+        #[arg(long)]
+        package: PathBuf,
+    },
+    Run {
+        #[arg(long)]
+        package: PathBuf,
+    },
+    Status,
+    /// Recover a retained transaction; never redispatch conversation work.
+    Recover {
+        transaction: String,
+        #[arg(long)]
+        rollback: bool,
     },
 }
 #[derive(Subcommand)]
@@ -198,6 +243,8 @@ async fn main() -> Result<()> {
             amplifier_native_platform::open_https_browser(url)?;
         }
         Action::Startup { action } => {
+            let _owner = native_update::startup_change_guard(&home)?;
+            let _activity = agent_conversations::update_admission::begin_configuration_home(&home)?;
             let config = Config::load(&home)?;
             let id = uuid::Uuid::parse_str(&config.id)?;
             match action {
@@ -317,6 +364,43 @@ async fn main() -> Result<()> {
             );
         }
         Action::Serve => server::serve(home).await?,
+        Action::ServeUpdate { transaction, nonce } => {
+            server::serve_update(home, transaction, nonce).await?
+        }
+        Action::NativeUpdate { action } => {
+            let value = match action {
+                NativeUpdateAction::Bootstrap { package } => {
+                    native_update::bootstrap(&home, &package)?
+                }
+                NativeUpdateAction::Plan { package } => native_update::plan(&home, &package)?,
+                NativeUpdateAction::Run { package } => native_update::run(&home, &package).await?,
+                NativeUpdateAction::Status => native_update::status(&home)?,
+                NativeUpdateAction::Rollback { transaction } => {
+                    native_update::rollback(&home, &transaction).await?
+                }
+                NativeUpdateAction::Recover {
+                    transaction,
+                    rollback,
+                } => native_update::recover(&home, &transaction, rollback).await?,
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        Action::NativeUpdateProtocol {
+            config,
+            mode,
+            action,
+        } => {
+            let value = if mode == "enrollment" {
+                match action.as_str() {
+                    "enroll" => native_update_protocol::claim_owner(&config)?,
+                    "registration" => native_update_protocol::registration(&config)?,
+                    _ => anyhow::bail!("Unknown enrollment action"),
+                }
+            } else {
+                native_update_protocol::run(&config, &mode, &action).await?
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
         Action::Status => {
             let c = Config::load(&home)?;
             let runtime = std::fs::read(home.join("runtime.json"))
@@ -458,6 +542,8 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&Config::load(&home)?)?)
             }
             ConfigAction::Set { file } => {
+                let _activity =
+                    agent_conversations::update_admission::begin_configuration_home(&home)?;
                 let c: Config = serde_json::from_slice(&std::fs::read(file)?)?;
                 let old = Config::load(&home)?;
                 ensure!(

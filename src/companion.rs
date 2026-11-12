@@ -409,6 +409,7 @@ pub async fn capabilities(
         return Err(ApiError::missing());
     }
     let agent = s.agent(&id)?.ok_or_else(ApiError::missing)?;
+    let _update_activity = crate::update_admission::begin_probe(&s)?;
     let result = crate::driver::probe(&agent).await;
     let image = result
         .as_ref()
@@ -659,21 +660,27 @@ pub async fn create(
         .ok_or_else(ApiError::missing)?;
     let voice = selected_voice(&s, &p.actor, &body.agent_id, profile)?;
     let a = s.agent(&body.agent_id)?.ok_or_else(ApiError::missing)?;
-    let room = s.create_room(
-        &format!("Call with {}", a.label),
-        &p.actor,
-        std::slice::from_ref(&body.agent_id),
+    let (id, room) = {
+        let mut db = s.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::update_admission::ensure_open(&tx)?;
+        let room = crate::rooms::insert_room(
+            &tx,
+            &format!("Call with {}", a.label),
+            &p.actor,
+            std::slice::from_ref(&body.agent_id),
+        )?;
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at,context_registered,endpoint_hash,voice) VALUES(?1,?2,?3,?4,?5,?6,'starting',?7,?7,?8,?9,?10)",params![id,p.actor,body.request_id,hash,body.agent_id,room,now_ms(),profile.context_registered,auth::digest(&serde_json::to_string(&a).context("Serialize call endpoint")?),voice])?;
+        tx.commit()?;
+        (id, room)
+    };
+    s.audit(
+        "conversation.created",
+        Some(&room),
+        json!({"actor":p.actor}),
     )?;
-    let room = room["id"]
-        .as_str()
-        .context("Missing created room")?
-        .to_owned();
-    let id = uuid::Uuid::new_v4().to_string();
-    s.db.lock().unwrap().execute("INSERT INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at,context_registered,endpoint_hash) VALUES(?1,?2,?3,?4,?5,?6,'starting',?7,?7,?8,?9)",params![id,p.actor,body.request_id,hash,body.agent_id,room,now_ms(),profile.context_registered,auth::digest(&serde_json::to_string(&a).context("Serialize call endpoint")?)])?;
-    s.db.lock().unwrap().execute(
-        "UPDATE companion_calls SET voice=?2 WHERE id=?1",
-        params![id, voice],
-    )?;
+    s.changed();
     let mcp = match crate::companion_tools::create_mcp_config(&s, &id) {
         Ok(value) => value,
         Err(error) => {
@@ -1842,7 +1849,7 @@ fn observe_results(s: &AppState, id: &str, room: &str, live: bool) -> Result<()>
     for (did, mid, at) in pending {
         type DeliveryResult = (String, Option<String>, Option<String>, Option<String>, bool);
         let result: Option<DeliveryResult> = s.db.lock().unwrap().query_row(
-            "SELECT d.state,m.status,m.text,m.id,(d.state='notAccepted' AND COALESCE(d.mode,'')='prompt' AND COALESCE(d.session_id,'')='' AND COALESCE(d.endpoint,'')='' AND d.receipt IS NULL AND COALESCE(m.status,'')='interrupted' AND COALESCE(m.text,'')='') FROM input_deliveries d JOIN companion_calls c ON c.id=?2 AND c.agent_id=d.agent_id AND c.conversation_id=d.conversation_id LEFT JOIN messages m ON m.id=d.target_turn AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id AND m.role='assistant' WHERE d.message_id=?1",
+            &format!("SELECT d.state,m.status,m.text,m.id,({}) FROM input_deliveries d JOIN companion_calls c ON c.id=?2 AND c.agent_id=d.agent_id AND c.conversation_id=d.conversation_id LEFT JOIN messages m ON m.id=d.target_turn AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id AND m.role='assistant' WHERE d.message_id=?1", crate::delivery::PROVEN_NOT_STARTED),
             params![mid,id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
         ).optional()?;
         if live {

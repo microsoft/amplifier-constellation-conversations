@@ -396,6 +396,10 @@ pub(crate) fn enqueue(s: &AppState, db: &Connection, post: &str) -> Result<Value
             received.push(json!({"agent_id":recipient["agent_id"],"state":"not_accepted","reason":"pending_capacity"}));
             continue;
         }
+        if crate::update_admission::closed(db)? {
+            received.push(json!({"agent_id":recipient["agent_id"],"state":"not_accepted","reason":"installation_updating"}));
+            continue;
+        }
         let input = uuid::Uuid::new_v4().to_string();
         db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES(?1,?2,?3,?4,'peer','received',?5)",params![input,post,parent,agent,now_ms()])?;
         db.execute(

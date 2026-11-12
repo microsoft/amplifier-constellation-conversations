@@ -24,6 +24,7 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 pub fn router(state: Arc<AppState>) -> Router {
     crate::delivery::resume(&state);
     Router::new()
+        .merge(crate::native_update::router())
         .route(
             "/markdown-notices.txt",
             get(|| async {
@@ -493,6 +494,7 @@ async fn config_put(
         ));
     }
     c.validate().map_err(|e| ApiError::bad(e.to_string()))?;
+    let _update_activity = crate::update_admission::begin_configuration(&s)?;
     c.save(&s.home)?;
     s.audit(
         "configuration.saved",
@@ -509,6 +511,7 @@ async fn check(State(s): State<Arc<AppState>>, h: HeaderMap) -> ApiResult<Json<V
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::busy())?;
+    let _update_activity = crate::update_admission::begin_probe(&s)?;
     driver::probe(&s.agent("default")?.ok_or_else(ApiError::missing)?).await.map(Json).map_err(|error| {
         if crate::acp_auth::authentication_required(&error) { return ApiError::bad(error.to_string()); }
         ApiError::bad(
@@ -819,6 +822,7 @@ pub(crate) async fn send_with_delivery_window(
                 Json(json!({"accepted":true,"duplicate":true,"message_id":msg.request_id})),
             ));
         }
+        crate::update_admission::ensure_open(&tx)?;
         crate::huddles::check_open(&tx, &id)?;
         let member: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM room_members WHERE conversation_id=?1 AND username=?2)",
@@ -1264,6 +1268,19 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 pub async fn serve(home: std::path::PathBuf) -> anyhow::Result<()> {
+    serve_inner(home, None).await
+}
+pub async fn serve_update(
+    home: std::path::PathBuf,
+    transaction: String,
+    nonce: String,
+) -> anyhow::Result<()> {
+    serve_inner(home, Some((transaction, nonce))).await
+}
+async fn serve_inner(
+    home: std::path::PathBuf,
+    startup: Option<(String, String)>,
+) -> anyhow::Result<()> {
     use fs2::FileExt;
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -1273,6 +1290,14 @@ pub async fn serve(home: std::path::PathBuf) -> anyhow::Result<()> {
         .open(home.join("service.lock"))?;
     lock.try_lock_exclusive()
         .map_err(|_| anyhow::anyhow!("This conversation service is already running"))?;
+    let startup = match startup {
+        Some(ticket) => Some(ticket),
+        None => crate::native_update::managed_startup_ticket(&home)?,
+    };
+    crate::native_update::validate_start(
+        &home,
+        startup.as_ref().map(|(id, n)| (id.as_str(), n.as_str())),
+    )?;
     let state = AppState::open(home)?;
     let listener = std::net::TcpListener::bind((state.config.bind.as_str(), state.config.port))?;
     listener.set_nonblocking(true)?;
@@ -1286,15 +1311,26 @@ pub async fn serve(home: std::path::PathBuf) -> anyhow::Result<()> {
     crate::config::private_write(
         &state.home.join("runtime.json"),
         &serde_json::to_vec_pretty(
-            &json!({"port":port,"url":format!("https://127.0.0.1:{port}"),"public_url":state.config.public_url,"provider_id":state.config.provider_id()}),
+            &json!({"port":port,"url":format!("https://127.0.0.1:{port}"),"public_url":state.config.public_url,"provider_id":state.config.provider_id(),"process_nonce":auth::random_token(),"transaction_id":startup.as_ref().map(|s|&s.0),"launch_nonce":startup.as_ref().map(|s|&s.1)}),
         )?,
     )?;
     println!("Agent Conversations is listening on HTTPS port {port}");
     if !state.config.public_url.is_empty() {
         println!("Open {}", state.config.public_url);
     }
-    axum_server::from_tcp_rustls(listener, tls)?
+    let handle = axum_server::Handle::new();
+    let shutdown = handle.clone();
+    let mut signal = state.native_shutdown.subscribe();
+    let waiter = tokio::spawn(async move {
+        if signal.changed().await.is_ok() {
+            shutdown.graceful_shutdown(Some(Duration::from_secs(3)));
+        }
+    });
+    let result = axum_server::from_tcp_rustls(listener, tls)?
+        .handle(handle)
         .serve(router(state).into_make_service())
-        .await?;
+        .await;
+    waiter.abort();
+    result?;
     Ok(())
 }

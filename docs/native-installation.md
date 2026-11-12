@@ -1,5 +1,8 @@
 # Native Conversations and Companion packages
 
+For whole-bundle updates, rollback and optional existing-updater enrollment, see
+[Native installation updates](native-updates.md).
+
 The native bundle is a self-contained hosting package for an existing ACP agent.
 It contains the Conversations executable, a private Node runtime and the locked
 production voice/MCP SDK dependencies. It does not install an ACP engine, model,
@@ -140,6 +143,37 @@ OS account sign-in, browser microphone/camera permissions and physical media,
 startup registration, signed installation/SmartScreen/Gatekeeper and upgrade/
 rollback require separate platform receipts. Passing build or manifest tests
 must not be reported as passing those checks.
+
+The separate `scripts/test-native-startup.py` controller is for disposable native
+CI accounts only. It requires `CONSTELLATION_NATIVE_STARTUP_TEST=1`, installs a
+single UUID-named current-user registration for a temporary Unicode installation
+path, inspects it, repeats registration to check identity, starts it through the
+real OS manager, checks HTTPS with the installation CA and the authenticated API,
+then runs an actual whole-bundle update and fresh rollback before stopping and
+removing that same registration. It compares the complete registration hash,
+enabled/masked state, and manager running state after both operations; on Linux
+and macOS it also matches the manager's process ID to the authenticated service.
+The derived candidate changes a support document and manifest version while
+retaining the same tested service/private runtime bytes, so this proves the
+lifecycle boundary rather than migration between different application versions.
+It does not create another OS
+account, test a password, log the user out, or enable voice. A missing user service
+manager or macOS GUI domain is recorded as not tested and exits unsuccessfully;
+it is never treated as passing startup coverage.
+
+This startup test is distinct from the package's clean-PATH test: the service
+manager supplies the launched service's environment. The startup controller does
+not change the account's global manager environment or claim a freshly installed
+consumer OS. Linux CI needs its disposable account's user service manager; macOS
+needs that account's existing GUI launchd domain. Windows uses the current
+account's Task Scheduler registration and inspects Unicode task details through
+COM. No administrator rights are added to the application registration.
+
+Cleanup verifies the fixed owned command before stopping or removing it. If
+cleanup cannot establish that the owned process and registration are settled, the
+receipt records failure and retains only that temporary installation for diagnosis.
+It does not remove files underneath an uncertain running service. No existing
+user application, registration, account or installation is selected by this test.
 
 Optional filesystem callbacks remain explicitly constrained by platform support;
 terminal callbacks require the existing Linux confinement. A native voice package

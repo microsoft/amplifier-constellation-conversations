@@ -79,6 +79,13 @@ class PackageTests(unittest.TestCase):
         return {"path": str(p), "sha256": package_native.sha(contents)}
 
     def spec(self, target="linux-x64"):
+        support_payloads = {
+            "docs/native-installation.md": b"Native installation instructions\n",
+            "docs/native-updates.md": b"Native whole-bundle update and rollback instructions\n",
+            "ops/pam-agent-conversations": b"# Reviewed platform authentication policy\n",
+            "ops/companion.example.json": json.dumps({"enabled": False,
+                "node": "<bundle>/runtime/node", "bridge": "<bundle>/bridge/live.mjs", "profiles": {}}).encode(),
+        }
         return {"schema_version": 1, "target": target, "version": "0.12.8", "source_revision": "a" * 40,
                 "service": self.pinned("service", synthetic_header(target)),
                 "node": {"executable": self.pinned("node", synthetic_header(target)), "version": "22.23.5",
@@ -87,12 +94,9 @@ class PackageTests(unittest.TestCase):
                            "node_modules": str(self.modules), "node_modules_sha256": package_native.tree_digest(package_native.tree_files(self.modules))},
                 "license": self.pinned("license", b"Microsoft MIT\n"),
                 "third_party_notices": self.pinned("notices", b"Rust dependencies and license texts\n"),
-                "support_files": {
-                    "docs/native-installation.md": self.pinned("installation.md", b"Native installation instructions\n"),
-                    "ops/pam-agent-conversations": self.pinned("pam-policy", b"# Reviewed platform authentication policy\n"),
-                    "ops/companion.example.json": self.pinned("companion-template.json", json.dumps({"enabled": False,
-                        "node": "<bundle>/runtime/node", "bridge": "<bundle>/bridge/live.mjs", "profiles": {}}).encode()),
-                }}
+                "support_files": {name: self.pinned("support-" + name.replace("/", "-"),
+                    support_payloads.get(name, ("Fixture support document " + name + "\n").encode()))
+                    for name in sorted(package_native.SUPPORT_FILES)}}
 
     def build(self, spec=None, name="dist"):
         output = self.root / name
@@ -367,6 +371,7 @@ class PackageTests(unittest.TestCase):
         archive, receipt = self.build(spec)
         _, files = package_native.inspect_archive(archive, receipt["archive_sha256"])
         self.assertTrue(package_native.SUPPORT_FILES <= files.keys())
+        self.assertEqual(files["docs/native-updates.md"], b"Native whole-bundle update and rollback instructions\n")
         self.assertFalse(json.loads(files["ops/companion.example.json"])["enabled"])
         for field, value in [("enabled", True), ("profiles", {"owner": {"api_key": "not-real"}}), ("api_key", "not-real")]:
             template = {"enabled": False, "node": "<bundle>/runtime/node", "bridge": "<bundle>/bridge/live.mjs", "profiles": {}}

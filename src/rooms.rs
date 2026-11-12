@@ -158,26 +158,39 @@ impl AppState {
         owner: &str,
         agents: &[String],
     ) -> anyhow::Result<Value> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let at = now_ms();
-        {
+        let id = {
             let mut db = self.db.lock().unwrap();
             let tx = db.transaction()?;
-            tx.execute("INSERT INTO conversations(id,title,created_at,updated_at,status,note,owner,shared) VALUES(?1,?2,?3,?3,'idle','',?4,?5)",params![id,title,at,owner,agents.len()>1])?;
-            tx.execute("INSERT INTO room_members(conversation_id,username,role,joined_at) VALUES(?1,?2,'owner',?3)",params![id,owner,at])?;
-            for agent in agents {
-                tx.execute(
-                    "INSERT INTO room_agents(conversation_id,agent_id) VALUES(?1,?2)",
-                    params![id, agent],
-                )?;
-            }
+            let id = insert_room(&tx, title, owner, agents)?;
             tx.commit()?;
-        }
+            id
+        };
         self.audit("conversation.created", Some(&id), json!({"actor":owner}))?;
         self.changed();
         Ok(self.conversation(&id)?.unwrap())
     }
 }
+/// Insert room identity in the caller's transaction, allowing call admission to
+/// reserve its room and active-call row atomically with the installation gate.
+pub(crate) fn insert_room(
+    db: &rusqlite::Connection,
+    title: &str,
+    owner: &str,
+    agents: &[String],
+) -> anyhow::Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let at = now_ms();
+    db.execute("INSERT INTO conversations(id,title,created_at,updated_at,status,note,owner,shared) VALUES(?1,?2,?3,?3,'idle','',?4,?5)",params![id,title,at,owner,agents.len()>1])?;
+    db.execute("INSERT INTO room_members(conversation_id,username,role,joined_at) VALUES(?1,?2,'owner',?3)",params![id,owner,at])?;
+    for agent in agents {
+        db.execute(
+            "INSERT INTO room_agents(conversation_id,agent_id) VALUES(?1,?2)",
+            params![id, agent],
+        )?;
+    }
+    Ok(id)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemberWrite {
@@ -320,6 +333,7 @@ pub async fn add_agent(
     a.config
         .validate()
         .map_err(|e| ApiError::bad(e.to_string()))?;
+    let _update_activity = crate::update_admission::begin_configuration(&s)?;
     let running = s.running.lock().unwrap();
     if !running.is_empty() {
         return Err(ApiError::busy());
@@ -370,6 +384,7 @@ pub async fn delete_agent(
             "Keep the default connection; it can be edited",
         ));
     }
+    let _update_activity = crate::update_admission::begin_configuration(&s)?;
     let db = s.db.lock().unwrap();
     let in_use: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM room_agents WHERE agent_id=?1)",

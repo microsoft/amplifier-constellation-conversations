@@ -30,7 +30,7 @@ TARGETS = {
 }
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?\Z")
-SUPPORT_FILES = {"docs/native-installation.md", "ops/pam-agent-conversations", "ops/companion.example.json"}
+SUPPORT_FILES = {"docs/native-installation.md", "docs/native-updates.md", "ops/pam-agent-conversations", "ops/companion.example.json"}
 
 
 def require(condition: bool, message: str) -> None:
