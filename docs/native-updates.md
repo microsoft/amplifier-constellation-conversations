@@ -125,9 +125,13 @@ The fixed participant CLI uses one monotonic clock for the entire invocation,
 including owner validation, OS-manager calls, verification, and result output.
 The lifecycle wire remains 30 seconds for prepare/restore and 300 seconds for
 verify. Nested waits share the remaining budget: work stops accepting new waits
-two seconds before the wire limit, and a process watchdog exits with code 124
-one second before it. The watchdog stays armed through JSON serialization and
-stdout flush, including blocked synchronous COM calls or output readers.
+two seconds before the wire limit, and a process watchdog requests immediate
+self-termination with code 124 one second before it. The watchdog stays armed
+through JSON serialization and stdout flush, including blocked synchronous COM
+calls or output readers. Termination bypasses Rust/C exit handlers and Windows
+DLL-detach cleanup; an unexpected failure to terminate aborts the process.
+OS scheduling and pending I/O teardown can still delay observed process exit,
+so the caller's deadline remains an uncertainty boundary.
 
 Exit 124 means the outcome is **unknown**. It does not prove that an OS-manager
 request was cancelled and does not perform compensation or write a terminal

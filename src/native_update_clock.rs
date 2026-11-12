@@ -63,11 +63,32 @@ fn install_budget(budget: Budget) -> Result<Invocation> {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             // No logging, journal writes, cancellation claim, or compensation here:
-            // even stderr may be blocked. Process exit ends local late worker writes.
-            std::process::exit(UNKNOWN_EXIT);
+            // even stderr may be blocked. Do not run cleanup on the stuck process.
+            terminate_unknown();
         })
         .context("Cannot establish participant invocation deadline")?;
     Ok(Invocation { sender, budget })
+}
+
+fn terminate_unknown() -> ! {
+    // std::process::exit flushes Rust stdout and runs platform exit handlers.
+    // Those can block on output or locks held by the operation we are bounding.
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(UNKNOWN_EXIT)
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+            // Only this participant process, never a recorded PID or child.
+            // Successful self-termination does not return or run DLL detach code.
+            let _ = TerminateProcess(GetCurrentProcess(), UNKNOWN_EXIT as u32);
+        }
+        // A failed platform termination must not return to work or run cleanup.
+        std::process::abort()
+    }
 }
 
 pub(crate) struct Invocation {
@@ -171,6 +192,66 @@ mod tests {
         thread::sleep(Duration::from_millis(400));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "bounded subprocess with blocked exit-time stdout cleanup"]
+    fn buffered_stdout_fixture() {
+        use std::{
+            io::Write,
+            os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        };
+        // Clear test-harness output before replacing stdout. Keep the read end
+        // open without consuming it, so the full pipe blocks instead of EPIPE.
+        std::io::stdout().flush().unwrap();
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let _reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let bytes = [b'x'; 4096];
+        let mut size = bytes.len();
+        loop {
+            let written = unsafe { libc::write(writer.as_raw_fd(), bytes.as_ptr().cast(), size) };
+            if written >= 0 {
+                continue;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            if size == 1 {
+                break;
+            }
+            size = 1; // Fill any capacity smaller than an atomic pipe write too.
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::dup2(writer.as_raw_fd(), libc::STDOUT_FILENO) },
+            libc::STDOUT_FILENO
+        );
+        drop(writer);
+        // No newline: leave one byte buffered and RELEASE the stdout lock.
+        // std::process::exit would acquire it and block flushing during cleanup.
+        std::io::stdout().write_all(b"x").unwrap();
+        let now = Instant::now();
+        let _clock = install_budget(Budget {
+            work: now + Duration::from_millis(150),
+            exit: now + Duration::from_millis(250),
+        })
+        .unwrap();
+        thread::sleep(Duration::from_secs(60));
+        panic!("Watchdog waited for buffered stdout cleanup");
+    }
+
     fn fixture(name: &str) -> std::process::ExitStatus {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", name, "--nocapture"])
@@ -202,5 +283,13 @@ mod tests {
     #[test]
     fn completed_and_flushed_invocation_cancels_watchdog() {
         assert!(fixture("native_update_clock::tests::completed_operation_fixture").success());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_exits_unknown_without_flushing_buffered_stdout() {
+        assert_eq!(
+            fixture("native_update_clock::tests::buffered_stdout_fixture").code(),
+            Some(UNKNOWN_EXIT)
+        );
     }
 }
