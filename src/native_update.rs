@@ -76,7 +76,11 @@ fn save(path: &Path, v: &Value) -> Result<()> {
         Some(INSTALLED) => "Cannot commit installed bundle receipt",
         _ => "Cannot persist native installation receipt",
     };
-    config::private_write(path, &serde_json::to_vec_pretty(v)?).context(context)
+    // These callers publish mutable JSON journals, installation receipts and
+    // Windows process-exit evidence. Existing readers may retain their snapshot;
+    // executable replacement and create-only ownership keep their strict APIs.
+    amplifier_native_platform::private_write_data(path, &serde_json::to_vec_pretty(v)?)
+        .context(context)
 }
 fn id(value: &str) -> Result<()> {
     uuid::Uuid::parse_str(value)?;
@@ -1544,6 +1548,43 @@ mod startup_tests {
     use rusqlite::{Connection, params};
     use std::sync::mpsc;
 
+    #[test]
+    fn data_receipts_publish_while_open_readers_keep_their_snapshot() {
+        use std::io::Read;
+        let home = tempfile::tempdir().unwrap();
+        for name in [JOURNAL, INSTALLED, "native-update-process-exit.json"] {
+            let path = home.path().join(name);
+            let previous = json!({"generation":1,"historical_outcome":"unknown"});
+            let current = json!({"generation":2,"historical_outcome":"unknown"});
+            save(&path, &previous).unwrap();
+            let mut reader = File::open(&path).unwrap();
+            save(&path, &current).unwrap();
+            let mut retained = Vec::new();
+            reader.read_to_end(&mut retained).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&retained).unwrap(),
+                previous
+            );
+            assert_eq!(read(&path).unwrap(), current);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn binary_replacement_still_refuses_an_open_reader() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("candidate.exe");
+        let target = home.path().join("installed.exe");
+        config::private_write(&source, b"candidate executable bytes").unwrap();
+        config::private_write(&target, b"previous executable bytes").unwrap();
+        let reader = File::open(&target).unwrap();
+        assert!(write_binary(&source, &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"previous executable bytes");
+        drop(reader);
+        write_binary(&source, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"candidate executable bytes");
+    }
+
     fn initialized_home() -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
         let config: Config = serde_json::from_value(json!({
@@ -1701,7 +1742,10 @@ mod startup_tests {
             let _launch = launch_guard_waiting(&path, || contended.send(()).unwrap())?;
             // The same guarded publication as save(); the callback makes the
             // first failed acquisition observable without a scheduling guess.
-            config::private_write(&path.join(JOURNAL), &serde_json::to_vec_pretty(&j)?)
+            amplifier_native_platform::private_write_data(
+                &path.join(JOURNAL),
+                &serde_json::to_vec_pretty(&j)?,
+            )
         });
         observed.recv_timeout(Duration::from_secs(5)).unwrap();
         // The wait deadline already exists and acquisition has actually failed.
