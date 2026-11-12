@@ -1,0 +1,110 @@
+name: Native packages
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Cargo.*'
+      - 'src/**'
+      - 'bridge/**'
+      - 'scripts/*native*'
+      - 'tests/*native*'
+      - 'tests/native/**'
+      - '.github/workflows/native-platform.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.target }} native package and clean-path install
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64
+            suffix: ''
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+            suffix: ''
+          - runner: macos-15-intel
+            target: macos-x64
+            suffix: ''
+          - runner: macos-15
+            target: macos-arm64
+            suffix: ''
+          # This is native x64 Windows Server build/launch coverage. A separate
+          # Windows 11 x64 consumer-machine receipt is still required.
+          - runner: windows-2025
+            target: windows-x64
+            suffix: '.exe'
+          - runner: windows-11-arm
+            target: windows-arm64
+            suffix: '.exe'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build dependencies only
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libclang-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.5'
+      - name: Build the native executable and run platform unit tests
+        run: |
+          cargo test --locked --lib platform::
+          cargo test --locked --lib native_bundle::
+          cargo build --locked --release
+      - name: Acquire locked build-time dependencies
+        run: |
+          npm ci --ignore-scripts --omit=dev --prefix bridge
+          npm ci --ignore-scripts --prefix tests/native
+          python scripts/native-ci-inputs.py --target '${{ matrix.target }}' --service 'target/release/agent-conversations${{ matrix.suffix }}' --output '${{ runner.temp }}/native-inputs'
+      - name: Check package validation regressions
+        run: python -m unittest discover -s tests -p 'test_*native*.py'
+      - name: Assemble self-contained immutable bundle
+        run: python scripts/package-native.py build --inputs '${{ runner.temp }}/native-inputs/inputs.json' --output dist
+      - name: Install and launch with developer tools absent from child PATH
+        run: |
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('clean_install', 'tests/native_clean_install.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          receipts = list(Path('dist').glob('conversations-*.json'))
+          assert len(receipts) == 1, 'Expected one immutable package receipt'
+          import json
+          receipt = json.loads(receipts[0].read_text())
+          module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/clean-path-install.json').resolve())
+          PY
+      - name: Retain exact build and qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conversations-native-${{ matrix.target }}
+          path: |
+            dist/*
+            ${{ runner.temp }}/native-inputs/node-provenance.json
+          if-no-files-found: warn
+          retention-days: 7
+
+# These lanes use native hosted runners. They do not install onto a newly
+# provisioned consumer machine, enroll OS certificate trust, test an OS password,
+# exercise a physical microphone/camera, sign artifacts, publish a release or
+# adopt a package on any existing installation. In particular this workflow does
+# not resume the separately paused speech release.

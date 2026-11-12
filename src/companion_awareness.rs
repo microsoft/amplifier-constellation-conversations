@@ -748,14 +748,9 @@ async fn followthrough_tick(
 async fn invoke(command: &[String], input: &Value, decisions: bool) -> Result<Value> {
     ensure!(command_valid(command), "Invalid observer command");
     let mut cmd = tokio::process::Command::new(&command[0]);
-    cmd.args(&command[1..])
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
-    for name in ["HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
-        if let Ok(v) = std::env::var(name) {
-            cmd.env(name, v);
-        }
-    }
+    cmd.args(&command[1..]);
+    crate::platform::child_environment(&mut cmd);
+    crate::platform::ProcessTree::prepare(&mut cmd);
     if decisions && let Ok(v) = std::env::var("OPENAI_API_KEY") {
         cmd.env("OPENAI_API_KEY", v);
     }
@@ -765,6 +760,7 @@ async fn invoke(command: &[String], input: &Value, decisions: bool) -> Result<Va
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
+    let mut process_tree = crate::platform::ProcessTree::attach(&child)?;
     tokio::time::timeout(
         Duration::from_secs(if decisions { 20 } else { 12 }),
         async {
@@ -780,10 +776,10 @@ async fn invoke(command: &[String], input: &Value, decisions: bool) -> Result<Va
                 .take(131073)
                 .read_to_end(&mut bytes)
                 .await?;
-            ensure!(
-                bytes.len() <= 131072 && child.wait().await?.success(),
-                "Observer did not settle within bounds"
-            );
+            ensure!(bytes.len() <= 131072, "Observer output exceeded bounds");
+            let status = child.wait().await?;
+            process_tree.reaped();
+            ensure!(status.success(), "Observer did not settle within bounds");
             Ok(serde_json::from_slice(&bytes)?)
         },
     )

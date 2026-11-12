@@ -49,6 +49,7 @@ name = "agent-conversations"
 version = "0.12.8"
 dependencies = [
  "amplifier-acp-connection",
+ "amplifier-native-platform",
  "anyhow",
  "axum",
  "axum-server",
@@ -72,6 +73,8 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -96,6 +99,18 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "amplifier-native-platform"
+version = "0.1.0"
+source = "git+https://github.com/microsoft/amplifier-constellation?rev=c1f63858ac7fb5ed77cce344350accb14c2628bb#c1f63858ac7fb5ed77cce344350accb14c2628bb"
+dependencies = [
+ "anyhow",
+ "libc",
+ "url",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

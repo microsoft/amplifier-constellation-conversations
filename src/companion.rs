@@ -1004,8 +1004,11 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
     let mut retained_bridge = None;
     let result:Result<bool>=async {
         let mut cmd=Command::new(&c.node); cmd.arg(&c.bridge).env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
-        for name in ["PATH","HOME","SSL_CERT_FILE","SSL_CERT_DIR","OPENAI_API_KEY"] { if let Ok(v)=std::env::var(name) { cmd.env(name,v); } }
+        crate::platform::child_environment(&mut cmd);
+        if let Some(v)=std::env::var_os("OPENAI_API_KEY") { cmd.env("OPENAI_API_KEY",v); }
+        crate::platform::ProcessTree::prepare(&mut cmd);
         let mut child=cmd.spawn().context("Voice bridge unavailable")?;
+        let mut process_tree=crate::platform::ProcessTree::attach(&child)?;
         let mut input=child.stdin.take().context("Missing voice input")?;
         let mut initial=initial;
         initial["retain_receipts"]=json!(!initial["mcp"].is_null());
@@ -1062,7 +1065,7 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
                             if !initial["mcp"].is_null() {
                                 // Provider media is closed; retain only the same
                                 // official MCP listener for accepted backend work.
-                                retained_bridge=Some((child,input));
+                                retained_bridge=Some((process_tree,child,input));
                             }
                             return Ok(confirmed);
                         },
@@ -1073,7 +1076,7 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
                 command=rx.recv()=>command,
                 _=wait_for_advance(&mut timer,transcript_wake)=>{
                     let heartbeat:i64=s.db.lock().unwrap().query_row("SELECT heartbeat_at FROM companion_calls WHERE id=?1",[&id],|r|r.get(0))?;
-                    if closing.is_some_and(|deadline|started.elapsed()>deadline) { child.start_kill()?; return Ok(false); }
+                    if closing.is_some_and(|deadline|started.elapsed()>deadline) { process_tree.terminate(&mut child); return Ok(false); }
                     let duration_expired=duration_expired(c.max_call_seconds,started.elapsed());
                     if closing.is_none() && (duration_expired || now_ms()-heartbeat>60_000 || !private_room(&s,&room,&owner)? || auth::check(&s,&h,"chat",false).is_err()) { Some(json!({"op":"close","source":if now_ms()-heartbeat>60_000 {"heartbeat_expired"} else if duration_expired {"duration_limit"} else {"access_revoked"}})) }
                     else if closing.is_none() { advance(&s,&id,&room,&h).await?; crate::companion_delivery::take_ready(&s,&id)? } else { None }
@@ -1151,18 +1154,21 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
             "UPDATE companion_tool_grants SET port=NULL WHERE call_id=?1",
             [&result_id],
         );
-        if let Some((mut child, mut input)) = retained_bridge {
+        // Field order also governs cancellation: dispose the owned process tree
+        // before Tokio can reap its child and release the Unix process-group ID.
+        if let Some((mut process_tree, mut child, mut input)) = retained_bridge {
             let _ = tokio::time::timeout(Duration::from_secs(2), async {
                 input.write_all(b"{\"op\":\"dispose\"}\n").await?;
                 input.flush().await
             })
             .await;
             drop(input);
-            if tokio::time::timeout(Duration::from_secs(2), child.wait())
-                .await
-                .is_err()
-            {
-                let _ = child.kill().await;
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(_)) => process_tree.reaped(),
+                _ => {
+                    process_tree.terminate(&mut child);
+                    let _ = child.wait().await;
+                }
             }
         }
     });

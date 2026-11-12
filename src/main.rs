@@ -1,6 +1,6 @@
 use agent_conversations::{
     config::{self, Agent, Config},
-    driver, server,
+    driver, native_bundle, platform, server,
     state::AppState,
 };
 use anyhow::{Context, Result, ensure};
@@ -23,6 +23,18 @@ struct Cli {
 // One command is parsed once at startup; boxing individual CLI fields adds no value.
 #[allow(clippy::large_enum_variant)]
 enum Action {
+    /// Open the existing HTTPS interface in the system browser.
+    Open,
+    /// Configure sign-in startup for this installation without starting it now.
+    Startup {
+        #[command(subcommand)]
+        action: StartupAction,
+    },
+    /// Verify or install a complete native package without changing live state.
+    Bundle {
+        #[command(subcommand)]
+        action: BundleAction,
+    },
     Init {
         #[arg(long, default_value = "Conversations")]
         label: String,
@@ -34,7 +46,7 @@ enum Action {
         port: u16,
         #[arg(long, default_value = "")]
         public_url: String,
-        #[arg(long, default_value = "agent-conversations")]
+        #[arg(long, default_value_t = platform::default_auth_service().to_owned())]
         pam_service: String,
         #[arg(long)]
         agent_home: Option<PathBuf>,
@@ -75,6 +87,22 @@ enum Action {
         path: String,
         #[arg(long)]
         body_file: Option<PathBuf>,
+    },
+}
+#[derive(Subcommand)]
+enum StartupAction {
+    Install,
+    Remove,
+}
+#[derive(Subcommand)]
+enum BundleAction {
+    Verify {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    Install {
+        #[arg(long)]
+        path: PathBuf,
     },
 }
 #[derive(Subcommand)]
@@ -126,10 +154,49 @@ enum ContextAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let home = cli
-        .home
-        .context("Supply --home with this conversation installation folder")?;
+    let home = match cli.home {
+        Some(home) => home,
+        None => amplifier_native_platform::default_home(&native_bundle::APPLICATION, "default")?,
+    };
     match cli.command {
+        Action::Open => {
+            // No bearer or control token is placed in a URL. Authentication stays
+            // in the browser's existing HTTPS/CSRF flow.
+            let config = Config::load(&home)?;
+            let runtime: Value =
+                serde_json::from_slice(&std::fs::read(home.join("runtime.json"))?)?;
+            let url = if config.public_url.is_empty() {
+                runtime["url"]
+                    .as_str()
+                    .context("Start this installation before opening it")?
+            } else {
+                &config.public_url
+            };
+            amplifier_native_platform::open_https_browser(url)?;
+        }
+        Action::Startup { action } => {
+            let config = Config::load(&home)?;
+            let id = uuid::Uuid::parse_str(&config.id)?;
+            match action {
+                StartupAction::Install => amplifier_native_platform::install_startup(
+                    &native_bundle::APPLICATION,
+                    &home,
+                    &id,
+                )?,
+                StartupAction::Remove => amplifier_native_platform::remove_startup(
+                    &native_bundle::APPLICATION,
+                    &home,
+                    &id,
+                )?,
+            }
+        }
+        Action::Bundle { action } => {
+            let receipt = match action {
+                BundleAction::Verify { path } => native_bundle::verify(&path)?,
+                BundleAction::Install { path } => native_bundle::install(&path, &home)?,
+            };
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
         Action::Init {
             label,
             owner,
@@ -160,7 +227,10 @@ async fn main() -> Result<()> {
                 );
                 let p = std::fs::canonicalize(agent_home)?;
                 (
-                    p.join("bin/agent-instance").to_string_lossy().into_owned(),
+                    p.join("bin")
+                        .join(platform::executable("agent-instance"))
+                        .to_string_lossy()
+                        .into_owned(),
                     vec![
                         "acp".into(),
                         "--home".into(),
@@ -187,9 +257,10 @@ async fn main() -> Result<()> {
             let c = Config {
                 id: uuid::Uuid::new_v4().to_string(),
                 label,
-                owner: owner
-                    .or_else(|| std::env::var("USER").ok())
-                    .context("Supply --owner")?,
+                owner: match owner {
+                    Some(owner) => owner,
+                    None => platform::current_user()?,
+                },
                 allowed_users: Vec::new(),
                 embed_origins: Vec::new(),
                 bind,
@@ -218,7 +289,7 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &json!({"home":home,"provider_id":c.provider_id(),"control_token_file":home.join("secrets/control-token"),"context_token_file":home.join("secrets/context-token"),"import_token_file":home.join("secrets/import-token"),"next":"Configure the PAM service, then run serve. No agent persona or runtime was installed."})
+                    &json!({"home":home,"provider_id":c.provider_id(),"control_token_file":home.join("secrets/control-token"),"context_token_file":home.join("secrets/context-token"),"import_token_file":home.join("secrets/import-token"),"authentication":platform::auth_method(),"next":if cfg!(target_os="linux") { "Configure the local PAM service, trust the installation certificate, then run serve. No agent persona or runtime was installed." } else { "Trust the installation certificate, then run serve. Sign in using an explicitly allowed local account's password. No agent persona or runtime was installed." }})
                 )?
             );
         }

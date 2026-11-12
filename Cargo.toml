@@ -10,6 +10,7 @@ description = "Browser conversations, people and agents, threads, approvals, and
 
 [dependencies]
 amplifier-acp-connection = { git = "https://github.com/microsoft/amplifier-constellation", rev = "fd95c20a5773a739c8a1c99fb69713a2f0849bf3" }
+amplifier-native-platform = { git = "https://github.com/microsoft/amplifier-constellation", rev = "c1f63858ac7fb5ed77cce344350accb14c2628bb" }
 anyhow = "1"
 base64 = "0.22"
 axum = { version = "0.8.9", features = ["macros"] }
@@ -19,7 +20,6 @@ futures-util = "0.3"
 fs2 = "0.4"
 get_if_addrs = "0.5"
 libc = "0.2"
-pam-client = { version = "0.5", default-features = false }
 rand = "0.8"
 rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -31,6 +31,13 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 time = { version = "0.3", features = ["parsing"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+pam-client = { version = "0.5", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authentication_Identity", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"
