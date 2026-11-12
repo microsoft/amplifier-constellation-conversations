@@ -121,38 +121,6 @@ pub fn startup_change_guard(home: &Path) -> Result<InstallationLock> {
     }
     Ok(guard)
 }
-#[cfg(test)]
-mod lock_tests {
-    use super::lock;
-
-    #[test]
-    fn installation_lock_rejects_a_live_owner() {
-        let home = tempfile::tempdir().unwrap();
-        let owner = lock(home.path(), "native-update.lock").unwrap();
-        assert!(lock(home.path(), "native-update.lock").is_err());
-        drop(owner);
-        assert!(lock(home.path(), "native-update.lock").is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn installation_lock_releases_while_an_inherited_description_remains_open() {
-        let home = tempfile::tempdir().unwrap();
-        let owner = lock(home.path(), "native-update.lock").unwrap();
-        // try_clone duplicates the same open file description, deterministically
-        // reproducing the descriptor inherited by a child before its exec.
-        let inherited = owner.file.try_clone().unwrap();
-        assert!(lock(home.path(), "native-update.lock").is_err());
-        drop(owner);
-        let next_owner = lock(home.path(), "native-update.lock").unwrap();
-        assert!(lock(home.path(), "native-update.lock").is_err());
-        // Closing an older duplicate must not release the new owner's lock.
-        drop(inherited);
-        assert!(lock(home.path(), "native-update.lock").is_err());
-        drop(next_owner);
-        assert!(lock(home.path(), "native-update.lock").is_ok());
-    }
-}
 fn write_binary(from: &Path, to: &Path) -> Result<()> {
     ordinary(from)?;
     config::private_dir(to.parent().context("Missing binary folder")?)?;
@@ -1461,5 +1429,38 @@ mod windows_exit {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::lock;
+
+    #[test]
+    fn installation_lock_rejects_a_live_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let owner = lock(home.path(), "native-update.lock").unwrap();
+        assert!(lock(home.path(), "native-update.lock").is_err());
+        drop(owner);
+        assert!(lock(home.path(), "native-update.lock").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installation_lock_releases_while_an_inherited_description_remains_open() {
+        let home = tempfile::tempdir().unwrap();
+        let owner = lock(home.path(), "native-update.lock").unwrap();
+        // try_clone duplicates the same open file description, deterministically
+        // reproducing the descriptor inherited by a child before its exec.
+        let inherited = owner.file.try_clone().unwrap();
+        assert!(lock(home.path(), "native-update.lock").is_err());
+        drop(owner);
+        let next_owner = lock(home.path(), "native-update.lock").unwrap();
+        assert!(lock(home.path(), "native-update.lock").is_err());
+        // Closing an older duplicate must not release the new owner's lock.
+        drop(inherited);
+        assert!(lock(home.path(), "native-update.lock").is_err());
+        drop(next_owner);
+        assert!(lock(home.path(), "native-update.lock").is_ok());
     }
 }
