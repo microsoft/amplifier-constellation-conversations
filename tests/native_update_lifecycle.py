@@ -34,6 +34,22 @@ clean = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(clean)
 require = clean.require
 
+# Do not synchronously close a timed-out Windows pipe while its daemon reader
+# may own the buffered stream lock. Keep it alive until exact service cleanup
+# releases any writers, or the disposable controller exits.
+UNSETTLED_CAPTURES: list[subprocess.Popen] = []
+
+
+def capture_summary(value) -> dict:
+    """Bounded metadata only; command output can contain credentials/nonces."""
+    if value is None:
+        return {"available": False, "content_retained": False}
+    sample = value[:4096]
+    encoded = sample.encode("utf-8", errors="replace") if isinstance(sample, str) else sample
+    return {"available": True, "sample_bytes": min(len(encoded), 4096),
+            "sample_truncated": len(value) > 4096 or len(encoded) > 4096,
+            "content_retained": False}
+
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -142,6 +158,7 @@ class Installation:
         empty.mkdir()
         self.env = clean.isolated_environment(user, empty)
         self.children: list[subprocess.Popen] = []
+        self.unsettled_commands: list[subprocess.Popen] = []
         self.streams = []
         self.ports: set[int] = set()
         self.fixture_calls: set[str] = set()
@@ -177,14 +194,51 @@ class Installation:
         operation = self.begin_operation(command_label(arguments), timeout)
         started, outcome, return_code = time.monotonic(), "error", None
         try:
+            argv = [str(self.worker), "--home", str(self.home), *map(str, arguments)]
+            process = subprocess.Popen(argv, env=env, cwd=self.root,
+                                       stdin=subprocess.PIPE if input_text is not None else None,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, encoding="utf-8")
             try:
-                completed = subprocess.run([str(self.worker), "--home", str(self.home), *map(str, arguments)],
-                                           env=env, cwd=self.root, capture_output=True, text=True,
-                                           encoding="utf-8", timeout=timeout, input=input_text)
-            except subprocess.TimeoutExpired:
+                stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+            except subprocess.TimeoutExpired as first_timeout:
                 outcome = "timeout"
-                # TimeoutExpired includes the full command in its string.
-                raise TimeoutError(f"Native {operation['operation']} exceeded {timeout}s") from None
+                return_code = process.poll()
+                diagnostic = {"helper_return_code_at_timeout": return_code,
+                              "helper_alive_at_timeout": return_code is None,
+                              "kill_attempted": return_code is None, "capture_settled": False,
+                              "final_drain_seconds": 10, "operation_outcome": "unknown"}
+                operation["timeout_diagnostic"] = diagnostic
+                self.checkpoint()
+                if return_code is None:
+                    try:
+                        process.kill()  # Only this exact Popen child, never descendants/PID lookup.
+                    except OSError as error:
+                        diagnostic["kill_error"] = type(error).__name__
+                        diagnostic["kill_errno"] = error.errno
+                stdout, stderr = first_timeout.stdout, first_timeout.stderr
+                try:
+                    # subprocess.run() uses an unbounded drain here on Windows.
+                    # Do not enter a Popen context manager or call unbounded wait.
+                    stdout, stderr = process.communicate(timeout=10)
+                    diagnostic["capture_settled"] = True
+                except subprocess.TimeoutExpired as drain_timeout:
+                    if drain_timeout.stdout is not None:
+                        stdout = drain_timeout.stdout
+                    if drain_timeout.stderr is not None:
+                        stderr = drain_timeout.stderr
+                    self.unsettled_commands.append(process)
+                    UNSETTLED_CAPTURES.append(process)
+                return_code = process.poll()
+                diagnostic.update(helper_return_code_after_drain=return_code,
+                                  helper_exit_observed=return_code is not None,
+                                  stdout=capture_summary(stdout), stderr=capture_summary(stderr))
+                # A late successful exit is still a failed timed-out operation.
+                # TimeoutExpired's own string exposes argv, so never propagate it.
+                raise TimeoutError(f"Native {operation['operation']} exceeded {timeout}s; "
+                                   f"helper_return_code={return_code}, capture_settled={diagnostic['capture_settled']}; "
+                                   "operation outcome remains unknown") from None
+            completed = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
             return_code = completed.returncode
             outcome = "succeeded" if return_code == 0 else "nonzero_exit"
             if expect_success:
@@ -421,6 +475,8 @@ class Installation:
         self.fixture_calls.discard(identity)
 
     def cleanup(self, candidate: Path):
+        require(all(process.poll() is not None for process in self.unsettled_commands),
+                "Timed-out native helper exit remains unknown; retaining its disposable installation")
         for identity in list(self.fixture_calls):
             self.remove_fixture_call(identity)
         current = self.running()
