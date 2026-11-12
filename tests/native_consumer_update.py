@@ -144,12 +144,18 @@ class NativeObserver:
 
     def sample(self):
         ledger = self.install.home / "native-browser-update/control.json"
-        if not ledger.is_file():
-            return
-        value = read_json(ledger)
+        try:
+            if not ledger.is_file():
+                return False
+            value = read_json(ledger)
+        except (PermissionError, FileNotFoundError):
+            # Publication can overlap this read-only observation. Unavailable
+            # evidence advances no proof; the caller retains its existing clock.
+            # A persistent refusal remains incomplete, never a mutation retry.
+            return False
         operation_id = value.get("current_operation")
         if not operation_id or operation_id == self.previous_operation:
-            return
+            return False
         operation = value["operations"][operation_id]
         attempt = operation["attempt"]["id"]
         transaction = operation["transaction_id"]
@@ -159,10 +165,10 @@ class NativeObserver:
                 "Operation or launch attempt changed without a new controller mutation")
         worker = self.call({"kind": "worker", "operation": operation_id, "attempt": attempt}, previous=self.old_identity)
         if worker.get("status") != "observed":
-            return
+            return False
         if worker.get("profile_matches") is not True:
             require(worker.get("active") is not True, "Active worker registration does not match its saved fixed profile")
-            return  # Marker publication legitimately precedes registration.
+            return False  # Marker publication legitimately precedes registration.
         self.worker_observation = worker
         identity = worker.get("actual_worker_identity")
         if isinstance(identity, dict):
@@ -185,13 +191,14 @@ class NativeObserver:
         if not self.observations or public != self.observations[-1]:
             self.observations.append(public)
             require(len(self.observations) <= 64, "Too many worker state changes for one fixed attempt")
+        return True
 
     def settled(self, operation, running):
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
-            self.sample()
+            sampled = self.sample()
             worker = self.worker_observation
-            if (worker and worker.get("active") is False and worker.get("transitioning") is False
+            if (sampled and worker and worker.get("active") is False and worker.get("transitioning") is False
                     and worker.get("processes") == [] and worker.get("actual_worker_alive") is False):
                 break
             time.sleep(0.1)

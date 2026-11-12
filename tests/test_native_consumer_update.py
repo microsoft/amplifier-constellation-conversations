@@ -116,6 +116,90 @@ class ConsumerUpdateControllerTests(unittest.TestCase):
             self.assertTrue(observer.survived_old_exit)
             self.assertIsNotNone(observer.actual_worker_generation)
 
+    def observer_read_fixture(self, home):
+        ledger = home / "native-browser-update/control.json"
+        ledger.parent.mkdir()
+        ledger.write_text(json.dumps({"current_operation": "operation", "operations": {"operation": {
+            "transaction_id": "transaction", "attempt": {"id": "attempt", "claimed": True}}}}))
+        observer = controller.NativeObserver.__new__(controller.NativeObserver)
+        observer.install = SimpleNamespace(home=home)
+        observer.previous_operation = observer.operation = observer.attempt = observer.transaction = None
+        observer.worker_generation = observer.actual_worker_generation = observer.worker_observation = None
+        observer.old_identity = {"pid": 1, "birth": "old"}
+        observer.old_exit = observer.survived_old_exit = False
+        observer.observations = []
+        worker = {"status": "observed", "profile_matches": True, "active": True, "transitioning": False,
+                  "processes": [{"identity": {"pid": 2, "birth": "engine"}}], "previous_process_alive": False,
+                  "actual_worker_identity": {"pid": 3, "birth": "worker"}, "actual_worker_alive": True,
+                  "actual_worker_manager_binding": "descendant_of_task_engine"}
+        observer.call = Mock(return_value=worker)
+        return observer, ledger, worker
+
+    @staticmethod
+    def observer_proof(observer):
+        fields = ["previous_operation", "operation", "attempt", "transaction", "worker_generation",
+                  "actual_worker_generation", "worker_observation", "old_identity", "old_exit",
+                  "survived_old_exit", "observations"]
+        return json.dumps({key: getattr(observer, key) for key in fields}, sort_keys=True)
+
+    def test_unavailable_ledger_sample_advances_no_proof_and_next_sample_is_fresh(self):
+        for error in [PermissionError(13, "fixture private reader unavailable"), FileNotFoundError("fixture replaced")]:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                observer, _, _ = self.observer_read_fixture(Path(directory))
+                before = self.observer_proof(observer)
+                with patch.object(controller, "read_json", side_effect=error):
+                    self.assertFalse(observer.sample())
+                self.assertEqual(self.observer_proof(observer), before)
+                observer.call.assert_not_called()
+                self.assertTrue(observer.sample())
+                self.assertTrue(observer.old_exit and observer.survived_old_exit)
+                self.assertIsNotNone(observer.actual_worker_generation)
+                observer.call.assert_called_once()
+
+    def test_persistent_unavailable_ledger_cannot_reuse_stale_exit_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            observer, _, worker = self.observer_read_fixture(Path(directory))
+            self.assertTrue(observer.sample())
+            observer.worker_observation = {**worker, "active": False, "processes": [], "actual_worker_alive": False}
+            before = self.observer_proof(observer)
+            observer.call.reset_mock()
+            with patch.object(controller, "read_json", side_effect=PermissionError(13, "unavailable")), \
+                 patch.object(controller.time, "monotonic", side_effect=[0, 0, 1, 40]), \
+                 patch.object(controller.time, "sleep"), patch.object(controller, "submit_once") as submit:
+                with self.assertRaisesRegex(TimeoutError, "Actual worker exit is unobserved"):
+                    observer.settled({"id": "operation", "transaction_id": "transaction"}, {})
+                submit.assert_not_called()
+            self.assertEqual(self.observer_proof(observer), before)
+            observer.call.assert_not_called()
+
+    def test_terminal_journal_cannot_supply_missed_worker_lifetime_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            observer, _, worker = self.observer_read_fixture(Path(directory))
+            with patch.object(controller, "read_json", side_effect=PermissionError(13, "unavailable")):
+                self.assertFalse(observer.sample())
+            observer.call.return_value = {**worker, "active": False, "processes": [], "actual_worker_alive": False}
+            with self.assertRaisesRegex(AssertionError, "survival after old-parent exit"):
+                observer.settled({"id": "operation", "transaction_id": "transaction", "phase": "completed", "outcome": "applied"}, {})
+            self.assertFalse(observer.survived_old_exit)
+            self.assertIsNone(observer.worker_generation)
+            observer.call.assert_called_once()
+
+    def test_malformed_or_rebound_ledger_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            observer, ledger, _ = self.observer_read_fixture(Path(directory))
+            self.assertTrue(observer.sample())
+            before = self.observer_proof(observer)
+            observer.call.reset_mock()
+            ledger.write_text("{invalid-json")
+            with self.assertRaises(json.JSONDecodeError):
+                observer.sample()
+            ledger.write_text(json.dumps({"current_operation": "operation", "operations": {"operation": {
+                "transaction_id": "another-transaction", "attempt": {"id": "attempt", "claimed": True}}}}))
+            with self.assertRaisesRegex(AssertionError, "Operation or launch attempt changed"):
+                observer.sample()
+            self.assertEqual(self.observer_proof(observer), before)
+            observer.call.assert_not_called()
+
     def test_legacy_startup_success_does_not_require_json_output(self):
         install = SimpleNamespace(worker=Path("app"), home=Path("owned-home"),
                                   begin_operation=Mock(return_value={}), end_operation=Mock())
