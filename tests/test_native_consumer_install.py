@@ -68,6 +68,37 @@ class ConsumerControllerTests(unittest.TestCase):
     def test_account_requests_never_follow_redirects(self):
         self.assertIsNone(consumer.NoRedirect().redirect_request(None, None, 307, "redirect", {}, "http://attacker.invalid"))
 
+    def test_browser_failure_artifact_retains_reason_but_redacts_private_inputs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            install = self.fixture(root)
+            child = Mock(returncode=1)
+            child.communicate.return_value = ("setup=secret-token", "assertion: contact missing " + consumer.PASSWORD + " " + consumer.FIXTURE_KEY)
+            with patch.object(consumer.subprocess, "Popen", return_value=child):
+                with self.assertRaises(AssertionError):
+                    consumer.run_browser(install, root / "test", root / "node", root / "artifacts", "secret-token")
+            artifact = consumer.read_json(root / "artifacts/controller-browser-output.json")
+            self.assertIn("assertion: contact missing", artifact["stderr"]["text"])
+            self.assertEqual(artifact["return_code"], 1)
+            for secret in ["secret-token", consumer.PASSWORD, consumer.FIXTURE_KEY]:
+                self.assertNotIn(secret, json.dumps(artifact))
+
+    def test_browser_diagnostic_redacts_before_bounding_and_handles_absent_or_byte_capture(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            secret = "private-value-spanning-boundary"
+            consumer.retain_browser_output(root, "x" * 40000 + secret + "y" * 32760,
+                                           b"static failure " + secret.encode(), [secret], returncode=None, timed_out=True)
+            artifact = consumer.read_json(root / "controller-browser-output.json")
+            self.assertTrue(artifact["stdout"]["truncated"])
+            self.assertLessEqual(len(artifact["stdout"]["text"].encode()), 32768)
+            self.assertNotIn("boundary", artifact["stdout"]["text"])
+            self.assertEqual(artifact["stderr"]["text"], "static failure [redacted]")
+            consumer.retain_browser_output(root, None, None, [secret], returncode=None, timed_out=True)
+            self.assertEqual(consumer.read_json(root / "controller-browser-output.json")["stdout"]["text"], "")
+            consumer.retain_browser_output(root, "日" * 40000, None, [secret], returncode=1, timed_out=False)
+            self.assertLessEqual(len(consumer.read_json(root / "controller-browser-output.json")["stdout"]["text"].encode()), 32768)
+
 
 if __name__ == "__main__":
     unittest.main()

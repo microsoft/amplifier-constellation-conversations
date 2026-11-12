@@ -6,6 +6,8 @@ on:
     paths:
       - 'Cargo.*'
       - 'src/**'
+      - 'ui/**'
+      - 'package*.json'
       - 'bridge/**'
       - 'scripts/*native*'
       - 'scripts/vendor/node/**'
@@ -130,10 +132,17 @@ jobs:
           receipt = json.loads(receipts[0].read_text())
           module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/clean-path-install.json').resolve())
           PY
+      - name: Prepare browser controller for the packaged consumer flow
+        if: matrix.target == 'linux-x64'
+        run: |
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
       - name: Verify consumer first launch, local account, contact setup and update continuity
+        env:
+          CONSUMER_BROWSER_TEST: ${{ matrix.target == 'linux-x64' && '1' || '0' }}
         run: |
           python - <<'PY'
-          import importlib.util, json
+          import importlib.util, json, os
           from pathlib import Path
           spec = importlib.util.spec_from_file_location('consumer_install', 'tests/native_consumer_install.py')
           module = importlib.util.module_from_spec(spec)
@@ -141,7 +150,11 @@ jobs:
           receipts = list(Path('dist').glob('conversations-*.json'))
           assert len(receipts) == 1, 'Expected one immutable package receipt'
           receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
-          result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/native-consumer-install.json').resolve())
+          browser = {}
+          if os.environ['CONSUMER_BROWSER_TEST'] == '1':
+              browser = {'browser_test': Path('tests/native_consumer_browser.mjs').resolve(),
+                         'browser_artifacts': Path('dist/consumer-browser-artifacts').resolve()}
+          result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/native-consumer-install.json').resolve(), **browser)
           assert result['status'] == 'passed', 'Consumer setup qualification did not pass'
           PY
       - name: Verify standalone and enrolled whole-bundle update and rollback

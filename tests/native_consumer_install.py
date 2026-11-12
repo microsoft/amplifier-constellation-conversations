@@ -166,6 +166,26 @@ def add_acp_fixture(install: ConsumerInstallation):
     return log
 
 
+def retain_browser_output(artifacts, stdout, stderr, secrets, *, returncode, timed_out):
+    """Retain a bounded diagnostic after replacing every supplied private input."""
+    def sanitized(value):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        value = value or ""
+        # Redact before truncating, so a capture boundary cannot retain part of
+        # a known secret. JSON escaping is included for controller diagnostics.
+        for secret in sorted({item for item in secrets if item}, key=len, reverse=True):
+            for spelling in {secret, json.dumps(secret)[1:-1]}:
+                value = value.replace(spelling, "[redacted]")
+        encoded = value.encode("utf-8", errors="replace")
+        return {"text": encoded[-32768:].decode("utf-8", errors="ignore"),
+                "truncated": len(encoded) > 32768}
+    write_json(artifacts / "controller-browser-output.json", {
+        "schema": 1, "return_code": returncode, "timed_out": timed_out,
+        "maximum_bytes_per_stream": 32768,
+        "stdout": sanitized(stdout), "stderr": sanitized(stderr)})
+
+
 def run_browser(install, script, node, artifacts, setup_token):
     artifacts.mkdir(parents=True, exist_ok=True)
     payload = {"url": read_json(install.home / "config.json")["public_url"], "setup_token": setup_token,
@@ -175,13 +195,22 @@ def run_browser(install, script, node, artifacts, setup_token):
                              stderr=subprocess.PIPE, text=True, encoding="utf-8", cwd=ROOT)
     try:
         stdout, stderr = child.communicate(json.dumps(payload), timeout=120)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as first_timeout:
         child.kill()
+        stdout, stderr = first_timeout.stdout, first_timeout.stderr
         try:
-            child.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
+            stdout, stderr = child.communicate(timeout=10)
+        except subprocess.TimeoutExpired as drain_timeout:
+            if drain_timeout.stdout is not None:
+                stdout = drain_timeout.stdout
+            if drain_timeout.stderr is not None:
+                stderr = drain_timeout.stderr
             install.unsettled_commands.append(child)
+        retain_browser_output(artifacts, stdout, stderr, [setup_token, PASSWORD, FIXTURE_KEY],
+                              returncode=child.returncode, timed_out=True)
         raise TimeoutError("Consumer browser fixture exceeded its 120-second allowance") from None
+    retain_browser_output(artifacts, stdout, stderr, [setup_token, PASSWORD, FIXTURE_KEY],
+                          returncode=child.returncode, timed_out=False)
     require(child.returncode == 0, "Consumer browser fixture failed; inspect its private browser artifacts")
     require(not any(secret in stdout + stderr for secret in [setup_token, PASSWORD, FIXTURE_KEY]),
             "Consumer browser fixture output contained private input")
