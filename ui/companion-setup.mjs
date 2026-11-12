@@ -69,13 +69,21 @@ export function installSetup({api, getSession, signedIn, refreshContacts, showLo
       $('setup-agent').replaceChildren(...agents.map(agent => new Option(agent.label || agent.id,agent.id)));
       $('setup-voice').replaceChildren(...(setup.voices || []).map(voice => new Option(voice,voice)));
       if ((setup.voices || []).includes('marin')) $('setup-voice').value = 'marin';
-      $('setup-agent-note').textContent = agents.length ? 'Selecting an existing contact preserves its conversations and settings.' : 'Connect an existing agent below. You can leave setup and come back later.';
+      const selectionChanged = () => {
+        const saved = agents.find(agent => agent.id === $('setup-agent').value)?.voice_configured === true;
+        $('setup-voice-fields').hidden = saved;
+        $('setup-voice').disabled = saved;
+        $('save-contact').textContent = saved ? 'Done' : 'Add contact';
+        $('setup-agent-note').textContent = saved ? 'Already added. Use Voice on its contact to change settings.' : agents.length ? 'Choose a voice for this new contact.' : 'Connect an existing agent below. You can leave setup and come back later.';
+      };
+      $('setup-agent').onchange = selectionChanged;
+      selectionChanged();
       $('save-contact').disabled = !agents.length;
       $('setup-key-fields').hidden = setup.credential.configured || setup.credential.environment_override;
       $('setup-openai-key').required = !setup.credential.configured && !setup.credential.environment_override;
       $('setup-key-note').textContent = setup.credential.environment_override
         ? (setup.credential.configured ? 'This installation already supplies a key through its environment.' : 'An empty environment key overrides saved keys. Update the installation environment before calling.')
-        : setup.credential.configured ? 'A key is saved privately on this computer. Provider access has not been tested.' : 'The key is saved privately on this computer and is never shown again. Voice calls use your OpenAI account.';
+        : setup.credential.configured ? 'Your OpenAI key is saved privately on this computer.' : 'The key is saved privately on this computer and is never shown again. Voice calls use your OpenAI account.';
       if (!agents.some(agent => agent.voice_configured)) $('contact-setup').open = true;
     } catch (failure) {
       if (generation === setupGeneration) { $('contact-setup').hidden = false; error('contact-setup-status',failure.message); }
@@ -92,6 +100,8 @@ export function installSetup({api, getSession, signedIn, refreshContacts, showLo
       const result = await api('/api/v1/companion/setup','POST',body);
       if (generation !== setupGeneration) return;
       error('contact-setup-status', result.credential.configured ? 'Contact saved. Choose Call when you’re ready.' : 'Contact saved. Voice access is still missing.');
+      $('contact-setup').open = false;
+      notice(result.credential.configured ? 'Contact saved. Choose Call when you’re ready.' : 'Contact saved. Voice access is still missing.');
       await refreshContacts();
     } catch (failure) {
       if (generation === setupGeneration) error('contact-setup-status', failure.uncertain ? 'The reply was interrupted. Refresh the contacts before saving again.' : failure.message);
@@ -105,7 +115,7 @@ export function installSetup({api, getSession, signedIn, refreshContacts, showLo
       await api('/api/v1/companion/local-agent','POST',{id:$('local-agent-id').value,label:$('local-agent-label').value,home:$('local-agent-home').value});
       if (generation !== setupGeneration) return;
       error('local-agent-status','Connection saved. Select it above to add a voice contact.');
-      await refresh(); $('setup-agent').value = $('local-agent-id').value; $('setup-agent').focus();
+      await refresh(); $('setup-agent').value = $('local-agent-id').value; $('setup-agent').onchange(); $('setup-agent').focus();
     } catch (failure) {
       if (generation === setupGeneration) error('local-agent-status',failure.uncertain ? 'The connection check could not be confirmed. Refresh the saved list before trying again.' : failure.message);
     } finally { $('connect-local-agent').disabled = false; }

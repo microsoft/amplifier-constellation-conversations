@@ -285,6 +285,14 @@ def exercise(install, a, b, *, browser_test=None, browser_node=None, browser_art
 
 
 def qualify(archive: Path, receipt: Path, output: Path, *, browser_test=None, browser_node=None, browser_artifacts=None):
+    # A controller configuration error must fail before inspecting/extracting a
+    # package or publishing any disposable installation identity.
+    if browser_test is not None:
+        require(browser_node is not None and browser_artifacts is not None,
+                "Browser fixture requires explicit controller Node and artifact paths")
+        require(isinstance(browser_node, Path) and browser_node.is_absolute()
+                and browser_node.is_file() and os.access(browser_node, os.X_OK),
+                "Browser fixture requires an absolute executable controller Node file")
     provenance = read_json(receipt)
     package = lifecycle.clean.package_module()
     manifest, contents = package.inspect_archive(archive, provenance["archive_sha256"])

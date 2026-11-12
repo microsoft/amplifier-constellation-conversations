@@ -1402,7 +1402,8 @@ video.shared-media,audio.shared-media {width:100%}
 .contact-setup input,.contact-setup select{width:100%;min-height:44px;font:inherit;padding:.7rem;border:1px solid var(--line,#aaa);border-radius:.5rem;background:var(--paper,#fff);color:inherit}
 .contact-setup button{justify-self:start;min-height:44px;margin-top:.5rem}
 .contact-setup p{margin-block:.25rem .6rem;max-width:65ch}
-.setup-check{display:flex;align-items:start;gap:.6rem;margin-block:1rem;line-height:1.5}
+.login-card .setup-check{display:flex;align-items:start;gap:.6rem;margin-block:1rem;line-height:1.5;min-height:44px;font-weight:400}
 .setup-check input{width:auto;min-width:1.2rem;height:1.2rem;margin-top:.15rem}
+#setup-voice-fields:not([hidden]){display:grid;gap:.65rem}
 
 .contact-setup select:focus-visible{outline:3px solid #6b8cbb;outline-offset:4px}

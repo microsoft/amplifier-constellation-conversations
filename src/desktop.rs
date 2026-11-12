@@ -172,6 +172,23 @@ fn verify_running_identity(home: &Path, config: &Config, status: &Value) -> Resu
     Ok(())
 }
 
+fn ready_url(origin: &str, transport: Transport, setup_token: Option<&str>) -> Result<String> {
+    if transport == Transport::Https {
+        platform::validate_https_origin(origin)?;
+        ensure!(
+            setup_token.is_none(),
+            "HTTPS does not use first-account setup"
+        );
+        return Ok(origin.to_owned());
+    }
+    let mut url = format!("{}/companion", origin.trim_end_matches('/'));
+    if let Some(token) = setup_token {
+        url.push_str("#setup=");
+        url.push_str(token);
+    }
+    Ok(url)
+}
+
 pub fn ready(home: &Path, config: &Config, open_browser: bool) -> Result<()> {
     let runtime: Value = serde_json::from_slice(&fs::read(home.join("runtime.json"))?)?;
     let origin = if config.public_url.is_empty() {
@@ -181,16 +198,13 @@ pub fn ready(home: &Path, config: &Config, open_browser: bool) -> Result<()> {
     } else {
         &config.public_url
     };
-    let mut url = format!("{}/companion", origin.trim_end_matches('/'));
+    let setup_token = if open_browser && config.auth_mode == AuthMode::LocalPassword {
+        auth::prepare_first_account(home)?
+    } else {
+        None
+    };
+    let url = ready_url(origin, config.transport, setup_token.as_deref())?;
     if open_browser {
-        if let Some(token) = if config.auth_mode == AuthMode::LocalPassword {
-            auth::prepare_first_account(home)?
-        } else {
-            None
-        } {
-            url.push_str("#setup=");
-            url.push_str(&token);
-        }
         if config.transport == Transport::LocalHttp {
             platform::open_browser(&url)?;
         } else {
@@ -295,6 +309,10 @@ pub async fn proved_local_api(
             .as_str()
             .context("Missing local installation proof")?,
     )?;
+    // Consuming the response body does not promise that Hyper's dispatcher
+    // has completed its handoff. Wait on this exact proved connection; a
+    // closed connection fails here without reconnecting or sending a bearer.
+    sender.ready().await?;
     let mut request = hyper::Request::builder()
         .method(method)
         .uri(path)
@@ -343,6 +361,38 @@ pub async fn local_api(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn ready_url_preserves_https_origin_and_local_setup_fragment() {
+        for origin in [
+            "https://companion.example:9443",
+            "https://companion.example:9443/",
+        ] {
+            let url = ready_url(origin, Transport::Https, None).unwrap();
+            assert_eq!(url, origin);
+            platform::validate_https_origin(&url).unwrap();
+        }
+        assert!(
+            ready_url(
+                "https://companion.example/companion",
+                Transport::Https,
+                None
+            )
+            .is_err()
+        );
+        assert!(ready_url("https://companion.example", Transport::Https, Some("token")).is_err());
+        let origin = "http://127.0.0.1:31471";
+        let plain = ready_url(origin, Transport::LocalHttp, None).unwrap();
+        assert_eq!(plain, "http://127.0.0.1:31471/companion");
+        platform::validate_local_url(&plain).unwrap();
+        let token = "a".repeat(64);
+        let setup = ready_url(origin, Transport::LocalHttp, Some(&token)).unwrap();
+        assert_eq!(
+            setup,
+            format!("http://127.0.0.1:31471/companion#setup={token}")
+        );
+        platform::validate_local_url(&setup).unwrap();
+    }
 
     #[test]
     fn atomic_new_home_has_no_agent_and_never_replaces_an_existing_identity() {
@@ -481,9 +531,11 @@ mod tests {
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fake_listener_receives_no_bearer_and_valid_proof_reuses_exact_connection() {
-        for valid in [false, true] {
+        // Exercise the proof-to-bearer handoff while Hyper's dispatcher runs
+        // independently; a single-thread runtime can hide readiness races.
+        for valid in std::iter::once(false).chain(std::iter::repeat_n(true, 64)) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
                 let root = tempfile::tempdir().unwrap();
@@ -515,10 +567,40 @@ mod tests {
                     }
                 });
                 let result = proved_local_api(&config, token, "GET", "/api/v1/fixture", None).await;
-                assert_eq!(result.is_ok(), valid);
+                assert_eq!(result.is_ok(), valid, "{result:?}");
                 if valid { assert_eq!(result.unwrap(), json!({"ok":true})); }
                 server.await.unwrap();
             }).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn closed_proved_connection_receives_no_bearer_or_reconnect() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let config = Config::local(root.path(), "Closed connection", listener.local_addr().unwrap().port()).unwrap();
+            let server_config = config.clone();
+            let token = "fixture-control-token-never-reconnect";
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = request(&mut stream).await;
+                assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+                let nonce = body["nonce"].as_str().unwrap();
+                let proof = platform::local_auth::listener_proof(PROOF_DOMAIN, &server_config.id, &server_config.public_url, nonce, token).unwrap();
+                let body = json!({"id":server_config.id,"origin":server_config.public_url,"nonce":nonce,"proof":proof}).to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut tail = Vec::new();
+                stream.read_to_end(&mut tail).await.unwrap();
+                assert!(tail.is_empty(), "A closing proved connection must not receive a bearer");
+                // A replacement connection would have no proof reply and make
+                // the enclosing bounded test fail instead of silently passing.
+                listener
+            });
+            assert!(proved_local_api(&config, token, "GET", "/api/v1/fixture", None).await.is_err());
+            let listener = server.await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(25), listener.accept()).await.is_err());
+        }).await.unwrap();
     }
 }

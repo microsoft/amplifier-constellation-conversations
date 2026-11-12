@@ -28,7 +28,7 @@
       <form id="first-account-form" class="login-card"><h2>Create your local account</h2><p>Choose a password for Companion on this computer. It is separate from your computer’s sign-in.</p>
         <label for="new-password">Password</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required aria-describedby="new-password-hint"><p id="new-password-hint" class="small">Use at least 12 characters.</p>
         <label for="confirm-password">Confirm password</label><input id="confirm-password" type="password" autocomplete="new-password" required>
-        <label class="setup-check"><input id="start-at-signin" type="checkbox"> Open Companion when I sign in to this computer</label>
+        <label class="setup-check"><input id="start-at-signin" type="checkbox"><span>Keep Companion available when I sign in to this computer</span></label>
         <p id="first-account-error" class="error-text" role="alert" hidden></p><button id="create-account" class="primary" type="submit">Create account</button>
       </form>
     </section>
@@ -45,7 +45,7 @@
         <p id="empty-contacts" class="empty-state" hidden>Add an agent to your contacts to start a conversation.</p>
         <details id="contact-setup" class="contact-setup" hidden><summary>Add an agent</summary>
           <form id="contact-setup-form"><h2>Choose a saved connection</h2><label for="setup-agent">Agent</label><select id="setup-agent" required></select><p id="setup-agent-note" class="small"></p>
-            <label for="setup-voice">Voice</label><select id="setup-voice" required></select>
+            <div id="setup-voice-fields"><label for="setup-voice">Voice</label><select id="setup-voice" required></select></div>
             <div id="setup-key-fields"><label for="setup-openai-key">OpenAI API key</label><input id="setup-openai-key" type="password" autocomplete="off" maxlength="8192" spellcheck="false" aria-describedby="setup-key-note"></div><p id="setup-key-note" class="small"></p>
             <p class="small">Voice uses OpenAI GPT-Live. Saving a contact does not start a call or test your key.</p><button id="save-contact" class="primary" type="submit">Add contact</button><p id="contact-setup-status" role="status"></p>
           </form>

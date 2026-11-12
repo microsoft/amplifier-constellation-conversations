@@ -142,7 +142,7 @@ jobs:
           CONSUMER_BROWSER_TEST: ${{ matrix.target == 'linux-x64' && '1' || '0' }}
         run: |
           python - <<'PY'
-          import importlib.util, json, os
+          import importlib.util, json, os, shutil
           from pathlib import Path
           spec = importlib.util.spec_from_file_location('consumer_install', 'tests/native_consumer_install.py')
           module = importlib.util.module_from_spec(spec)
@@ -152,7 +152,10 @@ jobs:
           receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
           browser = {}
           if os.environ['CONSUMER_BROWSER_TEST'] == '1':
+              controller_node = shutil.which('node')
+              assert controller_node, 'Missing browser controller runtime'
               browser = {'browser_test': Path('tests/native_consumer_browser.mjs').resolve(),
+                         'browser_node': Path(controller_node).resolve(),
                          'browser_artifacts': Path('dist/consumer-browser-artifacts').resolve()}
           result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/native-consumer-install.json').resolve(), **browser)
           assert result['status'] == 'passed', 'Consumer setup qualification did not pass'

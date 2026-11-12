@@ -68,6 +68,29 @@ class ConsumerControllerTests(unittest.TestCase):
     def test_account_requests_never_follow_redirects(self):
         self.assertIsNone(consumer.NoRedirect().redirect_request(None, None, 307, "redirect", {}, "http://attacker.invalid"))
 
+    def test_browser_controller_preflight_refuses_missing_or_invalid_node_before_installation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            node = root / "node"
+            node.write_bytes(b"controller test fixture")
+            node.chmod(0o700)
+            cases = [(None, root / "artifacts"), (node, None),
+                     (Path("relative-node"), root / "artifacts"),
+                     (root / "absent-node", root / "artifacts"),
+                     (root, root / "artifacts")]
+            with patch.object(consumer, "read_json") as read, patch.object(consumer.tempfile, "mkdtemp") as allocate:
+                for controller, artifacts in cases:
+                    with self.subTest(controller=controller, artifacts=artifacts), self.assertRaises(AssertionError):
+                        consumer.qualify(root / "archive", root / "receipt", root / "result",
+                                         browser_test=root / "browser.mjs", browser_node=controller,
+                                         browser_artifacts=artifacts)
+                with patch.object(consumer.os, "access", return_value=False), self.assertRaises(AssertionError):
+                    consumer.qualify(root / "archive", root / "receipt", root / "result",
+                                     browser_test=root / "browser.mjs", browser_node=node,
+                                     browser_artifacts=root / "artifacts")
+                read.assert_not_called()
+                allocate.assert_not_called()
+
     def test_browser_failure_artifact_retains_reason_but_redacts_private_inputs(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
