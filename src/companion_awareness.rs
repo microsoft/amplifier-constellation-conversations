@@ -691,6 +691,7 @@ async fn followthrough_tick(
         }
         let actions: Vec<_> = selected.iter().map(|(_, action)| action.clone()).collect();
         let response = invoke(
+            &s.home,
             &source.command,
             &json!({"version":1,"cursor":null,"actions":actions}),
             false,
@@ -745,19 +746,19 @@ async fn followthrough_tick(
     Ok(pending)
 }
 
-async fn invoke(command: &[String], input: &Value, decisions: bool) -> Result<Value> {
+async fn invoke(
+    home: &std::path::Path,
+    command: &[String],
+    input: &Value,
+    decisions: bool,
+) -> Result<Value> {
     ensure!(command_valid(command), "Invalid observer command");
     let mut cmd = tokio::process::Command::new(&command[0]);
-    cmd.args(&command[1..])
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
-    for name in ["HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
-        if let Ok(v) = std::env::var(name) {
-            cmd.env(name, v);
-        }
-    }
-    if decisions && let Ok(v) = std::env::var("OPENAI_API_KEY") {
-        cmd.env("OPENAI_API_KEY", v);
+    cmd.args(&command[1..]);
+    crate::platform::child_environment(&mut cmd);
+    crate::platform::ProcessTree::prepare(&mut cmd);
+    if decisions {
+        crate::credentials::apply_openai_environment(&mut cmd, home)?;
     }
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -765,6 +766,7 @@ async fn invoke(command: &[String], input: &Value, decisions: bool) -> Result<Va
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
+    let mut process_tree = crate::platform::ProcessTree::attach(&mut child).await?;
     tokio::time::timeout(
         Duration::from_secs(if decisions { 20 } else { 12 }),
         async {
@@ -780,10 +782,10 @@ async fn invoke(command: &[String], input: &Value, decisions: bool) -> Result<Va
                 .take(131073)
                 .read_to_end(&mut bytes)
                 .await?;
-            ensure!(
-                bytes.len() <= 131072 && child.wait().await?.success(),
-                "Observer did not settle within bounds"
-            );
+            ensure!(bytes.len() <= 131072, "Observer output exceeded bounds");
+            let status = child.wait().await?;
+            process_tree.reaped();
+            ensure!(status.success(), "Observer did not settle within bounds");
             Ok(serde_json::from_slice(&bytes)?)
         },
     )
@@ -1577,6 +1579,7 @@ pub(crate) async fn connection_status(
     };
     let started = now_ms();
     let response = invoke(
+        &s.home,
         &source.command,
         &json!({"version":1,"cursor":null,"actions":[]}),
         false,
@@ -2590,6 +2593,7 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
             )
         };
         let result = invoke(
+            &s.home,
             &source.command,
             &json!({"version":1,"cursor":cursor,"actions":actions}),
             false,
@@ -2710,9 +2714,11 @@ async fn tick(s: &Arc<AppState>, id: &str, h: &HeaderMap) -> Result<()> {
         let request_id = format!("{key}:{}", &context_revision[..16]);
         let (user, agent, at) = crate::companion_surface::activity(s, id)?;
         let request = json!({"version":1,"request_id":request_id,"event":{"id":event["id"],"revision":event["revision"],"source":source.label,"connection_id":source.id,"actor":event["actor"],"audience":"installation-authorized call owner","kind":event["kind"],"text":event["text"],"occurred_at":event["occurred_at"]},"transcript":transcript,"request_context":request_context,"guidance":c.guidance,"context":{"user_speaking":if now_ms()-at<=5000{user}else{None},"agent_speaking":if now_ms()-at<=5000{agent}else{None}}});
-        let mut decision = invoke(&c.decision_command, &request, true).await.unwrap_or(
-            json!({"status":"fallback","decision":"quiet","reason":"helper_unavailable"}),
-        );
+        let mut decision = invoke(&s.home, &c.decision_command, &request, true)
+            .await
+            .unwrap_or(
+                json!({"status":"fallback","decision":"quiet","reason":"helper_unavailable"}),
+            );
         let policy = decision_policy(&decision);
         let valid = decision["version"] == 1
             && decision["request_id"] == request_id
@@ -3084,6 +3090,10 @@ pub fn action_observation(s: &AppState, id: &str, request: &str) -> Result<Optio
 #[cfg(test)]
 #[path = "companion_awareness_tests.rs"]
 mod boundary_tests;
+
+#[cfg(test)]
+#[path = "companion_awareness_process_tests.rs"]
+mod process_tests;
 
 #[cfg(test)]
 mod tests {

@@ -9,7 +9,6 @@ import math
 import os
 import pathlib
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -828,11 +827,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=pathlib.Path, required=True)
     args = parser.parse_args()
-    def expired(_signum, _frame):
-        raise TimeoutError("observation_deadline")
-    # Connector hosts are Unix; bound even a stalled local file/read/socket.
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, 10)
+    # Companion owns the complete 12-second process-tree deadline, including
+    # stdin and local file reads. Keep portable per-request/subprocess limits
+    # inside observe(); a standalone caller must provide its own supervision.
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT + 1)
         if len(raw) > MAX_INPUT:
@@ -841,7 +838,6 @@ def main():
     except Exception:
         value = None
     result = observe(args.config, value)
-    signal.setitimer(signal.ITIMER_REAL, 0)
     sys.stdout.buffer.write(encoded(result) + b"\n")
 
 

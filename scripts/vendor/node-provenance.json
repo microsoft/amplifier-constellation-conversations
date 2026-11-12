@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/microsoft/amplifier-constellation",
+  "commit": "02e4b9494ff445d0b6104ee645cab3f381bc7f01",
+  "path": "packaging/node",
+  "tree": "be12ee094929189054eedb62aa46017b093f3656",
+  "tested_commit": "35a6a522ec2d0ef659f552d2c4cb2332be408ebd",
+  "copied_byte_exact": true,
+  "files": {
+    ".gitattributes": {
+      "git_blob": "fa1385d99a319b43c06f5309d1aae9fdd3adea46",
+      "sha256": "705fd4d6451a31d36b3df7de96f83f30ac976c9b4a6d1e51671d8e2f33e2d0da"
+    },
+    "README.md": {
+      "git_blob": "1591de68e0a3271b56af262a6a00772c5cb9690f",
+      "sha256": "01a75b1d945922d3cd13005dbd5ba4166570853c7ff83ad7cea52b86c236f9e0"
+    },
+    "lock.json": {
+      "git_blob": "906b681de73f7eb072220b88fc8b9cc76a24a728",
+      "sha256": "ccadd58999f075005e40b3ad042e80b04c021d109de261776bd0758e902436fd"
+    },
+    "node_support.py": {
+      "git_blob": "fcc4e7f2bae8f4b664d3462aa631678787059a92",
+      "sha256": "004642110e8a7d89513a0b4c91307ef7ab0b59675c5d1902c7f7c45b65a6f6c6"
+    },
+    "test_support.py": {
+      "git_blob": "ca8ce64c371a4131ffbe5f332161dda5053def5f",
+      "sha256": "4de1bfa63ad4af7b478838e8f667bcc0a643b39f7cffd8c54ee3d2d804e04972"
+    }
+  },
+  "repository_license": {
+    "path": "node-LICENSE",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+  },
+  "scope": "Build-time pinned private Node acquisition only; not a runtime dependency, installer, global service or npm SDK owner"
+}

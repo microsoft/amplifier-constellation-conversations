@@ -34,6 +34,35 @@ pub struct Config {
 fn default_import() -> String {
     "toad".into()
 }
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn account_names_keep_platform_identity_and_reject_wildcards() {
+        for invalid in ["", "*", "user\0", "a/b", "a\nb"] {
+            assert!(!valid_user(invalid), "unexpected account: {invalid:?}");
+        }
+        assert!(valid_user("ordinary-user"));
+        #[cfg(windows)]
+        {
+            for valid in [
+                "COMPUTER\\Brian",
+                ".\\Renée",
+                "域\\使用者",
+                "Jane Doe",
+                "user@example.com",
+            ] {
+                assert!(valid_user(valid), "expected Windows account: {valid}");
+            }
+            for invalid in ["\\user", "domain\\", "domain\\user\\other"] {
+                assert!(!valid_user(invalid));
+            }
+        }
+        #[cfg(not(windows))]
+        assert!(!valid_user("domain\\user"));
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Agent {
@@ -146,37 +175,38 @@ impl Config {
     }
 }
 pub fn private_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    amplifier_native_platform::private_dir(path)
 }
 pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    amplifier_native_platform::private_write(path, bytes)
 }
 
 pub fn valid_user(user: &str) -> bool {
-    !user.is_empty()
-        && user.len() <= 100
-        && user
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.@".contains(&b))
+    #[cfg(windows)]
+    {
+        // Windows account names may be Unicode or contain spaces. Reject control
+        // characters, wildcards and malformed DOMAIN\\user forms, not OS aliases.
+        !user.is_empty()
+            && user.len() <= 100
+            && user.trim() == user
+            && !user
+                .chars()
+                .any(|c| c.is_control() || "/[]:;|=,+*?\"<>".contains(c))
+            && match user.split_once('\\') {
+                Some((domain, name)) => {
+                    !domain.is_empty() && !name.is_empty() && !name.contains('\\')
+                }
+                None => true,
+            }
+    }
+    #[cfg(not(windows))]
+    {
+        !user.is_empty()
+            && user.len() <= 100
+            && user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.@".contains(&b))
+    }
 }
 impl Agent {
     pub fn validate(&self) -> Result<()> {

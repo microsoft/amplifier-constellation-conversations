@@ -950,6 +950,26 @@ class MinecraftObserveTests(unittest.TestCase):
         self.assertNotIn(TOKEN, result.stdout)
         self.assertEqual(json.loads(result.stdout)["availability"], "unavailable")
 
+    def test_cli_does_not_require_unix_alarm_apis(self):
+        # Exercise the executable path with precisely the APIs Windows lacks.
+        # Old SIGALRM setup failed before it could return an unavailable read.
+        script = """import runpy,signal,sys
+for name in ('SIGALRM','ITIMER_REAL','setitimer'):
+ if hasattr(signal,name):delattr(signal,name)
+helper=sys.argv.pop(1)
+sys.argv[0]=helper
+runpy.run_path(helper,run_name='__main__')
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(HELPER), "--config", str(self.config)],
+            input="bad " + TOKEN, text=True, capture_output=True, check=True, timeout=5,
+        )
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn(TOKEN, result.stdout)
+        response = json.loads(result.stdout)
+        self.assertEqual(response["availability"], "unavailable")
+        self.assertEqual(response["events"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -812,16 +812,17 @@ pub async fn action(
     Ok(Json(action_row(&s, &id, &a.request_id)?.unwrap()))
 }
 async fn invoke(command: &[String], input: &Value) -> Result<Value> {
-    let mut child = tokio::process::Command::new(&command[0])
-        .args(&command[1..])
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+    let mut cmd = tokio::process::Command::new(&command[0]);
+    cmd.args(&command[1..]);
+    crate::platform::child_environment(&mut cmd);
+    crate::platform::ProcessTree::prepare(&mut cmd);
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
+    let mut process_tree = crate::platform::ProcessTree::attach(&mut child).await?;
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(input.to_string().as_bytes()).await?;
@@ -836,10 +837,9 @@ async fn invoke(command: &[String], input: &Value) -> Result<Value> {
             .read_to_end(&mut bytes)
             .await?;
         ensure!(bytes.len() <= 65536, "Action receipt exceeded limit");
-        ensure!(
-            child.wait().await?.success(),
-            "Action helper did not settle"
-        );
+        let status = child.wait().await?;
+        process_tree.reaped();
+        ensure!(status.success(), "Action helper did not settle");
         Ok(serde_json::from_slice(&bytes)?)
     })
     .await?

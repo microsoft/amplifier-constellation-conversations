@@ -47,8 +47,11 @@ fn fixture(mode: &str) -> Fixture {
         .unwrap();
     let python = String::from_utf8(python.stdout).unwrap().trim().to_owned();
     let bridge = home.path().join("bridge.py");
-    std::fs::write(&bridge,r#"import json,sys,pathlib
+    std::fs::write(&bridge,r#"import json,sys,pathlib,traceback
 root=pathlib.Path(__file__).parent
+def fixture_exception(kind,error,tb):
+ with (root/'bridge-error.txt').open('w') as output:traceback.print_exception(kind,error,tb,file=output)
+sys.excepthook=fixture_exception
 def emit(v): print(json.dumps(v),flush=True)
 c=json.loads(sys.stdin.readline())
 with (root/'bridge-starts').open('a') as f:f.write('start\n')
@@ -297,7 +300,12 @@ async fn start(f: &Fixture) -> (Value, Value) {
     let input = json!({"request_id":uuid::Uuid::new_v4().to_string(),"agent_id":"default","sdp":"v=0\r\nfixture-offer"});
     let (status, value) = request(f, "POST", "/api/v1/companion/calls", Some(input.clone())).await;
     assert_eq!(status, StatusCode::OK, "{value}");
-    assert!(["connecting", "connected"].contains(&value["state"].as_str().unwrap()));
+    assert!(
+        ["connecting", "connected"].contains(&value["state"].as_str().unwrap()),
+        "Unexpected fixture setup result: {value}; fixture error: {}",
+        std::fs::read_to_string(f.home.path().join("bridge-error.txt"))
+            .unwrap_or_else(|_| "none recorded".into())
+    );
     attach_browser(f, value["id"].as_str().unwrap()).await;
     (input, value)
 }

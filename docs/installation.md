@@ -1,10 +1,12 @@
 # Installation and connection configuration
 
-These commands configure the current Conversations service. Run repository build
-commands from the checkout root. The [interface map](README.md) locates the
+For a native binary package, use [native installation](native-installation.md).
+That path includes a private Node runtime and locked dependencies and needs no
+developer tools. This page's build commands are for contributors building from
+source; run them from the checkout root. The [interface map](README.md) locates the
 service contracts; [validation](validation.md) covers reproducible checks.
 
-## Build and install
+## Build and install from source
 
 On Ubuntu, install the Rust toolchain and build prerequisites (`build-essential`, `pkg-config`, `libpam0g-dev`, and `libclang-dev`), then:
 
@@ -14,7 +16,12 @@ install -Dm755 target/release/agent-conversations "$HOME/.local/bin/agent-conver
 sudo install -m644 ops/pam-agent-conversations /etc/pam.d/agent-conversations
 ```
 
-PAM supports each explicitly allowed local account’s ordinary password. The host account must permit PAM authentication. This release is tested on Ubuntu; Windows and native mobile authentication are not implemented.
+PAM supports each explicitly allowed local account’s ordinary password. The host
+account must permit PAM authentication. These source-build commands target Ubuntu;
+they are not Windows or macOS installation instructions. Native packages have
+separate OS-specific authentication and qualification requirements described in
+the native installation guide. A browser on a mobile device authenticates to the
+hosting installation; this does not install a native mobile application.
 
 Initialize a separate installation folder for this experience:
 

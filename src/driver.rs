@@ -332,13 +332,12 @@ impl Peer {
 struct Client {
     child: Child,
     peer: Peer,
-    pid: u32,
+    process_tree: crate::platform::ProcessTree,
 }
 impl Client {
     async fn start(c: &Agent) -> Result<Self> {
         let mut cmd = Command::new(&c.command);
-        #[cfg(unix)]
-        cmd.process_group(0);
+        crate::platform::ProcessTree::prepare(&mut cmd);
         cmd.args(&c.args)
             .env_clear()
             .current_dir(&c.cwd)
@@ -346,33 +345,20 @@ impl Client {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        for name in [
-            "PATH",
-            "HOME",
-            "USER",
-            "LANG",
-            "SYSTEMROOT",
-            "WINDIR",
-            "TEMP",
-            "TMP",
-            "SSL_CERT_FILE",
-            "SSL_CERT_DIR",
-            "SSH_AUTH_SOCK",
-        ] {
-            if let Ok(value) = std::env::var(name) {
-                cmd.env(name, value);
-            }
+        crate::platform::child_environment(&mut cmd);
+        if let Some(value) = std::env::var_os("SSH_AUTH_SOCK") {
+            cmd.env("SSH_AUTH_SOCK", value);
         }
         cmd.envs(&c.env);
         let mut child = cmd
             .spawn()
             .context("The ACP command could not be started")?;
-        let pid = child.id().context("The ACP command exited during launch")?;
+        let process_tree = crate::platform::ProcessTree::attach(&mut child).await?;
         let input = child.stdin.take().context("Missing agent input")?;
         let output = child.stdout.take().context("Missing agent output")?;
         Ok(Self {
             child,
-            pid,
+            process_tree,
             peer: Peer {
                 connection: amplifier_acp_connection::Connection::client(
                     output,
@@ -395,16 +381,7 @@ impl Client {
     }
 
     fn terminate(&mut self) {
-        #[cfg(unix)]
-        if self.pid > 0 {
-            // The child has not been waited/reaped, so its PID still identifies
-            // our process group. Dispose descendants before releasing that ID.
-            unsafe {
-                libc::kill(-(self.pid as i32), libc::SIGKILL);
-            }
-            self.pid = 0;
-        }
-        let _ = self.child.start_kill();
+        self.process_tree.terminate(&mut self.child);
     }
 }
 impl Drop for Client {

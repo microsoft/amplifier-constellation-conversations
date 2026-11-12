@@ -13,13 +13,18 @@ use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
+#[cfg(unix)]
+use zeroize::Zeroizing;
 
+#[cfg(all(unix, not(target_os = "macos")))]
 struct PasswordConversation {
-    password: String,
+    password: Zeroizing<String>,
     answered: bool,
 }
+#[cfg(all(unix, not(target_os = "macos")))]
 impl pam_client::ConversationHandler for PasswordConversation {
     fn prompt_echo_on(&mut self, _: &CStr) -> Result<CString, pam_client::ErrorCode> {
         Err(pam_client::ErrorCode::CONV_ERR)
@@ -35,10 +40,48 @@ impl pam_client::ConversationHandler for PasswordConversation {
             return Err(pam_client::ErrorCode::CONV_ERR);
         }
         self.answered = true;
-        CString::new(self.password.clone()).map_err(|_| pam_client::ErrorCode::CONV_ERR)
+        CString::new(self.password.as_bytes()).map_err(|_| pam_client::ErrorCode::CONV_ERR)
     }
     fn text_info(&mut self, _: &CStr) {}
     fn error_msg(&mut self, _: &CStr) {}
+}
+
+/// Authenticate first, then return the configured actor used in rooms/audiences.
+/// Windows accepts OS account aliases only when their authenticated SID matches
+/// an explicitly configured account. Additional users are not restricted to the
+/// service process owner, and are not elevated to administrator by an alias.
+pub fn authenticate_allowed(
+    service: &str,
+    username: &str,
+    password: String,
+    allowed: &[String],
+) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let _ = service;
+        crate::platform::windows::authenticate_allowed(username, password, allowed)
+    }
+    #[cfg(unix)]
+    {
+        let password = Zeroizing::new(password);
+        let actor = allowed.iter().find(|actor| actor.as_str() == username)?;
+        #[cfg(target_os = "macos")]
+        let success = crate::platform::macos::authenticate(service, username, password.to_string());
+        #[cfg(not(target_os = "macos"))]
+        let success = {
+            let conversation = PasswordConversation {
+                password,
+                answered: false,
+            };
+            let Ok(mut context) = pam_client::Context::new(service, Some(username), conversation)
+            else {
+                return None;
+            };
+            context.authenticate(pam_client::Flag::NONE).is_ok()
+                && context.acct_mgmt(pam_client::Flag::NONE).is_ok()
+        };
+        success.then(|| actor.clone())
+    }
 }
 
 pub fn random_token() -> String {
@@ -213,38 +256,28 @@ pub async fn login(
             [now_ms()],
         )?;
     }
-    let owner = login.username.clone();
-    let allowed = config.allows_user(&owner);
+    let mut allowed = vec![config.owner.clone()];
+    allowed.extend(config.allowed_users.iter().cloned());
     let service = config.pam_service;
-    let success = if allowed {
-        let worker = tokio::task::spawn_blocking(move || {
-            // The permit stays with a timed-out PAM call, bounding blocked workers too.
-            let _permit = permit;
-            let username = login.username;
-            let conversation = PasswordConversation {
-                password: login.password,
-                answered: false,
-            };
-            let Ok(mut context) = pam_client::Context::new(&service, Some(&username), conversation)
-            else {
-                return false;
-            };
-            context.authenticate(pam_client::Flag::NONE).is_ok()
-                && context.acct_mgmt(pam_client::Flag::NONE).is_ok()
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(20), worker)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false)
-    } else {
-        false
-    };
-    if !success {
+    let worker = tokio::task::spawn_blocking(move || {
+        // The permit remains held even if an OS login outlives the HTTP timeout.
+        let _permit = permit;
+        authenticate_allowed(&service, &login.username, login.password, &allowed)
+    });
+    let actor = tokio::time::timeout(std::time::Duration::from_secs(20), worker)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    let Some(owner) = actor else {
         state.db.lock().unwrap().execute("INSERT INTO login_attempts(key,failures,locked_until) VALUES('owner',1,0) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN locked_until>0 AND locked_until<?1 THEN 1 ELSE failures+1 END, locked_until=CASE WHEN failures>=4 THEN ?1+60000 ELSE 0 END",[now_ms()])?;
-        state.audit("auth.failed", None, json!({"method":"pam"}))?;
+        state.audit(
+            "auth.failed",
+            None,
+            json!({"method":crate::platform::auth_method()}),
+        )?;
         return Err(ApiError::unauthorized());
-    }
+    };
     let token = random_token();
     let csrf = random_token();
     {
@@ -258,7 +291,7 @@ pub async fn login(
     state.audit(
         "auth.signed_in",
         None,
-        json!({"actor":owner,"method":"pam"}),
+        json!({"actor":owner,"method":crate::platform::auth_method()}),
     )?;
     let cookie = format!(
         "{}={}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800",
@@ -311,16 +344,30 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> A
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(unix, not(target_os = "macos")))]
     use pam_client::ConversationHandler;
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn password_is_not_reused_for_another_authentication_challenge() {
         let mut c = PasswordConversation {
-            password: "test".into(),
+            password: Zeroizing::new("test".into()),
             answered: false,
         };
         assert!(c.prompt_echo_off(c"Verification code:").is_err());
         assert!(c.prompt_echo_off(c"Password:").is_ok());
         assert!(c.prompt_echo_off(c"Password:").is_err());
         assert!(c.prompt_echo_on(c"Username:").is_err());
+    }
+    #[test]
+    fn unlisted_accounts_fail_without_creating_a_session() {
+        assert_eq!(
+            authenticate_allowed(
+                "agent-conversations-no-such-policy",
+                "unlisted",
+                "fixture".into(),
+                &[]
+            ),
+            None
+        );
     }
 }

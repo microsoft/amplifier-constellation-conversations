@@ -1,0 +1,3 @@
+# Keep pinned license/provenance bytes independent of consumer checkout settings.
+node-LICENSE -text
+node-provenance.json -text

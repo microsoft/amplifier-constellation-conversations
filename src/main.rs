@@ -1,6 +1,6 @@
 use agent_conversations::{
     config::{self, Agent, Config},
-    driver, server,
+    credentials, driver, native_bundle, platform, server,
     state::AppState,
 };
 use anyhow::{Context, Result, ensure};
@@ -23,6 +23,23 @@ struct Cli {
 // One command is parsed once at startup; boxing individual CLI fields adds no value.
 #[allow(clippy::large_enum_variant)]
 enum Action {
+    /// Open the existing HTTPS interface in the system browser.
+    Open,
+    /// Configure sign-in startup for this installation without starting it now.
+    Startup {
+        #[command(subcommand)]
+        action: StartupAction,
+    },
+    /// Verify or install a complete native package without changing live state.
+    Bundle {
+        #[command(subcommand)]
+        action: BundleAction,
+    },
+    /// Import an installation-owned provider credential without exposing it in arguments.
+    Credential {
+        #[command(subcommand)]
+        action: CredentialAction,
+    },
     Init {
         #[arg(long, default_value = "Conversations")]
         label: String,
@@ -34,7 +51,7 @@ enum Action {
         port: u16,
         #[arg(long, default_value = "")]
         public_url: String,
-        #[arg(long, default_value = "agent-conversations")]
+        #[arg(long, default_value_t = platform::default_auth_service().to_owned())]
         pam_service: String,
         #[arg(long)]
         agent_home: Option<PathBuf>,
@@ -76,6 +93,27 @@ enum Action {
         #[arg(long)]
         body_file: Option<PathBuf>,
     },
+}
+#[derive(Subcommand)]
+enum StartupAction {
+    Install,
+    Remove,
+}
+#[derive(Subcommand)]
+enum BundleAction {
+    Verify {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    Install {
+        #[arg(long)]
+        path: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CredentialAction {
+    /// Read one OpenAI API key from standard input; never print or test it.
+    ImportOpenai,
 }
 #[derive(Subcommand)]
 enum ConfigAction {
@@ -126,10 +164,62 @@ enum ContextAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let home = cli
-        .home
-        .context("Supply --home with this conversation installation folder")?;
+    let home = match cli.home {
+        Some(home) => home,
+        None => amplifier_native_platform::default_home(&native_bundle::APPLICATION, "default")?,
+    };
     match cli.command {
+        Action::Credential {
+            action: CredentialAction::ImportOpenai,
+        } => {
+            use std::io::IsTerminal;
+            Config::load(&home)?;
+            let input = std::io::stdin();
+            ensure!(
+                !input.is_terminal(),
+                "Supply the key through protected standard input; do not type it into an echoing terminal"
+            );
+            credentials::import_openai(&home, input.lock())?;
+            println!("{}", json!({"stored":true,"provider":"openai"}));
+        }
+        Action::Open => {
+            // No bearer or control token is placed in a URL. Authentication stays
+            // in the browser's existing HTTPS/CSRF flow.
+            let config = Config::load(&home)?;
+            let runtime: Value =
+                serde_json::from_slice(&std::fs::read(home.join("runtime.json"))?)?;
+            let url = if config.public_url.is_empty() {
+                runtime["url"]
+                    .as_str()
+                    .context("Start this installation before opening it")?
+            } else {
+                &config.public_url
+            };
+            amplifier_native_platform::open_https_browser(url)?;
+        }
+        Action::Startup { action } => {
+            let config = Config::load(&home)?;
+            let id = uuid::Uuid::parse_str(&config.id)?;
+            match action {
+                StartupAction::Install => amplifier_native_platform::install_startup(
+                    &native_bundle::APPLICATION,
+                    &home,
+                    &id,
+                )?,
+                StartupAction::Remove => amplifier_native_platform::remove_startup(
+                    &native_bundle::APPLICATION,
+                    &home,
+                    &id,
+                )?,
+            }
+        }
+        Action::Bundle { action } => {
+            let receipt = match action {
+                BundleAction::Verify { path } => native_bundle::verify(&path)?,
+                BundleAction::Install { path } => native_bundle::install(&path, &home)?,
+            };
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
         Action::Init {
             label,
             owner,
@@ -151,16 +241,19 @@ async fn main() -> Result<()> {
                 "This installation already exists; no files were changed"
             );
             config::private_dir(&home)?;
-            let home = std::fs::canonicalize(&home)?;
+            let home = dunce::canonicalize(&home)?;
             config::private_dir(&home.join("workspace"))?;
             let (command, args, cwd) = if let Some(agent_home) = agent_home {
                 ensure!(
                     agent_command.is_none() && agent_arg.is_empty(),
                     "Use either --agent-home or --agent-command"
                 );
-                let p = std::fs::canonicalize(agent_home)?;
+                let p = dunce::canonicalize(agent_home)?;
                 (
-                    p.join("bin/agent-instance").to_string_lossy().into_owned(),
+                    p.join("bin")
+                        .join(platform::executable("agent-instance"))
+                        .to_string_lossy()
+                        .into_owned(),
                     vec![
                         "acp".into(),
                         "--home".into(),
@@ -187,9 +280,10 @@ async fn main() -> Result<()> {
             let c = Config {
                 id: uuid::Uuid::new_v4().to_string(),
                 label,
-                owner: owner
-                    .or_else(|| std::env::var("USER").ok())
-                    .context("Supply --owner")?,
+                owner: match owner {
+                    Some(owner) => owner,
+                    None => platform::current_user()?,
+                },
                 allowed_users: Vec::new(),
                 embed_origins: Vec::new(),
                 bind,
@@ -218,7 +312,7 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &json!({"home":home,"provider_id":c.provider_id(),"control_token_file":home.join("secrets/control-token"),"context_token_file":home.join("secrets/context-token"),"import_token_file":home.join("secrets/import-token"),"next":"Configure the PAM service, then run serve. No agent persona or runtime was installed."})
+                    &json!({"home":home,"provider_id":c.provider_id(),"control_token_file":home.join("secrets/control-token"),"context_token_file":home.join("secrets/context-token"),"import_token_file":home.join("secrets/import-token"),"authentication":platform::auth_method(),"next":if cfg!(target_os="linux") { "Configure the local PAM service, trust the installation certificate, then run serve. No agent persona or runtime was installed." } else { "Trust the installation certificate, then run serve. Sign in using an explicitly allowed local account's password. No agent persona or runtime was installed." }})
                 )?
             );
         }
@@ -460,7 +554,7 @@ fn generate_tls(home: &std::path::Path) -> Result<(PathBuf, PathBuf, Option<Path
     )?;
     let issuer = Issuer::new(ca, ca_key);
     let mut names = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
-    if let Ok(entries) = get_if_addrs::get_if_addrs() {
+    if let Ok(entries) = if_addrs::get_if_addrs() {
         names.extend(entries.into_iter().map(|a| a.ip().to_string()));
     }
     names.sort();
@@ -472,6 +566,8 @@ fn generate_tls(home: &std::path::Path) -> Result<(PathBuf, PathBuf, Option<Path
     leaf.not_after = now + Duration::days(365);
     leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    // Identify the issuing local CA for strict RFC 5280 path validation.
+    leaf.use_authority_key_identifier_extension = true;
     let key = KeyPair::generate()?;
     let cert = leaf.signed_by(&key, &issuer)?;
     config::private_write(&home.join("tls/cert.pem"), cert.pem().as_bytes())?;

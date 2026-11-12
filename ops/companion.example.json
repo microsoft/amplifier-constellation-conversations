@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "node": "REPLACE_WITH_INSTALLED_ABSOLUTE_NODE_PATH",
+  "bridge": "REPLACE_WITH_INSTALLED_ABSOLUTE_BRIDGE_PATH",
+  "profiles": {}
+}
