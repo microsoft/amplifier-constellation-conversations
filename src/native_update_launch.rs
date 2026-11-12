@@ -1591,6 +1591,73 @@ mod tests {
 
     #[test]
     fn retired_history_beyond_old_limit_does_not_block_new_launch_or_cleanup() {
+        use std::{
+            process::{Command, Stdio},
+            thread,
+            time::{Duration, Instant},
+        };
+        // The shared guard releases flock by closing its descriptor. A parallel
+        // test's child between fork and exec can briefly inherit that open file
+        // description, making immediate retirement correctly fail closed. Run
+        // this long sequential-history proof after exec, with no parallel tests;
+        // preserve every assertion and never retry a retirement or relax locks.
+        let proof = tempfile::tempdir().unwrap();
+        let acknowledgement = proof.path().join("completed");
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let output = proof.path().join("stdout");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "native_update_launch::tests::retired_history_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CONSTELLATION_NATIVE_HISTORY_TEST_ACK", &acknowledgement)
+            .env("CONSTELLATION_NATIVE_HISTORY_TEST_NONCE", &nonce)
+            .stdin(Stdio::null())
+            // Keep the child's successful summary out of the selected-test
+            // controller, which deliberately requires one parent summary.
+            .stdout(fs::File::create(&output).unwrap())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                if !status.success() {
+                    let mut diagnostic = String::new();
+                    fs::File::open(&output)
+                        .unwrap()
+                        .take(32 * 1024)
+                        .read_to_string(&mut diagnostic)
+                        .unwrap();
+                    panic!("Isolated retained-history proof failed: {diagnostic}");
+                }
+                // An unknown --exact filter can exit successfully with zero
+                // tests. Only the final fixture assertion publishes this ack.
+                assert_eq!(fs::read(&acknowledgement).unwrap(), nonce.as_bytes());
+                return;
+            }
+            if Instant::now() >= deadline {
+                // Exit can race the final observation; always attempt reaping.
+                let _ = child.kill();
+                child.wait().unwrap();
+                panic!("Isolated retained-history proof exceeded 60 seconds");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "helper subprocess for the isolated retained-history proof"]
+    fn retired_history_fixture() {
+        let Some(acknowledgement) = std::env::var_os("CONSTELLATION_NATIVE_HISTORY_TEST_ACK")
+        else {
+            return; // Running all ignored tests cannot invent a completion.
+        };
+        let nonce = std::env::var("CONSTELLATION_NATIVE_HISTORY_TEST_NONCE").unwrap();
+        assert_eq!(uuid::Uuid::parse_str(&nonce).unwrap().to_string(), nonce);
         let fixture = Fixture::new();
         let manager = FakeManager::new(ActionOutcome::Accepted);
         let retirement = FakeRetirement::new(RetirementOutcome::Retired { removed: true });
@@ -1638,6 +1705,8 @@ mod tests {
             assert_eq!(fs::read(marker).unwrap(), bytes);
             assert!(retirement.exists());
         }
+        amplifier_native_platform::private_create(Path::new(&acknowledgement), nonce.as_bytes())
+            .unwrap();
     }
 
     #[test]
