@@ -110,6 +110,10 @@ struct Attempt {
     claimed: bool,
     handoff_nonce: String,
     launch: Option<crate::native_update_launch::PreparedLaunch>,
+    // Private process-generation evidence for the exact admitted worker. Omit
+    // absent legacy values so immutable historical bytes remain identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_process: Option<Value>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -836,6 +840,7 @@ pub(crate) fn apply(
                 claimed: false,
                 handoff_nonce: auth::random_token(),
                 launch: None,
+                worker_process: None,
             },
             state: OperationState::Accepted,
             outcome: None,
@@ -936,6 +941,7 @@ pub(crate) fn recover(
                         claimed: false,
                         handoff_nonce: auth::random_token(),
                         launch: None,
+                        worker_process: None,
                     },
                     state: OperationState::Unknown,
                     outcome: None,
@@ -1015,6 +1021,7 @@ pub(crate) fn recover(
             claimed: false,
             handoff_nonce: auth::random_token(),
             launch: None,
+            worker_process: None,
         };
         operation.state = OperationState::Accepted;
         let spec = launch_spec(home, &operation)?;
@@ -1157,6 +1164,18 @@ fn claim(
     attempt_id: &str,
     executable: &Path,
 ) -> Result<Operation> {
+    claim_with_identity(home, operation_id, attempt_id, executable, || {
+        amplifier_native_platform::process::identity(std::process::id())?
+            .context("Cannot establish this worker process generation")
+    })
+}
+fn claim_with_identity(
+    home: &Path,
+    operation_id: &str,
+    attempt_id: &str,
+    executable: &Path,
+    identity: impl FnOnce() -> Result<Value>,
+) -> Result<Operation> {
     uuid(operation_id)?;
     uuid(attempt_id)?;
     ensure!(
@@ -1182,6 +1201,13 @@ fn claim(
         dunce::canonicalize(executable)? == dunce::canonicalize(spec.executable)?,
         "Only the exact verified immutable helper can claim this attempt"
     );
+    let worker_process = identity()?;
+    ensure!(
+        worker_process["pid"].as_u64() == Some(u64::from(std::process::id()))
+            && amplifier_native_platform::process::matches(&worker_process)?,
+        "Worker process generation is unavailable or changed"
+    );
+    operation.attempt.worker_process = Some(worker_process);
     operation.attempt.claimed = true;
     operation.state = OperationState::Running;
     let operation = operation.clone();
@@ -1551,6 +1577,187 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_entry_identity_is_private_and_claimed_once_before_lifecycle_intent() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let checked = fixture.check(&launch);
+        let request = id();
+        apply(
+            &fixture.home,
+            ApplyInput {
+                request_id: request.clone(),
+                check_id: checked,
+            },
+            &launch,
+        )
+        .unwrap();
+        let ledger = load(&fixture.home).unwrap();
+        assert!(ledger.operations[&request].attempt.worker_process.is_none());
+        let helper = launch_spec(&fixture.home, &ledger.operations[&request])
+            .unwrap()
+            .executable;
+        let _execution = native_update::lock(&fixture.home, WORKER_LOCK).unwrap();
+        let claimed = claim(&fixture.home, &request, &request, &helper).unwrap();
+        let process = claimed.attempt.worker_process.unwrap();
+        assert_eq!(process["pid"], std::process::id());
+        assert!(amplifier_native_platform::process::matches(&process).unwrap());
+        let saved = fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap();
+        assert!(
+            claim_with_identity(&fixture.home, &request, &request, &helper, || panic!(
+                "duplicate claim must not recapture identity"
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap(),
+            saved
+        );
+        assert!(!fixture.home.join("native-update.json").exists());
+        let public = status(&fixture.home, "normal", Some(&request), &launch)
+            .unwrap()
+            .to_string();
+        for private in [
+            "worker_process",
+            "start_ticks",
+            "boot_id",
+            "creation_time_100ns",
+            "start_microseconds",
+        ] {
+            assert!(!public.contains(private));
+        }
+    }
+    #[test]
+    fn missing_malformed_or_changed_worker_identity_leaves_dispatch_unclaimed() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let checked = fixture.check(&launch);
+        let request = id();
+        apply(
+            &fixture.home,
+            ApplyInput {
+                request_id: request.clone(),
+                check_id: checked,
+            },
+            &launch,
+        )
+        .unwrap();
+        let ledger = load(&fixture.home).unwrap();
+        let helper = launch_spec(&fixture.home, &ledger.operations[&request])
+            .unwrap()
+            .executable;
+        let before = fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap();
+        assert!(
+            claim_with_identity(
+                &fixture.home,
+                &request,
+                &request,
+                &helper,
+                || anyhow::bail!("fixture identity unavailable")
+            )
+            .is_err()
+        );
+        assert!(
+            claim_with_identity(&fixture.home, &request, &request, &helper, || Ok(
+                json!({"pid":std::process::id()})
+            ))
+            .is_err()
+        );
+        let mut changed = amplifier_native_platform::process::identity(std::process::id())
+            .unwrap()
+            .unwrap();
+        let birth = ["start_ticks", "start_seconds", "creation_time_100ns"]
+            .into_iter()
+            .find(|key| changed.get(*key).is_some())
+            .unwrap();
+        changed[birth] = json!("0");
+        assert!(
+            claim_with_identity(&fixture.home, &request, &request, &helper, || Ok(changed))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap(),
+            before
+        );
+        assert!(!fixture.home.join("native-update.json").exists());
+    }
+    #[test]
+    fn failed_worker_identity_publication_cannot_enter_lifecycle_work() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let checked = fixture.check(&launch);
+        let request = id();
+        apply(
+            &fixture.home,
+            ApplyInput {
+                request_id: request.clone(),
+                check_id: checked,
+            },
+            &launch,
+        )
+        .unwrap();
+        let ledger = load(&fixture.home).unwrap();
+        let helper = launch_spec(&fixture.home, &ledger.operations[&request])
+            .unwrap()
+            .executable;
+        let path = fixture.home.join(DIRECTORY).join(LEDGER);
+        let backup = fixture.home.join("fixture-control-backup.json");
+        let before = fs::read(&path).unwrap();
+        let result = claim_with_identity(&fixture.home, &request, &request, &helper, || {
+            // Fail the atomic publisher after control was read and before any
+            // lifecycle phase: the original exact ledger remains in backup.
+            fs::rename(&path, &backup)?;
+            fs::create_dir(&path)?;
+            Ok(amplifier_native_platform::process::identity(std::process::id())?.unwrap())
+        });
+        assert!(result.is_err());
+        assert!(path.is_dir());
+        assert_eq!(fs::read(&backup).unwrap(), before);
+        assert!(!fixture.home.join("native-update.json").exists());
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&backup, &path).unwrap();
+        assert!(
+            !load(&fixture.home).unwrap().operations[&request]
+                .attempt
+                .claimed
+        );
+    }
+    #[test]
+    fn legacy_attempt_and_immutable_archive_bytes_omit_absent_worker_identity() {
+        let fixture = Fixture::new();
+        let checked = fixture.check(&LostReply::default());
+        let request = id();
+        let operation = completed_record(&fixture, &request, &checked);
+        let legacy = serde_json::to_vec(&operation).unwrap();
+        assert!(
+            !std::str::from_utf8(&legacy)
+                .unwrap()
+                .contains("worker_process")
+        );
+        let decoded: Operation = serde_json::from_slice(&legacy).unwrap();
+        assert!(decoded.attempt.worker_process.is_none());
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), legacy);
+        let ledger = load(&fixture.home).unwrap();
+        history_write(
+            &fixture.home,
+            &ledger.installation_id,
+            "operations",
+            &request,
+            &decoded,
+        )
+        .unwrap();
+        let path = history_path(&fixture.home, "operations", &request).unwrap();
+        let before = fs::read(&path).unwrap();
+        history_write(
+            &fixture.home,
+            &ledger.installation_id,
+            "operations",
+            &request,
+            &decoded,
+        )
+        .unwrap();
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
     #[tokio::test]
     async fn unobserved_blocking_completion_is_uncertain_not_rejected() {
         let result =
@@ -1952,6 +2159,7 @@ mod tests {
                 claimed: true,
                 handoff_nonce: "private archive nonce".into(),
                 launch: None,
+                worker_process: None,
             },
             state: OperationState::Completed,
             outcome: Some("applied".into()),
