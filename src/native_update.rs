@@ -75,7 +75,26 @@ fn path(v: &Value, name: &str) -> Result<PathBuf> {
 fn binary(home: &Path) -> PathBuf {
     amplifier_native_platform::installed_binary(&native_bundle::APPLICATION, home)
 }
-pub(crate) fn lock(home: &Path, name: &str) -> Result<File> {
+/// An owned installation lock, released before its file descriptor is closed.
+///
+/// On Unix, a child between fork and exec can retain the same open file
+/// description despite CLOEXEC. Closing only this process's descriptor would
+/// leave its flock held until that child closes the inherited descriptor.
+#[must_use = "Keep the guard alive for the entire installation operation"]
+pub struct InstallationLock {
+    file: File,
+}
+impl Drop for InstallationLock {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            // Drop cannot report an error to the operation. Keep ordinary file
+            // close as the fallback; a subsequent acquisition still fails closed
+            // if an inherited descriptor keeps the lock alive.
+            eprintln!("Could not explicitly release installation lock: {error}");
+        }
+    }
+}
+pub(crate) fn lock(home: &Path, name: &str) -> Result<InstallationLock> {
     let p = home.join(name);
     if !p.exists() {
         match amplifier_native_platform::private_create(&p, b"") {
@@ -90,9 +109,9 @@ pub(crate) fn lock(home: &Path, name: &str) -> Result<File> {
     let f = fs::OpenOptions::new().read(true).write(true).open(p)?;
     f.try_lock_exclusive()
         .context("This installation operation is already running")?;
-    Ok(f)
+    Ok(InstallationLock { file: f })
 }
-pub fn startup_change_guard(home: &Path) -> Result<File> {
+pub fn startup_change_guard(home: &Path) -> Result<InstallationLock> {
     let guard = lock(home, "native-update.lock")?;
     if home.join(JOURNAL).exists() {
         ensure!(
@@ -101,6 +120,38 @@ pub fn startup_change_guard(home: &Path) -> Result<File> {
         );
     }
     Ok(guard)
+}
+#[cfg(test)]
+mod lock_tests {
+    use super::lock;
+
+    #[test]
+    fn installation_lock_rejects_a_live_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let owner = lock(home.path(), "native-update.lock").unwrap();
+        assert!(lock(home.path(), "native-update.lock").is_err());
+        drop(owner);
+        assert!(lock(home.path(), "native-update.lock").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installation_lock_releases_while_an_inherited_description_remains_open() {
+        let home = tempfile::tempdir().unwrap();
+        let owner = lock(home.path(), "native-update.lock").unwrap();
+        // try_clone duplicates the same open file description, deterministically
+        // reproducing the descriptor inherited by a child before its exec.
+        let inherited = owner.file.try_clone().unwrap();
+        assert!(lock(home.path(), "native-update.lock").is_err());
+        drop(owner);
+        let next_owner = lock(home.path(), "native-update.lock").unwrap();
+        assert!(lock(home.path(), "native-update.lock").is_err());
+        // Closing an older duplicate must not release the new owner's lock.
+        drop(inherited);
+        assert!(lock(home.path(), "native-update.lock").is_err());
+        drop(next_owner);
+        assert!(lock(home.path(), "native-update.lock").is_ok());
+    }
 }
 fn write_binary(from: &Path, to: &Path) -> Result<()> {
     ordinary(from)?;
@@ -296,7 +347,7 @@ pub async fn local_api(
     );
     Ok(v)
 }
-async fn wait_stopped(home: &Path) -> Result<File> {
+async fn wait_stopped(home: &Path) -> Result<InstallationLock> {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(f) = lock(home, "service.lock") {
@@ -309,7 +360,7 @@ async fn wait_stopped(home: &Path) -> Result<File> {
         tokio::time::sleep(Duration::from_millis(75)).await;
     }
 }
-async fn stop_running(home: &Path, j: &Value) -> Result<File> {
+async fn stop_running(home: &Path, j: &Value) -> Result<InstallationLock> {
     if let Ok(f) = lock(home, "service.lock") {
         if j["startup"]["managed"] == true {
             native_startup_state::stop(&j["startup"])?;
@@ -554,8 +605,8 @@ pub async fn apply(home: &Path, transaction: &str, plan: &Value, rollback: bool)
     let _owner = lock(home, "native-update.lock")?;
     let mut j = journal(home, transaction)?;
     ensure!(
-        j["restore_started"] != true && !terminal(&j),
-        "Restoration began; only restoration may be retried"
+        j["restore_started"] != true && j["rollback_aborted"] != true && !terminal(&j),
+        "Restoration or rollback abort began; only that recovery may be retried"
     );
     ensure!(
         matches!(
@@ -819,6 +870,10 @@ pub async fn verify(home: &Path, transaction: &str) -> Result<Value> {
 pub async fn restore(home: &Path, transaction: &str, outcome: &str) -> Result<Value> {
     let _owner = lock(home, "native-update.lock")?;
     let mut j = journal(home, transaction)?;
+    ensure!(
+        j["rollback_aborted"] != true || outcome == "unchanged",
+        "An aborted rollback can only restore unchanged"
+    );
     if j["phase"] == "deferred" {
         ensure!(
             outcome == "unchanged" && update_admission::status(home)?["closed"] == false,
@@ -926,6 +981,104 @@ pub async fn run(home: &Path, package: &Path) -> Result<Value> {
     restore(home, &transaction, "applied").await
 }
 
+/// Abort a standalone explicit B -> A rollback back to its captured B bundle.
+/// Selection is durable before files move; verification/restoration are separate
+/// and admission remains closed. An enrolled owner cannot use this path.
+pub async fn abort_rollback(home: &Path, transaction: &str, reason: &str) -> Result<Value> {
+    standalone_worker(home)?;
+    let _owner = lock(home, "native-update.lock")?;
+    let mut j = journal(home, transaction)?;
+    ensure!(
+        j["context"]["owner"] == "standalone" && j["context"]["plan"]["operation"] == "rollback",
+        "This is not a standalone explicit rollback transaction"
+    );
+    ensure!(
+        j["restore_started"] != true && !terminal(&j),
+        "Restoration began; only restoration may be retried"
+    );
+    ensure!(
+        matches!(
+            j["phase"].as_str(),
+            Some("prepared" | "applied" | "switching" | "verifying" | "verified")
+        ),
+        "Preparation has not established an idle boundary"
+    );
+    let admission = update_admission::status(home)?;
+    ensure!(
+        admission["ready"] == true && admission["transaction_id"] == transaction,
+        "The rollback no longer owns its settled admission boundary"
+    );
+    check_package(&j["previous"])?;
+    if j["rollback_aborted"] == true {
+        ensure!(
+            j["selected"] == "previous" && j["direction"] == "unchanged",
+            "The retained rollback abort selection changed"
+        );
+        if matches!(
+            j["phase"].as_str(),
+            Some("applied" | "verifying" | "verified")
+        ) {
+            return Ok(
+                json!({"selected_previous":true,"rollback_aborted":true,"transaction_id":transaction}),
+            );
+        }
+    }
+    // A crash before the first apply may not yet have a candidate. B is still
+    // the only selected bundle; do not fabricate or discover an A replacement.
+    if j["candidate"].is_null() {
+        j["candidate"] = j["previous"].clone();
+    }
+    j["rollback_aborted"] = json!(true);
+    if j["rollback_failure"].is_null() {
+        j["rollback_failure"] = json!(reason.chars().take(2000).collect::<String>());
+    }
+    j["direction"] = json!("unchanged");
+    j["selected"] = json!("previous");
+    j["launch_nonce"] = Value::Null;
+    phase(home, &mut j, "switching")?;
+    let _service = stop_running(home, &j).await?;
+    switch(home, &j, true)?;
+    phase(home, &mut j, "applied")?;
+    Ok(json!({"selected_previous":true,"rollback_aborted":true,"transaction_id":transaction}))
+}
+
+async fn restore_aborted_rollback(home: &Path, transaction: &str, reason: &str) -> Result<Value> {
+    abort_rollback(home, transaction, reason).await?;
+    verify(home, transaction).await?;
+    let mut result = restore(home, transaction, "unchanged").await?;
+    result["rollback_aborted"] = json!(true);
+    result["outcome"] = json!("unchanged");
+    Ok(result)
+}
+
+async fn continue_explicit_rollback(home: &Path, transaction: &str) -> Result<Value> {
+    let j = journal(home, transaction)?;
+    let result = async {
+        if matches!(j["phase"].as_str(), Some("prepared" | "switching")) {
+            let plan = if j["frozen_plan"].is_null() {
+                &j["context"]["rollback_plan"]
+            } else {
+                &j["frozen_plan"]
+            };
+            ensure!(
+                !plan.is_null(),
+                "The retained rollback target plan is unavailable"
+            );
+            apply(home, transaction, plan, true).await?;
+        }
+        verify(home, transaction).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        restore_aborted_rollback(home, transaction, &error.to_string()).await?;
+        anyhow::bail!(
+            "Requested rollback failed; the pre-rollback bundle was verified and restored unchanged: {error}"
+        );
+    }
+    restore(home, transaction, "rolled_back").await
+}
+
 /// Deliberate rollback is a new idle transaction, never a rewind of accepted
 /// work or a retry of the already completed update.
 pub async fn rollback(home: &Path, previous_transaction: &str) -> Result<Value> {
@@ -952,7 +1105,7 @@ pub async fn rollback(home: &Path, previous_transaction: &str) -> Result<Value> 
         home,
         &transaction,
         &json!({"id":transaction,"owner":"standalone","plan":{"operation":"rollback"},
-            "previous_transaction":previous_transaction}),
+            "previous_transaction":previous_transaction,"rollback_plan":previous["frozen_plan"]}),
     )
     .await?;
     if ready["ready"] != true {
@@ -960,30 +1113,34 @@ pub async fn rollback(home: &Path, previous_transaction: &str) -> Result<Value> 
         restore(home, &transaction, "unchanged").await?;
         return Ok(ready);
     }
-    apply(home, &transaction, &previous["frozen_plan"], true).await?;
-    verify(home, &transaction).await?;
-    restore(home, &transaction, "rolled_back").await
+    continue_explicit_rollback(home, &transaction).await
 }
 
 pub async fn recover(home: &Path, transaction: &str, rollback: bool) -> Result<Value> {
     standalone_worker(home)?;
     let mut j = journal(home, transaction)?;
     if terminal(&j) {
-        return Ok(json!({"restored":true,"transaction_id":transaction}));
+        return Ok(json!({"restored":true,"transaction_id":transaction,
+            "outcome":j["restore_outcome"],"rollback_aborted":j["rollback_aborted"] == true}));
     }
     if j["restore_started"] == true {
         ensure!(
             !rollback,
             "Restoration already began; rollback is no longer allowed"
         );
-        return restore(
+        let mut result = restore(
             home,
             transaction,
             j["restore_outcome"]
                 .as_str()
                 .context("Missing restoration outcome")?,
         )
-        .await;
+        .await?;
+        if j["rollback_aborted"] == true {
+            result["rollback_aborted"] = json!(true);
+            result["outcome"] = json!("unchanged");
+        }
+        return Ok(result);
     }
     if matches!(j["phase"].as_str(), Some("intent" | "preparing")) {
         let readiness = prepare(home, transaction, &j["context"]).await?;
@@ -993,6 +1150,21 @@ pub async fn recover(home: &Path, transaction: &str, rollback: bool) -> Result<V
             return Ok(readiness);
         }
         j = journal(home, transaction)?;
+    }
+    if j["context"]["owner"] == "standalone"
+        && j["context"]["plan"]["operation"] == "rollback"
+        && j["phase"] != "deferred"
+    {
+        return if rollback || j["rollback_aborted"] == true {
+            restore_aborted_rollback(
+                home,
+                transaction,
+                "Explicit rollback aborted during recovery",
+            )
+            .await
+        } else {
+            continue_explicit_rollback(home, transaction).await
+        };
     }
     if rollback || j["phase"] == "switching" {
         apply(home, transaction, &j["frozen_plan"], true).await?;

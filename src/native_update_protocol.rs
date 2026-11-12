@@ -2,7 +2,6 @@
 //! lifecycle participant protocol 1. This module performs no OS service operation
 //! and never resolves a release or command supplied by chat, the browser or ACP.
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -358,26 +357,7 @@ pub fn registration(config_path: &Path) -> Result<Value> {
 /// It neither registers with an Instance nor activates scheduled installation.
 pub fn claim_owner(config_path: &Path) -> Result<Value> {
     let owner = load_owner(config_path)?;
-    let lock_path = owner.config.home.join("native-update.lock");
-    if !lock_path.exists() {
-        match amplifier_native_platform::private_create(&lock_path, b"") {
-            Ok(()) => (),
-            Err(error) if lock_path.exists() => {
-                let _ = error;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    ensure!(
-        ordinary(&fs::symlink_metadata(&lock_path)?),
-        "Invalid owner update lock"
-    );
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
-    lock.try_lock_exclusive()
-        .context("An installation update is already running")?;
+    let _owner = crate::native_update::lock(&owner.config.home, "native-update.lock")?;
     let marker_path = owner.config.home.join(OWNER_FILE);
     if marker_path.exists() {
         // An identical repeated enrollment has no side effect, including during

@@ -42,6 +42,15 @@ rollback of the latest completed update uses `rollback`, which creates a fresh
 idle transaction. It does not roll back conversation data, accepted work, outcome
 receipts, credentials or user configuration.
 
+For an explicit B-to-A rollback, ordinary recovery continues toward the frozen A
+target. `recover --rollback` aborts that incomplete attempt back to the captured
+B bundle. If A fails verification, standalone rollback automatically takes this
+abort path. B must be verified before admission reopens; if that also fails, the
+gate stays closed for recovery. The journal retains the original failure and
+records the aborted rollback as `unchanged`, not as successful restoration of A.
+An interrupted abort keeps selecting B on subsequent recovery. Neither abort nor
+bundle reselection is permitted once restoration has begun.
+
 Preparation atomically closes new call/work admission and checks existing work.
 Active calls, accepted background work and unresolved outcomes defer an update;
 ending the call alone does not make its background work disposable. A deferred

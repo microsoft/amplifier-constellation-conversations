@@ -2,7 +2,7 @@
 """Exercise a packaged Companion's real standalone/enrolled update lifecycle.
 
 The controller needs Python; every application/updater process has an empty PATH
-and no inherited provider credentials. It uses one disposable installation and
+and no inherited provider credentials. It uses two disposable installations and
 only local authenticated HTTP. A/B share the tested executable: B changes a
 manifest version and support document. C deliberately uses the bundled Node as
 the service to prove failed real startup rolls back. These are lifecycle tests,
@@ -211,19 +211,23 @@ class Installation:
         self.children.append(child)
         return child, self.await_running()
 
-    def initialize(self):
+    def initialize(self, *, baseline_bundle: Path | None = None, launch_initial: bool = True):
+        baseline_bundle = baseline_bundle or self.bundle
+        baseline_manifest = read_json(baseline_bundle / "manifest.json")
         workspace = self.root / "Agent workspace"
         workspace.mkdir()
         owner = os.environ.get("USERNAME") or os.environ.get("USER") or "fixture-owner"
         clean.run([self.worker, "--home", self.home, "init", "--owner", owner,
                    "--agent-command", self.node, "--agent-arg=--version", "--agent-cwd", workspace], self.env, self.root)
-        write_json(self.home / "companion.json", {"enabled": False, "node": str(self.node),
-                   "bridge": str(self.bundle / self.manifest["entrypoints"]["bridge"]), "profiles": {}, "max_call_seconds": 17})
-        self.update("bootstrap", "--package", self.bundle)
-        child, _ = self.start()
-        # This is an exact Popen child before any update/worker-created process.
-        child.terminate()
-        child.wait(timeout=10)
+        write_json(self.home / "companion.json", {"enabled": False,
+                   "node": str(baseline_bundle / baseline_manifest["entrypoints"]["node"]),
+                   "bridge": str(baseline_bundle / baseline_manifest["entrypoints"]["bridge"]), "profiles": {}, "max_call_seconds": 17})
+        self.update("bootstrap", "--package", baseline_bundle)
+        if launch_initial:
+            child, _ = self.start()
+            # This is an exact Popen child before any update/worker-created process.
+            child.terminate()
+            child.wait(timeout=10)
         self.await_stopped()
         imported = clean.run([self.worker, "--home", self.home, "credential", "import-openai"], self.env, self.root,
                              input_text="fixture-native-key-not-a-real-provider-credential\n")
@@ -238,7 +242,9 @@ class Installation:
             db.execute("INSERT INTO companion_actions VALUES('retained-call','retained-action','retained-delegation','fixture-connection','Earlier settled work.','{}','completed','{\"state\":\"completed\"}',100)")
         (self.home / "retained-unknown-evidence.json").write_text('{"historical_outcome":"unknown","retry":false}\n', encoding="utf-8")
         self.baseline = self.snapshot()
-        self.check("initialized real service/database; retained room, session, settled work, historical uncertainty and private credential")
+        self.check("initialized real service/database; retained room, session, settled work, historical uncertainty and private credential"
+                   if launch_initial else
+                   "initialized real CLI/database and protected state with deliberately incompatible baseline stopped")
 
     @staticmethod
     def insert_call(db, identity: str, state: str):
@@ -438,6 +444,64 @@ def exercise(install: Installation, a: Path, b: Path, c: Path):
     require(not restored["admission"]["closed"], "Final restoration left admission closed")
 
 
+def exercise_failed_explicit_rollback(install: Installation, a: Path, b: Path, c: Path):
+    # The original immutable C is intentionally unstartable, not edited after
+    # capture. A's real CLI initializes the database without launching C; the
+    # ordinary C -> B update then establishes an actual verified B installation.
+    manifests_before = {name: digest((bundle / "manifest.json").read_bytes())
+                        for name, bundle in [("A", a), ("B", b), ("C", c)]}
+    install.initialize(baseline_bundle=c, launch_initial=False)
+    install.selected(c)
+    require(install.installed()["package"]["binary_sha256"] == digest(install.node.read_bytes()),
+            "Failed rollback fixture is not the actual bundled Node executable")
+    applied = install.update("run", "--package", b)
+    require(applied.get("restored") is True and install.status()["original_running"] is False,
+            "C -> B did not complete actual verification with stopped state preserved")
+    install.await_stopped()
+    install.selected(b)
+    requested_plan = copy.deepcopy(install.journal()["frozen_plan"])
+    require(requested_plan["previous"]["bundle"]["manifest_sha256"] == manifests_before["C"]
+            and requested_plan["candidate"]["bundle"]["manifest_sha256"] == manifests_before["B"],
+            "Completed transaction did not retain exact C -> B plan")
+    _, before = install.start()
+    failure = install.update("rollback", applied["transaction_id"], expect_success=False)
+    require("Requested rollback failed; the pre-rollback bundle was verified and restored unchanged" in failure.stderr,
+            "Failed explicit rollback did not report verified return to B")
+    journal = install.journal()
+    require(journal["transaction_id"] != applied["transaction_id"] and journal["rollback_aborted"] is True
+            and journal["phase"] == "restored" and journal["direction"] == "unchanged"
+            and journal["restore_outcome"] == "unchanged" and journal["selected"] == "previous",
+            "Explicit rollback failure did not settle its durable abort selection")
+    require(journal["rollback_failure"] and "Candidate exited before verification" in journal["rollback_failure"],
+            "Rollback failed before the deliberately incompatible process was actually tested")
+    require(journal["frozen_plan"] == requested_plan and journal["context"]["rollback_plan"] == requested_plan
+            and journal["context"]["previous_transaction"] == applied["transaction_id"]
+            and journal["previous"]["bundle"]["manifest_sha256"] == manifests_before["B"]
+            and journal["candidate"]["bundle"]["manifest_sha256"] == manifests_before["C"],
+            "Abort changed the original requested rollback target or retained plan")
+    restored = install.await_running()
+    require(restored["process_nonce"] != before["process_nonce"] and not restored["admission"]["closed"],
+            "Abort did not verify and restore an actual fresh B service with open admission")
+    install.selected(b)
+    recovered = install.update("recover", journal["transaction_id"])
+    require(recovered.get("restored") is True and recovered.get("rollback_aborted") is True
+            and recovered.get("outcome") == "unchanged", "Recovery obscured the failed rollback outcome")
+    require(install.await_running()["process_nonce"] == restored["process_nonce"],
+            "Completed rollback-abort recovery restarted the working service")
+    require(install.journal() == journal, "Completed recovery rewrote original failed rollback evidence")
+    install.selected(b)
+    require({name: digest((bundle / "manifest.json").read_bytes())
+             for name, bundle in [("A", a), ("B", b), ("C", c)]} == manifests_before,
+            "Failed rollback qualification edited an immutable source manifest")
+    # Verify all canonical installed/source bundle bytes too, not just their
+    # manifest pointers. These calls inspect files and never start a service.
+    for bundle in [a, b, c, Path(journal["previous"]["bundle"]["bundle"]), Path(journal["candidate"]["bundle"]["bundle"])]:
+        install.command(["bundle", "verify", "--path", bundle])
+    install.check("real explicit rollback to retained incompatible C fails startup, aborts to verified running B, and preserves original intent/state",
+                  applied_transaction=applied["transaction_id"], rollback_transaction=journal["transaction_id"],
+                  rollback_aborted=True, outcome="unchanged", preserved_manifest_sha256=manifests_before)
+
+
 def qualify(archive: Path, receipt: Path, output: Path) -> dict:
     provenance = read_json(receipt)
     manifest, contents = clean.package_module().inspect_archive(archive, provenance["archive_sha256"])
@@ -455,7 +519,7 @@ def qualify(archive: Path, receipt: Path, output: Path) -> dict:
                   "no OS startup registration/login in this harness; qualified separately",
                   "no physical media, provider, model, game, or voice call; speech release remains paused"],
               "model_requests": 0, "speech_release": "unchanged_paused"}
-    install = None
+    installations = []
     failure = None
     try:
         a, b, c = root / "Release A", root / "Release B", root / "Deliberate failed C"
@@ -464,15 +528,33 @@ def qualify(archive: Path, receipt: Path, output: Path) -> dict:
         derive_bundle(a, c, "incompatible-c", broken=True)
         result["fixtures"] = {name: digest((bundle / "manifest.json").read_bytes()) for name, bundle in [("A", a), ("B", b), ("C", c)]}
         install = Installation(root, a, manifest, result)
+        installations.append(("primary", install))
         exercise(install, a, b, c)
+        secondary_root = root / "Explicit rollback failure installation"
+        secondary_root.mkdir()
+        secondary = Installation(secondary_root, a, manifest, result)
+        installations.append(("explicit_rollback_failure", secondary))
+        exercise_failed_explicit_rollback(secondary, a, b, c)
         result["status"] = "passed"
     except Exception as error:
         failure = error
         result.update(status="failed", error=str(error))
     finally:
         try:
-            if install is not None:
-                result["cleanup"] = install.cleanup(root / "Release B")
+            cleanup_errors = []
+            cleanup_receipts = {}
+            # Attempt every owned cleanup, even if another installation cannot
+            # settle. Never delete either home beneath an uncertain process.
+            for name, installation in reversed(installations):
+                try:
+                    cleanup_receipts[name] = installation.cleanup(root / "Release B")
+                except Exception as cleanup_error:
+                    cleanup_errors.append(f"{name}: {cleanup_error}")
+                    cleanup_receipts[name] = {"status": "uncertain", "error": str(cleanup_error)}
+            result["installation_cleanup"] = cleanup_receipts
+            if cleanup_errors:
+                raise RuntimeError("; ".join(cleanup_errors))
+            result["cleanup"] = cleanup_receipts.get("primary", {"no_application_started": True})
             shutil.rmtree(root)
             result["temporary_installation_removed"] = True
         except Exception as cleanup_error:

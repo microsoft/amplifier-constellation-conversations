@@ -709,3 +709,178 @@ async fn startup_boundary_failure_keeps_admission_closed_and_allows_only_restore
     f.selected(&f.original["package"]);
     f.retained();
 }
+
+async fn completed_fixture_update(f: &Fixture, plan: &Value) -> String {
+    let tx = prepare(f, "apply").await;
+    native_update::apply(&f.home, &tx, plan, false)
+        .await
+        .unwrap();
+    // These fixtures contain native-format headers, not runnable programs.
+    // Only simulate the health checkpoint; actual CLI health has its own suite.
+    let path = f.home.join("native-update.json");
+    let mut journal = read_json(&path);
+    journal["phase"] = json!("verified");
+    write_json(&path, &journal);
+    native_update::restore(&f.home, &tx, "applied")
+        .await
+        .unwrap();
+    tx
+}
+
+fn standalone_rollback_context(tx: &str, previous: &str, plan: &Value) -> Value {
+    json!({"id":tx,"owner":"standalone","plan":{"operation":"rollback"},
+        "previous_transaction":previous,"rollback_plan":plan})
+}
+
+#[tokio::test]
+async fn explicit_rollback_retains_target_before_apply_and_can_resume_to_that_target() {
+    let f = Fixture::new();
+    let plan = f.plan();
+    let first = completed_fixture_update(&f, &plan).await;
+    let tx = uuid::Uuid::new_v4().to_string();
+    let context = standalone_rollback_context(&tx, &first, &plan);
+    native_update::prepare(&f.home, &tx, &context)
+        .await
+        .unwrap();
+    let path = f.home.join("native-update.json");
+    let mut journal = read_json(&path);
+    assert!(journal["frozen_plan"].is_null());
+    assert_eq!(journal["context"]["rollback_plan"], plan);
+    let context_hash = journal["context_hash"].clone();
+    // An interrupted intent can reconstruct prepare without losing A's target.
+    journal["phase"] = json!("intent");
+    write_json(&path, &journal);
+    native_update::prepare(&f.home, &tx, &context)
+        .await
+        .unwrap();
+    let retained = read_json(&path)["context"]["rollback_plan"].clone();
+    native_update::apply(&f.home, &tx, &retained, true)
+        .await
+        .unwrap();
+    f.selected(&plan["previous"]);
+    journal = read_json(&path);
+    assert_eq!(journal["frozen_plan"], plan);
+    assert_eq!(journal["context"], context);
+    assert_eq!(journal["context_hash"], context_hash);
+    journal["phase"] = json!("verified");
+    write_json(&path, &journal);
+    assert_eq!(
+        native_update::recover(&f.home, &tx, false).await.unwrap()["restored"],
+        true
+    );
+    let finished = read_json(&path);
+    assert_eq!(finished["restore_outcome"], "rolled_back");
+    assert_ne!(finished["rollback_aborted"], true);
+    assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+    f.selected(&plan["previous"]);
+    f.retained();
+}
+
+#[tokio::test]
+async fn interrupted_explicit_rollback_abort_preserves_b_until_verified_restore() {
+    let f = Fixture::new();
+    let plan = f.plan();
+    let first = completed_fixture_update(&f, &plan).await;
+    let tx = uuid::Uuid::new_v4().to_string();
+    let context = standalone_rollback_context(&tx, &first, &plan);
+    native_update::prepare(&f.home, &tx, &context)
+        .await
+        .unwrap();
+    native_update::apply(&f.home, &tx, &plan, true)
+        .await
+        .unwrap();
+    f.selected(&plan["previous"]);
+    let path = f.home.join("native-update.json");
+    let mut journal = read_json(&path);
+    let context_hash = journal["context_hash"].clone();
+    // Simulate the abort journal's durable selection, followed by a crash before
+    // any A -> B file exchange. This is not a synthetic health success.
+    journal["rollback_aborted"] = json!(true);
+    journal["rollback_failure"] = json!("fixture target failed health");
+    journal["selected"] = json!("previous");
+    journal["direction"] = json!("unchanged");
+    journal["phase"] = json!("switching");
+    journal["launch_nonce"] = Value::Null;
+    write_json(&path, &journal);
+    config::private_write(&f.home.join("native-update-owner.json"), b"{}").unwrap();
+    assert!(
+        native_update::abort_rollback(&f.home, &tx, "retry")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        read_json(&path),
+        journal,
+        "An enrolled home cannot bypass its owner"
+    );
+    fs::remove_file(f.home.join("native-update-owner.json")).unwrap();
+    assert_eq!(
+        native_update::abort_rollback(&f.home, &tx, "retry")
+            .await
+            .unwrap()["rollback_aborted"],
+        true
+    );
+    f.selected(&plan["candidate"]);
+    journal = read_json(&path);
+    assert_eq!(journal["previous"], plan["candidate"]);
+    assert_eq!(journal["candidate"], plan["previous"]);
+    assert_eq!(journal["frozen_plan"], plan);
+    assert_eq!(journal["context"], context);
+    assert_eq!(journal["context_hash"], context_hash);
+    assert_eq!(journal["rollback_failure"], "fixture target failed health");
+    assert_eq!(update_admission::status(&f.home).unwrap()["closed"], true);
+    assert!(
+        native_update::restore(&f.home, &tx, "unchanged")
+            .await
+            .is_err()
+    );
+    assert!(
+        native_update::apply(&f.home, &tx, &plan, true)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        read_json(&path),
+        journal,
+        "Neither unverified restore nor A replay may advance it"
+    );
+    // Simulate B's separate successful health checkpoint; it still cannot be
+    // reported as applying the failed target or completing the requested rollback.
+    journal["phase"] = json!("verified");
+    write_json(&path, &journal);
+    for wrong in ["applied", "rolled_back"] {
+        assert!(
+            native_update::restore(&f.home, &tx, wrong)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("aborted rollback can only restore unchanged")
+        );
+        assert_eq!(read_json(&path), journal);
+        assert_eq!(update_admission::status(&f.home).unwrap()["closed"], true);
+    }
+    // Now simulate interrupted restore start. Only forward restoration may
+    // reopen admission; changing the selected bundle is no longer allowed.
+    journal["phase"] = json!("restoring");
+    journal["restore_started"] = json!(true);
+    journal["restore_outcome"] = json!("unchanged");
+    write_json(&path, &journal);
+    assert!(
+        native_update::abort_rollback(&f.home, &tx, "too late")
+            .await
+            .is_err()
+    );
+    assert!(native_update::recover(&f.home, &tx, true).await.is_err());
+    assert_eq!(update_admission::status(&f.home).unwrap()["closed"], true);
+    let restored = native_update::recover(&f.home, &tx, false).await.unwrap();
+    assert_eq!(restored["restored"], true);
+    assert_eq!(restored["rollback_aborted"], true);
+    assert_eq!(restored["outcome"], "unchanged");
+    let finished = read_json(&path);
+    assert_eq!(finished["phase"], "restored");
+    assert_eq!(finished["direction"], "unchanged");
+    assert_eq!(finished["selected"], "previous");
+    assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+    f.selected(&plan["candidate"]);
+    f.retained();
+}
