@@ -109,13 +109,15 @@ dependencies = [
 [[package]]
 name = "amplifier-native-platform"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/amplifier-constellation?rev=2d8f4a3dba21631a4fefea00303d8c9b78a46e43#2d8f4a3dba21631a4fefea00303d8c9b78a46e43"
+source = "git+https://github.com/microsoft/amplifier-constellation?rev=016011550269c53b4969522e4f0173985b7076af#016011550269c53b4969522e4f0173985b7076af"
 dependencies = [
  "anyhow",
  "argon2",
  "hmac",
  "libc",
  "rand_core 0.6.4",
+ "serde",
+ "serde_json",
  "sha2",
  "url",
  "uuid",
