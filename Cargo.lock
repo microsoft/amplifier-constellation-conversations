@@ -86,13 +86,14 @@ dependencies = [
 [[package]]
 name = "amplifier-acp-connection"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/amplifier-constellation?rev=e0d6a03fd342b295d349b633d400376efbbe2c40#e0d6a03fd342b295d349b633d400376efbbe2c40"
+source = "git+https://github.com/microsoft/amplifier-constellation?rev=cf5df0622e42832b4709b14701a21add49cd1aa1#cf5df0622e42832b4709b14701a21add49cd1aa1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
  "futures-channel",
  "futures-util",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-util",
 ]
