@@ -49,6 +49,22 @@ credentials, contacts, transcripts and work records are not rollback snapshots.
 An enrolled installation has one updater owner; opening the app creates no
 additional scheduler. Standalone use does not require enrollment.
 
+Open **App updates** below your contacts to manage a standalone installation in
+a separate browser tab. Download and extract the complete package for this
+computer, then choose **Check package** and review the selected version before
+installing it. An active call or unsettled work can defer the change; the page
+does not force either to stop. An enrolled installation directs you to its existing
+updater instead of starting a second owner.
+
+The page reads the installation's saved operation while Companion restarts.
+Reloading the page does not submit the update again. If a request was not recorded,
+**Retry same request** deliberately reuses that request's identity and package
+selection. If Companion does not return, reopen the app on this computer. Its
+restricted recovery page uses your existing account and offers only the recovery
+actions allowed by the saved transaction. It does not open ordinary calls, create
+an agent session, or resume uncertain work. Restoring an earlier app package keeps
+the current account, contacts, conversations and work records.
+
 ## Qualification limits
 
 Native CI distinguishes architecture builds, application PATH without developer

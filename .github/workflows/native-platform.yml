@@ -137,6 +137,11 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npx playwright install --with-deps chromium
+      - name: Verify update controls and lost-reply reconciliation in Chromium
+        if: matrix.target == 'linux-x64'
+        env:
+          ARTIFACT_DIR: dist/native-updates-browser-artifacts
+        run: node tests/native_updates_browser.mjs > dist/native-updates-browser.json
       - name: Verify consumer first launch, local account, contact setup and update continuity
         env:
           CONSUMER_BROWSER_TEST: ${{ matrix.target == 'linux-x64' && '1' || '0' }}

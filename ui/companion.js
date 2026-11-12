@@ -95,6 +95,7 @@ async function openContacts() {
   }
   $('first-account').hidden = true;
   $('loading').hidden = true; $('login').hidden = true; $('app').hidden = false; $('sign-out').hidden = false;
+  $('app-updates-link').hidden = state.session?.admin !== true;
   $('availability').hidden = state.available;
   $('availability').textContent = config.reason || 'Voice calling has not been enabled on this installation yet.';
   $('empty-contacts').hidden = state.contacts.length !== 0;
@@ -126,6 +127,7 @@ function showLogin() {
   $('call-ended').hidden = true; $('call-screen').hidden = true; $('phonebook').hidden = false; showRecovery();
   for (const id of ['continue-work','ended-work-link','recovery-work-link']) { $(id).hidden = true; $(id).href = '/'; }
   $('loading').hidden = true; $('app').hidden = true; $('login').hidden = false; $('sign-out').hidden = true;
+  $('app-updates-link').hidden = true;
   $('username').value = state.session?.owner || ''; $('password').value = '';
   setup.signedOut(state.session);
 }
