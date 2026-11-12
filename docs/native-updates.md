@@ -148,6 +148,18 @@ identity for reconciliation. After restoration has begun, recovery remains
 restore-only; no rollback or replay is authorized by a timeout. Ordinary server,
 standalone update and direct library calls do not install this participant clock.
 
+## Settled operation cleanup
+
+Settled native operation registrations are maintained through authenticated
+`POST /api/v1/companion/update/cleanup` with an empty JSON object. The request
+accepts no caller paths or profiles. It reports confirmed retirement, refusal,
+or uncertainty for each retained worker/replacement identity; an active
+replacement is preserved. Original launch and retirement evidence remains
+private. Explicit package CHECK also performs bounded maintenance, while GET is
+read-only. A cleanup inventory refusal is recorded and does not claim cleanup
+succeeded or prevent package validation. Uncertain retirement is observation-only
+on later requests; it is never automatically dispatched again.
+
 ## Qualification boundaries
 
 The six-target CI matrix exercises package installation with developer tools

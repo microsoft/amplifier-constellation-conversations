@@ -20,6 +20,7 @@ SELECTIONS = [
     ("native_update_process::", False),
     ("native_update::startup_tests::", False),
     ("native_browser_update::", False),
+    ("native_browser_cleanup::", False),
     ("native_recovery::", False),
     ("native_update_launch::", False),
     ("native_startup_state::", False),
