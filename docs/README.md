@@ -1,38 +1,57 @@
-# Conversations and Companion documentation
+# Agreements and interfaces
 
-[The component vision](VISION.md) explains the intent of these services and their
-reference clients. This page locates the agreements and interfaces; it does not
-add another specification or prescribe a product UI.
+[Conversations](VISION.md) supplies reusable conversation and coordination
+services. [Companion](companion-vision.md) is a product for live interaction with
+an agent in the physical world. Their current implementations share this
+repository. Products can use the conversation services without adopting Companion.
+
+Start with the relevant vision, then the agreement or local interface your work
+changes. Setup instructions and examples illustrate these interfaces without
+adding separate commitments.
 
 ## Shared agreements
 
-The Constellation index owns the family-wide intent and commitments:
+Constellation owns the cross-component promises in six agreements:
 
-- [Constellation vision](https://github.com/microsoft/amplifier-constellation/blob/main/docs/VISION.md): what the family is working toward.
-- [Family composition and ownership](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/family.v1-candidate.md): service responsibilities, information ownership, interfaces and self-contained installations.
-- [Interaction across services and experiences](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/experience.v1-candidate.md): identity, audience, authority, continuity and observable outcomes across experiences.
-
-Those agreements apply across the family. The documents below own this
-component's concrete interfaces and behavior. Setup instructions and examples
-illustrate those interfaces without adding separate commitments.
-
-## Local interfaces and behavior
-
-| Document | What it defines |
+| Agreement | Responsibility |
 | --- | --- |
-| [API contract](api.md) | Authentication, rooms, messages, membership, attachments, imports, view state, source context, approvals and forms. |
-| [Shared conversations](shared-rooms.md) | Registered ACP connections, participant and history access, attachments, and reference-client operations. |
-| [Input continuity](input-continuity.md) | Ordered input, negotiated steering, delivery states, explicit Stop and uncertain-outcome recovery. |
-| [Optional ACP callbacks](client-callbacks.md) | Configured local filesystem and terminal access, audience checks, permissions and platform boundaries. |
-| [Observable huddles](huddles.md) | Work-room setup, participant enrollment, attributed posts and returns to the original request. |
-| [Companion](companion.md) | Call and media lifecycle, voice-provider configuration, scoped tools, camera, shared visual surface, observers and reference-client controls. |
-| [Companion's Minecraft observation bridge](companion-minecraft-observation.md) | Domain-owned source and action evidence exposed to a call, including outcome and audience limits. |
+| [Composition](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/composition.md) | Ownership and independent composition, including intended product and platform homes. |
+| [Interaction](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/interaction.md) | Conversation, human attention and return of useful results. |
+| [Work authority](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-authority.md) | Acceptance, changes, delegation and Stop. |
+| [Work continuity](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-continuity.md) | Input during work, interruption and recovery. |
+| [Installations](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/installations.md) | Setup, connections, updates and preservation of state. |
+| [Engine compatibility](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/engine-compatibility.md) | SDKs, negotiated capabilities and explicit engine/model choice. |
 
-For setup, start with [Build and install](../README.md#build-and-install), then
-the interface for the capability being configured. The browser screens provide
-developer, administrator and reference access; their layout is not the intended
-product experience for every future client.
+These agreements remain authoritative across components. Concrete routes,
+schemas, configuration and supported behavior remain with the serving owner.
+Intended repository homes do not establish a new API or transfer an existing one.
 
-[Validation](validation.md) describes reproducible checks and their limits.
-[Release notes](releases/) retain historical changes; they are not a separate
-source of current interface promises or a roadmap.
+## Conversations service interfaces
+
+| Local promise | Exact definition |
+| --- | --- |
+| Rooms expose messages, membership, attachments and view state through authenticated operations. | [API contract](api.md), [room participation and access](shared-rooms.md). |
+| Accepted messages retain their delivery identity and ordered path through steering or queued input. | [Input continuity](input-continuity.md). |
+| Optional local filesystem and terminal callbacks use configured audience checks and operation-bound approvals. | [ACP callbacks](client-callbacks.md). |
+| Huddles bind a work discussion to its original request, with attributed posts, inspection and result return. | [Huddle interface](huddles.md). |
+| Authorized context queries expose this service's conversations without granting permission to send messages or administer the service. | [Context-provider interface](api.md#context-provider-interface). |
+
+The linked specifications define these promises and their limits. Reference-client
+instructions describe one way to use the same operations.
+
+## Companion call interfaces
+
+| Local promise | Exact definition |
+| --- | --- |
+| Call/media controls, consent and provider connections belong to the call experience, separate from backend ACP work. | [Call behavior and installation](companion.md). |
+| Shared material, presentation controls and saved results retain their call and audience scope. | [Sharing and receipts](companion.md#sharing-capabilities-and-receipts), [call API](companion.md#api-reference). |
+| Optional connected tools and observers preserve source attribution and distinguish submitted work from observed outcomes. | [Connected-experience tools](companion.md#optional-connected-experience-tools), [observers](companion.md#read-only-observers), [Minecraft observation bridge](companion-minecraft-observation.md). |
+
+These are the current serving interfaces, not a claim that every product vision
+scenario is implemented. Media transport is not a new ACP protocol; the technical
+documents retain capability requirements and unsupported cases.
+
+For setup, use [Installation and connection configuration](installation.md) and
+the relevant component's configuration above. [Validation](validation.md) describes reproducible
+checks and their limits. [Release notes](releases/) retain historical changes;
+they do not define another roadmap or set of current promises.
