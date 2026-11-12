@@ -118,6 +118,33 @@ jobs:
           python scripts/vendor/node/test_support.py
       - name: Assemble self-contained immutable bundle
         run: python scripts/package-native.py build --inputs '${{ runner.temp }}/native-inputs/inputs.json' --output dist
+      - name: Retain the exact test controller outside the product bundle
+        run: |
+          python - <<'PYCONTROLLER'
+          import hashlib, importlib.util, json, platform, shutil, subprocess
+          from pathlib import Path
+          source = Path('target/${{ matrix.rust_target }}/release/examples/native-update-controller${{ matrix.suffix }}')
+          target = Path('dist/qualification-tools')
+          target.mkdir()
+          destination = target / source.name
+          shutil.copy2(source, destination)
+          digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          assert digest(source) == digest(destination), 'Qualification controller copy changed'
+          receipt = {'schema': 1, 'target': '${{ matrix.target }}', 'rust_target': '${{ matrix.rust_target }}',
+              'source_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'source_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'filename': destination.name, 'bytes': destination.stat().st_size, 'sha256': digest(destination),
+              'purpose': 'Test-only native qualification controller, excluded from the product package'}
+          if platform.system() == 'Windows':
+              import pefile
+              assert pefile.__version__ == '2024.8.26', 'Unexpected PE inspector version'
+              spec = importlib.util.spec_from_file_location('native_imports', 'scripts/check-native-imports.py')
+              imports = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(imports)
+              receipt['pe_imports'] = imports.inspect(destination, receipt['sha256'], '${{ matrix.architecture }}', pefile)
+              assert not receipt['pe_imports']['unresolved_dependencies'], 'Qualification controller has unreviewed DLL imports'
+          (target / 'native-update-controller.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+          PYCONTROLLER
       - name: Install and launch with developer tools absent from child PATH
         run: |
           python - <<'PY'
