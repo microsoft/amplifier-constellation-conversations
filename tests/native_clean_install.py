@@ -74,6 +74,14 @@ def certificate_failure(error: Exception) -> bool:
         getattr(error, "reason", None), ssl.SSLCertVerificationError)
 
 
+def physically_inside(path: Path, home: Path) -> bool:
+    # Rust canonical paths may retain Windows' extended \\?\ prefix while
+    # Python/Node report the ordinary drive spelling. Compare actual directory
+    # identity, not lexical prefixes; resolving first still rejects outside links.
+    require(home.is_dir(), "Installation home is not a directory")
+    return any(parent.samefile(home) for parent in path.resolve(strict=True).parents)
+
+
 def run(command: list, env: dict, cwd: Path, *, timeout: int = 60, input_text: str | None = None) -> subprocess.CompletedProcess:
     result = subprocess.run([str(v) for v in command], env=env, cwd=cwd,
                             capture_output=True, text=True, encoding="utf-8", timeout=timeout, input=input_text)
@@ -135,8 +143,9 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
         installed_service = Path(entrypoints["service"])
         installed_node = Path(entrypoints["node"])
         require(installed_service.is_absolute() and installed_node.is_absolute(), "Installer must return absolute entrypoints")
-        require(installed_service.resolve().is_relative_to(home.resolve())
-                and installed_node.resolve().is_relative_to(home.resolve()), "Installation escaped its own home")
+        require(physically_inside(installed_service, home)
+                and physically_inside(installed_node, home),
+                f"Installed entrypoints are not physically inside home: {installed_service}, {installed_node}, {home}")
         run([installed_service, "--home", home, "bundle", "verify", "--path", installed_service.parent], env, root)
         checks.append("native bundle verify/install and relocated installed executable pass")
         fixture = root / "Read only ACP fixture"
@@ -169,7 +178,7 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
         require(probe["ok"] and probe["agent_info"]["name"] == "native-package-fixture", "Official SDK initialize did not complete")
         events = [json.loads(line) for line in log.read_text().splitlines()]
         require([event["method"] for event in events] == ["initialize"], "Installation probe created a session or prompt")
-        require(Path(events[0]["node"]).resolve() == installed_node.resolve(), "ACP fixture used an ambient Node installation")
+        require(Path(events[0]["node"]).samefile(installed_node), "ACP fixture used an ambient Node installation")
         require(events[0]["provider_key_present"] is False, "Voice provider key leaked into the ACP child")
         checks.append("official ACP SDK initialize through installed private Node; no session or model prompt")
         bridge = Path(entrypoints["bridge"])

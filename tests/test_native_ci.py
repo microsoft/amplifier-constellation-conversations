@@ -24,20 +24,56 @@ def load(name, path):
 
 
 ci = load("native_ci", ROOT / "scripts/native-ci-inputs.py")
+node = ci.node_module()
 clean = load("native_clean", ROOT / "tests/native_clean_install.py")
 imports = load("native_imports", ROOT / "scripts/check-native-imports.py")
 rust_tests = load("native_rust_tests", ROOT / "scripts/run-native-rust-tests.py")
 
 
 class NativeBuildHarnessTests(unittest.TestCase):
+    def test_installed_paths_use_physical_ancestry_and_reject_outside_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "install"
+            home.mkdir()
+            child = home / "service"
+            child.write_bytes(b"fixture")
+            outside = root / "outside"
+            outside.write_bytes(b"outside")
+            self.assertTrue(clean.physically_inside(child, home))
+            self.assertFalse(clean.physically_inside(outside, home))
+            if os.name == "nt":
+                extended = Path("\\\\?\\" + str(child.absolute()))
+                self.assertTrue(clean.physically_inside(extended, home))
+                self.assertTrue(extended.samefile(child))
+                self.assertFalse(clean.physically_inside(Path("\\\\?\\" + str(outside.absolute())), home))
+            else:
+                alias = root / "alias"
+                alias.symlink_to(home, target_is_directory=True)
+                self.assertTrue(clean.physically_inside(alias / "service", home))
+                escape = home / "escape"
+                escape.symlink_to(outside)
+                self.assertFalse(clean.physically_inside(escape, home))
+
     def test_frozen_node_inputs_cover_exact_six_targets(self):
-        data = json.loads((ROOT / "scripts/native-node-lock.json").read_text())
+        data = json.loads((ROOT / "scripts/vendor/node/lock.json").read_text())
         self.assertEqual(set(data["targets"]), {"linux-x64", "linux-arm64", "macos-x64",
                                                "macos-arm64", "windows-x64", "windows-arm64"})
         self.assertTrue(data["source"].startswith("https://nodejs.org/dist/v"))
         for row in data["targets"].values():
             self.assertEqual(len(row["sha256"]), 64)
             self.assertIn("v" + data["version"], row["file"])
+
+    def test_vendored_node_helper_matches_accepted_source_manifest(self):
+        vendor = ROOT / "scripts/vendor"
+        provenance = json.loads((vendor / "node-provenance.json").read_text())
+        self.assertEqual(provenance["commit"], "02e4b9494ff445d0b6104ee645cab3f381bc7f01")
+        self.assertEqual(set(provenance["files"]),
+                         {".gitattributes", "README.md", "lock.json", "node_support.py", "test_support.py"})
+        for name, record in provenance["files"].items():
+            self.assertEqual(hashlib.sha256((vendor / "node" / name).read_bytes()).hexdigest(), record["sha256"])
+        self.assertEqual(hashlib.sha256((vendor / provenance["repository_license"]["path"]).read_bytes()).hexdigest(),
+                         provenance["repository_license"]["sha256"])
 
     def test_child_environment_has_no_provider_or_tool_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -76,21 +112,39 @@ class NativeBuildHarnessTests(unittest.TestCase):
                     stream.addfile(info, io.BytesIO(contents))
             lock = {"version": "22.23.5", "source": "https://nodejs.org/dist/v22.23.5/SHASUMS256.txt",
                     "targets": {"linux-x64": {"file": name, "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}}}
-            (scripts / "native-node-lock.json").write_text(json.dumps(lock))
-            with patch.object(ci, "ROOT", root):
+            (scripts / "lock.json").write_text(json.dumps(lock))
+            with patch.object(node, "ROOT", scripts), patch.object(ci, "node_module", return_value=node):
                 result = ci.node_inputs("linux-x64", output)
             self.assertEqual(Path(result["executable"]["path"]).read_bytes(), b"exact-node")
             self.assertEqual(Path(result["license"]["path"]).read_bytes(), b"exact-license")
             self.assertFalse((root / "outside").exists())
+            self.assertEqual(set(result), {"version", "executable", "license"})
+            self.assertEqual(result["version"], "22.23.5")
+            self.assertEqual(result["executable"]["sha256"], hashlib.sha256(b"exact-node").hexdigest())
+            provenance = json.loads((output / "node-provenance.json").read_text())
+            self.assertEqual(provenance, {**lock["targets"]["linux-x64"], "version": lock["version"],
+                "checksum_source": lock["source"], "url": "https://nodejs.org/dist/v22.23.5/" + name})
+
+    def test_node_adapter_refuses_replacing_a_previous_materialization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            (output / "node").mkdir()
+            (output / "node/node").write_bytes(b"preserve an earlier build")
+            with patch.object(node, "download", side_effect=AssertionError("No acquisition expected")), \
+                    patch.object(ci, "node_module", return_value=node):
+                with self.assertRaisesRegex(ValueError, "new Node package destination"):
+                    ci.node_inputs("linux-x64", output)
+            self.assertEqual((output / "node/node").read_bytes(), b"preserve an earlier build")
+            self.assertFalse((output / "node-provenance.json").exists())
 
     def test_corrupt_cached_node_cannot_be_executed_or_packaged(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "scripts").mkdir()
-            (root / "scripts/native-node-lock.json").write_text(json.dumps({"version": "22.23.5", "source": "https://nodejs.org/",
+            (root / "scripts/lock.json").write_text(json.dumps({"version": "22.23.5", "source": "https://nodejs.org/",
                 "targets": {"linux-x64": {"file": "node.tar.xz", "sha256": "0" * 64}}}))
             (root / "node.tar.xz").write_bytes(b"corrupt")
-            with patch.object(ci, "ROOT", root):
+            with patch.object(node, "ROOT", root / "scripts"), patch.object(ci, "node_module", return_value=node):
                 with self.assertRaisesRegex(ValueError, "checksum"):
                     ci.node_inputs("linux-x64", root)
             self.assertFalse((root / "node").exists())

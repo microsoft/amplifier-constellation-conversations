@@ -8,6 +8,12 @@ on:
       - 'src/**'
       - 'bridge/**'
       - 'scripts/*native*'
+      - 'scripts/vendor/node/**'
+      - 'scripts/vendor/node-provenance.json'
+      - 'scripts/vendor/node-LICENSE'
+      - 'ops/companion.example.json'
+      - 'ops/pam-agent-conversations'
+      - 'docs/native-*.md'
       - 'tests/*native*'
       - 'tests/native/**'
       - '.github/workflows/native-platform.yml'
@@ -101,7 +107,9 @@ jobs:
           python -m pip install --no-deps --only-binary=:all: --require-hashes -r scripts/native-build-requirements.txt
           python scripts/check-native-imports.py --inputs '${{ runner.temp }}/native-inputs/inputs.json' --output '${{ runner.temp }}/native-inputs/pe-imports.json'
       - name: Check package validation regressions
-        run: python -m unittest discover -s tests -p 'test_*native*.py'
+        run: |
+          python -m unittest discover -s tests -p 'test_*native*.py'
+          python scripts/vendor/node/test_support.py
       - name: Assemble self-contained immutable bundle
         run: python scripts/package-native.py build --inputs '${{ runner.temp }}/native-inputs/inputs.json' --output dist
       - name: Install and launch with developer tools absent from child PATH

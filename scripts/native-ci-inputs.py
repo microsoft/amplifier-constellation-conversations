@@ -13,9 +13,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import tarfile
-import urllib.request
-import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,59 +28,27 @@ def package_module():
     return module
 
 
+def node_module():
+    # Byte-exact upstream build helper; provenance lives beside the vendor tree.
+    spec = importlib.util.spec_from_file_location("constellation_node_support",
+        ROOT / "scripts/vendor/node/node_support.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def node_inputs(target: str, scratch: Path) -> dict:
-    lock = json.loads((ROOT / "scripts/native-node-lock.json").read_text())
-    row = lock["targets"][target]
-    url = f'https://nodejs.org/dist/v{lock["version"]}/{row["file"]}'
-    archive = scratch / row["file"]
-    if not archive.exists():
-        temporary = archive.with_suffix(archive.suffix + ".part")
-        try:
-            with urllib.request.urlopen(url, timeout=90) as response, temporary.open("xb") as output:
-                while block := response.read(1024 * 1024):
-                    output.write(block)
-            if digest(temporary)["sha256"] != row["sha256"]:
-                raise ValueError("Official Node archive checksum does not match frozen input")
-            temporary.replace(archive)
-        finally:
-            temporary.unlink(missing_ok=True)
-    if digest(archive)["sha256"] != row["sha256"]:
-        raise ValueError("Cached Node archive checksum does not match frozen input")
-    windows = target.startswith("windows-")
-    name = "node.exe" if windows else "node"
-    suffix = "/node.exe" if windows else "/bin/node"
-    prefix = row["file"]
-    for extension in (".tar.gz", ".tar.xz", ".zip"):
-        prefix = prefix.removesuffix(extension)
-    names = {prefix + suffix: name, prefix + "/LICENSE": "LICENSE"}
-    extracted = {}
-    if windows:
-        with zipfile.ZipFile(archive) as stream:
-            for member in stream.infolist():
-                if member.filename in names:
-                    key = names[member.filename]
-                    if key in extracted or member.is_dir():
-                        raise ValueError("Ambiguous official Node archive inputs")
-                    extracted[key] = stream.read(member)
-    else:
-        with tarfile.open(archive) as stream:
-            for member in stream:
-                if member.name in names:
-                    key = names[member.name]
-                    if key in extracted or not member.isfile():
-                        raise ValueError("Ambiguous official Node archive inputs")
-                    extracted[key] = stream.extractfile(member).read()
-    if set(extracted) != {name, "LICENSE"}:
-        raise ValueError("Incomplete official Node archive")
-    destination = scratch / "node"
-    destination.mkdir(exist_ok=True)
-    for key, data in extracted.items():
-        (destination / key).write_bytes(data)
-    (destination / name).chmod(0o755)
-    (scratch / "node-provenance.json").write_text(json.dumps({**row, "url": url,
-        "checksum_source": lock["source"], "version": lock["version"]}, indent=2) + "\n")
-    return {"executable": digest(destination / name), "license": digest(destination / "LICENSE"),
-            "version": lock["version"]}
+    prepared = node_module().prepare(target, scratch, scratch / "node")
+    # Keep this component's established input/receipt shape. Acquisition, cache
+    # validation and extraction belong to the accepted shared implementation.
+    version = prepared["version"]
+    (scratch / "node-provenance.json").write_text(json.dumps({
+        "file": prepared["archive"], "sha256": prepared["archive_sha256"],
+        "url": f'https://nodejs.org/dist/v{version}/{prepared["archive"]}',
+        "checksum_source": prepared["checksum_source"], "version": version}, indent=2) + "\n")
+    return {"executable": {"path": prepared["executable"], "sha256": prepared["executable_sha256"]},
+            "license": {"path": prepared["license"], "sha256": prepared["license_sha256"]},
+            "version": version}
 
 
 def rust_notices(scratch: Path) -> Path:
