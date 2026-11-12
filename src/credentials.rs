@@ -39,9 +39,6 @@ fn ordinary(metadata: &fs::Metadata, directory: bool) -> bool {
     } else {
         metadata.is_file()
     };
-    if !expected || metadata.file_type().is_symlink() {
-        return false;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -50,7 +47,7 @@ fn ordinary(metadata: &fs::Metadata, directory: bool) -> bool {
             return false;
         }
     }
-    true
+    expected && !metadata.file_type().is_symlink()
 }
 
 fn check_path(metadata: &fs::Metadata, directory: bool, require_private: bool) -> Result<()> {

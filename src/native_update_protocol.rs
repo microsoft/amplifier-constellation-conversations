@@ -194,9 +194,6 @@ fn absolute(path: &Path) -> Result<()> {
     Ok(())
 }
 fn ordinary(metadata: &fs::Metadata) -> bool {
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return false;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -204,7 +201,7 @@ fn ordinary(metadata: &fs::Metadata) -> bool {
             return false;
         }
     }
-    true
+    metadata.is_file() && !metadata.file_type().is_symlink()
 }
 fn read_regular(path: &Path, limit: u64, private: bool) -> Result<Vec<u8>> {
     ensure!(
