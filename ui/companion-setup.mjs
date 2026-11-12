@@ -115,7 +115,7 @@ export function installSetup({api, getSession, signedIn, refreshContacts, showLo
       await api('/api/v1/companion/local-agent','POST',{id:$('local-agent-id').value,label:$('local-agent-label').value,home:$('local-agent-home').value});
       if (generation !== setupGeneration) return;
       error('local-agent-status','Connection saved. Select it above to add a voice contact.');
-      await refresh(); $('setup-agent').value = $('local-agent-id').value; $('setup-agent').onchange(); $('setup-agent').focus();
+      await refresh(); $('setup-agent').value = $('local-agent-id').value; $('setup-agent').onchange?.(); $('setup-agent').focus();
     } catch (failure) {
       if (generation === setupGeneration) error('local-agent-status',failure.uncertain ? 'The connection check could not be confirmed. Refresh the saved list before trying again.' : failure.message);
     } finally { $('connect-local-agent').disabled = false; }
