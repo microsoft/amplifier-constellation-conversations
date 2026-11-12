@@ -193,6 +193,7 @@ fn router(state: Arc<RecoveryState>) -> Router {
         .route("/auth/local-listener-proof", post(proof))
         .route("/api/v1/companion/update", get(status))
         .route("/api/v1/companion/update/recover", post(recover))
+        .route("/api/v1/companion/update/cleanup", post(cleanup))
         .route(RELEASE_PATH, post(release))
         .route(IDENTITY_PATH, get(identity))
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -250,6 +251,24 @@ async fn recover(
     })?
     .map(Json)
 }
+async fn cleanup(
+    State(state): State<Arc<RecoveryState>>,
+    headers: HeaderMap,
+    Json(_input): Json<crate::native_browser_cleanup::CleanupInput>,
+) -> ApiResult<Json<Value>> {
+    auth::check_account(state.account(), &headers, "admin", true)?;
+    let home = state.home.clone();
+    tokio::task::spawn_blocking(move || crate::native_browser_cleanup::cleanup(&home))
+        .await
+        .map_err(|_| {
+            ApiError(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Retained cleanup completion could not be observed".into(),
+            )
+        })?
+        .map(Json)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Proof {

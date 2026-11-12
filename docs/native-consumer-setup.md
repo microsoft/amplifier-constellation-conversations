@@ -75,3 +75,14 @@ consumer OS, password sign-in after a reboot, physical microphone/camera behavio
 and publisher signing or notarization. Those results require their own receipts;
 package integrity alone does not establish them. The paused speech variant is not
 activated by native packaging or setup.
+
+
+Settled native operation registrations are maintained through authenticated
+`POST /api/v1/companion/update/cleanup` with an empty JSON object. The request
+accepts no caller paths or profiles. It reports confirmed retirement, refusal,
+or uncertainty for each retained worker/replacement identity; an active
+replacement is preserved. Original launch and retirement evidence remains
+private. Explicit package CHECK also performs bounded maintenance, while GET is
+read-only. A cleanup inventory refusal is recorded and does not claim cleanup
+succeeded or prevent package validation. Uncertain retirement is observation-only
+on later requests; it is never automatically dispatched again.

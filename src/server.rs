@@ -26,6 +26,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(crate::native_update::router())
         .merge(crate::native_browser_update::router())
+        .merge(crate::native_browser_cleanup::router())
         .merge(crate::native_browser_update::assets())
         .route(
             "/markdown-notices.txt",

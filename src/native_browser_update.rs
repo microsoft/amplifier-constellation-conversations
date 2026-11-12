@@ -523,6 +523,7 @@ pub(crate) fn check(
             "Choose the full path to an extracted complete native package",
         ));
     }
+    crate::native_browser_cleanup::before_check(home)?;
     let package = crate::desktop::checked_package_folder(&input.package_path)?;
     let plan = native_update::plan(home, &package)?;
     if !plan["version"]
@@ -1095,6 +1096,59 @@ pub(crate) fn owns_pending_transaction(home: &Path, transaction: &str) -> Result
         .is_some_and(|op| op.transaction_id == transaction && op.attempt.claimed))
 }
 
+/// A cleanup snapshot contains only identities with a terminal verified native
+/// outcome. Private plans, package paths and startup nonces remain in the ledger.
+pub(crate) struct CleanupAuthority {
+    pub(crate) workers: std::collections::BTreeSet<(String, String)>,
+    pub(crate) transactions: std::collections::BTreeSet<String>,
+    pub current_settled: bool,
+}
+impl CleanupAuthority {
+    pub fn worker(&self, operation: &str, attempt: &str) -> bool {
+        self.workers
+            .contains(&(operation.to_owned(), attempt.to_owned()))
+    }
+    pub fn replacement(&self, transaction: &str) -> bool {
+        self.transactions.contains(transaction)
+    }
+}
+pub(crate) fn cleanup_authority(home: &Path) -> Result<CleanupAuthority> {
+    let ledger = load(home)?;
+    let journal = native_update::recovery_snapshot(home)?;
+    let mut authority = CleanupAuthority {
+        workers: Default::default(),
+        transactions: Default::default(),
+        current_settled: ledger.current_operation.is_none(),
+    };
+    for original in ledger.operations.values() {
+        let mut operation = original.clone();
+        settle(&mut operation, journal.as_ref());
+        let verified = terminal(&operation)
+            && operation
+                .outcome
+                .as_deref()
+                .is_some_and(|outcome| matches!(outcome, "unchanged" | "applied" | "rolled_back"));
+        if ledger.current_operation.as_deref() == Some(&operation.id) {
+            authority.current_settled = verified;
+        }
+        if verified {
+            authority
+                .transactions
+                .insert(operation.transaction_id.clone());
+            for request in ledger
+                .requests
+                .values()
+                .filter(|request| request.operation_id == operation.id)
+            {
+                authority
+                    .workers
+                    .insert((operation.id.clone(), request.attempt_id.clone()));
+            }
+        }
+    }
+    Ok(authority)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1649,6 +1703,52 @@ mod tests {
             before
         );
         assert_eq!(launch.calls.load(Ordering::SeqCst), calls);
+    }
+    #[test]
+    fn cleanup_authority_requires_verified_terminal_outcome_and_known_attempts() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let checked = fixture.check(&launch);
+        let first = id();
+        let accepted = apply(
+            &fixture.home,
+            ApplyInput {
+                request_id: first.clone(),
+                check_id: checked,
+            },
+            &launch,
+        )
+        .unwrap();
+        let tx = accepted["operation"]["transaction_id"].as_str().unwrap();
+        let second = id();
+        recover(
+            &fixture.home,
+            "normal",
+            RecoverInput {
+                request_id: second.clone(),
+                operation_id: first.clone(),
+                action: RecoveryAction::Resume,
+            },
+            &launch,
+        )
+        .unwrap();
+        let pending = cleanup_authority(&fixture.home).unwrap();
+        assert!(!pending.worker(&first, &first));
+        assert!(!pending.replacement(tx));
+        assert!(!pending.current_settled);
+        journal(&fixture.home, tx, "restored");
+        let settled = cleanup_authority(&fixture.home).unwrap();
+        assert!(settled.worker(&first, &first));
+        assert!(settled.worker(&first, &second));
+        assert!(!settled.worker(&first, &id()));
+        assert!(settled.replacement(tx));
+        assert!(settled.current_settled);
+        let mut ledger = load(&fixture.home).unwrap();
+        let operation = ledger.operations.get_mut(&first).unwrap();
+        operation.state = OperationState::Failed;
+        operation.outcome = None;
+        save(&fixture.home, &ledger).unwrap();
+        assert!(!cleanup_authority(&fixture.home).unwrap().replacement(tx));
     }
     #[test]
     fn unavailable_or_enrolled_never_records_or_dispatches_new_request() {
