@@ -2422,8 +2422,9 @@ fn mismatched_domain_queue_and_malformed_amendment_cannot_become_facts() {
 fn scoped_outcome_requires_exact_original_actor_audience_and_source_receipt() {
     let request = uuid::Uuid::new_v4().to_string();
     let queue = uuid::Uuid::new_v4().to_string();
+    let source_at = now_ms();
     let source = json!({"version":1,"request_id":request,"call_id":"original-call","intent_id":"original-intent",
-        "revision":"original-human-text-revision","occurred_at":timestamp(now_ms()),
+        "revision":"original-human-text-revision","occurred_at":timestamp(source_at),
         "actor":{"id":"authenticated-human","label":"authenticated-human"},
         "audience":{"kind":"private","experience":"companion","id":"original-room"}});
     let action = json!({"request_id":request,"receipt":{"request_id":request,"state":"queued","scope":"private_installation_input",
@@ -2473,7 +2474,7 @@ fn scoped_outcome_requires_exact_original_actor_audience_and_source_receipt() {
         ("call_id", json!("other-call")),
         ("intent_id", json!("other-intent")),
         ("revision", json!("other-revision")),
-        ("occurred_at", json!(timestamp(now_ms() - 1000))),
+        ("occurred_at", json!(timestamp(source_at - 1000))),
         ("request_id", json!(uuid::Uuid::new_v4().to_string())),
     ] {
         let mut changed = update.clone();

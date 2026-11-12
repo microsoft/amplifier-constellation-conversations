@@ -213,6 +213,11 @@ pub fn set(state: &AppState, id: &str, status: &str) -> Result<()> {
     state.changed();
     Ok(())
 }
+
+/// Exact existing evidence that a locally prepared prompt never reached a
+/// backend. SQL callers bind `d` to its delivery and `m` to its exact assistant
+/// target in the same conversation/agent; a generic rejection label is not proof.
+pub(crate) const PROVEN_NOT_STARTED: &str = "d.state='notAccepted' AND COALESCE(d.mode,'')='prompt' AND COALESCE(d.session_id,'')='' AND COALESCE(d.endpoint,'')='' AND d.receipt IS NULL AND COALESCE(m.status,'')='interrupted' AND COALESCE(m.text,'')=''";
 pub fn bind(
     state: &AppState,
     id: &str,
@@ -301,7 +306,14 @@ pub async fn resolve(
     if running.contains_key(&room) {
         return Err(ApiError::busy());
     }
-    let changed=s.db.lock().unwrap().execute("UPDATE input_deliveries SET state='ack_pending',updated_at=?3 WHERE id=?1 AND conversation_id=?2 AND state IN ('unknown','notAccepted') AND message_id IN (SELECT id FROM messages WHERE actor=?4)",params![id,room,now_ms(),p.actor])?;
+    let changed = {
+        let mut db = s.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::update_admission::ensure_open(&tx)?;
+        let changed=tx.execute("UPDATE input_deliveries SET state='ack_pending',updated_at=?3 WHERE id=?1 AND conversation_id=?2 AND state IN ('unknown','notAccepted') AND message_id IN (SELECT id FROM messages WHERE actor=?4)",params![id,room,now_ms(),p.actor])?;
+        tx.commit()?;
+        changed
+    };
     if changed == 0 {
         return Err(ApiError::bad(
             "Only the message author can acknowledge its uncertain delivery",
@@ -346,6 +358,9 @@ pub fn pending_ack(state: &AppState, room: &str, agent: &str) -> Result<Vec<Ackn
 pub fn launch(state: &Arc<AppState>, room: &str) {
     let mut running = state.running.lock().unwrap();
     if running.contains_key(room) {
+        return;
+    }
+    if crate::update_admission::closed(&state.db.lock().unwrap()).unwrap_or(true) {
         return;
     }
     let (tx, rx) = watch::channel(false);

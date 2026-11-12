@@ -65,7 +65,10 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
             suffix: '.exe'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # Native builds plus multiple whole-bundle/OS-startup rollback transactions
+    # need a separate CI wall clock. Participant prepare/restore still use 30s,
+    # and verification 300s; no application or agent-work allowance is extended.
+    timeout-minutes: 75
     defaults:
       run:
         shell: bash
@@ -95,6 +98,7 @@ jobs:
       - name: Build the native executable and run platform unit tests
         run: |
           python scripts/run-native-rust-tests.py --target '${{ matrix.rust_target }}' --output '${{ runner.temp }}/native-rust-tests.json'
+          cargo test --locked --target '${{ matrix.rust_target }}' --test native_update_bundle --test native_update_admission
           cargo build --locked --target '${{ matrix.rust_target }}' --release
       - name: Acquire locked build-time dependencies
         run: |
@@ -125,6 +129,42 @@ jobs:
           import json
           receipt = json.loads(receipts[0].read_text())
           module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/clean-path-install.json').resolve())
+          PY
+      - name: Verify standalone and enrolled whole-bundle update and rollback
+        run: |
+          python - <<'PY'
+          import importlib.util, json
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('native_update_lifecycle', 'tests/native_update_lifecycle.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          receipts = list(Path('dist').glob('conversations-*.json'))
+          assert len(receipts) == 1, 'Expected one immutable package receipt'
+          receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
+          module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/native-update-lifecycle.json').resolve())
+          PY
+      - name: Prepare disposable Linux current-user service manager
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Register, start, verify, stop and remove disposable native startup
+        env:
+          CONSTELLATION_NATIVE_STARTUP_TEST: '1'
+        run: |
+          python - <<'PY'
+          import importlib.util, json
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('native_startup', 'scripts/test-native-startup.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          receipts = list(Path('dist').glob('conversations-*.json'))
+          assert len(receipts) == 1, 'Expected one immutable package receipt'
+          receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
+          result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/native-startup.json').resolve())
+          assert result['status'] == 'passed', 'Unavailable startup manager is not a passing qualification'
           PY
       - name: Test minimal Ubuntu userland without installed developer tools
         if: runner.os == 'Linux'
@@ -159,6 +199,8 @@ jobs:
 # These lanes use native hosted runners; Linux additionally exercises an isolated
 # Ubuntu userland with no developer tools installed. They do not install onto a newly
 # provisioned consumer machine, enroll OS certificate trust, test an OS password,
-# exercise a physical microphone/camera, sign artifacts, publish a release or
+# or exercise a real sign-out/sign-in cycle. The separate startup step uses one
+# UUID-named registration on the disposable runner account, not an existing user
+# desktop. These lanes do not exercise physical microphone/camera, sign, publish or
 # adopt a package on any existing installation. In particular this workflow does
 # not resume the separately paused speech release.

@@ -26,6 +26,7 @@ pub struct AppState {
     pub config: Config,
     pub db: Mutex<Connection>,
     pub changes: watch::Sender<u64>,
+    pub(crate) native_shutdown: watch::Sender<bool>,
     pub login_gate: Arc<Semaphore>,
     pub turn_gate: Arc<Semaphore>,
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
@@ -57,6 +58,7 @@ impl AppState {
         crate::companion_surface::migrate(&db)?;
         crate::huddles::migrate(&db)?;
         crate::huddle_auto::migrate(&db)?;
+        crate::update_admission::migrate(&db)?;
         db.execute("UPDATE conversations SET status='error',note='The service restarted during this turn. Review delivery status before continuing; work was not replayed.' WHERE status='working'", [])?;
         db.execute(
             "UPDATE messages SET status='interrupted' WHERE status='streaming'",
@@ -95,6 +97,7 @@ impl AppState {
             config,
             db: Mutex::new(db),
             changes: watch::channel(0).0,
+            native_shutdown: watch::channel(false).0,
             login_gate: Arc::new(Semaphore::new(2)),
             turn_gate: Arc::new(Semaphore::new(4)),
             running: Mutex::new(HashMap::new()),

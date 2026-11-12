@@ -208,6 +208,17 @@ class NativeBuildHarnessTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "successful"):
             rust_tests.passed_counts("test result: FAILED. 0 passed; 1 failed; 0 ignored;")
 
+    def test_service_spawn_qualification_runs_on_each_native_target(self):
+        # This filter includes portable UTF-16 encoding cases and, on Windows,
+        # the real persistent-child handle exclusion witness.
+        self.assertIn(("native_update_process::", False), rust_tests.SELECTIONS)
+
+    def test_participant_clock_qualification_runs_on_each_native_target(self):
+        self.assertIn(("native_update_clock::", False), rust_tests.SELECTIONS)
+
+    def test_startup_authorization_qualification_runs_on_each_native_target(self):
+        self.assertIn(("native_update::startup_tests::", False), rust_tests.SELECTIONS)
+
     def test_certificate_failures_are_not_retried_as_startup_delays(self):
         error = ssl.SSLCertVerificationError(1, "Missing Authority Key Identifier")
         self.assertTrue(clean.certificate_failure(error))

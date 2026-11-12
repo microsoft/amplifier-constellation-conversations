@@ -363,6 +363,45 @@ fn outcome_terminal(value: &Value) -> bool {
             ))
 }
 
+/// Read-only lifecycle classification of an immutable submission receipt plus
+/// its later domain observation. This is settlement within the observed scope,
+/// not a claim that an external task succeeded or permission to replay it.
+pub(crate) fn action_settled_for_update(
+    db: &rusqlite::Connection,
+    call: &str,
+    request: &str,
+) -> Result<bool> {
+    let row: Option<(String, String, String)> = db.query_row(
+        "SELECT a.connection_id,a.result,o.data FROM companion_actions a JOIN companion_action_observers b ON b.call_id=a.call_id AND b.request_id=a.request_id AND b.connection_id=a.connection_id JOIN companion_observations o ON o.call_id=a.call_id AND o.request_id=a.request_id WHERE a.call_id=?1 AND a.request_id=?2 AND a.state IN ('queued','accepted')",
+        params![call, request], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional()?;
+    let Some((connection, receipt, observation)) = row else {
+        return Ok(false);
+    };
+    let (Ok(receipt), Ok(observation)) = (
+        serde_json::from_str::<Value>(&receipt),
+        serde_json::from_str::<Value>(&observation),
+    ) else {
+        return Ok(false);
+    };
+    if !original_source_valid(db, call, request)? {
+        return Ok(false);
+    }
+    if let Some(queue) = receipt["receipt"]["request_id"].as_str() {
+        let count: i64 = db.query_row(
+            "SELECT count(*) FROM companion_actions WHERE connection_id=?1 AND json_extract(result,'$.receipt.request_id')=?2",
+            params![connection, queue], |r| r.get(0),
+        )?;
+        if count != 1 {
+            return Ok(false);
+        }
+    }
+    Ok(observation_valid(
+        &observation,
+        &[json!({"request_id":request,"receipt":receipt})],
+    ) && outcome_terminal(&observation))
+}
+
 /// Exact owner/agent/endpoint and private-room binding is checked on every read,
 /// including after hang-up and after restart. Config changes revoke this reader.
 fn tracked_actions(
