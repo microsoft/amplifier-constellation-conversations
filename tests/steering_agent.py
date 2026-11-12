@@ -45,7 +45,7 @@ while True:
     method=value.get('method');p=value.get('params',{})
     if method=='initialize':
         result={'protocolVersion':1,'agentCapabilities':{'loadSession':True},'agentInfo':{'name':'Steering fixture','version':'1'}}
-        if mode!='generic':result['_meta']={'steering':{'supported':True,'version':1,'idleBehavior':['promptRequired'],'receiptsMethod':'_session/input_receipts','acknowledgeMethod':'_session/acknowledge_inputs'}}
+        if mode!='generic' and not mode.startswith('cleanup-'):result['_meta']={'steering':{'supported':True,'version':1,'idleBehavior':['promptRequired'],'receiptsMethod':'_session/input_receipts','acknowledgeMethod':'_session/acknowledge_inputs'}}
         if mode.startswith('attention_'):result['_meta']['com.microsoft.amplifier.attention']={'version':1,'enabled':True,'method':'_amplifier/attention'}
         write({'id':value['id'],'result':result})
     elif method=='session/load' and log.with_name('reject-load').exists():
@@ -103,3 +103,23 @@ while True:
         approved=True
         if value.get('result',{}).get('outcome',{}).get('optionId')=='yes':record({'effect':'write-once'})
     elif method:write({'id':value.get('id'),'error':{'code':-32601,'message':'Unsupported'}})
+
+if mode.startswith('cleanup-'):
+    record({'cleanup':'eof','pid':os.getpid()})
+    # These must never become new answer text, approval, or host work after end_turn.
+    write({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'LATE ANSWER'}}}})
+    write({'id':'late-write','method':'fs/write_text_file','params':{'sessionId':sid,'path':str(log.with_name('late-write')),'content':'not admitted'}})
+    write({'id':'late-permission','method':'session/request_permission','params':{'sessionId':sid,'toolCall':{'toolCallId':'late','title':'Must not be admitted','kind':'edit'},'options':[{'optionId':'yes','kind':'allow_once','name':'Allow'}]}})
+    if mode=='cleanup-early-eof':
+        import subprocess
+        child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        record({'cleanup':'descendant','pid':child.pid})
+        os.close(1)
+        time.sleep(120)
+    elif mode=='cleanup-error':
+        # Exceed the existing frame bound: terminal drain fails, not the prompt.
+        os.write(1,b'x'*(24*1024*1024+1)+b'\n')
+        time.sleep(120)
+    else:
+        while not log.with_name('cleanup-release').exists():time.sleep(.01)
+        record({'cleanup':'finished','pid':os.getpid()})

@@ -393,17 +393,44 @@ impl Client {
         );
         Ok(init)
     }
-}
-impl Drop for Client {
-    fn drop(&mut self) {
+
+    fn terminate(&mut self) {
         #[cfg(unix)]
         if self.pid > 0 {
-            // SAFETY: this positive PID identifies the process group started above.
+            // The child has not been waited/reaped, so its PID still identifies
+            // our process group. Dispose descendants before releasing that ID.
             unsafe {
                 libc::kill(-(self.pid as i32), libc::SIGKILL);
             }
+            self.pid = 0;
         }
         let _ = self.child.start_kill();
+    }
+}
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// A prompt already accepted by the conversation, with its process still owned.
+/// Disposal cannot change that prompt's result or admit another callback.
+pub(crate) struct CompletedTurn(Client);
+
+impl CompletedTurn {
+    pub(crate) async fn close(mut self, cancel: &mut tokio::sync::watch::Receiver<bool>) {
+        let mut cancel = Some(cancel.clone());
+        // Match the existing cancellation grace. This is terminal transport
+        // cleanup, not an acknowledgment that all auxiliary work has finished.
+        tokio::select! {
+            biased;
+            _ = cancel_signal(&mut cancel) => {},
+            _ = tokio::time::timeout(Duration::from_secs(3), self.0.peer.connection.close_and_drain()) => {},
+        }
+        // EOF ends the opportunity, even if a peer closed stdout early. Keep
+        // the child unreaped until group disposal; never signal a reused PGID.
+        self.0.terminate();
+        let _ = self.0.child.wait().await;
     }
 }
 pub async fn probe(agent: &Agent) -> Result<Value> {
@@ -414,6 +441,14 @@ pub async fn probe(agent: &Agent) -> Result<Value> {
     }).await.context("ACP connection check timed out")?
 }
 pub async fn deliver(state: Arc<AppState>, input: crate::delivery::Input) -> Result<()> {
+    // Callers without the room worker retain immediate process disposal.
+    deliver_owned(state, input).await.map(drop)
+}
+
+pub(crate) async fn deliver_owned(
+    state: Arc<AppState>,
+    input: crate::delivery::Input,
+) -> Result<Option<CompletedTurn>> {
     if let Err(error) = crate::delivery::check_owner(&state, &input) {
         crate::delivery::set(&state, &input.id, "cancelled")?;
         return Err(error);
@@ -519,6 +554,7 @@ pub async fn reconcile(state: Arc<AppState>, input: crate::delivery::Input) -> R
     tokio::time::timeout(Duration::from_secs(timeout + 5), turn_agent(state, turn))
         .await
         .context("Delivery review timed out")?
+        .map(drop)
 }
 
 struct CallbackLifetime(Arc<crate::client_callbacks::ClientCallbacks>);
@@ -573,7 +609,7 @@ fn steering_params(
         json!({"sessionId":sid,"prompt":blocks,"_meta":{"steering":{"idleBehavior":"promptRequired","inputId":input.id},"com.microsoft.amplifier.conversations":{"messageId":input.message_id,"author":input.actor,"sequence":input.seq,"conversationId":input.room}}}),
     )
 }
-async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
+async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<Option<CompletedTurn>> {
     let Turn {
         agent_id,
         agent,
@@ -789,7 +825,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
         crate::delivery::set(&state, &id, "dismissed")?;
     }
     if reconcile_only {
-        return Ok(());
+        return Ok(None);
     }
     state.db.lock().unwrap().execute(
         "UPDATE room_agents SET session_id=?3,endpoint=?4 WHERE conversation_id=?1 AND agent_id=?2",
@@ -835,7 +871,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 .execute("DELETE FROM messages WHERE id=?1", [&message_id])?;
             crate::delivery::set(&state, &input_id, "held")?;
             state.changed();
-            return Ok(());
+            return Ok(None);
         }
         ensure!(
             offer["id"].is_string() && offer["ticket"].is_string(),
@@ -1134,7 +1170,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<()> {
                 )?;
             }
             state.db.lock().unwrap().execute("UPDATE room_agents SET last_seq=MAX(last_seq,?3,COALESCE((SELECT MAX(m.seq) FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.target_turn=?4 AND d.state IN ('submitted','received_remote','remoteQueued','incorporated','completed')),0)) WHERE conversation_id=?1 AND agent_id=?2",params![conversation,agent_id,source_seq,message_id])?;
-            return Ok(());
+            return Ok(Some(CompletedTurn(c)));
         }
         if v["method"] == "$/cancel_request" {
             forms.cancel(&v["params"]["requestId"]);

@@ -31,6 +31,20 @@ of an opaque agent. Each `(room, agent connection)` retains its own session,
 queue and delivered cursor. A message targeting another agent or another room
 never enters the current prompt. Per-room agent execution remains sequential.
 
+After a successful prompt, its response and delivery are final and visible before
+the client closes the agent's input and drains output for at most three seconds.
+This terminal cleanup does not dispatch callbacks, append to the completed answer
+or admit new work. The same room waits for cleanup before its next prompt, while
+other rooms can use the released execution capacity. Stop ends the wait without
+changing the accepted response or replaying it.
+
+Output EOF, cleanup failure, Stop or the deadline ends this best-effort opportunity:
+Conversations terminates the child and, on Unix, its still-owned process group,
+then reaps the child. EOF is
+not proof of process exit or graceful agent retirement; an agent that closes
+stdout early gets no further execution grace. Auxiliary work is not guaranteed
+to finish. Failure and interrupted-prompt disposal otherwise remain unchanged.
+
 The queue is bounded to 32 unresolved source messages and 8 MiB of source text
 and attachments per room. HTTP 429 means the new message was not accepted. No
 accepted source is silently discarded. Each ordinary next prompt takes its own

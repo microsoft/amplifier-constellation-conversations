@@ -86,13 +86,22 @@ impl Fixture {
         }
     }
     async fn request(&self, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
+        self.request_in(&self.room, method, path, body).await
+    }
+    async fn request_in(
+        &self,
+        room: &str,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let r = self
             .app
             .clone()
             .oneshot(
                 Request::builder()
                     .method(method)
-                    .uri(format!("/api/v1/conversations/{}/{path}", self.room))
+                    .uri(format!("/api/v1/conversations/{room}/{path}"))
                     .header("authorization", format!("Bearer {}", self.token))
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
@@ -380,6 +389,149 @@ async fn ordinary_acp_queues_without_cancelling_or_overlapping() {
             .any(|v| v["method"] == "session/cancel" || v["method"] == "_session/steering")
     );
     assert!(f.deliveries().iter().all(|d| d["state"] == "completed"));
+}
+
+async fn cleanup_started(f: &Fixture) -> u32 {
+    for _ in 0..500 {
+        if let Some(row) = f.frames().iter().find(|v| v["cleanup"] == "eof") {
+            return row["pid"].as_u64().unwrap() as u32;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("The peer did not observe input EOF");
+}
+
+fn assert_cleanup_kept_success(f: &Fixture) {
+    let room = f.state.conversation(&f.room).unwrap().unwrap();
+    let messages = room["messages"].as_array().unwrap();
+    let answers: Vec<_> = messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert!(!answers.is_empty());
+    for answer in answers {
+        assert_eq!(answer["status"], "complete");
+        assert_eq!(answer["text"], "Completed the work once.");
+    }
+    assert!(f.deliveries().iter().all(|d| d["state"] == "completed"));
+    assert!(f.state.permissions.list(&f.room, "owner").is_empty());
+    assert!(!f.home.path().join("late-write").exists());
+}
+
+#[tokio::test]
+async fn cleanup_releases_capacity_but_keeps_same_room_sequential_and_success_visible() {
+    let f = Fixture::new("cleanup-hold", false, false);
+    // Leave one global slot, so another room needs this turn's released permit.
+    let _other_slots = f
+        .state
+        .turn_gate
+        .clone()
+        .acquire_many_owned(3)
+        .await
+        .unwrap();
+    let mut changes = f.state.changes.subscribe();
+    f.send("Original").await;
+    f.release();
+    cleanup_started(&f).await;
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    assert_cleanup_kept_success(&f);
+    assert!(f.state.running.lock().unwrap().contains_key(&f.room));
+    assert_eq!(f.state.turn_gate.available_permits(), 1);
+
+    f.send("Same room next").await;
+    let other = f.state.create("Other room").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        f.request_in(
+            &other,
+            "POST",
+            "messages",
+            json!({"text":"Other room now","request_id":uuid::Uuid::new_v4()})
+        )
+        .await
+        .0,
+        StatusCode::ACCEPTED
+    );
+    f.frames_at_least("session/prompt", 2).await;
+    let frames = f.frames();
+    let prompts: Vec<_> = frames
+        .iter()
+        .filter(|v| v["method"] == "session/prompt")
+        .collect();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[1]["params"]["prompt"][0]["text"], "Other room now");
+    std::fs::write(f.home.path().join("cleanup-release"), b"1").unwrap();
+    f.idle().await;
+    f.frames_at_least("session/prompt", 3).await;
+    assert_cleanup_kept_success(&f);
+    assert!(f.frames().iter().any(|v| v["cleanup"] == "finished"));
+}
+
+#[tokio::test]
+async fn cleanup_deadline_and_stop_preserve_accepted_delivery_and_reap_child() {
+    for stop in [false, true] {
+        let f = Fixture::new("cleanup-hold", false, false);
+        f.send("Complete first").await;
+        f.release();
+        let pid = cleanup_started(&f).await;
+        assert_cleanup_kept_success(&f);
+        let before = tokio::time::Instant::now();
+        if stop {
+            assert_eq!(
+                f.request("POST", "cancel", json!({})).await.0,
+                StatusCode::OK
+            );
+        }
+        f.idle().await;
+        assert_cleanup_kept_success(&f);
+        assert!(!f.frames().iter().any(|v| v["cleanup"] == "finished"));
+        assert!(before.elapsed() < Duration::from_secs(if stop { 2 } else { 5 }));
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "Owned child was not reaped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cleanup_drain_failure_preserves_accepted_delivery() {
+    let f = Fixture::new("cleanup-error", false, false);
+    f.send("Complete first").await;
+    f.release();
+    cleanup_started(&f).await;
+    let before = tokio::time::Instant::now();
+    f.idle().await;
+    assert!(before.elapsed() < Duration::from_secs(2));
+    assert_cleanup_kept_success(&f);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cleanup_early_stdout_close_disposes_live_child_and_descendant_before_reaping() {
+    let f = Fixture::new("cleanup-early-eof", false, false);
+    f.send("Complete first").await;
+    f.release();
+    let pid = cleanup_started(&f).await;
+    let before = tokio::time::Instant::now();
+    f.idle().await;
+    assert!(before.elapsed() < Duration::from_secs(2));
+    assert_cleanup_kept_success(&f);
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    let frames = f.frames();
+    let descendant = frames
+        .iter()
+        .find(|v| v["cleanup"] == "descendant")
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    // The container's init may not have reaped the orphan yet; a zombie is dead.
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{descendant}/stat")) {
+        assert_eq!(stat.rsplit_once(") ").unwrap().1.chars().next(), Some('Z'));
+    }
 }
 
 #[tokio::test]
