@@ -446,9 +446,11 @@ async fn worker(state: Arc<AppState>, room: String, mut cancel: watch::Receiver<
             return;
         };
         let result = if recovery {
-            driver::reconcile(state.clone(), input.clone()).await
+            driver::reconcile(state.clone(), input.clone())
+                .await
+                .map(|()| None)
         } else {
-            driver::deliver(state.clone(), input.clone()).await
+            driver::deliver_owned(state.clone(), input.clone()).await
         };
         if result.is_err() {
             failed = true;
@@ -457,6 +459,12 @@ async fn worker(state: Arc<AppState>, room: String, mut cancel: watch::Receiver<
             }
         }
         state.changed();
+        // Accepted delivery is final and visible before terminal cleanup. Keep
+        // this room's worker/cancel ownership, but let other rooms use capacity.
+        drop(permit);
+        if let Ok(Some(completed)) = result {
+            completed.close(&mut cancel).await;
+        }
     }
 }
 
