@@ -134,8 +134,18 @@ class Installation:
             write_json(path, envelope)
             extra = {"CONSTELLATION_UPDATE_TRANSACTION": transaction,
                      "CONSTELLATION_UPDATE_PLAN": str(path), "CONSTELLATION_UPDATE_OUTCOME": outcome}
-        return self.command(["native-update-protocol", "--config", self.owner_config,
-                             "--mode", mode, "--action", action], extra_env=extra, expect_success=expect_success)
+        # Match the accepted shared Worker's participant clocks rather than
+        # letting this controller's general command allowance hide a hook overrun.
+        timeout = (300 if action == "verify" else 30) if mode == "participant" else 120
+        started = time.monotonic()
+        try:
+            return self.command(["native-update-protocol", "--config", self.owner_config,
+                                 "--mode", mode, "--action", action], extra_env=extra,
+                                expect_success=expect_success, timeout=timeout)
+        finally:
+            self.result.setdefault("protocol_timings", []).append({
+                "mode": mode, "action": action, "timeout_seconds": timeout,
+                "elapsed_seconds": time.monotonic() - started})
 
     @contextmanager
     def db(self):
