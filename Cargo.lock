@@ -86,7 +86,7 @@ dependencies = [
 [[package]]
 name = "amplifier-acp-connection"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/amplifier-constellation?rev=cf5df0622e42832b4709b14701a21add49cd1aa1#cf5df0622e42832b4709b14701a21add49cd1aa1"
+source = "git+https://github.com/microsoft/amplifier-constellation?rev=fd95c20a5773a739c8a1c99fb69713a2f0849bf3#fd95c20a5773a739c8a1c99fb69713a2f0849bf3"
 dependencies = [
  "agent-client-protocol",
  "anyhow",

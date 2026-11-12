@@ -9,7 +9,7 @@ repository = "https://github.com/microsoft/amplifier-constellation-conversations
 description = "Browser conversations, people and agents, threads, approvals, and source context."
 
 [dependencies]
-amplifier-acp-connection = { git = "https://github.com/microsoft/amplifier-constellation", rev = "cf5df0622e42832b4709b14701a21add49cd1aa1" }
+amplifier-acp-connection = { git = "https://github.com/microsoft/amplifier-constellation", rev = "fd95c20a5773a739c8a1c99fb69713a2f0849bf3" }
 anyhow = "1"
 base64 = "0.22"
 axum = { version = "0.8.9", features = ["macros"] }
