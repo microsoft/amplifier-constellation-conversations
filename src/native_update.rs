@@ -5,6 +5,7 @@ use crate::{
     auth,
     config::{self, Config},
     native_bundle, native_startup_state,
+    native_update_process::{self, ServiceChild},
     state::AppState,
     update_admission,
 };
@@ -21,7 +22,6 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -710,7 +710,7 @@ pub fn validate_start(home: &Path, startup: Option<(&str, &str)>) -> Result<()> 
     }
     Ok(())
 }
-fn start(home: &Path, j: &mut Value) -> Result<Option<Child>> {
+fn start(home: &Path, j: &mut Value) -> Result<Option<ServiceChild>> {
     let nonce = auth::random_token();
     j["launch_nonce"] = json!(nonce);
     j["child_pid"] = Value::Null;
@@ -722,21 +722,12 @@ fn start(home: &Path, j: &mut Value) -> Result<Option<Child>> {
         native_startup_state::start(&j["startup"])?;
         return Ok(None);
     }
-    let mut cmd = Command::new(binary(home));
-    cmd.arg("--home")
-        .arg(home)
-        .arg("serve-update")
-        .arg(j["transaction_id"].as_str().unwrap())
-        .arg(nonce)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x00000200 | 0x00000008);
-    }
-    let mut child = cmd.spawn()?;
+    let mut child = native_update_process::spawn_service(
+        &binary(home),
+        home,
+        j["transaction_id"].as_str().unwrap(),
+        &nonce,
+    )?;
     j["child_pid"] = json!(child.id());
     if let Err(e) = save(&home.join(JOURNAL), j) {
         let _ = child.kill();
@@ -745,14 +736,14 @@ fn start(home: &Path, j: &mut Value) -> Result<Option<Child>> {
     }
     Ok(Some(child))
 }
-fn stop_child(child: &mut Child) -> Result<()> {
+fn stop_child(child: &mut ServiceChild) -> Result<()> {
     if child.try_wait()?.is_none() {
         child.kill()?;
     }
     child.wait()?;
     Ok(())
 }
-async fn healthy(home: &Path, j: &Value, mut child: Option<&mut Child>) -> Result<Value> {
+async fn healthy(home: &Path, j: &Value, mut child: Option<&mut ServiceChild>) -> Result<Value> {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(c) = child.as_deref_mut() {

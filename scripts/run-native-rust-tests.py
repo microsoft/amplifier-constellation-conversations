@@ -13,6 +13,7 @@ SELECTIONS = [
     ("credentials::", False),
     ("native_bundle::", False),
     ("native_update_protocol::", False),
+    ("native_update_process::", False),
     ("native_startup_state::", False),
     ("update_admission::", False),
     ("companion_awareness::process_tests::stalled_observer_and_descendant_are_stopped_without_facts", True),
