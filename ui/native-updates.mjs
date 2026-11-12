@@ -143,7 +143,9 @@ function signedOut() {
   $('update-username-label').hidden = local; $('update-username').hidden = local;
   $('update-username').value = session?.owner || ''; $('update-password').value = '';
   $('update-login-description').textContent = local ? 'Use the password you chose for Companion.' : 'Use your account on this service’s host.';
-  $('return-to-companion').hidden = false;
+  // A signed-out page cannot yet establish whether normal contacts are served.
+  // Initial account setup is the only known normal flow before authentication.
+  $('return-to-companion').hidden = !session?.first_account_needed;
   if (session?.first_account_needed) error('Open Companion on this computer to finish setting up your account.');
 }
 async function refresh() {

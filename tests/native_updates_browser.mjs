@@ -162,11 +162,14 @@ try {
   fixture.operation={id:randomUUID(),transaction_id:randomUUID(),request_id:randomUUID(),phase:'unknown'};fixture.actions={check:false,apply:false,recover:true,rollback:false};
   await page.goto(origin+'/updates');await page.locator('#update-login').waitFor({state:'visible'});
   assert.equal(await page.locator('#update-username').isVisible(),false);
+  assert.equal(await page.locator('a[href="/companion"]:visible').count(),0);
   await page.locator('#update-password').fill(password);await page.locator('#update-sign-in').click();await page.locator('#update-resume').waitFor({state:'visible'});
   assert.equal(await page.locator('#update-package-form').isVisible(),false);assert.equal(await page.locator('#update-rollback').isVisible(),false);
   assert.equal(await page.locator('#return-to-companion').isVisible(),false);assert.equal(await page.locator('#update-password').inputValue(),'');
   assert.equal(await page.locator('a[href="/companion"]:visible').count(),0);
   await screenshot('updates-recovery-desktop.png');
+  await page.locator('#update-sign-out').click();await page.locator('#update-login').waitFor({state:'visible'});
+  assert.equal(await page.locator('a[href="/companion"]:visible').count(),0);
   checks.push('Recovery uses the existing password and offers only server-authorized recovery, without normal work navigation');
 
   await open();fixture.owner='enrolled';fixture.actions={check:true,apply:true,recover:true,rollback:true};await goto();
