@@ -8,7 +8,7 @@
 use crate::{config::Config, native_bundle::APPLICATION};
 use amplifier_native_platform::{
     installation::{self, ActionOutcome, Service, ServiceAction, ServiceManager},
-    registration::{self, Registration, RegistrationOutcome},
+    registration::{self, Registration, RegistrationOutcome, RetirementOutcome},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -67,6 +68,259 @@ pub struct LaunchObservation {
     pub receipt: Option<LaunchReceipt>,
     pub profile_matches: bool,
     pub snapshot: Value,
+}
+
+/// Non-secret identity used by the caller's settled-operation eligibility check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchIdentity {
+    Worker { operation: String, attempt: String },
+    Replacement { transaction: String },
+}
+
+/// Private enumeration result, not a browser response. The prepared replacement
+/// still contains its startup nonce and must remain in protected storage.
+#[derive(Clone, Debug)]
+pub struct RetainedLaunch {
+    pub identity: LaunchIdentity,
+    pub prepared: PreparedLaunch,
+    pub launch_receipt: Option<LaunchReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RetirementReceipt {
+    Retired { removed: bool },
+    Refused { code: String },
+    Unknown { code: String },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementRecord {
+    prepared: PreparedLaunch,
+    expected: Value,
+    receipt: Option<RetirementReceipt>,
+}
+
+const MAX_HOME_ENTRIES: usize = 4096;
+const MAX_LAUNCH_MARKERS: usize = 256;
+const MAX_LAUNCH_BYTES: usize = 128 * 1024;
+const MAX_ENUMERATION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RETIREMENT_BYTES: usize = 1024 * 1024;
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    ordinary(path, false)?;
+    ensure!(
+        fs::metadata(path)?.len() <= limit as u64,
+        "Fixed control record exceeds observation limit"
+    );
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= limit,
+        "Fixed control record grew beyond observation limit"
+    );
+    Ok(bytes)
+}
+
+/// Read only; scans this home's fixed dispatch markers, never manager-provided
+/// paths or arbitrary directories. Every record is reconstructed and bound to
+/// its filename before the caller can consider cleanup eligibility.
+pub fn enumerate(home: &Path) -> Result<Vec<RetainedLaunch>> {
+    ordinary(home, true)?;
+    let home = dunce::canonicalize(home)?;
+    let mut paths = Vec::new();
+    for (index, entry) in fs::read_dir(&home)?.enumerate() {
+        ensure!(
+            index < MAX_HOME_ENTRIES,
+            "Installation directory exceeds enumeration limit"
+        );
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("native-browser-launch-") && name.ends_with(".json") {
+            ensure!(
+                paths.len() < MAX_LAUNCH_MARKERS,
+                "Too many retained launch markers"
+            );
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    let mut total = 0;
+    let mut launches = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = read_bounded(&path, MAX_LAUNCH_BYTES)?;
+        total += bytes.len();
+        ensure!(
+            total <= MAX_ENUMERATION_BYTES,
+            "Retained launch data exceeds enumeration limit"
+        );
+        let record: DispatchRecord = serde_json::from_slice(&bytes)?;
+        let plan = record.prepared;
+        plan.validate()?;
+        ensure!(
+            plan.home == home && plan.marker() == path,
+            "Launch marker belongs to another home or fixed identity"
+        );
+        let identity = match &plan.identity {
+            Identity::Worker { operation, attempt } => LaunchIdentity::Worker {
+                operation: operation.clone(),
+                attempt: attempt.clone(),
+            },
+            Identity::Replacement { transaction, .. } => LaunchIdentity::Replacement {
+                transaction: transaction.clone(),
+            },
+        };
+        launches.push(RetainedLaunch {
+            identity,
+            prepared: plan,
+            launch_receipt: record.receipt,
+        });
+    }
+    Ok(launches)
+}
+
+trait RetirementManager: Manager {
+    fn is_retired(&self, plan: &PreparedLaunch) -> Result<bool>;
+    fn retire(&self, plan: &PreparedLaunch, expected: &Value) -> Result<RetirementOutcome>;
+}
+impl RetirementManager for NativeManager {
+    fn is_retired(&self, plan: &PreparedLaunch) -> Result<bool> {
+        registration::is_retired(&plan.service)
+    }
+    fn retire(&self, plan: &PreparedLaunch, expected: &Value) -> Result<RetirementOutcome> {
+        registration::retire(&plan.service, &plan.profile, expected)
+    }
+}
+
+fn retirement_path(plan: &PreparedLaunch) -> PathBuf {
+    plan.home.join(format!(
+        "native-browser-retirement-{}.json",
+        plan.service.name
+    ))
+}
+fn read_retirement(plan: &PreparedLaunch) -> Result<Option<RetirementRecord>> {
+    let path = retirement_path(plan);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let record: RetirementRecord =
+        serde_json::from_slice(&read_bounded(&path, MAX_RETIREMENT_BYTES)?)?;
+    ensure!(
+        record.prepared == *plan,
+        "Retirement marker binds a different fixed profile"
+    );
+    Ok(Some(record))
+}
+fn retirement_unknown(code: &str) -> RetirementReceipt {
+    RetirementReceipt::Unknown { code: code.into() }
+}
+fn retirement_observation(
+    plan: &PreparedLaunch,
+    manager: &dyn RetirementManager,
+    previous: Option<RetirementRecord>,
+) -> Result<Option<RetirementReceipt>> {
+    if manager.is_retired(plan)? {
+        return Ok(Some(RetirementReceipt::Retired { removed: false }));
+    }
+    Ok(previous.map(|record| match record.receipt {
+        Some(receipt @ RetirementReceipt::Refused { .. }) => receipt,
+        _ => retirement_unknown("retirement_unconfirmed"),
+    }))
+}
+
+/// Observe confirmed manager AND definition absence without retrying cleanup.
+/// False/uninspectable native presence never becomes deletion authority.
+pub fn observe_retirement(prepared: &PreparedLaunch) -> Result<Option<RetirementReceipt>> {
+    observe_retirement_with(prepared, &NativeManager)
+}
+fn observe_retirement_with(
+    plan: &PreparedLaunch,
+    manager: &dyn RetirementManager,
+) -> Result<Option<RetirementReceipt>> {
+    plan.validate()?;
+    ensure!(
+        read_dispatch(plan)?.is_some(),
+        "Missing original dispatch evidence"
+    );
+    retirement_observation(plan, manager, read_retirement(plan)?)
+}
+
+/// Caller must first prove a terminal owned operation/transaction under its
+/// lifecycle locks and authorize explicit cleanup. This wrapper never stops a
+/// process or removes evidence. The shared candidate rechecks the entire native
+/// snapshot/profile and owns all manager/definition retirement.
+pub fn retire(prepared: &PreparedLaunch) -> Result<RetirementReceipt> {
+    retire_with(prepared, &NativeManager)
+}
+fn retire_with(
+    plan: &PreparedLaunch,
+    manager: &dyn RetirementManager,
+) -> Result<RetirementReceipt> {
+    plan.validate()?;
+    ensure!(
+        read_dispatch(plan)?.is_some(),
+        "Missing original dispatch evidence"
+    );
+    let previous = read_retirement(plan)?;
+    if previous.is_some() {
+        return Ok(retirement_observation(plan, manager, previous)?
+            .expect("Existing retirement yields an observation"));
+    }
+    if manager.is_retired(plan)? {
+        return Ok(RetirementReceipt::Retired { removed: false });
+    }
+    let expected = manager.snapshot(plan)?;
+    // Ordinary active/transitioning/mismatched registrations get no retirement
+    // intent marker, so a later explicitly authorized settled cleanup can run.
+    // The shared primitive additionally checks every manager-specific condition.
+    if !manager.matches(plan, &expected)? {
+        return Ok(RetirementReceipt::Refused {
+            code: "fixed_profile_mismatch".into(),
+        });
+    }
+    if expected["active"] != false
+        || expected["transitioning"] != false
+        || expected["masked"] != false
+        || expected["start_allowed"] != true
+        || !expected["processes"].as_array().is_some_and(Vec::is_empty)
+    {
+        return Ok(RetirementReceipt::Refused {
+            code: "registration_not_settled".into(),
+        });
+    }
+    let mut record = RetirementRecord {
+        prepared: plan.clone(),
+        expected,
+        receipt: None,
+    };
+    let bytes = serde_json::to_vec(&record)?;
+    ensure!(
+        bytes.len() <= MAX_RETIREMENT_BYTES,
+        "Retirement intent exceeds storage bound"
+    );
+    if amplifier_native_platform::private_create(&retirement_path(plan), &bytes).is_err() {
+        return Ok(retirement_unknown("retirement_intent_unconfirmed"));
+    }
+    let result = match manager.retire(plan, &record.expected) {
+        Ok(RetirementOutcome::Retired { removed }) => RetirementReceipt::Retired { removed },
+        Ok(RetirementOutcome::Refused { code, .. }) => RetirementReceipt::Refused { code },
+        Ok(RetirementOutcome::Unknown { code, .. }) => RetirementReceipt::Unknown { code },
+        Err(_) => retirement_unknown("retirement_unconfirmed"),
+    };
+    record.receipt = Some(result.clone());
+    let bytes = serde_json::to_vec(&record)?;
+    if bytes.len() > MAX_RETIREMENT_BYTES
+        || amplifier_native_platform::private_write_data(&retirement_path(plan), &bytes).is_err()
+    {
+        return Ok(retirement_unknown("retirement_receipt_unconfirmed"));
+    }
+    Ok(result)
 }
 
 fn uuid(value: &str) -> Result<()> {
@@ -325,13 +579,9 @@ fn read_dispatch(plan: &PreparedLaunch) -> Result<Option<DispatchRecord>> {
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
-        Ok(_) => ordinary(&path, false)?,
+        Ok(_) => {}
     }
-    ensure!(
-        fs::metadata(&path)?.len() <= 128 * 1024,
-        "Launch receipt exceeds observation limit"
-    );
-    let record: DispatchRecord = serde_json::from_slice(&fs::read(&path)?)?;
+    let record: DispatchRecord = serde_json::from_slice(&read_bounded(&path, MAX_LAUNCH_BYTES)?)?;
     ensure!(
         record.prepared == *plan,
         "Dispatch marker binds a different fixed profile"
@@ -422,7 +672,7 @@ mod tests {
     use serde_json::json;
     use std::sync::{
         Arc, Barrier,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     struct Fixture {
@@ -733,5 +983,258 @@ mod tests {
         );
         assert_eq!(manager.registrations.load(Ordering::SeqCst), 1);
         assert_eq!(manager.starts.load(Ordering::SeqCst), 1);
+    }
+
+    struct FakeRetirement {
+        manager: FakeManager,
+        absent: AtomicBool,
+        calls: AtomicUsize,
+        outcome: RetirementOutcome,
+    }
+    impl FakeRetirement {
+        fn new(outcome: RetirementOutcome) -> Self {
+            let mut manager = FakeManager::new(ActionOutcome::Accepted);
+            manager.snapshot["processes"] = json!([]);
+            manager.snapshot["start_allowed"] = json!(true);
+            Self {
+                manager,
+                absent: AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+                outcome,
+            }
+        }
+    }
+    impl Manager for FakeRetirement {
+        fn register(&self, _: &PreparedLaunch) -> Result<RegistrationOutcome> {
+            panic!("Retirement must never register a service")
+        }
+        fn snapshot(&self, plan: &PreparedLaunch) -> Result<Value> {
+            self.manager.snapshot(plan)
+        }
+        fn matches(&self, plan: &PreparedLaunch, snapshot: &Value) -> Result<bool> {
+            self.manager.matches(plan, snapshot)
+        }
+        fn start(&self, _: &PreparedLaunch, _: &Value) -> Result<ActionOutcome> {
+            panic!("Retirement must never start a service")
+        }
+    }
+    impl RetirementManager for FakeRetirement {
+        fn is_retired(&self, _: &PreparedLaunch) -> Result<bool> {
+            Ok(self.absent.load(Ordering::SeqCst))
+        }
+        fn retire(&self, plan: &PreparedLaunch, expected: &Value) -> Result<RetirementOutcome> {
+            assert_eq!(*expected, self.manager.snapshot);
+            let retained = read_retirement(plan)?.expect("Durable intent must precede retirement");
+            assert_eq!(retained.expected, *expected);
+            assert!(retained.receipt.is_none());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.outcome, RetirementOutcome::Retired { .. }) {
+                self.absent.store(true, Ordering::SeqCst);
+            }
+            Ok(self.outcome.clone())
+        }
+    }
+    fn recorded(plan: &PreparedLaunch) {
+        let record = DispatchRecord {
+            prepared: plan.clone(),
+            receipt: Some(LaunchReceipt::Accepted),
+        };
+        amplifier_native_platform::private_create(
+            &plan.marker(),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn enumeration_is_read_only_binds_filenames_and_excludes_nonce_from_identity() {
+        let fixture = Fixture::new();
+        let worker = fixture.plan();
+        let replacement = prepare_replacement(
+            &fixture.home,
+            &fixture.id,
+            &uuid::Uuid::new_v4().to_string(),
+            "private-startup-nonce",
+            &fixture.installed,
+        )
+        .unwrap();
+        recorded(&worker);
+        recorded(&replacement);
+        let original = fs::read(replacement.marker()).unwrap();
+        let entries = fs::read_dir(&fixture.home).unwrap().count();
+        let launches = enumerate(&fixture.home).unwrap();
+        assert_eq!(launches.len(), 2);
+        assert!(
+            launches
+                .iter()
+                .any(|launch| matches!(launch.identity, LaunchIdentity::Worker { .. }))
+        );
+        assert!(
+            launches
+                .iter()
+                .any(|launch| matches!(launch.identity, LaunchIdentity::Replacement { .. }))
+        );
+        assert!(
+            !format!(
+                "{:?}",
+                launches
+                    .iter()
+                    .map(|launch| &launch.identity)
+                    .collect::<Vec<_>>()
+            )
+            .contains("private-startup-nonce")
+        );
+        assert_eq!(fs::read(replacement.marker()).unwrap(), original);
+        assert_eq!(fs::read_dir(&fixture.home).unwrap().count(), entries);
+        let wrong = fixture.home.join("native-browser-launch-wrong-name.json");
+        fs::write(wrong, original).unwrap();
+        assert!(enumerate(&fixture.home).is_err());
+    }
+
+    #[test]
+    fn enumeration_refuses_oversized_and_excess_markers_before_cleanup() {
+        let fixture = Fixture::new();
+        let plan = fixture.plan();
+        fs::File::create(plan.marker())
+            .unwrap()
+            .set_len(MAX_LAUNCH_BYTES as u64 + 1)
+            .unwrap();
+        assert!(enumerate(&fixture.home).is_err());
+        assert!(!retirement_path(&plan).exists());
+        let fixture = Fixture::new();
+        for index in 0..=MAX_LAUNCH_MARKERS {
+            fs::write(
+                fixture
+                    .home
+                    .join(format!("native-browser-launch-{index}.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        assert!(
+            enumerate(&fixture.home)
+                .unwrap_err()
+                .to_string()
+                .contains("Too many")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enumeration_refuses_a_symlink_without_following_it() {
+        let fixture = Fixture::new();
+        let plan = fixture.plan();
+        let target = fixture.home.join("unrelated.json");
+        fs::write(&target, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&target, plan.marker()).unwrap();
+        assert!(enumerate(&fixture.home).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn active_replacement_refusal_leaves_later_explicit_retirement_possible() {
+        let fixture = Fixture::new();
+        let plan = fixture.plan();
+        recorded(&plan);
+        let dispatch = fs::read(plan.marker()).unwrap();
+        let mut manager = FakeRetirement::new(RetirementOutcome::Retired { removed: true });
+        manager.manager.snapshot["active"] = json!(true);
+        assert_eq!(
+            retire_with(&plan, &manager).unwrap(),
+            RetirementReceipt::Refused {
+                code: "registration_not_settled".into()
+            }
+        );
+        assert!(!retirement_path(&plan).exists());
+        manager.manager.snapshot["active"] = json!(false);
+        assert_eq!(
+            retire_with(&plan, &manager).unwrap(),
+            RetirementReceipt::Retired { removed: true }
+        );
+        assert_eq!(
+            retire_with(&plan, &manager).unwrap(),
+            RetirementReceipt::Retired { removed: false }
+        );
+        assert_eq!(manager.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(plan.marker()).unwrap(), dispatch);
+        assert!(retirement_path(&plan).exists());
+    }
+
+    #[test]
+    fn uncertain_retirement_is_never_replayed_and_absence_is_read_only() {
+        let fixture = Fixture::new();
+        let plan = fixture.plan();
+        recorded(&plan);
+        let manager = FakeRetirement::new(RetirementOutcome::Unknown {
+            code: "lost_reply".into(),
+            message: "private definition detail".into(),
+        });
+        assert_eq!(
+            retire_with(&plan, &manager).unwrap(),
+            retirement_unknown("lost_reply")
+        );
+        let before = fs::read(retirement_path(&plan)).unwrap();
+        assert!(matches!(
+            retire_with(&plan, &manager).unwrap(),
+            RetirementReceipt::Unknown { .. }
+        ));
+        assert!(matches!(
+            observe_retirement_with(&plan, &manager).unwrap(),
+            Some(RetirementReceipt::Unknown { .. })
+        ));
+        assert_eq!(manager.calls.load(Ordering::SeqCst), 1);
+        manager.absent.store(true, Ordering::SeqCst);
+        assert_eq!(
+            observe_retirement_with(&plan, &manager).unwrap(),
+            Some(RetirementReceipt::Retired { removed: false })
+        );
+        assert_eq!(
+            retire_with(&plan, &manager).unwrap(),
+            RetirementReceipt::Retired { removed: false }
+        );
+        assert_eq!(fs::read(retirement_path(&plan)).unwrap(), before);
+        assert!(
+            !String::from_utf8(before)
+                .unwrap()
+                .contains("private definition detail")
+        );
+        assert_eq!(manager.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mismatched_profile_or_missing_evidence_never_enters_retirement() {
+        let fixture = Fixture::new();
+        let plan = fixture.plan();
+        let mut manager = FakeRetirement::new(RetirementOutcome::Retired { removed: true });
+        assert!(retire_with(&plan, &manager).is_err());
+        recorded(&plan);
+        manager.manager.matches = false;
+        assert_eq!(
+            retire_with(&plan, &manager).unwrap(),
+            RetirementReceipt::Refused {
+                code: "fixed_profile_mismatch".into()
+            }
+        );
+        assert_eq!(manager.calls.load(Ordering::SeqCst), 0);
+        assert!(!retirement_path(&plan).exists());
+    }
+
+    #[test]
+    fn post_intent_refusal_preserves_evidence_and_does_not_retry() {
+        let fixture = Fixture::new();
+        let plan = fixture.plan();
+        recorded(&plan);
+        let manager = FakeRetirement::new(RetirementOutcome::Refused {
+            code: "stale_snapshot".into(),
+            message: "preserved".into(),
+        });
+        let expected = RetirementReceipt::Refused {
+            code: "stale_snapshot".into(),
+        };
+        assert_eq!(retire_with(&plan, &manager).unwrap(), expected);
+        let original = fs::read(retirement_path(&plan)).unwrap();
+        assert_eq!(retire_with(&plan, &manager).unwrap(), expected);
+        assert_eq!(fs::read(retirement_path(&plan)).unwrap(), original);
+        assert_eq!(manager.calls.load(Ordering::SeqCst), 1);
     }
 }
