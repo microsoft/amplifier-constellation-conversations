@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use std::fs;
 use std::{
+    fs,
     io::Read,
-    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+};
+use std::{
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -46,16 +48,12 @@ struct Snapshot {
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+#[cfg(unix)]
 fn output(command: &mut Command) -> Result<Output> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
     let mut child = command
         .spawn()
         .context("Cannot run the fixed OS startup manager")?;
@@ -102,6 +100,7 @@ fn output(command: &mut Command) -> Result<Output> {
         stderr,
     })
 }
+#[cfg(unix)]
 fn checked(command: &mut Command) -> Result<String> {
     let result = output(command)?;
     ensure!(
@@ -582,53 +581,86 @@ fn inspect_platform(s: &mut Snapshot) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn powershell() -> Result<PathBuf> {
-    // GetSystemDirectoryW avoids PATH and user-selected command locations.
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetSystemDirectoryW(buffer: *mut u16, length: u32) -> u32;
-    }
-    let mut buffer = vec![0u16; 32768];
-    let count = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    ensure!(
-        count > 0 && count < buffer.len(),
-        "Cannot locate the Windows system directory"
-    );
-    let path = PathBuf::from(String::from_utf16(&buffer[..count])?)
-        .join("WindowsPowerShell/v1.0/powershell.exe");
-    ensure!(
-        path.is_absolute() && path.is_file(),
-        "Windows startup manager is unavailable"
-    );
-    Ok(path)
-}
-#[cfg(windows)]
 fn task(label: &str, action: &str) -> Result<Value> {
     ensure!(
         matches!(action, "query" | "stop" | "start"),
         "Invalid fixed task operation"
     );
-    const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);
-$s=New-Object -ComObject 'Schedule.Service'; $s.Connect();
-try {$t=$s.GetFolder('\').GetTask($env:CONSTELLATION_NATIVE_STARTUP_LABEL)}
-catch {if ($_.Exception.HResult -eq -2147024894 -or $_.Exception.InnerException.HResult -eq -2147024894) {'null'; exit 0}; throw}
-if ($env:CONSTELLATION_NATIVE_STARTUP_ACTION -eq 'stop') {$t.Stop(0)}
-elseif ($env:CONSTELLATION_NATIVE_STARTUP_ACTION -eq 'start') {$null=$t.Run($null)}
-elseif ($env:CONSTELLATION_NATIVE_STARTUP_ACTION -ne 'query') {throw 'Invalid operation'}
-$instances=$t.GetInstances(0);
-@{xml=$t.Xml; state=[int]$t.State; enabled=[bool]$t.Enabled; instances=[int]$instances.Count} | ConvertTo-Json -Compress"#;
-    let mut command = Command::new(powershell()?);
-    command
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            SCRIPT,
-        ])
-        .env("CONSTELLATION_NATIVE_STARTUP_LABEL", label)
-        .env("CONSTELLATION_NATIVE_STARTUP_ACTION", action);
-    Ok(serde_json::from_str(&checked(&mut command)?)?)
+    let id = label
+        .strip_prefix(&format!("{}-", APPLICATION.startup_prefix))
+        .context("Invalid fixed task identity")?;
+    ensure!(
+        uuid::Uuid::parse_str(id)?.to_string() == id,
+        "Invalid fixed task identity"
+    );
+    // Match the accepted shared native-platform COM owner pattern. A dedicated
+    // thread gives this call its own apartment; no shell, console codepage or
+    // PowerShell startup competes with concurrent installation verification.
+    // Join rather than detach a timed-out mutation: a local COM failure stays
+    // an error, not proof that Run/Stop was cancelled. The caller still verifies
+    // the actual fixed task state before continuing the update transaction.
+    let label = label.to_owned();
+    let action = action.to_owned();
+    thread::spawn(move || -> Result<Value> {
+        use windows::{
+            Win32::System::{
+                Com::{
+                    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+                    CoUninitialize,
+                },
+                TaskScheduler::{ITaskService, TaskScheduler},
+                Variant::VARIANT,
+            },
+            core::{BSTR, HRESULT},
+        };
+        struct Apartment;
+        impl Drop for Apartment {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+            let _apartment = Apartment;
+            let service: ITaskService =
+                CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)?;
+            let empty = VARIANT::default();
+            // Empty variants select this computer and the current user's token.
+            service.Connect(&empty, &empty, &empty, &empty)?;
+            let root = service.GetFolder(&BSTR::from("\\"))?;
+            let task = match root.GetTask(&BSTR::from(label)) {
+                Ok(task) => task,
+                Err(error) if error.code() == HRESULT::from_win32(2) => return Ok(Value::Null),
+                Err(error) => return Err(error).context("Cannot inspect owned startup task"),
+            };
+            match action.as_str() {
+                "stop" => task.Stop(0).context("Cannot stop owned startup task")?,
+                "start" => {
+                    task.Run(&empty)
+                        .context("Cannot start owned startup task")?;
+                }
+                "query" => {}
+                _ => unreachable!("validated fixed task operation"),
+            }
+            let xml = task.Xml()?;
+            ensure!(
+                xml.len() <= OUTPUT_LIMIT,
+                "Startup task XML exceeded its bound"
+            );
+            let document = String::from_utf16(&xml)?;
+            ensure!(
+                document.len() <= OUTPUT_LIMIT,
+                "Startup task XML exceeded its bound"
+            );
+            let state = task.State()?.0;
+            let enabled = task.Enabled()?.0 != 0;
+            let instances = task.GetInstances(0)?.Count()?;
+            ensure!(state >= 0 && instances >= 0, "Invalid native task state");
+            Ok(json!({"xml":document,"state":state,"enabled":enabled,"instances":instances}))
+        }
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Owned startup task operation did not complete"))?
 }
 #[cfg(windows)]
 fn inspect_platform(s: &mut Snapshot) -> Result<()> {

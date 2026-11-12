@@ -16,7 +16,9 @@ spec.loader.exec_module(startup)
 
 class NativeStartupHarnessTests(unittest.TestCase):
     def test_explicit_disposable_account_opt_in_is_required(self):
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {}, clear=True):
+        # Keep OS identity variables (including Windows processor metadata); only
+        # the explicit registration permission is absent in this refusal case.
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {startup.OPT_IN: ""}):
             out = Path(temp) / "result.json"
             with self.assertRaisesRegex(AssertionError, "opt-in"):
                 startup.qualify(Path("absent.tar.gz"), Path("absent.json"), out)
