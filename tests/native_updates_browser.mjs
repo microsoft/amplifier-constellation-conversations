@@ -89,6 +89,14 @@ try {
   assert.equal(fixture.posts.length,posts);assert.equal(fixture.operation.transaction_id,operation.transaction_id);
   checks.push('Package check and apply; reload reads the same operation without another mutation');
 
+  fixture.operation.phase='failed';fixture.operation.outcome='rolled_back';
+  fixture.actions={check:true,apply:false,recover:false,rollback:false};
+  await refresh();
+  assert.equal(await page.locator('#update-progress-title').innerText(),'Update wasn’t installed');
+  assert.equal(await page.locator('#update-progress-detail').innerText(),'The previous version was restored. You can keep using Companion.');
+  assert.equal(await page.locator('#update-resume').isVisible(),false);
+  checks.push('A failed update with verified rollback says the previous app is restored without offering unavailable recovery');
+
   await open();await goto();await check();fixture.fail='after-record';fixture.phase='unknown';
   await page.locator('#update-apply').click();await page.locator('#update-resume').waitFor({state:'visible'});
   await page.waitForFunction(()=>!document.querySelector('#update-resume').disabled);

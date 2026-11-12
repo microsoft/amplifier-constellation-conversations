@@ -55,6 +55,10 @@ const phases = {
   failed:['Update needs attention','Use the available recovery action to continue from the saved state.'],
 };
 function progress(operation) {
+  if (operation.phase === 'failed' && operation.outcome === 'rolled_back')
+    return ['Update wasn’t installed','The previous version was restored. You can keep using Companion.'];
+  if (operation.phase === 'failed' && operation.outcome === 'unchanged')
+    return ['App version unchanged','The app package was left unchanged. Check its status before trying another update.'];
   if (['completed','restored'].includes(operation.phase)) {
     if (operation.outcome === 'rolled_back') return ['Previous version restored','Companion is available with the previous app package.'];
     if (operation.outcome === 'unchanged') return ['App version unchanged','The installation’s previous availability has been restored.'];
