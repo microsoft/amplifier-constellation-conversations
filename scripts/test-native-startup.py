@@ -29,6 +29,26 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 OPT_IN = "CONSTELLATION_NATIVE_STARTUP_TEST"
 RETAIN = ".retain-after-uncertain-cleanup"
+TASK_QUERY_STAGE_PREFIX = "CONSTELLATION_STARTUP_QUERY_STAGE:"
+TASK_QUERY_STAGES = {"started", "COMcreated", "connected", "folder", "task", "serialized"}
+
+
+def task_query_timeout_stage(stderr) -> str:
+    # TimeoutExpired can carry bytes even with text capture. Retain only the
+    # last exact fixed marker, never PowerShell errors, argv, labels or paths.
+    if isinstance(stderr, bytes):
+        text = stderr[-8192:].decode("ascii", errors="replace")
+    elif isinstance(stderr, str):
+        text = stderr[-8192:]
+    else:
+        return "unobserved"
+    last = "unobserved"
+    for line in text.splitlines():
+        if line.startswith(TASK_QUERY_STAGE_PREFIX):
+            stage = line[len(TASK_QUERY_STAGE_PREFIX):]
+            if stage in TASK_QUERY_STAGES:
+                last = stage
+    return last
 
 
 def load_clean_install():
@@ -135,14 +155,29 @@ class Startup:
     def task(self) -> dict | None:
         # Fixed OS COM query, not a product host-command surface. Output is
         # explicitly UTF-8; schtasks' console XML may use a lossy codepage.
-        powershell = Path(self.env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-        script = r"""$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);
-$s=New-Object -ComObject 'Schedule.Service'; $s.Connect();
-try {$t=$s.GetFolder('\').GetTask($env:CONSTELLATION_TEST_TASK_LABEL)}
-catch {if ($_.Exception.HResult -eq -2147024894 -or $_.Exception.InnerException.HResult -eq -2147024894) {'null'; exit 0}; throw}
-@{xml=$t.Xml; state=[int]$t.State; enabled=[bool]$t.Enabled; instances=[int]($t.GetInstances(0).Count)} | ConvertTo-Json -Compress"""
+        system32 = Path(self.env["SYSTEMROOT"]) / "System32"
+        powershell = system32 / "WindowsPowerShell/v1.0/powershell.exe"
+        script = r"""[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:started');
+$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);
+$s=New-Object -ComObject 'Schedule.Service';
+[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:COMcreated');
+$s.Connect(); [Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:connected');
+try {$folder=$s.GetFolder('\'); [Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:folder'); $t=$folder.GetTask($env:CONSTELLATION_TEST_TASK_LABEL)}
+catch {if ($_.Exception.HResult -eq -2147024894 -or $_.Exception.InnerException.HResult -eq -2147024894) {[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:task'); 'null'; [Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:serialized'); exit 0}; throw}
+[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:task');
+$json=@{xml=$t.Xml; state=[int]$t.State; enabled=[bool]$t.Enabled; instances=[int]($t.GetInstances(0).Count)} | ConvertTo-Json -Compress;
+[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:serialized'); $json"""
         env = dict(self.env, CONSTELLATION_TEST_TASK_LABEL=self.label)
-        result = command([powershell, "-NoProfile", "-NonInteractive", "-Command", script], env=env)
+        # Only this independent controller query gets the fixed OS search path.
+        # Application CLI calls retain their empty PATH and WSL exclusion; no
+        # account/global manager environment or registration privilege changes.
+        env["PATH"] = ";".join([str(system32), str(powershell.parent)])
+        try:
+            result = command([powershell, "-NoProfile", "-NonInteractive", "-Command", script], env=env, timeout=30)
+        except subprocess.TimeoutExpired as error:
+            stage = task_query_timeout_stage(error.stderr)
+            raise TimeoutError("Windows startup controller task query exceeded 30 seconds; "
+                               f"last_observed_stage={stage}") from None
         return json.loads(result.stdout.lstrip("\ufeff"))
 
     def exists(self) -> bool:

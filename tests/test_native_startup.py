@@ -52,6 +52,65 @@ class NativeStartupHarnessTests(unittest.TestCase):
             self.assertEqual(command.call_args.args[0],
                 [root / "Windows/System32/schtasks.exe", "/Run", "/TN", "owned-task"])
 
+    def test_windows_task_query_has_independent_controller_path_and_json_stdout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app_env = {"HOME": str(root), "USERPROFILE": str(root), "SYSTEMROOT": str(root / "Windows"),
+                       "PATH": str(root / "empty application PATH")}
+            before = dict(app_env)
+            with patch.object(startup.platform, "system", return_value="Windows"):
+                manager = startup.Startup(root / "home", "owned-task", root / "app.exe", app_env)
+            task = {"xml": "<Task/>", "state": 4, "enabled": True, "instances": 1}
+            markers = "\n".join(startup.TASK_QUERY_STAGE_PREFIX + stage
+                for stage in ["started", "COMcreated", "connected", "folder", "task", "serialized"])
+            response = SimpleNamespace(stdout="\ufeff" + json.dumps(task), stderr=markers, returncode=0)
+            with patch.object(startup, "command", return_value=response) as command:
+                self.assertEqual(manager.task(), task)
+            query = command.call_args
+            system32 = root / "Windows/System32"
+            powershell = system32 / "WindowsPowerShell/v1.0/powershell.exe"
+            self.assertEqual(query.args[0][:4], [powershell, "-NoProfile", "-NonInteractive", "-Command"])
+            self.assertEqual(query.kwargs["timeout"], 30)
+            self.assertEqual(query.kwargs["env"]["PATH"], str(system32) + ";" + str(powershell.parent))
+            self.assertEqual(query.kwargs["env"]["CONSTELLATION_TEST_TASK_LABEL"], "owned-task")
+            self.assertIsNot(query.kwargs["env"], app_env)
+            self.assertIs(manager.env, app_env)
+            self.assertEqual(app_env, before)
+            script = query.args[0][-1]
+            for stage in startup.TASK_QUERY_STAGES:
+                self.assertIn("[Console]::Error.WriteLine('" + startup.TASK_QUERY_STAGE_PREFIX + stage + "')", script)
+            # Later application commands still receive the original isolated
+            # environment; even the manager's other OS command does not inherit
+            # this temporary PowerShell-only search path.
+            with patch.object(manager, "inspect"), patch.object(startup, "command") as command:
+                manager.start()
+            self.assertIs(command.call_args.kwargs["env"], app_env)
+            self.assertEqual(command.call_args.kwargs["env"]["PATH"], before["PATH"])
+
+    def test_windows_task_timeout_retains_only_last_exact_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(startup.platform, "system", return_value="Windows"):
+                manager = startup.Startup(root / "secret-home", "secret-task", root / "secret-app.exe",
+                    {"HOME": str(root), "USERPROFILE": str(root), "SYSTEMROOT": str(root / "secret-Windows"), "PATH": "empty"})
+            prefix = startup.TASK_QUERY_STAGE_PREFIX
+            for stderr, expected in [
+                ("secret-stderr\n" + prefix + "started\r\n" + prefix + "connected\n" + prefix + "secret-stage", "connected"),
+                ((prefix + "COMcreated\nsecret-token").encode(), "COMcreated"),
+                ("secret" + prefix + "connected\n" + prefix + "task secret-label", "unobserved"),
+                (None, "unobserved"),
+            ]:
+                with self.subTest(expected=expected):
+                    timeout = startup.subprocess.TimeoutExpired(["secret-command", "secret-argv"], 30,
+                        output=b"secret-stdout", stderr=stderr)
+                    with patch.object(startup, "command", side_effect=timeout):
+                        with self.assertRaises(TimeoutError) as raised:
+                            manager.task()
+                    self.assertEqual(str(raised.exception), "Windows startup controller task query exceeded 30 seconds; "
+                        "last_observed_stage=" + expected)
+                    self.assertTrue(raised.exception.__suppress_context__)
+                    self.assertNotIn("secret", str(raised.exception))
+
     def test_windows_task_identity_uses_actual_executable_and_unicode_argv(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
