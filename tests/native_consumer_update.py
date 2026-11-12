@@ -522,6 +522,23 @@ def manager_environment(install, startup):
     return controller_environment
 
 
+def startup_command(install, controller_environment, action):
+    """Legacy startup commands acknowledge through exit status, not JSON."""
+    require(action in {"install", "remove"}, "Startup fixture action is not fixed")
+    operation = install.begin_operation({"kind": "startup", "action": action}, 30)
+    started, outcome, return_code = time.monotonic(), "unknown", None
+    try:
+        completed = startup_module().command([install.worker, "--home", install.home, "startup", action],
+                                              env=controller_environment, check=False, timeout=30)
+        return_code = completed.returncode
+        outcome = "succeeded" if return_code == 0 else "nonzero_exit"
+        require(return_code == 0, f"Exact fixture startup {action} failed with exit code {return_code}")
+    except subprocess.TimeoutExpired:
+        raise TimeoutError("Exact fixture startup outcome is unknown; no retry or raw removal") from None
+    finally:
+        install.end_operation(operation, started, outcome, return_code)
+
+
 def managed_parent(install, prepared, startup, controller_environment):
     config = read_json(install.home / "config.json")
     registration = startup.Startup(install.home, "agent-conversations-" + config["id"],
@@ -529,7 +546,7 @@ def managed_parent(install, prepared, startup, controller_environment):
     registration.preflight()
     install.result["original_registration_attempted"] = True
     install.checkpoint()
-    install.command(["startup", "install"], extra_env={"PATH": controller_environment["PATH"]})
+    startup_command(install, controller_environment, "install")
     first = registration.inspect()
     child = prepared["original_child"]
     require(child.poll() is None, "Prepared foreground parent unexpectedly exited")
@@ -658,7 +675,7 @@ def cleanup_case(install, observer, registration, controller_environment):
         require(observer.preference(original) == observer.baseline_startup and original.get("active") is False,
                 "Original startup registration changed before its separate removal")
         registration.inspect()
-        install.command(["startup", "remove"], extra_env={"PATH": controller_environment["PATH"]})
+        startup_command(install, controller_environment, "remove")
         require(not registration.exists(), "Exact original startup registration remains")
         cleanup["original_startup"] = "exact inactive fixture registration removed separately"
     require(all(child.poll() is not None for child in install.children), "A controller-owned child remains alive")

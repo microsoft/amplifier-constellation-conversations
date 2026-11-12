@@ -15,6 +15,16 @@ spec.loader.exec_module(controller)
 
 
 class ConsumerUpdateControllerTests(unittest.TestCase):
+    def test_legacy_startup_success_does_not_require_json_output(self):
+        install = SimpleNamespace(worker=Path("app"), home=Path("owned-home"),
+                                  begin_operation=Mock(return_value={}), end_operation=Mock())
+        native = SimpleNamespace(command=Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr="")))
+        with patch.object(controller, "startup_module", return_value=native):
+            controller.startup_command(install, {"PATH": "fixed-os-tools"}, "install")
+        native.command.assert_called_once_with([Path("app"), "--home", Path("owned-home"), "startup", "install"],
+            env={"PATH": "fixed-os-tools"}, check=False, timeout=30)
+        self.assertEqual(install.end_operation.call_args.args[2:], ("succeeded", 0))
+
     def test_protected_receipt_keeps_only_hashes_and_rejects_changed_work(self):
         baseline = {"files": {"secrets/local-password.json": "digest"},
                     "tables": {"browser_sessions": [["private-session-row"]],
