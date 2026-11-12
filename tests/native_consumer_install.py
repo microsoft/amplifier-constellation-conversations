@@ -219,8 +219,13 @@ def run_browser(install, script, node, artifacts, setup_token):
     return result
 
 
-def exercise(install, a, b, *, browser_test=None, browser_node=None, browser_artifacts=None):
-    _, original = install.desktop_start()
+def prepare_consumer_installation(install, *, browser_test=None, browser_node=None, browser_artifacts=None):
+    """Create the existing private account/contact fixture without updating it.
+
+    Returned private values stay in controller memory; receipts retain only
+    independent comparisons and digests of the protected installation state.
+    """
+    child, original = install.desktop_start()
     config_bytes = (install.home / "config.json").read_bytes()
     config = json.loads(config_bytes)
     require(config["auth_mode"] == "local_password" and config["transport"] == "local_http"
@@ -271,6 +276,15 @@ def exercise(install, a, b, *, browser_test=None, browser_node=None, browser_art
             "Reopen changed the saved identity or account")
     install.check("second open proves the same actual process and preserves the existing identity/account")
     install.baseline = install.snapshot()
+    return {"fixture_log": fixture_log, "original_process": original, "original_child": child,
+            "config_bytes": config_bytes, "account_bytes": account_bytes,
+            "conversation_id": room["id"], "baseline": install.baseline}
+
+
+def exercise(install, a, b, *, browser_test=None, browser_node=None, browser_artifacts=None):
+    prepared = prepare_consumer_installation(install, browser_test=browser_test,
+                                            browser_node=browser_node, browser_artifacts=browser_artifacts)
+    fixture_log = prepared["fixture_log"]
     applied = install.update("run", "--package", b)
     require(applied["restored"] is True, "Local HTTP update did not restore availability")
     install.await_running()

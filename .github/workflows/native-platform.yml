@@ -101,7 +101,7 @@ jobs:
         run: |
           python scripts/run-native-rust-tests.py --target '${{ matrix.rust_target }}' --output '${{ runner.temp }}/native-rust-tests.json'
           cargo test --locked --target '${{ matrix.rust_target }}' --test native_update_bundle --test native_update_admission --test native_consumer_setup
-          cargo build --locked --target '${{ matrix.rust_target }}' --release
+          cargo build --locked --target '${{ matrix.rust_target }}' --release --bin agent-conversations --example native-update-controller
       - name: Acquire locked build-time dependencies
         run: |
           npm ci --ignore-scripts --omit=dev --prefix bridge
@@ -200,6 +200,32 @@ jobs:
           receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
           result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/native-startup.json').resolve())
           assert result['status'] == 'passed', 'Unavailable startup manager is not a passing qualification'
+          PY
+      - name: Verify actual browser update, manager lifetimes and checked retirement
+        env:
+          CONSTELLATION_NATIVE_STARTUP_TEST: '1'
+          CONSUMER_BROWSER_TEST: ${{ matrix.target == 'linux-x64' && '1' || '0' }}
+          NATIVE_UPDATE_CONTROLLER: target/${{ matrix.rust_target }}/release/examples/native-update-controller${{ matrix.suffix }}
+        run: |
+          python - <<'PY'
+          import importlib.util, json, os, shutil
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('consumer_update', 'tests/native_consumer_update.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          receipts = list(Path('dist').glob('conversations-*.json'))
+          assert len(receipts) == 1, 'Expected one immutable package receipt'
+          receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
+          browser = {}
+          if os.environ['CONSUMER_BROWSER_TEST'] == '1':
+              controller_node = shutil.which('node')
+              assert controller_node, 'Missing browser controller runtime'
+              browser = {'browser_test': Path('tests/native_updates_actual_browser.mjs').resolve(),
+                         'browser_node': Path(controller_node).resolve(),
+                         'browser_artifacts': Path('dist/consumer-update-browser-artifacts').resolve()}
+          result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(),
+              Path('dist/native-consumer-update.json').resolve(), Path(os.environ['NATIVE_UPDATE_CONTROLLER']).resolve(), **browser)
+          assert result['status'] == 'passed', 'Actual update lifetime/retirement qualification did not pass'
           PY
       - name: Test minimal Ubuntu userland without installed developer tools
         if: runner.os == 'Linux'
