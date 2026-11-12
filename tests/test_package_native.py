@@ -181,7 +181,7 @@ class PackageTests(unittest.TestCase):
         spec = self.spec()
         (self.modules / "sdk" / "index.js").unlink()
         self.repin_bridge(spec)
-        with self.assertRaisesRegex(ValueError, "missing package entrypoint"):
+        with self.assertRaisesRegex(ValueError, "missing used package entrypoint"):
             self.build(spec)
 
     def test_conditional_exports_and_cache_exclusion(self):
@@ -196,11 +196,49 @@ class PackageTests(unittest.TestCase):
         archive, receipt = self.build(spec)
         _, files = package_native.inspect_archive(archive, receipt["archive_sha256"])
         self.assertFalse(any(".cache" in path for path in files))
+        # Unused optional exports do not establish runtime requirements.
         descriptor["exports"]["./missing"] = "./missing.js"
         (p / "package.json").write_text(json.dumps(descriptor))
         self.repin_bridge(spec)
-        with self.assertRaisesRegex(ValueError, "missing package entrypoint"):
+        self.build(spec, "unused")
+        (self.bridge / "live.mjs").write_text("import 'sdk/missing';\n")
+        self.repin_bridge(spec)
+        with self.assertRaisesRegex(ValueError, "missing used package entrypoint"):
             self.build(spec, "invalid")
+
+    def test_official_mcp_shape_allows_missing_unused_root_and_types_but_requires_used_client(self):
+        name = "@modelcontextprotocol/sdk"
+        descriptor = {"name": name, "version": "1.32.2", "type": "module", "exports": {
+            ".": {"types": "./dist/esm/index.d.ts", "import": "./dist/esm/index.js", "require": "./dist/cjs/index.js"},
+            "./client": {"types": "./dist/esm/client/index.d.ts", "import": "./dist/esm/client/index.js", "require": "./dist/cjs/client/index.js"},
+            "./*": {"types": "./dist/esm/*.d.ts", "import": "./dist/esm/*", "require": "./dist/cjs/*"}}}
+        bridge = {"live.mjs": b"import {Client} from '@modelcontextprotocol/sdk/client/index.js';\n",
+                  "companion-mcp.mjs": b"import {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js';\n"}
+        installed = {name + "/package.json": json.dumps(descriptor).encode(),
+                     name + "/dist/esm/client/index.js": b"export class Client {}",
+                     name + "/dist/esm/server/mcp.js": b"export class McpServer {}"}
+        package_native.validate_app_imports(bridge, installed, {name})
+        del installed[name + "/dist/esm/client/index.js"]
+        with self.assertRaisesRegex(ValueError, "missing used package entrypoint.*client/index.js"):
+            package_native.validate_app_imports(bridge, installed, {name})
+
+    def test_import_uses_runtime_condition_and_exact_export_not_types_or_legacy_main(self):
+        installed = {"sdk/package.json": json.dumps({"main": "missing-cjs.js", "exports": {
+            ".": {"require": {"default": "./missing-cjs.js"}, "types": "./missing.d.mts", "default": "./index.mjs"},
+            "./feature/*": {"types": "./feature/*.d.ts", "import": "./feature/*.mjs"}}}).encode(),
+            "sdk/index.mjs": b"export {};", "sdk/feature/example.mjs": b"export {};"}
+        bridge = {"live.mjs": b"import SDK from 'sdk';\nimport {example} from 'sdk/feature/example';\n"}
+        package_native.validate_app_imports(bridge, installed, {"sdk"})
+        installed["sdk/feature/example.mjs.js"] = installed.pop("sdk/feature/example.mjs")
+        with self.assertRaisesRegex(ValueError, "missing used package entrypoint"):
+            package_native.validate_app_imports(bridge, installed, {"sdk"})
+
+    def test_blocked_used_export_and_undeclared_import_fail(self):
+        installed = {"sdk/package.json": b'{"exports":{".":null}}'}
+        with self.assertRaisesRegex(ValueError, "no Node import export"):
+            package_native.validate_app_imports({"live.mjs": b"import 'sdk';"}, installed, {"sdk"})
+        with self.assertRaisesRegex(ValueError, "undeclared bridge runtime dependency"):
+            package_native.validate_app_imports({"live.mjs": b"import 'unlocked';"}, installed, {"sdk"})
 
     def test_stale_dependency_tree_digest_refused(self):
         spec = self.spec()

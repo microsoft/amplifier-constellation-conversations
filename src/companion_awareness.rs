@@ -3082,6 +3082,10 @@ pub fn action_observation(s: &AppState, id: &str, request: &str) -> Result<Optio
 mod boundary_tests;
 
 #[cfg(test)]
+#[path = "companion_awareness_process_tests.rs"]
+mod process_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

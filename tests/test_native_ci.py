@@ -8,6 +8,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,8 @@ def load(name, path):
 
 ci = load("native_ci", ROOT / "scripts/native-ci-inputs.py")
 clean = load("native_clean", ROOT / "tests/native_clean_install.py")
+imports = load("native_imports", ROOT / "scripts/check-native-imports.py")
+rust_tests = load("native_rust_tests", ROOT / "scripts/run-native-rust-tests.py")
 
 
 class NativeBuildHarnessTests(unittest.TestCase):
@@ -89,6 +92,43 @@ class NativeBuildHarnessTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "checksum"):
                     ci.node_inputs("linux-x64", root)
             self.assertFalse((root / "node").exists())
+
+    def test_windows_developer_runtimes_are_not_assumed_to_be_os_files(self):
+        for name in ["VCRUNTIME140.dll", "msvcp140.dll", "concrt140.dll", "ucrtbased.dll"]:
+            self.assertEqual(imports.classify(name), "separate_redistributable_or_developer_runtime")
+        self.assertEqual(imports.classify("api-ms-win-crt-runtime-l1-1-0.dll"), "windows_system")
+        self.assertEqual(imports.classify("KERNEL32.dll"), "windows_system")
+        for name in ["other-library.dll", "../kernel32.dll", "folder\\user32.dll"]:
+            self.assertEqual(imports.classify(name), "unreviewed_import")
+
+    def test_delay_imports_and_warnings_are_retained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fixture.exe"
+            path.write_bytes(b"fixture-bytes")
+            image = SimpleNamespace(FILE_HEADER=SimpleNamespace(Machine=0xAA64),
+                                    OPTIONAL_HEADER=SimpleNamespace(Magic=0x20B),
+                                    DIRECTORY_ENTRY_IMPORT=[SimpleNamespace(dll=b"KERNEL32.dll")],
+                                    DIRECTORY_ENTRY_DELAY_IMPORT=[SimpleNamespace(dll=b"VCRUNTIME140.dll")],
+                                    parse_data_directories=lambda directories: None,
+                                    close=lambda: None, get_warnings=lambda: ["preserved warning"])
+            reader = SimpleNamespace(PE=lambda *args, **kwargs: image,
+                                     DIRECTORY_ENTRY={"IMAGE_DIRECTORY_ENTRY_IMPORT": 1, "IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT": 13})
+            result = imports.inspect(path, hashlib.sha256(path.read_bytes()).hexdigest(), "arm64", reader)
+            self.assertEqual(result["warnings"], ["preserved warning"])
+            self.assertEqual(len(result["unresolved_dependencies"]), 1)
+            self.assertTrue(result["unresolved_dependencies"][0]["delayed"])
+            with self.assertRaisesRegex(ValueError, "architecture"):
+                imports.inspect(path, result["sha256"], "x64", reader)
+            with self.assertRaisesRegex(ValueError, "changed"):
+                imports.inspect(path, "0" * 64, "arm64", reader)
+
+    def test_empty_native_test_selection_cannot_be_reported_as_passing(self):
+        with self.assertRaisesRegex(ValueError, "no passing"):
+            rust_tests.passed_counts("test result: ok. 0 passed; 0 failed; 0 ignored; 137 filtered out;")
+        self.assertEqual(rust_tests.passed_counts("test result: ok. 1 passed; 0 failed; 0 ignored; 136 filtered out;"),
+                         {"passed": 1, "failed": 0, "ignored": 0})
+        with self.assertRaisesRegex(ValueError, "successful"):
+            rust_tests.passed_counts("test result: FAILED. 0 passed; 1 failed; 0 ignored;")
 
 
 if __name__ == "__main__":

@@ -598,6 +598,13 @@ the Slack helper uses the official Slack SDK. Each poll has a bounded deadline,
 no retries, and at most 32 events and four known action receipts. Source text is
 not silently clipped; oversized facts are omitted with coverage information.
 
+Conversations owns the observer's complete 12-second process deadline, including
+input, local files, output and child exit. A stalled helper and its descendants
+are stopped; the read remains unavailable and supplies no observation. The
+Minecraft helper also keeps its existing HTTP and presence-subprocess limits.
+Standalone callers must provide their own process supervision; the helper does
+not rely on Unix-only alarm signals.
+
 When Minecraft supplies its optional `task.limit_state`, the observer can include
 that exact current limit summary for the same task and observation time. It
 keeps finite, explicitly unbounded, and unknown values distinct, preserves task

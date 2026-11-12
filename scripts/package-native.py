@@ -7,7 +7,6 @@ dependencies nor invokes npm, a compiler, the service, or an agent/model.
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import hashlib
 import json
 import os
@@ -168,45 +167,97 @@ def production_dependencies(bridge: dict[str, bytes], installed: dict[str, bytes
             result[path] = data
             copied.append(child)
         require(copied, f"empty production dependency: {location}")
-        validate_package_entrypoints(descriptor, copied, location)
         notices = [p for p in copied if re.match(r"(?i)(license|licence|copying|notice)(\.|$)", PurePosixPath(p).name)]
         inventory.append({"path": location, "name": descriptor.get("name"), "version": metadata["version"],
                           "resolved": metadata["resolved"], "integrity": metadata["integrity"],
                           "license": descriptor.get("license", metadata.get("license")), "notice_files": notices})
     require(result, "no production dependency files")
+    validate_app_imports(bridge, result, set(package["dependencies"]))
     return result, inventory
 
 
-def validate_package_entrypoints(descriptor: dict, copied: list[str], location: str) -> None:
-    """Catch incomplete installs; this does not replace a real SDK import smoke test."""
-    def target(value: str) -> None:
-        value = value.removeprefix("./")
-        relative(value)
-        if "*" in value:
-            require(any(fnmatch.fnmatchcase(p, value) for p in copied), f"missing exported files: {location}")
-        else:
-            require(any(p in copied for p in [value, value + ".js", value + ".json", value + "/index.js"]),
-                    f"missing package entrypoint: {location}")
+def validate_app_imports(bridge: dict[str, bytes], installed: dict[str, bytes], dependencies: set[str]) -> None:
+    """Check the bridge's literal runtime imports, not every SDK export.
 
-    def exports(value: object) -> None:
+    Some official SDK packages declare unused root/type-only exports whose files
+    are absent. Requiring those paths rejected a valid MCP SDK installation.
+    This catches incomplete *used* entrypoints without executing a foreign Node;
+    actual packaged-Node import smoke remains the recursive-resolution authority.
+    """
+    imports = set()
+    static = re.compile(r"(?m)^\s*(?:import|export)\s+(?:[^;\n]*?\s+from\s+)?(['\"])([^'\"\n]+)\1")
+    dynamic = re.compile(r"\bimport\s*\(\s*(['\"])([^'\"\n]+)\1\s*\)")
+    for name, data in bridge.items():
+        if name.endswith(".mjs"):
+            text = data.decode("utf-8")
+            imports.update(match[1] for match in static.findall(text))
+            imports.update(match[1] for match in dynamic.findall(text))
+
+    def selected(value: object) -> str | None:
         if isinstance(value, str):
-            require(value.startswith("./"), f"nonlocal package export: {location}")
-            target(value)
-        elif isinstance(value, dict):
-            for item in value.values():
-                exports(item)
-        elif isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            # Conditional export key order is significant. `types`, `require`,
+            # browser and custom conditions are not this Node ESM import path.
+            for condition, item in value.items():
+                if condition in {"node", "import", "default"}:
+                    chosen = selected(item)
+                    if chosen is not None:
+                        return chosen
+        if isinstance(value, list):
             for item in value:
-                exports(item)
-        else:
-            require(value is None, f"invalid package export: {location}")
+                chosen = selected(item)
+                if chosen is not None:
+                    return chosen
+        return None
 
-    for key in ["main", "module"]:
-        if key in descriptor:
-            require(isinstance(descriptor[key], str), f"invalid package entrypoint: {location}")
-            target(descriptor[key])
-    if "exports" in descriptor:
-        exports(descriptor["exports"])
+    for specifier in sorted(imports):
+        if specifier.startswith("node:"):
+            continue
+        if specifier.startswith("./"):
+            require(relative(specifier[2:]) in bridge, f"missing local bridge import: {specifier}")
+            continue
+        parts = specifier.split("/")
+        root_count = 2 if specifier.startswith("@") else 1
+        name = "/".join(parts[:root_count])
+        require(name in dependencies, f"undeclared bridge runtime dependency: {specifier}")
+        subpath = "/".join(parts[root_count:])
+        key = "./" + subpath if subpath else "."
+        descriptor = json.loads(installed[name + "/package.json"])
+        if "exports" in descriptor:
+            exports = descriptor["exports"]
+            chosen, capture = None, None
+            if isinstance(exports, dict) and any(k.startswith(".") for k in exports):
+                if key in exports:
+                    chosen = selected(exports[key])
+                else:
+                    matches = []
+                    for pattern, value in exports.items():
+                        if pattern.count("*") != 1:
+                            continue
+                        prefix, suffix = pattern.split("*")
+                        if key.startswith(prefix) and key.endswith(suffix) and len(key) >= len(prefix) + len(suffix):
+                            matches.append((len(prefix), len(suffix), pattern, value))
+                    if matches:
+                        _, _, pattern, value = max(matches, key=lambda row: row[:2])
+                        prefix, suffix = pattern.split("*")
+                        capture = key[len(prefix):len(key) - len(suffix) if suffix else None]
+                        chosen = selected(value)
+            elif key == ".":
+                chosen = selected(exports)
+            require(chosen is not None and chosen.startswith("./"), f"no Node import export: {specifier}")
+            if capture is not None:
+                chosen = chosen.replace("*", capture)
+            entry = relative(chosen[2:])
+            # ESM exports are exact paths; extension/directory probing would
+            # claim an invalid install is usable when Node itself rejects it.
+            require(name + "/" + entry in installed, f"missing used package entrypoint: {specifier}")
+        else:
+            entry = subpath or descriptor.get("main", "index.js")
+            require(isinstance(entry, str), f"invalid package entrypoint: {specifier}")
+            entry = relative(entry.removeprefix("./"))
+            candidates = [entry] if subpath else [entry, entry + ".js", entry + ".json", entry + "/index.js"]
+            require(any(name + "/" + p in installed for p in candidates), f"missing used package entrypoint: {specifier}")
 
 
 def build_bundle(spec: dict, output: Path) -> dict:

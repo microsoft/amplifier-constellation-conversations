@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -134,6 +135,15 @@ def main() -> None:
               "service": digest(args.service), "node": node, "bridge": source,
               "license": digest(ROOT / "LICENSE"), "third_party_notices": digest(rust_notices(args.output))}
     (args.output / "inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
+    triple = package.TARGETS[args.target][2]
+    target_flags = "CARGO_TARGET_" + triple.upper().replace("-", "_") + "_RUSTFLAGS"
+    build = {"schema_version": 1, "source_revision": inputs["source_revision"],
+             "target": args.target, "rust_target": triple, "service_sha256": inputs["service"]["sha256"],
+             "cargo_lock_sha256": digest(ROOT / "Cargo.lock")["sha256"],
+             "rustc": subprocess.check_output(["rustc", "--version", "--verbose"], text=True).strip(),
+             "flags": {"RUSTFLAGS": os.environ.get("RUSTFLAGS"), target_flags: os.environ.get(target_flags)},
+             "note": "Build environment provenance; actual Windows imports are inspected separately."}
+    (args.output / "native-build-provenance.json").write_text(json.dumps(build, indent=2) + "\n")
 
 
 if __name__ == "__main__":

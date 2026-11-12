@@ -346,10 +346,8 @@ impl Client {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         crate::platform::child_environment(&mut cmd);
-        for name in ["SSH_AUTH_SOCK"] {
-            if let Ok(value) = std::env::var(name) {
-                cmd.env(name, value);
-            }
+        if let Some(value) = std::env::var_os("SSH_AUTH_SOCK") {
+            cmd.env("SSH_AUTH_SOCK", value);
         }
         cmd.envs(&c.env);
         let mut child = cmd
