@@ -11,6 +11,7 @@ not qualification of a different application release, OS login, or signatures.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import copy
 import hashlib
 import importlib.util
@@ -136,10 +137,17 @@ class Installation:
         return self.command(["native-update-protocol", "--config", self.owner_config,
                              "--mode", mode, "--action", action], extra_env=extra, expect_success=expect_success)
 
+    @contextmanager
     def db(self):
         db = sqlite3.connect(self.home / "state.sqlite3", timeout=5)
-        db.execute("PRAGMA foreign_keys=ON")
-        return db
+        try:
+            db.execute("PRAGMA foreign_keys=ON")
+            with db:
+                yield db
+        finally:
+            # sqlite3's transaction context commits/rolls back but does not close
+            # the connection. Close before cleanup can remove WAL/SHM files.
+            db.close()
 
     def api(self, method="GET", path="/api/v1/native-update/status", body=None):
         runtime = read_json(self.home / "runtime.json")

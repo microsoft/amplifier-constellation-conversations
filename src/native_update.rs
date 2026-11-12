@@ -395,6 +395,14 @@ pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<
         Ok(readiness)
     }
     let _owner = lock(home, "native-update.lock")?;
+    if context["owner"] == "standalone" {
+        // Enrollment may have won the same lock after standalone planning but
+        // before preparation. Recheck before writing intent or acquiring a gate.
+        ensure!(
+            !home.join("native-update-owner.json").exists(),
+            "This home uses its enrolled updater; use that updater's existing controls"
+        );
+    }
     id(transaction)?;
     let context_hash = hash(&serde_json::to_vec(context)?);
     let existing = if home.join(JOURNAL).exists() {

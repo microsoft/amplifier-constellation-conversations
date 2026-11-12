@@ -500,6 +500,73 @@ async fn enrollment_binds_one_fixed_owner_without_policy_or_second_scheduler() {
 }
 
 #[tokio::test]
+async fn enrollment_after_standalone_plan_prevents_prepare_without_mutation() {
+    let f = Fixture::new();
+    let plan = f.plan();
+    assert_eq!(plan["available"], true);
+    assert!(!f.home.join("native-update-owner.json").exists());
+    assert!(!f.home.join("native-update.json").exists());
+
+    // Deterministically insert a real enrollment into the interval between the
+    // standalone caller's initial ownership check/plan and its locked prepare.
+    let owner_config = f._root.path().join("owner-after-plan.json");
+    let package = &f.original["package"]["bundle"];
+    write_json(
+        &owner_config,
+        &json!({
+            "schema":1,"installation_id":f.original["id"],"home":f.home,
+            "component_id":"companion","participant_id":"companion",
+            "components":["companion","instance"],
+            "candidate":plan["candidate"]["bundle"]["bundle"],
+            "helper_package":package["bundle"],
+            "helper_manifest_sha256":package["manifest_sha256"],
+            "helper_executable":package["entrypoints"]["service"]
+        }),
+    );
+    let registration = native_update_protocol::claim_owner(&owner_config).unwrap();
+    let marker = fs::read(f.home.join("native-update-owner.json")).unwrap();
+    let installed = fs::read(f.home.join("native-installation.json")).unwrap();
+    let companion = fs::read(f.home.join("companion.json")).unwrap();
+    let admission = update_admission::status(&f.home).unwrap();
+    for operation in ["apply", "rollback"] {
+        let transaction = uuid::Uuid::new_v4().to_string();
+        let context = json!({"id":transaction,"owner":"standalone",
+            "plan":{"operation":operation}});
+        assert!(
+            native_update::prepare(&f.home, &transaction, &context)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("enrolled updater")
+        );
+        assert!(!f.home.join("native-update.json").exists());
+        assert_eq!(update_admission::status(&f.home).unwrap(), admission);
+    }
+    let db = Connection::open(f.home.join("state.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM native_update_admission", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        native_update_protocol::registration(&owner_config).unwrap(),
+        registration
+    );
+    assert_eq!(
+        fs::read(f.home.join("native-update-owner.json")).unwrap(),
+        marker
+    );
+    assert_eq!(
+        fs::read(f.home.join("native-installation.json")).unwrap(),
+        installed
+    );
+    assert_eq!(fs::read(f.home.join("companion.json")).unwrap(), companion);
+    f.selected(&plan["previous"]);
+    f.retained();
+}
+
+#[tokio::test]
 async fn shared_only_outcomes_restore_same_bundle_and_remain_immutable_on_retry() {
     let f = Fixture::new();
     for outcome in ["applied", "rolled_back"] {

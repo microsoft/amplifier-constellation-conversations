@@ -11,6 +11,24 @@ spec.loader.exec_module(lifecycle)
 
 
 class LifecycleControllerTests(unittest.TestCase):
+    def test_database_transactions_close_on_success_and_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            install = object.__new__(lifecycle.Installation)
+            install.home = Path(folder)
+            with install.db() as committed:
+                committed.execute("CREATE TABLE retained(value INTEGER)")
+                committed.execute("INSERT INTO retained VALUES(1)")
+            with self.assertRaises(lifecycle.sqlite3.ProgrammingError):
+                committed.execute("SELECT 1")
+            with self.assertRaisesRegex(RuntimeError, "fixture failure"):
+                with install.db() as aborted:
+                    aborted.execute("INSERT INTO retained VALUES(2)")
+                    raise RuntimeError("fixture failure")
+            with self.assertRaises(lifecycle.sqlite3.ProgrammingError):
+                aborted.execute("SELECT 1")
+            with install.db() as checked:
+                self.assertEqual(checked.execute("SELECT value FROM retained").fetchall(), [(1,)])
+
     def fixture(self, root):
         source = root / "A"
         source.mkdir()
