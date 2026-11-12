@@ -1348,7 +1348,13 @@ $('login-form').onsubmit = async event => {
 };
 $('sign-out').onclick = async () => {
   if (state.call) endCall();
-  try { await api('/auth/logout','POST',{}); state.session = null; showLogin(); }
+  try {
+    await api('/auth/logout','POST',{});
+    // Retain only public sign-in presentation. A local account never requires
+    // the hidden OS-account username, and no authenticated state/CSRF survives.
+    state.session = {authenticated:false,auth_mode:state.session?.auth_mode,owner:state.session?.owner,first_account_needed:false};
+    showLogin();
+  }
   catch (error) { notice(error.message); }
 };
 document.addEventListener('visibilitychange', () => {
