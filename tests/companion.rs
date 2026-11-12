@@ -2921,6 +2921,25 @@ async fn blocked_received_inputs_report_not_started_once_and_preserve_unknown_re
                 && e["data"]["state"] == "blocked"
                 && e["data"]["delivery_state"] == "received")
     );
+    // backend_status precedes the queued voice batch. Wait for the fixture's
+    // matching append acknowledgement, not an assumed bridge scheduling delay.
+    let mut accepted = false;
+    for _ in 0..100 {
+        accepted = f.s.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND kind='context_delivery' AND json_extract(data,'$.state')='accepted' AND json_extract(data,'$.content') LIKE '%has not reached the agent%')",
+            [id],
+            |r| r.get(0),
+        ).unwrap();
+        if accepted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        accepted,
+        "The fixture must acknowledge the blocked-input notice"
+    );
+    // Keep observing subsequent advances to catch duplicate delivery.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
     assert_eq!(
