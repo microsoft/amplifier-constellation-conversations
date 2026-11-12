@@ -885,6 +885,89 @@ try {
     await page.setViewportSize({width:1280,height:900});
     checks.push('full private source card text remains unchanged in History; first and final qualification paragraphs are reachable by ordinary phone-size scrolling while call controls stay visible');
   }
+  {
+    // Native progress and a source reply are independent receipts. Neither
+    // reading the card nor retaining pending native work establishes effects.
+    emit('delegation',{id:'pending-after-source',state:'dispatched'});
+    emit('progress',{delegation_id:'pending-after-source',state:'running',elapsed_seconds:65});
+    emit('action_observation',{label:'A recorded source reply',observation:privateOutcome});
+    await wait(async()=>/Agent reply recorded/.test(await page.locator('#connection-status').innerText()),'recorded reply missing beside native progress');
+    await wait(async()=>/65 seconds/.test(await page.locator('#work-status').innerText()),'native progress disappeared');
+    const progressText=await page.locator('#work-status').innerText();
+    const presenceAt='2026-11-08T20:46:27.003Z';
+    const presence={username:'Coach',position:{x:-12.25,y:73,z:8.5},ready:true,busy:false,turn_active:false,players:[],players_omitted:2,
+      meaning:'Observed position and activity flags; not proof of current work or request fulfillment.'};
+    const source={id:'minecraft:presence:Coach',revision:'presence-revision-1',kind:'presence_observation',actor:'Coach',connection_id:'minecraft-coach',
+      occurred_at:presenceAt,audience:{kind:'public',experience:'minecraft',connection_id:'minecraft-coach'},provenance:{kind:'minecraft_public_presence',authority:false},text:JSON.stringify(presence)};
+    const presenceCard={title:'Coach · Workshop snapshot',awareness_id:'presence-ui-fixture',conversation_id:'room-coach',text:source.text,source,
+      attribution:{connection_id:'minecraft-coach',connection_label:'Workshop',actor:'Coach',scope:'presence_observation',occurred_at:presenceAt,observed_at:null,
+        current_state_snapshot:true,snapshot_kind:'presence',audience:source.audience,authority:false,observed_only:true},presentation:'quiet',observed_only:true};
+    emit('card',presenceCard);
+    const card=page.locator('.output-card').filter({has:page.getByRole('heading',{name:/Coach · Workshop snapshot/,includeHidden:true})});
+    await wait(async()=>await card.count()===1,'presence card missing');
+    // These two assertions reproduce the actual stale banner/raw-JSON defects
+    // together without treating a recorded reply as completed work.
+    assert.deepEqual({falseAbsenceClaim:/No completed result has arrived/.test(progressText),rawJsonSummary:(await card.locator('.card-answer').innerText()).trim().startsWith('{')},
+      {falseAbsenceClaim:false,rawJsonSummary:false});
+    assert.match(progressText,/request was still pending after 65 seconds/);
+    const summary=await card.locator('.presence-summary').innerText();
+    assert.match(summary,/Position: -12\.25, 73, 8\.5/);
+    assert.doesNotMatch(summary,/ready|busy|turn active|turn_active/);
+    assert.match(summary,/Saved observation/);
+    assert.doesNotMatch(summary,/idle|completed|world empty|no players|work stopped|healthy/i);
+    assert.equal(await card.locator('.presence-summary time').getAttribute('datetime'),presenceAt);
+    assert.equal(await card.locator('details').evaluate(node=>node.open),false);
+    assert.equal(await page.locator('#board-items .output-card').filter({hasText:'Coach · Workshop snapshot'}).count(),0);
+    await card.locator('summary').click();
+    assert.deepEqual(JSON.parse(await card.locator('pre').textContent()),source,'Details must retain the complete source, including meaning and omitted players');
+    await page.setViewportSize({width:390,height:844});await card.scrollIntoViewIfNeeded();
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+    if(process.env.COMPANION_SCREENSHOT)await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-presence-mobile.png'),fullPage:true});
+    await card.locator('summary').click();await page.setViewportSize({width:1280,height:900});
+    for(const [name,change] of [
+      ['unknown flags',v=>{v.source.text=v.text=JSON.stringify({...presence,ready:null,busy:'false',turn_active:0,position:{x:1,y:null,z:3},players:[]});}],
+      ['different observation time',v=>{v.source.observed_at='2026-11-08T20:48:20.500Z';}],
+      ['missing observation time',v=>{delete v.source.occurred_at;delete v.attribution.occurred_at;}]
+    ]) {
+      const value=structuredClone(presenceCard);value.title=name;value.awareness_id=name;change(value);emit('card',value);
+      const variant=page.locator('.output-card').filter({has:page.getByRole('heading',{name:new RegExp('^'+name),includeHidden:true})});
+      await wait(async()=>await variant.count()===1,`${name} card missing`);
+      const text=await variant.locator('.presence-summary').innerText();
+      if(name==='unknown flags'){assert.match(text,/Position unavailable in this snapshot/);assert.doesNotMatch(text,/ready =|busy =|turn active =|Position: 1/);}
+      if(name==='different observation time')assert.equal(await variant.locator('.presence-summary time').getAttribute('datetime'),value.source.observed_at);
+      if(name==='missing observation time'){assert.match(text,/Observation time not recorded/);assert.equal(await variant.locator('.presence-summary time').count(),0);}
+      assert.deepEqual(JSON.parse(await variant.locator('pre').textContent()),value.source);
+    }
+    for(const [name,change] of [
+      ['ordinary JSON',v=>{delete v.source;delete v.attribution;}],
+      ['untyped presence',v=>v.source.provenance.kind='other'],
+      ['different text',v=>v.text='A separate saved answer.'],
+      ['malformed presence',v=>{v.source.text=v.text='{bad JSON';}],
+      ['nonobject presence',v=>{v.source.text=v.text='[]';}],
+      ['source mismatch',v=>v.attribution.connection_id='another-world'],
+      ['untrusted observation',v=>v.observed_only=false]
+    ]) {
+      const value=structuredClone(presenceCard);value.title=name;value.awareness_id=name;change(value);emit('card',value);
+      const variant=page.locator('.output-card').filter({has:page.getByRole('heading',{name:new RegExp('^'+name),includeHidden:true})});
+      await wait(async()=>await variant.count()===1,`${name} card missing`);
+      assert.equal(await variant.locator('.presence-summary').count(),0,`${name} must preserve ordinary rendering`);
+      assert.equal((await variant.locator('.card-answer').innerText()).trim(),value.text);
+    }
+    const hostile=structuredClone(presenceCard);hostile.title='Safe presence details';hostile.awareness_id='safe-presence';
+    hostile.source.text=hostile.text=JSON.stringify({...presence,meaning:'<img src=x onerror="window.presenceInjected=true">'});emit('card',hostile);
+    const safe=page.locator('.output-card').filter({has:page.getByRole('heading',{name:/Safe presence details/,includeHidden:true})});
+    await wait(async()=>await safe.count()===1,'safe source card missing');
+    assert.equal(await safe.locator('img,script').count(),0);assert.equal(await page.evaluate(()=>window.presenceInjected),undefined);
+    assert.deepEqual(JSON.parse(await safe.locator('pre').textContent()),hostile.source);
+    emit('progress',{delegation_id:'pending-after-source',state:'blocked',elapsed_seconds:70});
+    await wait(async()=>/needs review/.test(await page.locator('#work-status').innerText()),'blocker lost after source reply');
+    emit('progress',{delegation_id:'pending-after-source',state:'awaiting_permission',elapsed_seconds:71});
+    await wait(async()=>/waiting for your decision/.test(await page.locator('#work-status').innerText()),'permission status lost after source reply');
+    emit('delegation',{id:'pending-after-source',state:'completed'});
+    await wait(async()=>await page.locator('#work-status').isHidden(),'completed native work remained pending');
+    checks.push('pending native progress never asserts global result absence; recorded reply labels and blocked/permission states remain independent');
+    checks.push('typed presence cards summarize only observed time, exact position; full flags and source Details, unknowns, ordinary cards and mobile safety are preserved');
+  }
   const permission={id:randomUUID(),conversation_id:'room-coach',agent:'Coach',expires_at:Date.now()+60000,tool_call:{title:'Check Minecraft status',rawInput:{command:'<img src=x onerror="window.permissionInjected=true">'}},options:[{optionId:'always',name:'Always',kind:'allow_always'},{optionId:'once',name:'Read basic status',kind:'allow_once'},{optionId:'detail',name:'Read detailed status',kind:'allow_once'},{optionId:'no',name:'Reject once',kind:'reject_once'}]};
   permissions.set(permission.id,permission);
   await page.locator('#transcript-tab').click();
