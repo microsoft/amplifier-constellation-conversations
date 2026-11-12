@@ -8,6 +8,7 @@
 use crate::{config::Config, native_bundle::APPLICATION};
 use amplifier_native_platform::{
     installation::{self, ActionOutcome, Service, ServiceAction, ServiceManager},
+    locking::InstallationLock,
     registration::{self, Registration, RegistrationOutcome, RetirementOutcome},
 };
 use anyhow::{Context, Result, ensure};
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -58,7 +60,14 @@ pub enum LaunchReceipt {
 #[serde(deny_unknown_fields)]
 struct DispatchRecord {
     prepared: PreparedLaunch,
+    // False is durable proof that this producer never entered the manager.
+    // Old records lacked the field and must retain their uncertain authority.
+    #[serde(default = "legacy_manager_attempted")]
+    manager_attempted: bool,
     receipt: Option<LaunchReceipt>,
+}
+fn legacy_manager_attempted() -> bool {
+    true
 }
 
 /// Private manager evidence, including the complete definition and process
@@ -103,7 +112,8 @@ struct RetirementRecord {
 }
 
 const MAX_HOME_ENTRIES: usize = 4096;
-const MAX_LAUNCH_MARKERS: usize = 256;
+const MAX_OUTSTANDING_LAUNCHES: usize = 256;
+const MAX_INDEX_BYTES: usize = 128 * 1024;
 const MAX_LAUNCH_BYTES: usize = 128 * 1024;
 const MAX_ENUMERATION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETIREMENT_BYTES: usize = 1024 * 1024;
@@ -125,44 +135,172 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Read only; scans this home's fixed dispatch markers, never manager-provided
-/// paths or arbitrary directories. Every record is reconstructed and bound to
-/// its filename before the caller can consider cleanup eligibility.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutstandingIndex {
+    schema: u32,
+    installation_id: String,
+    // The digest binds the immutable prepared profile, not its mutable receipt.
+    launches: BTreeMap<String, String>,
+}
+
+fn index_path(home: &Path) -> PathBuf {
+    home.join("native-browser-outstanding.json")
+}
+fn index_lock(home: &Path) -> Result<Option<InstallationLock>> {
+    Ok(InstallationLock::try_acquire(
+        &home.join("native-browser-outstanding.lock"),
+    )?)
+}
+fn profile_lock(plan: &PreparedLaunch) -> Result<Option<InstallationLock>> {
+    Ok(InstallationLock::try_acquire(&plan.home.join(format!(
+        "native-browser-dispatch-{}.lock",
+        plan.service.name
+    )))?)
+}
+fn marker_name(plan: &PreparedLaunch) -> String {
+    format!("native-browser-launch-{}.json", plan.service.name)
+}
+fn profile_digest(plan: &PreparedLaunch) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(plan)?)))
+}
+fn validate_index(index: &OutstandingIndex, id: &str) -> Result<()> {
+    ensure!(
+        index.schema == 1 && index.installation_id == id,
+        "Outstanding launch index belongs to another installation"
+    );
+    ensure!(
+        index.launches.len() <= MAX_OUTSTANDING_LAUNCHES,
+        "Too many outstanding registrations"
+    );
+    for (name, digest) in &index.launches {
+        ensure!(
+            name.starts_with("native-browser-launch-")
+                && name.ends_with(".json")
+                && name.len() <= 256
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-._".contains(&b))
+                && digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "Invalid outstanding launch identity"
+        );
+    }
+    Ok(())
+}
+fn read_index(home: &Path, id: &str) -> Result<Option<OutstandingIndex>> {
+    let path = index_path(home);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let index: OutstandingIndex = serde_json::from_slice(&read_bounded(&path, MAX_INDEX_BYTES)?)?;
+    validate_index(&index, id)?;
+    Ok(Some(index))
+}
+
+// Only an installation with no prior dispatch evidence can initialize an index.
+// Browser updates have not shipped with the earlier marker-only protocol. Its
+// retained fixture evidence must be inspected explicitly, never guessed away.
+fn require_no_legacy_markers(home: &Path) -> Result<()> {
+    for (index, entry) in fs::read_dir(home)?.enumerate() {
+        ensure!(
+            index < MAX_HOME_ENTRIES,
+            "Installation directory exceeds initial inventory limit"
+        );
+        let name = entry?.file_name();
+        if let Some(name) = name.to_str() {
+            ensure!(
+                !(name.starts_with("native-browser-launch-") && name.ends_with(".json")),
+                "Legacy pre-index launch markers require explicit inspection"
+            );
+        }
+    }
+    Ok(())
+}
+fn initialize_index(home: &Path, id: &str) -> Result<OutstandingIndex> {
+    if let Some(index) = read_index(home, id)? {
+        return Ok(index);
+    }
+    require_no_legacy_markers(home)?;
+    let index = OutstandingIndex {
+        schema: 1,
+        installation_id: id.into(),
+        launches: BTreeMap::new(),
+    };
+    amplifier_native_platform::private_create(&index_path(home), &serde_json::to_vec(&index)?)?;
+    Ok(index)
+}
+
+// This small storage seam lets the regression cover both failure before rename
+// and a committed atomic write whose acknowledgment is lost.
+trait IndexWriter {
+    fn write(&self, home: &Path, bytes: &[u8]) -> Result<()>;
+}
+struct PrivateIndexWriter;
+impl IndexWriter for PrivateIndexWriter {
+    fn write(&self, home: &Path, bytes: &[u8]) -> Result<()> {
+        amplifier_native_platform::private_write_data(&index_path(home), bytes)
+    }
+}
+fn save_index(home: &Path, index: &OutstandingIndex, writer: &dyn IndexWriter) -> Result<()> {
+    validate_index(index, &index.installation_id)?;
+    let bytes = serde_json::to_vec(index)?;
+    ensure!(
+        bytes.len() <= MAX_INDEX_BYTES,
+        "Outstanding index exceeds storage bound"
+    );
+    writer.write(home, &bytes)
+}
+fn require_membership(index: &OutstandingIndex, plan: &PreparedLaunch) -> Result<()> {
+    ensure!(
+        index.launches.get(&marker_name(plan)) == Some(&profile_digest(plan)?),
+        "Outstanding index does not bind this fixed launch"
+    );
+    Ok(())
+}
+fn remove_membership(plan: &PreparedLaunch, writer: &dyn IndexWriter) -> Result<()> {
+    let _lock = index_lock(&plan.home)?.context("Outstanding launch index is busy")?;
+    let mut index = read_index(&plan.home, &plan.installation_id)?
+        .context("Missing outstanding launch index; retained evidence requires inspection")?;
+    // A previous removal may have committed even though its reply was lost.
+    if index.launches.contains_key(&marker_name(plan)) {
+        require_membership(&index, plan)?;
+        index.launches.remove(&marker_name(plan));
+        save_index(&plan.home, &index, writer)?;
+    }
+    Ok(())
+}
+
+/// Read only; observes the bounded outstanding index and its exact dispatch
+/// records. Retired historical markers remain untouched and do not consume the
+/// bound. Missing legacy inventory is a refusal, never an empty success.
 pub fn enumerate(home: &Path) -> Result<Vec<RetainedLaunch>> {
     ordinary(home, true)?;
     let home = dunce::canonicalize(home)?;
-    let mut paths = Vec::new();
-    for (index, entry) in fs::read_dir(&home)?.enumerate() {
-        ensure!(
-            index < MAX_HOME_ENTRIES,
-            "Installation directory exceeds enumeration limit"
-        );
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with("native-browser-launch-") && name.ends_with(".json") {
-            ensure!(
-                paths.len() < MAX_LAUNCH_MARKERS,
-                "Too many retained launch markers"
-            );
-            paths.push(entry.path());
-        }
-    }
-    paths.sort();
+    let id = Config::load(&home)?.id;
+    let Some(index) = read_index(&home, &id)? else {
+        require_no_legacy_markers(&home)?;
+        return Ok(Vec::new());
+    };
     let mut total = 0;
-    let mut launches = Vec::with_capacity(paths.len());
-    for path in paths {
+    let mut launches = Vec::with_capacity(index.launches.len());
+    for (name, digest) in index.launches {
+        let path = home.join(name);
         let bytes = read_bounded(&path, MAX_LAUNCH_BYTES)?;
         total += bytes.len();
         ensure!(
             total <= MAX_ENUMERATION_BYTES,
-            "Retained launch data exceeds enumeration limit"
+            "Outstanding launch data exceeds enumeration limit"
         );
         let record: DispatchRecord = serde_json::from_slice(&bytes)?;
         let plan = record.prepared;
         plan.validate()?;
         ensure!(
-            plan.home == home && plan.marker() == path,
+            plan.home == home && plan.marker() == path && profile_digest(&plan)? == digest,
             "Launch marker belongs to another home or fixed identity"
         );
         let identity = match &plan.identity {
@@ -262,19 +400,39 @@ fn retire_with(
     plan: &PreparedLaunch,
     manager: &dyn RetirementManager,
 ) -> Result<RetirementReceipt> {
+    retire_with_writer(plan, manager, &PrivateIndexWriter)
+}
+fn retire_with_writer(
+    plan: &PreparedLaunch,
+    manager: &dyn RetirementManager,
+    writer: &dyn IndexWriter,
+) -> Result<RetirementReceipt> {
     plan.validate()?;
+    let Some(_profile_lock) = profile_lock(plan)? else {
+        return Ok(retirement_unknown("dispatch_or_retirement_in_progress"));
+    };
     ensure!(
         read_dispatch(plan)?.is_some(),
         "Missing original dispatch evidence"
     );
+    let index = read_index(&plan.home, &plan.installation_id)?
+        .context("Missing outstanding launch index; retained evidence requires inspection")?;
     let previous = read_retirement(plan)?;
+    if manager.is_retired(plan)? {
+        return Ok(match remove_membership(plan, writer) {
+            Ok(()) => RetirementReceipt::Retired { removed: false },
+            Err(_) => retirement_unknown("retirement_index_unconfirmed"),
+        });
+    }
     if previous.is_some() {
-        return Ok(retirement_observation(plan, manager, previous)?
+        return Ok(previous
+            .map(|record| match record.receipt {
+                Some(receipt @ RetirementReceipt::Refused { .. }) => receipt,
+                _ => retirement_unknown("retirement_unconfirmed"),
+            })
             .expect("Existing retirement yields an observation"));
     }
-    if manager.is_retired(plan)? {
-        return Ok(RetirementReceipt::Retired { removed: false });
-    }
+    require_membership(&index, plan)?;
     let expected = manager.snapshot(plan)?;
     // Ordinary active/transitioning/mismatched registrations get no retirement
     // intent marker, so a later explicitly authorized settled cleanup can run.
@@ -319,6 +477,11 @@ fn retire_with(
         || amplifier_native_platform::private_write_data(&retirement_path(plan), &bytes).is_err()
     {
         return Ok(retirement_unknown("retirement_receipt_unconfirmed"));
+    }
+    if matches!(result, RetirementReceipt::Retired { .. })
+        && remove_membership(plan, writer).is_err()
+    {
+        return Ok(retirement_unknown("retirement_index_unconfirmed"));
     }
     Ok(result)
 }
@@ -596,20 +759,64 @@ pub fn launch(prepared: &PreparedLaunch) -> Result<LaunchReceipt> {
 }
 
 fn launch_with(plan: &PreparedLaunch, manager: &dyn Manager) -> Result<LaunchReceipt> {
+    launch_with_writer(plan, manager, &PrivateIndexWriter)
+}
+fn launch_with_writer(
+    plan: &PreparedLaunch,
+    manager: &dyn Manager,
+    writer: &dyn IndexWriter,
+) -> Result<LaunchReceipt> {
     plan.validate()?;
+    // The same fixed profile lock spans retirement and confirmed index removal.
+    // A paused original launch cannot register after cleanup observed absence.
+    let Some(_profile_lock) = profile_lock(plan)? else {
+        return Ok(unknown("dispatch_or_retirement_in_progress"));
+    };
     if read_dispatch(plan)?.is_some() {
         return Ok(unknown("dispatch_already_attempted"));
     }
     let mut record = DispatchRecord {
         prepared: plan.clone(),
+        manager_attempted: false,
         receipt: None,
     };
-    // Create-only publication wins races. A failed flush can follow publication;
-    // therefore any error here remains uncertain and never enters the manager.
-    if amplifier_native_platform::private_create(&plan.marker(), &serde_json::to_vec(&record)?)
-        .is_err()
     {
-        return Ok(unknown("dispatch_intent_unconfirmed"));
+        let Some(_index_lock) = index_lock(&plan.home)? else {
+            return Ok(unknown("outstanding_index_busy"));
+        };
+        let mut index = initialize_index(&plan.home, &plan.installation_id)?;
+        ensure!(
+            index.launches.len() < MAX_OUTSTANDING_LAUNCHES,
+            "Too many outstanding registrations"
+        );
+        ensure!(
+            !index.launches.contains_key(&marker_name(plan)),
+            "Outstanding launch marker is missing"
+        );
+        // Create-only publication wins races. Even a failed flush can follow
+        // publication; it never permits a manager call or a later redispatch.
+        if amplifier_native_platform::private_create(&plan.marker(), &serde_json::to_vec(&record)?)
+            .is_err()
+        {
+            return Ok(unknown("dispatch_intent_unconfirmed"));
+        }
+        index
+            .launches
+            .insert(marker_name(plan), profile_digest(plan)?);
+        if save_index(&plan.home, &index, writer).is_err() {
+            return Ok(unknown("dispatch_index_unconfirmed"));
+        }
+        // False can remain outside the index only if no manager call was
+        // possible. An ambiguous true publication remains indexed and unknown.
+        record.manager_attempted = true;
+        if amplifier_native_platform::private_write_data(
+            &plan.marker(),
+            &serde_json::to_vec(&record)?,
+        )
+        .is_err()
+        {
+            return Ok(unknown("dispatch_authority_unconfirmed"));
+        }
     }
     let result = (|| -> Result<LaunchReceipt> {
         match manager.register(plan)? {
@@ -748,7 +955,13 @@ mod tests {
         }
     }
     impl Manager for FakeManager {
-        fn register(&self, _: &PreparedLaunch) -> Result<RegistrationOutcome> {
+        fn register(&self, plan: &PreparedLaunch) -> Result<RegistrationOutcome> {
+            let index = read_index(&plan.home, &plan.installation_id)?.unwrap();
+            require_membership(&index, plan)?;
+            assert!(read_dispatch(plan)?.unwrap().manager_attempted);
+            // Another profile (including the replacement) must be able to
+            // publish while this profile is inside its manager call.
+            let _index_lock = index_lock(&plan.home)?.expect("Index lock released before manager");
             self.registrations.fetch_add(1, Ordering::SeqCst);
             Ok(self.registration.clone())
         }
@@ -893,15 +1106,7 @@ mod tests {
         let fixture = Fixture::new();
         let plan = fixture.plan();
         let manager = FakeManager::new(ActionOutcome::Accepted);
-        let record = DispatchRecord {
-            prepared: plan.clone(),
-            receipt: None,
-        };
-        amplifier_native_platform::private_create(
-            &plan.marker(),
-            &serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
+        record_intent(&plan, None);
         assert!(matches!(
             launch_with(&plan, &manager).unwrap(),
             LaunchReceipt::Unknown { .. }
@@ -1034,16 +1239,26 @@ mod tests {
             Ok(self.outcome.clone())
         }
     }
-    fn recorded(plan: &PreparedLaunch) {
+    fn record_intent(plan: &PreparedLaunch, receipt: Option<LaunchReceipt>) {
+        let _lock = index_lock(&plan.home).unwrap().unwrap();
+        let mut index = initialize_index(&plan.home, &plan.installation_id).unwrap();
         let record = DispatchRecord {
             prepared: plan.clone(),
-            receipt: Some(LaunchReceipt::Accepted),
+            manager_attempted: true,
+            receipt,
         };
         amplifier_native_platform::private_create(
             &plan.marker(),
             &serde_json::to_vec(&record).unwrap(),
         )
         .unwrap();
+        index
+            .launches
+            .insert(marker_name(plan), profile_digest(plan).unwrap());
+        save_index(&plan.home, &index, &PrivateIndexWriter).unwrap();
+    }
+    fn recorded(plan: &PreparedLaunch) {
+        record_intent(plan, Some(LaunchReceipt::Accepted));
     }
 
     #[test]
@@ -1087,14 +1302,21 @@ mod tests {
         assert_eq!(fs::read(replacement.marker()).unwrap(), original);
         assert_eq!(fs::read_dir(&fixture.home).unwrap().count(), entries);
         let wrong = fixture.home.join("native-browser-launch-wrong-name.json");
-        fs::write(wrong, original).unwrap();
+        fs::write(&wrong, original).unwrap();
+        let mut index = read_index(&fixture.home, &fixture.id).unwrap().unwrap();
+        index.launches.insert(
+            wrong.file_name().unwrap().to_str().unwrap().into(),
+            profile_digest(&replacement).unwrap(),
+        );
+        save_index(&fixture.home, &index, &PrivateIndexWriter).unwrap();
         assert!(enumerate(&fixture.home).is_err());
     }
 
     #[test]
-    fn enumeration_refuses_oversized_and_excess_markers_before_cleanup() {
+    fn enumeration_refuses_oversized_and_excess_outstanding_before_cleanup() {
         let fixture = Fixture::new();
         let plan = fixture.plan();
+        recorded(&plan);
         fs::File::create(plan.marker())
             .unwrap()
             .set_len(MAX_LAUNCH_BYTES as u64 + 1)
@@ -1102,20 +1324,28 @@ mod tests {
         assert!(enumerate(&fixture.home).is_err());
         assert!(!retirement_path(&plan).exists());
         let fixture = Fixture::new();
-        for index in 0..=MAX_LAUNCH_MARKERS {
-            fs::write(
-                fixture
-                    .home
-                    .join(format!("native-browser-launch-{index}.json")),
-                b"{}",
-            )
-            .unwrap();
-        }
+        let index = OutstandingIndex {
+            schema: 1,
+            installation_id: fixture.id.clone(),
+            launches: (0..=MAX_OUTSTANDING_LAUNCHES)
+                .map(|number| {
+                    (
+                        format!("native-browser-launch-{number}.json"),
+                        "a".repeat(64),
+                    )
+                })
+                .collect(),
+        };
+        amplifier_native_platform::private_write_data(
+            &index_path(&fixture.home),
+            &serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
         assert!(
             enumerate(&fixture.home)
                 .unwrap_err()
                 .to_string()
-                .contains("Too many")
+                .contains("Too many outstanding")
         );
     }
 
@@ -1126,6 +1356,8 @@ mod tests {
         let plan = fixture.plan();
         let target = fixture.home.join("unrelated.json");
         fs::write(&target, b"unchanged").unwrap();
+        recorded(&plan);
+        fs::remove_file(plan.marker()).unwrap();
         std::os::unix::fs::symlink(&target, plan.marker()).unwrap();
         assert!(enumerate(&fixture.home).is_err());
         assert_eq!(fs::read(target).unwrap(), b"unchanged");
@@ -1236,5 +1468,242 @@ mod tests {
         assert_eq!(retire_with(&plan, &manager).unwrap(), expected);
         assert_eq!(fs::read(retirement_path(&plan)).unwrap(), original);
         assert_eq!(manager.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct LostIndexWrite {
+        commit: bool,
+        calls: AtomicUsize,
+    }
+    impl IndexWriter for LostIndexWrite {
+        fn write(&self, home: &Path, bytes: &[u8]) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.commit {
+                PrivateIndexWriter.write(home, bytes)?;
+            }
+            anyhow::bail!("Injected index publication acknowledgment failure")
+        }
+    }
+
+    #[test]
+    fn missing_legacy_inventory_is_never_silently_reclassified() {
+        let fixture = Fixture::new();
+        let plan = fixture.plan();
+        // This is the exact older shape, without manager_attempted. It must
+        // deserialize conservatively even if the manager currently looks absent.
+        let old = json!({"prepared":plan,"receipt":null});
+        amplifier_native_platform::private_create(
+            &plan.marker(),
+            &serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert!(read_dispatch(&plan).unwrap().unwrap().manager_attempted);
+        let before = fs::read(plan.marker()).unwrap();
+        assert!(
+            enumerate(&fixture.home)
+                .unwrap_err()
+                .to_string()
+                .contains("Legacy pre-index")
+        );
+        let manager = FakeManager::new(ActionOutcome::Accepted);
+        assert!(
+            launch_with(&fixture.plan(), &manager)
+                .unwrap_err()
+                .to_string()
+                .contains("Legacy pre-index")
+        );
+        let retire = FakeRetirement::new(RetirementOutcome::Retired { removed: true });
+        retire.absent.store(true, Ordering::SeqCst);
+        assert!(retire_with(&plan, &retire).is_err());
+        assert_eq!(manager.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(retire.calls.load(Ordering::SeqCst), 0);
+        assert!(!index_path(&fixture.home).exists());
+        assert_eq!(fs::read(plan.marker()).unwrap(), before);
+    }
+
+    #[test]
+    fn lost_index_publication_never_enters_manager_or_retries_dispatch() {
+        for commit in [false, true] {
+            let fixture = Fixture::new();
+            let plan = fixture.plan();
+            let manager = FakeManager::new(ActionOutcome::Accepted);
+            let writer = LostIndexWrite {
+                commit,
+                calls: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                launch_with_writer(&plan, &manager, &writer).unwrap(),
+                unknown("dispatch_index_unconfirmed")
+            );
+            let bytes = fs::read(plan.marker()).unwrap();
+            let record = read_dispatch(&plan).unwrap().unwrap();
+            assert!(!record.manager_attempted);
+            assert!(record.receipt.is_none());
+            assert_eq!(enumerate(&fixture.home).unwrap().len(), usize::from(commit));
+            assert_eq!(
+                launch_with(&plan, &manager).unwrap(),
+                unknown("dispatch_already_attempted")
+            );
+            assert_eq!(fs::read(plan.marker()).unwrap(), bytes);
+            assert_eq!(manager.registrations.load(Ordering::SeqCst), 0);
+            assert_eq!(manager.starts.load(Ordering::SeqCst), 0);
+            assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn failed_index_removal_reconciles_without_repeating_native_retirement() {
+        for commit in [false, true] {
+            let fixture = Fixture::new();
+            let plan = fixture.plan();
+            recorded(&plan);
+            let dispatch = fs::read(plan.marker()).unwrap();
+            let manager = FakeRetirement::new(RetirementOutcome::Retired { removed: true });
+            let writer = LostIndexWrite {
+                commit,
+                calls: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                retire_with_writer(&plan, &manager, &writer).unwrap(),
+                retirement_unknown("retirement_index_unconfirmed")
+            );
+            assert_eq!(
+                enumerate(&fixture.home).unwrap().len(),
+                usize::from(!commit)
+            );
+            let index = fs::read(index_path(&fixture.home)).unwrap();
+            let retirement = fs::read(retirement_path(&plan)).unwrap();
+            assert_eq!(
+                observe_retirement_with(&plan, &manager).unwrap(),
+                Some(RetirementReceipt::Retired { removed: false })
+            );
+            assert_eq!(fs::read(index_path(&fixture.home)).unwrap(), index);
+            assert_eq!(
+                retire_with(&plan, &manager).unwrap(),
+                RetirementReceipt::Retired { removed: false }
+            );
+            assert!(enumerate(&fixture.home).unwrap().is_empty());
+            assert_eq!(manager.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fs::read(plan.marker()).unwrap(), dispatch);
+            assert_eq!(fs::read(retirement_path(&plan)).unwrap(), retirement);
+        }
+    }
+
+    #[test]
+    fn retired_history_beyond_old_limit_does_not_block_new_launch_or_cleanup() {
+        let fixture = Fixture::new();
+        let manager = FakeManager::new(ActionOutcome::Accepted);
+        let retirement = FakeRetirement::new(RetirementOutcome::Retired { removed: true });
+        let mut historical = Vec::new();
+        for _ in 0..MAX_OUTSTANDING_LAUNCHES + 4 {
+            let plan = fixture.plan();
+            assert_eq!(
+                launch_with(&plan, &manager).unwrap(),
+                LaunchReceipt::Accepted
+            );
+            retirement.absent.store(false, Ordering::SeqCst);
+            assert_eq!(
+                retire_with(&plan, &retirement).unwrap(),
+                RetirementReceipt::Retired { removed: true }
+            );
+            historical.push((
+                plan.marker(),
+                fs::read(plan.marker()).unwrap(),
+                retirement_path(&plan),
+            ));
+        }
+        let next = fixture.plan();
+        assert_eq!(
+            launch_with(&next, &manager).unwrap(),
+            LaunchReceipt::Accepted
+        );
+        let outstanding = enumerate(&fixture.home).unwrap();
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].prepared, next);
+        retirement.absent.store(false, Ordering::SeqCst);
+        assert_eq!(
+            retire_with(&next, &retirement).unwrap(),
+            RetirementReceipt::Retired { removed: true }
+        );
+        assert!(enumerate(&fixture.home).unwrap().is_empty());
+        assert_eq!(
+            manager.starts.load(Ordering::SeqCst),
+            MAX_OUTSTANDING_LAUNCHES + 5
+        );
+        assert_eq!(
+            retirement.calls.load(Ordering::SeqCst),
+            MAX_OUTSTANDING_LAUNCHES + 5
+        );
+        for (marker, bytes, retirement) in historical {
+            assert_eq!(fs::read(marker).unwrap(), bytes);
+            assert!(retirement.exists());
+        }
+    }
+
+    #[test]
+    fn paused_dispatch_prevents_absence_cleanup_until_manager_call_finishes() {
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+        struct PausedManager {
+            inner: FakeManager,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Manager for PausedManager {
+            fn register(&self, plan: &PreparedLaunch) -> Result<RegistrationOutcome> {
+                self.entered.send(())?;
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))?;
+                self.inner.register(plan)
+            }
+            fn snapshot(&self, plan: &PreparedLaunch) -> Result<Value> {
+                self.inner.snapshot(plan)
+            }
+            fn matches(&self, plan: &PreparedLaunch, snapshot: &Value) -> Result<bool> {
+                self.inner.matches(plan, snapshot)
+            }
+            fn start(&self, plan: &PreparedLaunch, snapshot: &Value) -> Result<ActionOutcome> {
+                self.inner.start(plan, snapshot)
+            }
+        }
+        let fixture = Fixture::new();
+        let plan = fixture.plan();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let manager = Arc::new(PausedManager {
+            inner: FakeManager::new(ActionOutcome::Accepted),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let runner = {
+            let plan = plan.clone();
+            let manager = manager.clone();
+            std::thread::spawn(move || launch_with(&plan, manager.as_ref()).unwrap())
+        };
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let absent = FakeRetirement::new(RetirementOutcome::Retired { removed: true });
+        absent.absent.store(true, Ordering::SeqCst);
+        assert_eq!(
+            retire_with(&plan, &absent).unwrap(),
+            retirement_unknown("dispatch_or_retirement_in_progress")
+        );
+        assert_eq!(enumerate(&fixture.home).unwrap().len(), 1);
+        assert!(!retirement_path(&plan).exists());
+        // A different profile is independent even while this one is paused.
+        assert_eq!(
+            launch_with(&fixture.plan(), &FakeManager::new(ActionOutcome::Accepted)).unwrap(),
+            LaunchReceipt::Accepted
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(runner.join().unwrap(), LaunchReceipt::Accepted);
+        assert_eq!(
+            retire_with(&plan, &absent).unwrap(),
+            RetirementReceipt::Retired { removed: false }
+        );
+        assert_eq!(manager.inner.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(absent.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(enumerate(&fixture.home).unwrap().len(), 1);
     }
 }
