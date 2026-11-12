@@ -49,6 +49,46 @@ def write_json(path: Path, value) -> None:
     path.chmod(0o600)
 
 
+def persist_checkpoint(output: Path | None, result: dict) -> None:
+    if output is None:
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Replace a complete receipt atomically so a terminated CI controller does
+    # not leave a half-written JSON document. No package/application file changes.
+    descriptor, name = tempfile.mkstemp(prefix=f".{output.name}-", suffix=".tmp", dir=output.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(result, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def command_label(arguments: list) -> dict:
+    # Fixed classifications only: never include argv, paths, input, tokens,
+    # transaction/launch nonces, stdout, or stderr in progress evidence.
+    words = [str(value) for value in arguments]
+    kind = words[0] if words else ""
+    allowed = {
+        "native-update": {"bootstrap", "plan", "run", "status", "recover", "rollback"},
+        "bundle": {"verify", "install"}, "credential": {"import-openai"},
+    }
+    if kind in allowed:
+        return {"kind": kind, "action": words[1] if len(words) > 1 and words[1] in allowed[kind] else "unknown"}
+    if kind == "init":
+        return {"kind": "init"}
+    if kind == "native-update-protocol":
+        def fixed(flag, choices):
+            at = words.index(flag) + 1 if flag in words else len(words)
+            return words[at] if at < len(words) and words[at] in choices else "unknown"
+        return {"kind": kind, "mode": fixed("--mode", {"enrollment", "provider", "participant"}),
+                "action": fixed("--action", {"enroll", "registration", "status", "plan", "prepare", "apply", "verify", "restore", "rollback"})}
+    return {"kind": "unknown"}
+
+
 def extract(contents: dict[str, bytes], manifest: dict, destination: Path) -> None:
     destination.mkdir()
     for name, data in contents.items():
@@ -89,8 +129,9 @@ def participant_context(transaction: str, components: list[str], *, plan_id: str
 
 
 class Installation:
-    def __init__(self, root: Path, bundle: Path, manifest: dict, result: dict):
+    def __init__(self, root: Path, bundle: Path, manifest: dict, result: dict, *, checkpoint_output: Path | None = None):
         self.root, self.bundle, self.manifest, self.result = root, bundle, manifest, result
+        self.checkpoint_output = checkpoint_output
         self.home = root / "Companion installation 日本語"
         self.worker = bundle / manifest["entrypoints"]["service"]
         self.node = bundle / manifest["entrypoints"]["node"]
@@ -106,17 +147,53 @@ class Installation:
         self.fixture_calls: set[str] = set()
         self.baseline = None
 
-    def command(self, arguments: list, *, expect_success: bool = True, extra_env=None, timeout=120):
+    def checkpoint(self):
+        persist_checkpoint(self.checkpoint_output, self.result)
+
+    def begin_operation(self, operation: dict, timeout: int) -> dict:
+        sequence = self.result.get("native_operation_count", 0) + 1
+        self.result["native_operation_count"] = sequence
+        current = {"sequence": sequence, "operation": operation, "phase": "running", "timeout_seconds": timeout}
+        self.result["current_operation"] = current
+        self.checkpoint()
+        return current
+
+    def end_operation(self, operation: dict, started: float, outcome: str, return_code=None):
+        completed = {**operation, "phase": "completed", "outcome": outcome,
+                     "elapsed_seconds": time.monotonic() - started}
+        if return_code is not None:
+            completed["return_code"] = return_code
+        self.result["current_operation"] = completed
+        timings = self.result.setdefault("native_operation_timings", [])
+        timings.append(completed)
+        if len(timings) > 128:
+            del timings[:-128]
+            self.result["native_operation_timings_omitted"] = self.result.get("native_operation_timings_omitted", 0) + 1
+        self.checkpoint()
+
+    def command(self, arguments: list, *, expect_success: bool = True, extra_env=None, timeout=120, input_text=None):
         env = dict(self.env)
         env.update(extra_env or {})
-        completed = subprocess.run([str(self.worker), "--home", str(self.home), *map(str, arguments)],
-                                   env=env, cwd=self.root, capture_output=True, text=True,
-                                   encoding="utf-8", timeout=timeout)
-        if expect_success:
-            require(completed.returncode == 0, f"Native command {arguments[:2]} failed: {completed.stderr[-3000:]}")
-            return json.loads(completed.stdout)
-        require(completed.returncode != 0, f"Native command unexpectedly succeeded: {arguments[:2]}")
-        return completed
+        operation = self.begin_operation(command_label(arguments), timeout)
+        started, outcome, return_code = time.monotonic(), "error", None
+        try:
+            try:
+                completed = subprocess.run([str(self.worker), "--home", str(self.home), *map(str, arguments)],
+                                           env=env, cwd=self.root, capture_output=True, text=True,
+                                           encoding="utf-8", timeout=timeout, input=input_text)
+            except subprocess.TimeoutExpired:
+                outcome = "timeout"
+                # TimeoutExpired includes the full command in its string.
+                raise TimeoutError(f"Native {operation['operation']} exceeded {timeout}s") from None
+            return_code = completed.returncode
+            outcome = "succeeded" if return_code == 0 else "nonzero_exit"
+            if expect_success:
+                require(return_code == 0, f"Native {operation['operation']} failed with exit code {return_code}")
+                return json.loads(completed.stdout)
+            require(return_code != 0, f"Native {operation['operation']} unexpectedly succeeded")
+            return completed
+        finally:
+            self.end_operation(operation, started, outcome, return_code)
 
     def update(self, *arguments, **kwargs):
         return self.command(["native-update", *arguments], **kwargs)
@@ -146,6 +223,7 @@ class Installation:
             self.result.setdefault("protocol_timings", []).append({
                 "mode": mode, "action": action, "timeout_seconds": timeout,
                 "elapsed_seconds": time.monotonic() - started})
+            self.checkpoint()
 
     @contextmanager
     def db(self):
@@ -224,10 +302,17 @@ class Installation:
         executable = self.home / "bin" / self.worker.name
         stream = (self.root / f"owned-service-{len(self.children)}.log").open("w", encoding="utf-8")
         self.streams.append(stream)
-        child = subprocess.Popen([str(executable), "--home", str(self.home), "serve"],
-                                 env=self.env, cwd=self.root, stdout=stream, stderr=stream)
-        self.children.append(child)
-        return child, self.await_running()
+        operation = self.begin_operation({"kind": "service_start"}, 30)
+        started, outcome = time.monotonic(), "error"
+        try:
+            child = subprocess.Popen([str(executable), "--home", str(self.home), "serve"],
+                                     env=self.env, cwd=self.root, stdout=stream, stderr=stream)
+            self.children.append(child)
+            healthy = self.await_running()
+            outcome = "healthy"
+            return child, healthy
+        finally:
+            self.end_operation(operation, started, outcome)
 
     def initialize(self, *, baseline_bundle: Path | None = None, launch_initial: bool = True):
         baseline_bundle = baseline_bundle or self.bundle
@@ -235,8 +320,8 @@ class Installation:
         workspace = self.root / "Agent workspace"
         workspace.mkdir()
         owner = os.environ.get("USERNAME") or os.environ.get("USER") or "fixture-owner"
-        clean.run([self.worker, "--home", self.home, "init", "--owner", owner,
-                   "--agent-command", self.node, "--agent-arg=--version", "--agent-cwd", workspace], self.env, self.root)
+        self.command(["init", "--owner", owner, "--agent-command", self.node,
+                      "--agent-arg=--version", "--agent-cwd", workspace], timeout=60)
         write_json(self.home / "companion.json", {"enabled": False,
                    "node": str(baseline_bundle / baseline_manifest["entrypoints"]["node"]),
                    "bridge": str(baseline_bundle / baseline_manifest["entrypoints"]["bridge"]), "profiles": {}, "max_call_seconds": 17})
@@ -247,9 +332,9 @@ class Installation:
             child.terminate()
             child.wait(timeout=10)
         self.await_stopped()
-        imported = clean.run([self.worker, "--home", self.home, "credential", "import-openai"], self.env, self.root,
-                             input_text="fixture-native-key-not-a-real-provider-credential\n")
-        require(json.loads(imported.stdout)["stored"] is True, "Credential import failed")
+        imported = self.command(["credential", "import-openai"],
+                                input_text="fixture-native-key-not-a-real-provider-credential\n", timeout=60)
+        require(imported["stored"] is True, "Credential import failed")
         with self.db() as db:
             db.execute("INSERT INTO conversations(id,title,created_at,updated_at,status,note,session_id,owner) VALUES('retained-room','Retained room',100,100,'ready','Retained note','retained-session',?)", (owner,))
             db.execute("INSERT INTO room_members VALUES('retained-room',?,'owner',100)", (owner,))
@@ -295,6 +380,7 @@ class Installation:
 
     def check(self, text: str, **evidence):
         self.result["checks"].append({"name": text, **evidence})
+        self.checkpoint()
 
     def enroll(self, candidate: Path):
         write_json(self.owner_config, {"schema": 1, "installation_id": read_json(self.home / "config.json")["id"],
@@ -541,19 +627,22 @@ def qualify(archive: Path, receipt: Path, output: Path) -> dict:
     failure = None
     try:
         a, b, c = root / "Release A", root / "Release B", root / "Deliberate failed C"
+        result["current_operation"] = {"operation": {"kind": "fixture", "action": "extract"}, "phase": "running"}
+        persist_checkpoint(output, result)
         extract(contents, manifest, a)
+        result["current_operation"] = {"operation": {"kind": "fixture", "action": "derive_candidates"}, "phase": "running"}
+        persist_checkpoint(output, result)
         derive_bundle(a, b, "b")
         derive_bundle(a, c, "incompatible-c", broken=True)
         result["fixtures"] = {name: digest((bundle / "manifest.json").read_bytes()) for name, bundle in [("A", a), ("B", b), ("C", c)]}
-        install = Installation(root, a, manifest, result)
+        install = Installation(root, a, manifest, result, checkpoint_output=output)
         installations.append(("primary", install))
         exercise(install, a, b, c)
         secondary_root = root / "Explicit rollback failure installation"
         secondary_root.mkdir()
-        secondary = Installation(secondary_root, a, manifest, result)
+        secondary = Installation(secondary_root, a, manifest, result, checkpoint_output=output)
         installations.append(("explicit_rollback_failure", secondary))
         exercise_failed_explicit_rollback(secondary, a, b, c)
-        result["status"] = "passed"
     except Exception as error:
         failure = error
         result.update(status="failed", error=str(error))
@@ -573,14 +662,18 @@ def qualify(archive: Path, receipt: Path, output: Path) -> dict:
             if cleanup_errors:
                 raise RuntimeError("; ".join(cleanup_errors))
             result["cleanup"] = cleanup_receipts.get("primary", {"no_application_started": True})
+            result["current_operation"] = {"operation": {"kind": "fixture", "action": "remove_temporary_files"}, "phase": "running"}
+            persist_checkpoint(output, result)
             shutil.rmtree(root)
             result["temporary_installation_removed"] = True
+            result["current_operation"]["phase"] = "completed"
+            if failure is None:
+                result["status"] = "passed"
         except Exception as cleanup_error:
             result["status"] = "failed"
             result["cleanup"] = {"status": "uncertain", "error": str(cleanup_error), "retained_test_directory": str(root)}
             failure = failure or cleanup_error
-        output.parent.mkdir(parents=True, exist_ok=True)
-        write_json(output, result)
+        persist_checkpoint(output, result)
     if failure:
         raise failure
     return result

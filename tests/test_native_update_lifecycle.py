@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("native_update_lifecycle", Path(__file__).with_name("native_update_lifecycle.py"))
 lifecycle = importlib.util.module_from_spec(spec)
@@ -11,6 +12,50 @@ spec.loader.exec_module(lifecycle)
 
 
 class LifecycleControllerTests(unittest.TestCase):
+    def checkpoint_fixture(self, root):
+        install = object.__new__(lifecycle.Installation)
+        install.root, install.home, install.worker = root, root / "home", root / "app"
+        install.env = {}
+        install.result = {"status": "running", "checks": []}
+        install.checkpoint_output = root / "progress.json"
+        return install
+
+    def test_progress_checkpoint_precedes_command_and_omits_sensitive_data(self):
+        with tempfile.TemporaryDirectory() as folder:
+            install = self.checkpoint_fixture(Path(folder))
+            def operation(argv, **kwargs):
+                before = lifecycle.read_json(install.checkpoint_output)
+                self.assertEqual(before["status"], "running")
+                self.assertEqual(before["current_operation"]["phase"], "running")
+                self.assertEqual(before["current_operation"]["operation"],
+                    {"kind": "native-update-protocol", "mode": "participant", "action": "restore"})
+                return lifecycle.subprocess.CompletedProcess(argv, 0, '{"token":"secret-output"}', "secret-stderr")
+            with patch.object(lifecycle.subprocess, "run", side_effect=operation):
+                self.assertEqual(install.command(["native-update-protocol", "--config", "secret-path",
+                    "--mode", "participant", "--action", "restore", "secret-nonce"],
+                    extra_env={"PRIVATE_KEY": "secret-env"}, input_text="secret-input", timeout=30), {"token": "secret-output"})
+            install.check("completed fixed check")
+            text = install.checkpoint_output.read_text()
+            self.assertNotIn("secret", text)
+            after = json.loads(text)
+            self.assertEqual(after["current_operation"]["outcome"], "succeeded")
+            self.assertEqual(after["current_operation"]["return_code"], 0)
+            self.assertEqual(len(after["checks"]), 1)
+            self.assertIn("elapsed_seconds", after["native_operation_timings"][0])
+
+    def test_timeout_checkpoint_and_exception_do_not_expose_full_command(self):
+        with tempfile.TemporaryDirectory() as folder:
+            install = self.checkpoint_fixture(Path(folder))
+            timeout = lifecycle.subprocess.TimeoutExpired(["app", "secret-nonce"], 30)
+            with patch.object(lifecycle.subprocess, "run", side_effect=timeout):
+                with self.assertRaises(TimeoutError) as raised:
+                    install.command(["native-update", "recover", "secret-nonce"], timeout=30)
+            self.assertNotIn("secret", str(raised.exception))
+            result = lifecycle.read_json(install.checkpoint_output)
+            self.assertEqual(result["current_operation"]["outcome"], "timeout")
+            self.assertEqual(result["current_operation"]["timeout_seconds"], 30)
+            self.assertNotIn("secret", install.checkpoint_output.read_text())
+
     def test_database_transactions_close_on_success_and_failure(self):
         with tempfile.TemporaryDirectory() as folder:
             install = object.__new__(lifecycle.Installation)
