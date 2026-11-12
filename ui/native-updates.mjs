@@ -90,7 +90,9 @@ function render() {
   if (operation) {
     const [title,detail] = progress(operation);
     $('update-progress-title').textContent = title;
-    $('update-progress-detail').textContent = operation.message || detail;
+    // Render the saved phase/outcome in user-facing language. Internal worker
+    // diagnostics remain in the operation receipt, not in the main flow.
+    $('update-progress-detail').textContent = detail;
     $('update-reference-value').textContent = operation.transaction_id || operation.id || '';
     $('update-reference').hidden = !operation.id;
   } else if (pending) {

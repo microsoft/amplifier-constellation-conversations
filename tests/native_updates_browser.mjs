@@ -52,7 +52,7 @@ const server = createServer(async(req,res) => {
       else assert.equal(body.operation_id,fixture.operation.id);
       const freshRollback=!isApply && body.action==='rollback' && ['completed','restored'].includes(fixture.operation?.phase);
       fixture.operation={id:freshRollback?randomUUID():fixture.operation?.id || randomUUID(),transaction_id:freshRollback?randomUUID():fixture.operation?.transaction_id || randomUUID(),request_id:body.request_id,
-        phase:isApply?fixture.phase:'completed',outcome:isApply?null:body.action==='rollback'?'rolled_back':'applied'};
+        phase:isApply?fixture.phase:'completed',outcome:isApply?null:body.action==='rollback'?'rolled_back':'applied',message:'Internal worker transaction diagnostic'};
       fixture.requests.set(body.request_id,fixture.operation);
       fixture.actions={check:false,apply:false,recover:fixture.phase==='unknown',rollback:false};
       if(fixture.fail==='after-record') {fixture.fail=null;reply(503,{error:'Reply unavailable'});return;}
@@ -83,6 +83,7 @@ try {
   assert.ok(await page.locator('#return-to-companion').evaluate(el=>parseFloat(getComputedStyle(el).fontSize)>=13));
   await screenshot('updates-package-phone.png');
   await page.locator('#update-apply').click();await page.waitForFunction(()=>document.querySelector('#update-progress-title').textContent==='Update requested');
+  assert.equal(await page.locator('#update-progress-detail').innerText(),'Checking that Companion can safely stop.');
   const operation=fixture.operation,posts=fixture.posts.length;
   await page.reload();await page.locator('#update-progress').waitFor({state:'visible'});
   assert.equal(fixture.posts.length,posts);assert.equal(fixture.operation.transaction_id,operation.transaction_id);
