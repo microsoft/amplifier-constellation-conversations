@@ -219,7 +219,7 @@ def run_browser(install, script, node, artifacts, setup_token):
     return result
 
 
-def prepare_consumer_installation(install, *, browser_test=None, browser_node=None, browser_artifacts=None):
+def prepare_consumer_installation(install, *, browser_test=None, browser_node=None, browser_artifacts=None, managed_parent=False):
     """Create the existing private account/contact fixture without updating it.
 
     Returned private values stay in controller memory; receipts retain only
@@ -237,7 +237,8 @@ def prepare_consumer_installation(install, *, browser_test=None, browser_node=No
     install.browser_request("GET", "/auth/session", expected=403, headers={"Host": "attacker.invalid"})
     install.browser_request("GET", "/auth/session", expected=403, headers={"Origin": "http://attacker.invalid"})
     setup = read_json(install.home / "secrets/first-account.json")
-    install.check("ordinary no-argument launch publishes one local HTTP identity with no TLS setup, dummy agent, voice configuration or provider work")
+    install.check("library-assisted fresh setup and actual manager launch publish one local HTTP identity before account setup, without TLS, dummy agent, voice configuration or provider work"
+                  if managed_parent else "ordinary no-argument launch publishes one local HTTP identity with no TLS setup, dummy agent, voice configuration or provider work")
     fixture_log = add_acp_fixture(install)
     if browser_test is not None:
         require(browser_node is not None and browser_artifacts is not None, "Browser fixture requires explicit controller Node and artifact paths")

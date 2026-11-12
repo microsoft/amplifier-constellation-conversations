@@ -61,11 +61,13 @@ def public_observation(value):
     keys = ["status", "service_name", "manager", "profile_matches", "active", "transitioning",
             "enabled", "masked", "definition_matches", "definition_sha256", "effective_definition_sha256",
             "state_sha256", "registered", "startup_settings_sha256", "previous_process_alive", "launch_receipt",
-            "application_manager_binding"]
+            "application_manager_binding", "actual_worker_alive", "actual_worker_manager_binding"]
     result = {key: value[key] for key in keys if key in value}
     result["processes"] = [{"pid": row["identity"]["pid"], "identity_sha256": fingerprint(row["identity"]),
                             "instance_guid_sha256": row.get("instance_guid_sha256")}
                            for row in value.get("processes", [])]
+    if isinstance(value.get("actual_worker_identity"), dict):
+        result["actual_worker_identity_sha256"] = fingerprint(value["actual_worker_identity"])
     return result
 
 
@@ -77,10 +79,10 @@ class NativeObserver:
         self.baseline_startup = None
         self.phase = None
 
-    def call(self, target, *, action="inspect", previous=None):
-        require(action in {"inspect", "observe_retirement", "stop"}, "Native controller action is not fixed")
+    def call(self, target, *, action="inspect", previous=None, setup_bundle=None):
+        require(action in {"prepare_managed", "inspect", "observe_retirement", "stop"}, "Native controller action is not fixed")
         payload = {"home": str(self.install.home.resolve()), "action": action, "target": target,
-                   "previous_process": previous}
+                   "previous_process": previous, "setup_bundle": str(setup_bundle) if setup_bundle is not None else None}
         child = subprocess.Popen([str(self.controller)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, cwd=self.install.root, env=self.install.env)
         try:
@@ -130,6 +132,7 @@ class NativeObserver:
         self.phase, self.old_identity, self.previous_operation = phase, identity, previous
         self.operation, self.attempt, self.transaction = None, None, None
         self.worker_generation = None
+        self.actual_worker_generation = None
         self.survived_old_exit = False
         self.old_exit = False
         self.worker_observation = None
@@ -157,10 +160,18 @@ class NativeObserver:
             require(worker.get("active") is not True, "Active worker registration does not match its saved fixed profile")
             return  # Marker publication legitimately precedes registration.
         self.worker_observation = worker
+        identity = worker.get("actual_worker_identity")
+        if isinstance(identity, dict):
+            generation = fingerprint(identity)
+            if self.actual_worker_generation is None:
+                self.actual_worker_generation = generation
+            require(generation == self.actual_worker_generation, "Actual worker generation changed for one fixed attempt")
         old_gone = worker.get("previous_process_alive") is False
         self.old_exit = self.old_exit or old_gone
         if (worker.get("active") is True and worker.get("transitioning") is False
-                and worker.get("processes") and operation["attempt"]["claimed"] is True):
+                and worker.get("processes") and operation["attempt"]["claimed"] is True
+                and worker.get("actual_worker_alive") is True
+                and worker.get("actual_worker_manager_binding") in {"same_process", "descendant_of_task_engine"}):
             generation = fingerprint(worker["processes"])
             if self.worker_generation is None:
                 self.worker_generation = generation
@@ -176,14 +187,16 @@ class NativeObserver:
         while time.monotonic() < deadline:
             self.sample()
             worker = self.worker_observation
-            if worker and worker.get("active") is False and worker.get("transitioning") is False and worker.get("processes") == []:
+            if (worker and worker.get("active") is False and worker.get("transitioning") is False
+                    and worker.get("processes") == [] and worker.get("actual_worker_alive") is False):
                 break
             time.sleep(0.1)
         else:
             raise TimeoutError("Actual worker exit is unobserved; no rollback or retirement permitted")
         require((operation["id"], operation["transaction_id"]) == (self.operation, self.transaction),
                 "Settled browser receipt differs from the observed native operation")
-        require(self.old_exit and self.survived_old_exit and self.worker_generation is not None,
+        require(self.old_exit and self.survived_old_exit and self.worker_generation is not None
+                and self.actual_worker_generation is not None,
                 "Worker survival after old-parent exit was not actually observed")
         target = ({"kind": "original"} if self.managed else {"kind": "replacement", "transaction": self.transaction})
         replacement = self.call(target)
@@ -496,12 +509,29 @@ def exercise_browser(install, a, b, observer, script, node, artifacts):
 
 
 class UpdateInstallation(consumer.ConsumerInstallation):
-    def __init__(self, *args, outer_result, **kwargs):
+    def __init__(self, *args, outer_result, controller, managed, **kwargs):
         self.outer_result = outer_result
+        self.controller, self.managed = controller, managed
+        self.registration = None
         super().__init__(*args, **kwargs)
 
     def checkpoint(self):
         lifecycle.persist_checkpoint(self.checkpoint_output, self.outer_result)
+
+    def desktop_start(self, launcher=None, mac_app=None):
+        if not self.managed:
+            return super().desktop_start(launcher, mac_app)
+        require(launcher is None and mac_app is None and not self.home.exists() and not self.home.is_symlink(),
+                "Managed fixture setup requires a strictly fresh home and the exact package")
+        self.result["setup"] = "library-assisted fresh home, then actual native manager parent before account/contact setup"
+        self.checkpoint()
+        observer = NativeObserver(self, self.controller, managed=True)
+        prepared = observer.call({"kind": "original"}, action="prepare_managed", setup_bundle=self.bundle)
+        require(prepared.get("status") == "prepared" and prepared.get("service_started") is False,
+                "Fresh managed setup was not confirmed; preserve fixture without retry")
+        self.result["setup_receipt"] = prepared
+        self.registration, running = managed_parent(self, startup_module(), self.controller_environment)
+        return None, running
 
 
 def startup_module():
@@ -539,8 +569,9 @@ def startup_command(install, controller_environment, action):
         install.end_operation(operation, started, outcome, return_code)
 
 
-def managed_parent(install, prepared, startup, controller_environment):
-    config = read_json(install.home / "config.json")
+def managed_parent(install, startup, controller_environment):
+    config_bytes = (install.home / "config.json").read_bytes()
+    config = json.loads(config_bytes)
     registration = startup.Startup(install.home, "agent-conversations-" + config["id"],
                                    install.home / "bin" / install.worker.name, controller_environment)
     registration.preflight()
@@ -548,21 +579,15 @@ def managed_parent(install, prepared, startup, controller_environment):
     install.checkpoint()
     startup_command(install, controller_environment, "install")
     first = registration.inspect()
-    child = prepared["original_child"]
-    require(child.poll() is None, "Prepared foreground parent unexpectedly exited")
-    child.terminate()  # Exact controller-owned setup child, before any update.
-    child.wait(timeout=12)
-    install.await_stopped()
     registration.start()
     running = install.await_running()
     state = registration.await_active(running["pid"])
     require(state["definition"] == first, "Original manager definition changed while starting the fixture")
-    require((install.home / "config.json").read_bytes() == prepared["config_bytes"]
-            and (install.home / "secrets/local-password.json").read_bytes() == prepared["account_bytes"],
-            "Manager startup changed the prepared local account/configuration")
+    require((install.home / "config.json").read_bytes() == config_bytes,
+            "Manager startup changed the fresh fixture configuration")
     install.result["original_manager"] = state
-    install.check("actual native manager starts the original prepared consumer application")
-    return registration
+    install.check("actual native manager starts the original application before first-account/contact preparation")
+    return registration, running
 
 
 def retained_operations(home):
@@ -726,12 +751,14 @@ def qualify(archive: Path, receipt: Path, output: Path, controller: Path, *, bro
             case_root.mkdir()
             case = {"status": "running", "checks": [], "topology": "manager-parent" if managed else "manual-parent"}
             result["cases"][name] = case
-            install = UpdateInstallation(case_root, a, manifest, case, outer_result=result, checkpoint_output=output)
+            install = UpdateInstallation(case_root, a, manifest, case, outer_result=result, checkpoint_output=output,
+                                         controller=controller, managed=managed)
             installations.append((name, install))
             controller_environment = manager_environment(install, startup)
-            prepared = consumer.prepare_consumer_installation(install)
+            install.controller_environment = controller_environment
+            prepared = consumer.prepare_consumer_installation(install, managed_parent=managed)
             seed_retained_work(install, prepared["conversation_id"])
-            registration = managed_parent(install, prepared, startup, controller_environment) if managed else None
+            registration = install.registration
             observer = NativeObserver(install, controller, managed=managed)
             case["baseline"] = protected_receipt(install)
             if managed:

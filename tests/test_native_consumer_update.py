@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import queue
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -15,6 +16,32 @@ spec.loader.exec_module(controller)
 
 
 class ConsumerUpdateControllerTests(unittest.TestCase):
+    def test_task_engine_without_actual_worker_cannot_prove_survival(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            ledger = home / "native-browser-update/control.json"
+            ledger.parent.mkdir()
+            ledger.write_text(json.dumps({"current_operation": "operation", "operations": {"operation": {
+                "transaction_id": "transaction", "attempt": {"id": "attempt", "claimed": True}}}}))
+            observer = controller.NativeObserver.__new__(controller.NativeObserver)
+            observer.install = SimpleNamespace(home=home)
+            observer.previous_operation = observer.operation = observer.attempt = observer.transaction = None
+            observer.worker_generation = observer.actual_worker_generation = observer.worker_observation = None
+            observer.old_identity = {"pid": 1, "birth": "old"}
+            observer.old_exit = observer.survived_old_exit = False
+            observer.observations = []
+            engine = {"status": "observed", "profile_matches": True, "active": True, "transitioning": False,
+                      "processes": [{"identity": {"pid": 2, "birth": "engine"}}], "previous_process_alive": False}
+            observer.call = Mock(return_value=engine)
+            observer.sample()
+            self.assertFalse(observer.survived_old_exit)
+            self.assertIsNone(observer.actual_worker_generation)
+            observer.call.return_value = {**engine, "actual_worker_identity": {"pid": 3, "birth": "worker"},
+                                          "actual_worker_alive": True, "actual_worker_manager_binding": "descendant_of_task_engine"}
+            observer.sample()
+            self.assertTrue(observer.survived_old_exit)
+            self.assertIsNotNone(observer.actual_worker_generation)
+
     def test_legacy_startup_success_does_not_require_json_output(self):
         install = SimpleNamespace(worker=Path("app"), home=Path("owned-home"),
                                   begin_operation=Mock(return_value={}), end_operation=Mock())

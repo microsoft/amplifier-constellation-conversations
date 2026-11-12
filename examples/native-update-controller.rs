@@ -1,7 +1,10 @@
 //! Disposable qualification controller; never part of the packaged application.
 //! Private stdin selects only this installation's original application or a
 //! fixed launch already recorded by its real updater. There is no delete action.
-use agent_conversations::{config::Config, native_startup_state, native_update_launch};
+use agent_conversations::{
+    config::Config, desktop, native_bundle, native_startup_state, native_update,
+    native_update_launch,
+};
 use amplifier_native_platform::{
     installation::{self, ActionOutcome, Service, ServiceAction, ServiceManager},
     process,
@@ -16,6 +19,7 @@ use std::{fs, io::Read, path::PathBuf};
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
+    PrepareManaged,
     Inspect,
     ObserveRetirement,
     Stop,
@@ -36,6 +40,7 @@ struct Request {
     action: Action,
     target: Target,
     previous_process: Option<Value>,
+    setup_bundle: Option<PathBuf>,
 }
 
 fn digest(value: &Value) -> Result<String> {
@@ -170,6 +175,39 @@ fn application_binding(application: &Value, processes: &Value) -> Result<Option<
     Ok(None)
 }
 
+fn actual_worker(request: &Request, installation_id: &str) -> Result<Option<Value>> {
+    let Target::Worker { operation, attempt } = &request.target else {
+        return Ok(None);
+    };
+    let path = request.home.join("native-browser-update/control.json");
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= 4 * 1024 * 1024,
+        "Worker ledger is not a bounded ordinary file"
+    );
+    let ledger: Value = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        ledger["installation_id"] == installation_id,
+        "Worker ledger belongs to another installation"
+    );
+    let saved = &ledger["operations"][operation];
+    ensure!(
+        saved["id"] == *operation && saved["attempt"]["id"] == *attempt,
+        "Worker receipt binds another operation or attempt"
+    );
+    let identity = &saved["attempt"]["worker_process"];
+    if identity.is_null() {
+        return Ok(None);
+    }
+    ensure!(
+        saved["attempt"]["claimed"] == true,
+        "Worker process was not claimed"
+    );
+    Ok(Some(identity.clone()))
+}
+
 fn run(mut request: Request) -> Result<Value> {
     ensure!(
         std::env::var("CONSTELLATION_NATIVE_STARTUP_TEST").as_deref() == Ok("1"),
@@ -178,6 +216,43 @@ fn run(mut request: Request) -> Result<Value> {
     ensure!(
         request.home.is_absolute(),
         "Installation home must be absolute"
+    );
+    if matches!(request.action, Action::PrepareManaged) {
+        ensure!(
+            matches!(request.target, Target::Original),
+            "Setup target must be original"
+        );
+        ensure!(
+            request.previous_process.is_none(),
+            "Fresh setup has no prior process"
+        );
+        ensure!(
+            matches!(fs::symlink_metadata(&request.home), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "Managed fixture home must be strictly absent"
+        );
+        let bundle = request.setup_bundle.context("Missing exact setup bundle")?;
+        ensure!(bundle.is_absolute(), "Setup bundle must be absolute");
+        let verified = native_bundle::verify(&bundle)?;
+        ensure!(
+            verified["target"] == native_bundle::target()?,
+            "Setup bundle targets another host"
+        );
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        desktop::create(&request.home, listener.local_addr()?.port())?;
+        drop(listener);
+        native_update::bootstrap(&request.home, &bundle)?;
+        ensure!(
+            !request.home.join("runtime.json").exists(),
+            "Fresh setup unexpectedly launched an application"
+        );
+        return Ok(
+            json!({"status":"prepared","setup":"library_assisted_fresh_home", "service_started":false,
+            "manifest_sha256":verified["manifest_sha256"]}),
+        );
+    }
+    ensure!(
+        request.setup_bundle.is_none(),
+        "Setup bundle is only valid for fresh managed setup"
     );
     let metadata = fs::symlink_metadata(&request.home)?;
     ensure!(
@@ -272,6 +347,18 @@ fn run(mut request: Request) -> Result<Value> {
             value
         }
     };
+    if matches!(request.target, Target::Worker { .. }) {
+        let identity = actual_worker(&request, &config.id)?;
+        let alive = identity.as_ref().map(process::matches).transpose()?;
+        let binding = if alive == Some(true) {
+            application_binding(identity.as_ref().unwrap(), &result["processes"])?
+        } else {
+            None
+        };
+        result["actual_worker_identity"] = json!(identity);
+        result["actual_worker_alive"] = json!(alive);
+        result["actual_worker_manager_binding"] = json!(binding);
+    }
     if let Some(previous) = request.previous_process {
         result["previous_process_alive"] = json!(process::matches(&previous)?);
     }
