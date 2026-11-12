@@ -28,6 +28,7 @@ pub mod imports;
 pub mod native_bundle;
 pub mod native_startup_state;
 pub mod native_update;
+mod native_update_clock;
 mod native_update_process;
 pub mod native_update_protocol;
 pub mod permissions;

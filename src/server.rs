@@ -1294,11 +1294,12 @@ async fn serve_inner(
         Some(ticket) => Some(ticket),
         None => crate::native_update::managed_startup_ticket(&home)?,
     };
-    crate::native_update::validate_start(
+    let launch = crate::native_update::validate_start(
         &home,
         startup.as_ref().map(|(id, n)| (id.as_str(), n.as_str())),
     )?;
     let state = AppState::open(home)?;
+    drop(launch);
     let listener = std::net::TcpListener::bind((state.config.bind.as_str(), state.config.port))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();

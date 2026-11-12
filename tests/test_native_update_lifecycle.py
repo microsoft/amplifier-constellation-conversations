@@ -1,7 +1,7 @@
 """Controller invariants; real executable behavior is tested by the CI harness."""
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -69,6 +69,47 @@ class LifecycleControllerTests(unittest.TestCase):
             self.assertEqual(diagnostic["helper_return_code_after_drain"], -9)
             self.assertEqual(diagnostic["operation_outcome"], "unknown")
             self.assertNotIn("secret", install.checkpoint_output.read_text())
+
+    def test_nonzero_diagnostics_retain_only_static_categories_and_numeric_codes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            install = self.checkpoint_fixture(Path(folder))
+            process = Mock(returncode=1)
+            process.communicate.return_value = ('{"credential":"secret-output"}',
+                'Error: Cannot restrict application storage to this Windows user: secret-path (os error 206)\n'
+                'secret-nonce secret-token; Existing executable preserved; Frozen package changed; '
+                'Private files must be ordinary files; Companion node was customized; (os error 5)')
+            with patch.object(lifecycle.subprocess, "Popen", return_value=process):
+                with self.assertRaises(AssertionError) as raised:
+                    install.command(["native-update", "bootstrap", "secret-path"], input_text="secret-input")
+            self.assertNotIn("secret", str(raised.exception))
+            text = install.checkpoint_output.read_text()
+            self.assertNotIn("secret", text)
+            diagnostic = json.loads(text)["current_operation"]["failure_diagnostic"]
+            self.assertEqual(diagnostic["os_error_codes"], [5, 206])
+            self.assertEqual(diagnostic["reason_tags"], ["customized_binding", "existing_executable_preserved",
+                "frozen_package_changed", "invalid_private_path", "private_storage_permissions"])
+            self.assertFalse(diagnostic["raw_content_retained"])
+
+    def test_failure_reason_scan_and_error_codes_are_bounded(self):
+        diagnostic = lifecycle.failure_summary(None, " ".join(f"(os error {code})" for code in range(20))
+            + "x" * 8192 + "Cannot create private storage policy (os error 999)")
+        self.assertEqual(diagnostic["os_error_codes"], list(range(8)))
+        self.assertTrue(diagnostic["os_error_codes_truncated"])
+        self.assertEqual(diagnostic["reason_tags"], [])
+        self.assertTrue(diagnostic["stderr"]["sample_truncated"])
+
+    def test_fixture_path_evidence_counts_unicode_without_retaining_paths(self):
+        root = PureWindowsPath(r"C:\secret-user\fixture café 🧪")
+        home = root / "Companion installation 日本語"
+        manifest = {"files": [{"path": "bridge/node_modules/openai/src/resources/admin/organization/workload-identity-providers/index.js"}]}
+        first = lifecycle.fixture_path_lengths(root, home, manifest)
+        secondary_root = root / "Explicit rollback failure installation"
+        second = lifecycle.fixture_path_lengths(secondary_root, secondary_root / home.name, manifest)
+        self.assertEqual(first["root_utf16_units"], len(str(root).encode("utf-16-le")) // 2)
+        self.assertEqual(second["deepest_protected_staging_parent_utf16_units"]
+                         - first["deepest_protected_staging_parent_utf16_units"], 39)
+        self.assertNotIn("secret", json.dumps(first))
+        self.assertNotIn("Companion installation", json.dumps(second))
 
     def test_exited_helper_with_unsettled_capture_is_not_killed_or_reported_successful(self):
         with tempfile.TemporaryDirectory() as folder:

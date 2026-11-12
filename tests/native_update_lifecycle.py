@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import socket
 import sqlite3
@@ -49,6 +50,45 @@ def capture_summary(value) -> dict:
     return {"available": True, "sample_bytes": min(len(encoded), 4096),
             "sample_truncated": len(value) > 4096 or len(encoded) > 4096,
             "content_retained": False}
+
+
+def failure_summary(stdout, stderr) -> dict:
+    # These are fixed diagnostic categories, not retained process text. Inspect
+    # only bounded prefixes; even error output can contain paths or credentials.
+    def prefix(value):
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value[:8192].decode("utf-8", errors="replace")
+        return value[:8192]
+    text = (prefix(stdout) + "\n" + prefix(stderr)).lower()
+    reasons = {
+        "private_storage_policy": ("cannot create private storage policy",),
+        "private_storage_permissions": ("cannot restrict application storage to this windows user",),
+        "existing_executable_preserved": ("existing executable preserved",),
+        "frozen_package_changed": ("frozen package changed", "existing immutable package differs",
+                                   "candidate changed during transaction", "installed bundle changed"),
+        "invalid_private_path": ("private folders cannot be symbolic links", "private folder must be a directory",
+                                 "private files must be ordinary files", "private file needs a parent folder",
+                                 "private file is not an ordinary file", "invalid package parent", "invalid bundle manifest"),
+        "customized_binding": ("companion node was customized", "companion bridge was customized",
+                               "frozen companion binding changed"),
+    }
+    codes = sorted({int(code) for code in re.findall(r"\bos error ([0-9]{1,10})\b", text)})
+    return {"stdout": capture_summary(stdout), "stderr": capture_summary(stderr),
+            "reason_tags": sorted(tag for tag, fragments in reasons.items() if any(value in text for value in fragments)),
+            "os_error_codes": codes[:8], "os_error_codes_truncated": len(codes) > 8,
+            "reason_scan_prefix_units_per_stream": 8192, "raw_content_retained": False}
+
+
+def fixture_path_lengths(root: Path, home: Path, manifest: dict) -> dict:
+    def units(path):
+        return len(str(path).encode("utf-16-le", errors="surrogatepass")) // 2
+    stage = home / "packages" / ".install-00000000-0000-0000-0000-000000000000"
+    parents = [stage / Path(row["path"]).parent for row in manifest["files"]]
+    return {"basis": "fixture path spelling; UTF-16 code units excluding terminating NUL",
+            "root_utf16_units": units(root), "home_utf16_units": units(home),
+            "deepest_protected_staging_parent_utf16_units": max(map(units, parents), default=units(stage))}
 
 
 def digest(data: bytes) -> str:
@@ -163,6 +203,8 @@ class Installation:
         self.ports: set[int] = set()
         self.fixture_calls: set[str] = set()
         self.baseline = None
+        self.result.setdefault("fixture_path_lengths", []).append(fixture_path_lengths(root, self.home, manifest))
+        self.checkpoint()
 
     def checkpoint(self):
         persist_checkpoint(self.checkpoint_output, self.result)
@@ -241,6 +283,8 @@ class Installation:
             completed = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
             return_code = completed.returncode
             outcome = "succeeded" if return_code == 0 else "nonzero_exit"
+            if return_code != 0:
+                operation["failure_diagnostic"] = failure_summary(completed.stdout, completed.stderr)
             if expect_success:
                 require(return_code == 0, f"Native {operation['operation']} failed with exit code {return_code}")
                 return json.loads(completed.stdout)

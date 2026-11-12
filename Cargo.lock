@@ -106,7 +106,7 @@ dependencies = [
 [[package]]
 name = "amplifier-native-platform"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/amplifier-constellation?rev=5aaed39b0d1394b182c532f8694e56b919ab5867#5aaed39b0d1394b182c532f8694e56b919ab5867"
+source = "git+https://github.com/microsoft/amplifier-constellation?rev=774dcedfde21dfec133cd3c497fd6177e9cdfff6#774dcedfde21dfec133cd3c497fd6177e9cdfff6"
 dependencies = [
  "anyhow",
  "libc",

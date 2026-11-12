@@ -12,6 +12,25 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Holds the fixed participant CLI deadline through result serialization/output.
+/// Provider/enrollment commands retain their existing independent caller bounds.
+pub struct InvocationClock(Option<crate::native_update_clock::Invocation>);
+impl InvocationClock {
+    pub fn complete(self) -> Result<()> {
+        match self.0 {
+            Some(clock) => clock.complete(),
+            None => Ok(()),
+        }
+    }
+}
+pub fn invocation_clock(mode: &str, action: &str) -> Result<InvocationClock> {
+    Ok(InvocationClock(if mode == "participant" {
+        Some(crate::native_update_clock::install(action)?)
+    } else {
+        None
+    }))
+}
+
 const CONFIG_LIMIT: u64 = 64 * 1024;
 const ENVELOPE_LIMIT: u64 = 1024 * 1024;
 const OWNER_FILE: &str = "native-update-owner.json";

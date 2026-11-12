@@ -108,16 +108,33 @@ uses fixed arguments and installation-owned paths:
 
 The first command records one updater owner per home. The returned registration
 delta must be merged by exact component/participant ID using the host updater's
-normal controls. Both generic restart scopes are empty:
-`{"services":[],"instance":false,"slack_homes":[]}`. Companion alone stops,
-verifies and restores its application. Shared-only updates still select the
-participant when their explicitly enrolled IDs intersect its configuration.
+normal controls. The component's generic restart scope is empty:
+`{"services":[],"instance":false,"slack_homes":[]}`. Participant registration
+lists the affected component IDs; its incoming aggregate scope can include other
+enrolled components. Companion alone stops, verifies and restores its application.
+Shared-only updates still select the participant when their explicitly enrolled
+IDs intersect its configuration.
 
 These commands do not install a scheduler, change hourly/idle policy, discover a
 release or download a candidate. Candidate acquisition remains the owner's
 existing reviewed package-acquisition path. Plans freeze the selected complete
 bundle and owner configuration. Once enrolled, standalone mutation is refused;
 use the same enrolled updater for apply and recovery.
+
+The fixed participant CLI uses one monotonic clock for the entire invocation,
+including owner validation, OS-manager calls, verification, and result output.
+The lifecycle wire remains 30 seconds for prepare/restore and 300 seconds for
+verify. Nested waits share the remaining budget: work stops accepting new waits
+two seconds before the wire limit, and a process watchdog exits with code 124
+one second before it. The watchdog stays armed through JSON serialization and
+stdout flush, including blocked synchronous COM calls or output readers.
+
+Exit 124 means the outcome is **unknown**. It does not prove that an OS-manager
+request was cancelled and does not perform compensation or write a terminal
+journal receipt. Preserve the transaction, gate and exact process/registration
+identity for reconciliation. After restoration has begun, recovery remains
+restore-only; no rollback or replay is authorized by a timeout. Ordinary server,
+standalone update and direct library calls do not install this participant clock.
 
 ## Qualification boundaries
 

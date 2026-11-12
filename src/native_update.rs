@@ -61,6 +61,16 @@ fn read(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 fn save(path: &Path, v: &Value) -> Result<()> {
+    // Startup holds this same guard from its final ticket check through database
+    // initialization. All journal publication (including first prepare intent)
+    // participates; never retain the guard across a service stop or lock wait.
+    let _launch = if path.file_name() == Some(std::ffi::OsStr::new(JOURNAL)) {
+        Some(launch_guard(
+            path.parent().context("Missing installation home")?,
+        )?)
+    } else {
+        None
+    };
     config::private_write(path, &serde_json::to_vec_pretty(v)?)
 }
 fn id(value: &str) -> Result<()> {
@@ -110,6 +120,41 @@ pub(crate) fn lock(home: &Path, name: &str) -> Result<InstallationLock> {
     f.try_lock_exclusive()
         .context("This installation operation is already running")?;
     Ok(InstallationLock { file: f })
+}
+fn launch_guard(home: &Path) -> Result<InstallationLock> {
+    launch_guard_waiting(home, || {})
+}
+fn launch_guard_waiting(home: &Path, waiting: impl FnOnce()) -> Result<InstallationLock> {
+    // The spawned service may already be migrating its database when its parent
+    // records child_pid. Allow a healthy initialization, bounded by the whole
+    // participant budget or by thirty seconds for standalone startup/update.
+    let deadline =
+        std::time::Instant::now() + crate::native_update_clock::cap(Duration::from_secs(30))?;
+    let mut waiting = Some(waiting);
+    loop {
+        crate::native_update_clock::check()?;
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "Startup authorization is busy"
+        );
+        match lock(home, "native-launch.lock") {
+            Ok(guard) => return Ok(guard),
+            Err(error)
+                if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                    e.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+                }) && std::time::Instant::now() < deadline =>
+            {
+                if let Some(waiting) = waiting.take() {
+                    waiting();
+                }
+                std::thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+            }
+            Err(error) => return Err(error.context("Startup authorization is busy")),
+        }
+    }
 }
 pub fn startup_change_guard(home: &Path) -> Result<InstallationLock> {
     let guard = lock(home, "native-update.lock")?;
@@ -285,6 +330,7 @@ pub async fn local_api(
     endpoint: &str,
     body: Option<Value>,
 ) -> Result<Value> {
+    crate::native_update_clock::check()?;
     let c = Config::load(home)?;
     let r = read(&home.join("runtime.json"))?;
     let port = r["port"].as_u64().context("No recorded listener")?;
@@ -293,7 +339,7 @@ pub async fn local_api(
     let client = reqwest::Client::builder()
         .add_root_certificate(ca)
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(3))
+        .timeout(crate::native_update_clock::cap(Duration::from_secs(3))?)
         .build()?;
     let token = fs::read_to_string(home.join("secrets/control-token"))?;
     let mut req = client
@@ -316,8 +362,10 @@ pub async fn local_api(
     Ok(v)
 }
 async fn wait_stopped(home: &Path) -> Result<InstallationLock> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        std::time::Instant::now() + crate::native_update_clock::cap(Duration::from_secs(15))?;
     loop {
+        crate::native_update_clock::check()?;
         if let Ok(f) = lock(home, "service.lock") {
             return Ok(f);
         }
@@ -646,7 +694,9 @@ pub async fn apply(home: &Path, transaction: &str, plan: &Value, rollback: bool)
     j["direction"] = json!(if rollback { "rolled_back" } else { "applied" });
     let previous = rollback && !explicit_rollback;
     j["selected"] = json!(if previous { "previous" } else { "candidate" });
-    // Invalidates any spawned-but-not-yet-admitted verification process.
+    // Journal publication serializes revocation against the final startup
+    // check/AppState initialization, then releases that guard BEFORE waiting
+    // for service.lock. A revoked process still hashing its executable refuses.
     j["launch_nonce"] = Value::Null;
     phase(home, &mut j, "switching")?;
     let _service = stop_running(home, &j).await?;
@@ -682,8 +732,29 @@ pub fn managed_startup_ticket(home: &Path) -> Result<Option<(String, String)>> {
     Ok(None)
 }
 
-/// Called AFTER acquiring service.lock and BEFORE AppState::open/recovery.
-pub fn validate_start(home: &Path, startup: Option<(&str, &str)>) -> Result<()> {
+/// Called AFTER acquiring service.lock. Retain the returned guard through
+/// AppState::open/recovery so journal revocation cannot overtake initialization.
+pub fn validate_start(home: &Path, startup: Option<(&str, &str)>) -> Result<InstallationLock> {
+    validate_start_with_digest(home, startup, || digest(&std::env::current_exe()?))
+}
+fn validate_start_with_digest(
+    home: &Path,
+    startup: Option<(&str, &str)>,
+    executable_digest: impl FnOnce() -> Result<String>,
+) -> Result<InstallationLock> {
+    // Reject already-invalid launches before hashing, but do not confuse that
+    // observation with permission to initialize after slow executable I/O.
+    validate_start_record(home, startup, None)?;
+    let actual = startup.map(|_| executable_digest()).transpose()?;
+    let guard = launch_guard(home)?;
+    validate_start_record(home, startup, actual.as_deref())?;
+    Ok(guard)
+}
+fn validate_start_record(
+    home: &Path,
+    startup: Option<(&str, &str)>,
+    executable_digest: Option<&str>,
+) -> Result<()> {
     if !home.join(JOURNAL).exists() {
         ensure!(startup.is_none(), "No update startup is pending");
         return Ok(());
@@ -702,10 +773,12 @@ pub fn validate_start(home: &Path, startup: Option<(&str, &str)>) -> Result<()> 
                     && matches!(j["phase"].as_str(), Some("verifying" | "restoring")),
                 "This verification startup is no longer authorized"
             );
-            ensure!(
-                digest(&std::env::current_exe()?)? == current_record(&j)["binary_sha256"],
-                "Verification executable changed"
-            );
+            if let Some(actual) = executable_digest {
+                ensure!(
+                    actual == current_record(&j)["binary_sha256"],
+                    "Verification executable changed"
+                );
+            }
         }
     }
     Ok(())
@@ -744,8 +817,10 @@ fn stop_child(child: &mut ServiceChild) -> Result<()> {
     Ok(())
 }
 async fn healthy(home: &Path, j: &Value, mut child: Option<&mut ServiceChild>) -> Result<Value> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        std::time::Instant::now() + crate::native_update_clock::cap(Duration::from_secs(30))?;
     loop {
+        crate::native_update_clock::check()?;
         if let Some(c) = child.as_deref_mut() {
             ensure!(
                 c.try_wait()?.is_none(),
@@ -1414,8 +1489,10 @@ mod windows_exit {
             Ok(Some(h))
         }
         pub async fn wait(&self) -> Result<()> {
-            let end = std::time::Instant::now() + Duration::from_secs(5);
+            let end = std::time::Instant::now()
+                + crate::native_update_clock::cap(Duration::from_secs(5))?;
             loop {
+                crate::native_update_clock::check()?;
                 match unsafe { WaitForSingleObject(self.0, 0) } {
                     WAIT_OBJECT_0 => return Ok(()),
                     WAIT_TIMEOUT => {}
@@ -1428,6 +1505,188 @@ mod windows_exit {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use rusqlite::{Connection, params};
+    use std::sync::mpsc;
+
+    fn initialized_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(json!({
+            "id":uuid::Uuid::new_v4().to_string(),"label":"Startup fixture","owner":"owner",
+            "bind":"127.0.0.1","port":0,"public_url":"https://example.test",
+            "pam_service":"agent-conversations","tls_cert":home.path().join("cert.pem"),
+            "tls_key":home.path().join("key.pem"),"import_source":"fixture","import_surface":"fixture",
+            "agent":{"label":"Retained agent","command":std::env::current_exe().unwrap(),
+                "args":[],"cwd":home.path(),"env":{},"mcp_servers":[],"timeout_seconds":30}
+        })).unwrap();
+        config.save(home.path()).unwrap();
+        let state = AppState::open(home.path().to_owned()).unwrap();
+        let room = state
+            .create_room("Retained work", "owner", &["default".into()])
+            .unwrap();
+        {
+            let db = state.db.lock().unwrap();
+            db.execute(
+                "UPDATE conversations SET status='working' WHERE id=?1",
+                [room["id"].as_str().unwrap()],
+            )
+            .unwrap();
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at) VALUES('in-flight',?1,'assistant','Retain this unknown progress','streaming',1,1)", [room["id"].as_str().unwrap()]).unwrap();
+            // AppState::open would replace this exact credential row as well as
+            // interrupt the streaming message. A stale launch must reach neither.
+            db.execute(
+                "UPDATE tokens SET expires_at=17 WHERE id='local-control'",
+                [],
+            )
+            .unwrap();
+        }
+        drop(state);
+        home
+    }
+
+    fn protected(home: &Path) -> Vec<Vec<u8>> {
+        [
+            "state.sqlite3",
+            "secrets/control-token",
+            "secrets/context-token",
+        ]
+        .iter()
+        .map(|p| fs::read(home.join(p)).unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn revoked_launch_during_executable_hash_cannot_initialize_or_recover_state() {
+        for change_nonce_only in [false, true] {
+            let home = initialized_home();
+            let tx = uuid::Uuid::new_v4().to_string();
+            // The race is at the digest boundary, not in SHA-256 itself. Hash
+            // small fixture bytes instead of the entire debug test executable.
+            let executable = home.path().join("candidate-executable");
+            fs::write(&executable, b"fixture executable").unwrap();
+            let actual = digest(&executable).unwrap();
+            let mut j = json!({"transaction_id":tx,"phase":"verifying","launch_nonce":"original",
+                "selected":"previous","previous":{"binary_sha256":actual}});
+            save(&home.path().join(JOURNAL), &j).unwrap();
+            let before = protected(home.path());
+            let (hash_entered, hashing) = mpsc::channel();
+            let (resume, revoked) = mpsc::channel();
+            let path = home.path().to_owned();
+            let child_tx = tx.clone();
+            let startup = std::thread::spawn(move || -> Result<()> {
+                let _service = lock(&path, "service.lock")?;
+                let _launch =
+                    validate_start_with_digest(&path, Some((&child_tx, "original")), || {
+                        hash_entered.send(())?;
+                        revoked.recv_timeout(Duration::from_secs(5))?;
+                        digest(&executable)
+                    })?;
+                AppState::open(path)?;
+                Ok(())
+            });
+            hashing.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(lock(home.path(), "service.lock").is_err());
+            if change_nonce_only {
+                j["launch_nonce"] = json!("replacement");
+                save(&home.path().join(JOURNAL), &j).unwrap();
+            } else {
+                j["launch_nonce"] = Value::Null;
+                phase(home.path(), &mut j, "switching").unwrap();
+            }
+            resume.send(()).unwrap();
+            let error = startup.join().unwrap().unwrap_err().to_string();
+            assert!(error.contains("no longer authorized"), "{error}");
+            assert_eq!(protected(home.path()), before);
+            let db = Connection::open(home.path().join("state.sqlite3")).unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT status FROM messages WHERE id='in-flight'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "streaming"
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT expires_at FROM tokens WHERE id=?1",
+                    params!["local-control"],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                17
+            );
+            assert!(lock(home.path(), "service.lock").is_ok());
+        }
+    }
+
+    #[test]
+    fn normal_startup_guard_serializes_first_prepare_intent_until_initialization_boundary() {
+        let home = initialized_home();
+        let _service = lock(home.path(), "service.lock").unwrap();
+        let launch = validate_start(home.path(), None).unwrap();
+        let (contended, observed) = mpsc::channel();
+        let path = home.path().to_owned();
+        let writer = std::thread::spawn(move || {
+            assert!(lock(&path, "native-launch.lock").is_err());
+            contended.send(()).unwrap();
+            save(&path.join(JOURNAL), &json!({"phase":"intent"}))
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!home.path().join(JOURNAL).exists());
+        // This is the exact boundary at which server::serve_inner drops the
+        // guard after AppState::open, before any listener or health operation.
+        drop(launch);
+        writer.join().unwrap().unwrap();
+        assert_eq!(read(&home.path().join(JOURNAL)).unwrap()["phase"], "intent");
+        assert!(validate_start(home.path(), None).is_err());
+    }
+
+    #[test]
+    fn post_spawn_pid_publication_waits_past_two_seconds_for_initialization() {
+        let home = initialized_home();
+        let tx = uuid::Uuid::new_v4().to_string();
+        let executable = home.path().join("candidate-executable");
+        fs::write(&executable, b"fixture executable").unwrap();
+        let actual = digest(&executable).unwrap();
+        let mut j = json!({"transaction_id":tx,"phase":"verifying","launch_nonce":"original",
+            "selected":"previous","previous":{"binary_sha256":actual},"child_pid":null});
+        save(&home.path().join(JOURNAL), &j).unwrap();
+        let before = protected(home.path());
+        let before_journal = j.clone();
+        let _service = lock(home.path(), "service.lock").unwrap();
+        let launch = validate_start_with_digest(home.path(), Some((&tx, "original")), || {
+            digest(&executable)
+        })
+        .unwrap();
+        let (contended, observed) = mpsc::channel();
+        let path = home.path().to_owned();
+        j["child_pid"] = json!(123);
+        let writer = std::thread::spawn(move || {
+            let _launch = launch_guard_waiting(&path, || contended.send(()).unwrap())?;
+            // The same guarded publication as save(); the callback makes the
+            // first failed acquisition observable without a scheduling guess.
+            config::private_write(&path.join(JOURNAL), &serde_json::to_vec_pretty(&j)?)
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The wait deadline already exists and acquisition has actually failed.
+        // A valid migration may exceed two seconds; no publication is allowed
+        // while its final authorization/database boundary is still held.
+        std::thread::sleep(Duration::from_millis(2200));
+        assert_eq!(read(&home.path().join(JOURNAL)).unwrap(), before_journal);
+        assert_eq!(protected(home.path()), before);
+        drop(launch);
+        writer.join().unwrap().unwrap();
+        let receipt = read(&home.path().join(JOURNAL)).unwrap();
+        assert_eq!(receipt["child_pid"], 123);
+        assert_eq!(receipt["launch_nonce"], "original");
+        assert_eq!(receipt["phase"], "verifying");
+        assert_eq!(protected(home.path()), before);
     }
 }
 

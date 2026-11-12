@@ -50,6 +50,7 @@ fn hash(bytes: &[u8]) -> String {
 }
 #[cfg(unix)]
 fn output(command: &mut Command) -> Result<Output> {
+    let deadline = Instant::now() + crate::native_update_clock::cap(Duration::from_secs(15))?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -63,16 +64,20 @@ fn output(command: &mut Command) -> Result<Output> {
         .take()
         .context("Missing startup error output")?;
     let read = |pipe: Box<dyn Read + Send>| {
-        thread::spawn(move || -> std::io::Result<Vec<u8>> {
-            let mut bytes = Vec::new();
-            pipe.take((OUTPUT_LIMIT + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            Ok(bytes)
-        })
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| -> std::io::Result<Vec<u8>> {
+                let mut bytes = Vec::new();
+                pipe.take((OUTPUT_LIMIT + 1) as u64)
+                    .read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })();
+            let _ = sender.send(result);
+        });
+        receiver
     };
     let out = read(Box::new(out));
     let err = read(Box::new(err));
-    let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -84,12 +89,18 @@ fn output(command: &mut Command) -> Result<Output> {
         }
         thread::sleep(Duration::from_millis(20));
     };
+    // A child can exit while a descendant retains a pipe writer. Never join
+    // its reader without a bound; it owns only this bounded capture, not state.
     let stdout = out
-        .join()
-        .map_err(|_| anyhow::anyhow!("Startup output reader failed"))??;
+        .recv_timeout(crate::native_update_clock::cap(
+            deadline.saturating_duration_since(Instant::now()),
+        )?)
+        .context("Startup output capture did not settle; outcome is unknown")??;
     let stderr = err
-        .join()
-        .map_err(|_| anyhow::anyhow!("Startup error reader failed"))??;
+        .recv_timeout(crate::native_update_clock::cap(
+            deadline.saturating_duration_since(Instant::now()),
+        )?)
+        .context("Startup error capture did not settle; outcome is unknown")??;
     ensure!(
         stdout.len() <= OUTPUT_LIMIT && stderr.len() <= OUTPUT_LIMIT,
         "Startup manager output exceeded its bound"
@@ -582,6 +593,7 @@ fn inspect_platform(s: &mut Snapshot) -> Result<()> {
 
 #[cfg(windows)]
 fn task(label: &str, action: &str) -> Result<Value> {
+    crate::native_update_clock::check()?;
     ensure!(
         matches!(action, "query" | "stop" | "start"),
         "Invalid fixed task operation"
@@ -596,9 +608,10 @@ fn task(label: &str, action: &str) -> Result<Value> {
     // Match the accepted shared native-platform COM owner pattern. A dedicated
     // thread gives this call its own apartment; no shell, console codepage or
     // PowerShell startup competes with concurrent installation verification.
-    // Join rather than detach a timed-out mutation: a local COM failure stays
-    // an error, not proof that Run/Stop was cancelled. The caller still verifies
-    // the actual fixed task state before continuing the update transaction.
+    // Never detach a timed-out mutation and unlock the transaction as if it
+    // had been cancelled. The participant CLI's process watchdog bounds this
+    // synchronous join, retaining the durable intent and unknown outcome. The
+    // caller still verifies the fixed task state before continuing.
     let label = label.to_owned();
     let action = action.to_owned();
     thread::spawn(move || -> Result<Value> {
@@ -786,6 +799,7 @@ pub fn verify_restored(snapshot: &Value) -> Result<()> {
     Ok(())
 }
 fn operate(snapshot: &Value, start: bool) -> Result<()> {
+    let deadline = Instant::now() + crate::native_update_clock::cap(Duration::from_secs(10))?;
     let saved = decode(snapshot)?;
     let before = inspect(&saved.home, &saved.id)?;
     compare(&saved, &before)?;
@@ -836,8 +850,8 @@ fn operate(snapshot: &Value, start: bool) -> Result<()> {
     {
         task(&saved.label, if start { "start" } else { "stop" })?;
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
+        crate::native_update_clock::check()?;
         match inspect(&saved.home, &saved.id) {
             Ok(current) => {
                 compare(&saved, &current)?;

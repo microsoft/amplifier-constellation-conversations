@@ -390,6 +390,7 @@ async fn main() -> Result<()> {
             mode,
             action,
         } => {
+            let clock = native_update_protocol::invocation_clock(&mode, &action)?;
             let value = if mode == "enrollment" {
                 match action.as_str() {
                     "enroll" => native_update_protocol::claim_owner(&config)?,
@@ -399,7 +400,13 @@ async fn main() -> Result<()> {
             } else {
                 native_update_protocol::run(&config, &mode, &action).await?
             };
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            // The watchdog remains active even if the caller stops reading.
+            use std::io::Write;
+            let output = serde_json::to_string_pretty(&value)? + "\n";
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(output.as_bytes())?;
+            stdout.flush()?;
+            clock.complete()?;
         }
         Action::Status => {
             let c = Config::load(&home)?;
