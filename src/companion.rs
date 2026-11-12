@@ -1008,7 +1008,7 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
         crate::credentials::apply_openai_environment(&mut cmd,&s.home)?;
         crate::platform::ProcessTree::prepare(&mut cmd);
         let mut child=cmd.spawn().context("Voice bridge unavailable")?;
-        let mut process_tree=crate::platform::ProcessTree::attach(&child)?;
+        let mut process_tree=crate::platform::ProcessTree::attach(&mut child).await?;
         let mut input=child.stdin.take().context("Missing voice input")?;
         let mut initial=initial;
         initial["retain_receipts"]=json!(!initial["mcp"].is_null());

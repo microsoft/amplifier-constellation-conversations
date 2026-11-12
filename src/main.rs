@@ -241,14 +241,14 @@ async fn main() -> Result<()> {
                 "This installation already exists; no files were changed"
             );
             config::private_dir(&home)?;
-            let home = std::fs::canonicalize(&home)?;
+            let home = dunce::canonicalize(&home)?;
             config::private_dir(&home.join("workspace"))?;
             let (command, args, cwd) = if let Some(agent_home) = agent_home {
                 ensure!(
                     agent_command.is_none() && agent_arg.is_empty(),
                     "Use either --agent-home or --agent-command"
                 );
-                let p = std::fs::canonicalize(agent_home)?;
+                let p = dunce::canonicalize(agent_home)?;
                 (
                     p.join("bin")
                         .join(platform::executable("agent-instance"))

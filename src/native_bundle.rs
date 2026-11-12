@@ -342,14 +342,17 @@ fn result(root: &Path, m: &Manifest, hash: &str) -> Value {
 }
 pub fn verify(root: &Path) -> Result<Value> {
     let (m, _, hash) = load(root)?;
-    Ok(result(&fs::canonicalize(root)?, &m, &hash))
+    // Expose a canonical path usable by the bundled Node module loader too.
+    // On Windows std canonicalization always adds the verbatim prefix; dunce
+    // removes it only when the ordinary spelling names the same filesystem path.
+    Ok(result(&dunce::canonicalize(root)?, &m, &hash))
 }
 pub fn install(root: &Path, home: &Path) -> Result<Value> {
     // Verify before creating installation state; extraction/download belongs to
     // the package acquisition surface, not to a remotely callable host API.
     let (m, bytes, hash) = load(root)?;
     config::private_dir(home)?;
-    let home = fs::canonicalize(home)?;
+    let home = dunce::canonicalize(home)?;
     let packages = home.join("packages");
     config::private_dir(&packages)?;
     let destination = packages.join(&hash);
@@ -447,6 +450,34 @@ mod tests {
             b"existing credentials and sessions"
         );
         assert!(!home.join("runtime.json").exists());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn public_entrypoints_keep_identity_with_node_compatible_windows_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source café");
+        fs::create_dir(&source).unwrap();
+        fixture(&source);
+        let home = tmp.path().join("Companion 日本語");
+        let installed = install(&source, &home).unwrap();
+        for receipt in [verify(&source).unwrap(), installed.clone()] {
+            let root = Path::new(receipt["bundle"].as_str().unwrap());
+            assert!(!root.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+            for value in receipt["entrypoints"].as_object().unwrap().values() {
+                let path = Path::new(value.as_str().unwrap());
+                assert!(!path.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+                assert!(
+                    fs::canonicalize(path)
+                        .unwrap()
+                        .starts_with(fs::canonicalize(root).unwrap())
+                );
+                assert!(path.is_file());
+            }
+        }
+        assert_eq!(
+            verify(Path::new(installed["bundle"].as_str().unwrap())).unwrap()["entrypoints"],
+            installed["entrypoints"]
+        );
     }
     #[test]
     fn rejects_tampering_extras_and_wrong_architecture_before_install() {

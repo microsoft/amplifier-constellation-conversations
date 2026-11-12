@@ -822,7 +822,7 @@ async fn invoke(command: &[String], input: &Value) -> Result<Value> {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
-    let mut process_tree = crate::platform::ProcessTree::attach(&child)?;
+    let mut process_tree = crate::platform::ProcessTree::attach(&mut child).await?;
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(input.to_string().as_bytes()).await?;

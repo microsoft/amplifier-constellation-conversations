@@ -197,11 +197,17 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
         require(events[0]["provider_key_present"] is False, "Voice provider key leaked into the ACP child")
         checks.append("official ACP SDK initialize through installed private Node; no session or model prompt")
         bridge = Path(entrypoints["bridge"])
+        # Import the actual production module without selecting its CLI entry or
+        # starting a call. This also exercises its relative/package resolution.
+        bridge_import = """const {pathToFileURL}=require('node:url'); const entry=process.argv[1]; process.argv.splice(1);
+          import(pathToFileURL(entry)).then(m=>{if(typeof m.LiveBridge!=='function')throw Error('Missing production bridge export');console.log('production bridge imported without call')}).catch(e=>{console.error(e);process.exitCode=1});"""
+        imported_bridge = run([installed_node, "-e", bridge_import, bridge], env, root)
+        require(imported_bridge.stdout.strip() == "production bridge imported without call", "Production bridge import started unexpected work")
         import_script = """const {createRequire}=require('node:module'); const {pathToFileURL}=require('node:url');
           const r=createRequire(process.argv[1]); (async()=>{for(const n of ['openai','ws','zod','@modelcontextprotocol/sdk/client/index.js','@slack/web-api'])await import(pathToFileURL(r.resolve(n))); console.log('bundled SDK imports passed')})().catch(e=>{console.error(e);process.exitCode=1});"""
         run([installed_node, "-e", import_script, bridge], env, root)
         run([installed_node, "--check", bridge], env, root)
-        checks.append("private bridge SDK dependencies import without npm or ambient node_modules")
+        checks.append("production bridge and private SDK dependencies import without a call, npm or ambient node_modules")
         context = strict_tls_context(home / "tls/root-ca.crt")
         with (root / "server.log").open("w", encoding="utf-8") as stream:
             server = subprocess.Popen([str(installed_service), "--home", str(home), "serve"],

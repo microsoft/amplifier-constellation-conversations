@@ -766,7 +766,7 @@ async fn invoke(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
-    let mut process_tree = crate::platform::ProcessTree::attach(&child)?;
+    let mut process_tree = crate::platform::ProcessTree::attach(&mut child).await?;
     tokio::time::timeout(
         Duration::from_secs(if decisions { 20 } else { 12 }),
         async {

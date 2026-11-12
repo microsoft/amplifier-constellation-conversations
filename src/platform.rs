@@ -462,8 +462,17 @@ pub mod windows {
     pub struct ProcessJob(usize);
     impl ProcessJob {
         pub fn attach(child: &tokio::process::Child) -> Result<Self> {
-            // Bind Tokio's actual process handle rather than reopening a PID.
-            // This is immediate post-spawn assignment, not suspended-spawn containment.
+            Self::attach_with(child, assign_job, resume_suspended)
+        }
+        // Closures expose the two OS failure boundaries to native tests without
+        // environment flags or failure injection in a production command/API.
+        pub(super) fn attach_with(
+            child: &tokio::process::Child,
+            assign: impl FnOnce(HANDLE, HANDLE) -> Result<()>,
+            resume: impl FnOnce(u32) -> Result<()>,
+        ) -> Result<Self> {
+            // CREATE_SUSPENDED prevents child code and descendants from running
+            // until its actual borrowed process handle belongs to this job.
             let process = child
                 .raw_handle()
                 .context("Child exited before job assignment")?;
@@ -483,13 +492,62 @@ pub mod windows {
                 } != 0,
                 "Cannot configure child process cleanup"
             );
-            ensure!(
-                unsafe { AssignProcessToJobObject(job, process) } != 0,
-                "Cannot attach child to process job: {}",
-                std::io::Error::last_os_error()
-            );
+            assign(job, process)?;
+            resume(child.id().context("Child exited before resume")?)?;
             Ok(guard)
         }
+    }
+    pub(super) fn assign_job(job: HANDLE, process: HANDLE) -> Result<()> {
+        ensure!(
+            unsafe { AssignProcessToJobObject(job, process) } != 0,
+            "Cannot attach child to process job: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
+    }
+    // Tokio retains the process handle, not the initial thread handle. The
+    // suspended process is still alive, so its PID cannot have been reused.
+    pub(super) fn resume_suspended(pid: u32) -> Result<()> {
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::{Diagnostics::ToolHelp::*, Threading::*},
+        };
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        ensure!(
+            snapshot != INVALID_HANDLE_VALUE,
+            "Cannot inspect suspended child"
+        );
+        let snapshot = OwnedHandle(snapshot);
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut found = None;
+        let mut available = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+        while available {
+            if entry.th32OwnerProcessID == pid {
+                found = Some(entry.th32ThreadID);
+                break;
+            }
+            available = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+        }
+        let id = found.context("Suspended child has no initial thread")?;
+        let thread = unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                id,
+            )
+        };
+        ensure!(!thread.is_null(), "Cannot open suspended child thread");
+        let thread = OwnedHandle(thread);
+        ensure!(
+            unsafe { GetProcessIdOfThread(thread.0) } == pid,
+            "Suspended child thread ownership changed"
+        );
+        ensure!(
+            unsafe { ResumeThread(thread.0) } == 1,
+            "Cannot resume suspended child"
+        );
+        Ok(())
     }
     impl Drop for ProcessJob {
         fn drop(&mut self) {
@@ -557,9 +615,17 @@ impl ProcessTree {
         #[cfg(unix)]
         command.process_group(0);
         #[cfg(windows)]
-        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        command.creation_flags(
+            windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+                | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        );
     }
-    pub fn attach(child: &Child) -> Result<Self> {
+    pub async fn attach(child: &mut Child) -> Result<Self> {
+        #[cfg(windows)]
+        let job = {
+            let result = windows::ProcessJob::attach(child);
+            Self::finish_attach(child, result).await?
+        };
         #[cfg(unix)]
         let pid = child
             .id()
@@ -568,8 +634,31 @@ impl ProcessTree {
             #[cfg(unix)]
             pid: Some(i32::try_from(pid).context("Invalid child process identifier")?),
             #[cfg(windows)]
-            job: Some(windows::ProcessJob::attach(child)?),
+            job: Some(job),
         })
+    }
+    #[cfg(windows)]
+    async fn finish_attach(
+        child: &mut Child,
+        result: Result<windows::ProcessJob>,
+    ) -> Result<windows::ProcessJob> {
+        match result {
+            Ok(job) => Ok(job),
+            Err(error) => {
+                // The child may not yet belong to a job. Always terminate the
+                // actual owned child and reap it before reporting launch failure.
+                let _ = child.start_kill();
+                match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                    Ok(Ok(_)) => Err(error),
+                    Ok(Err(cleanup)) => {
+                        Err(error.context(format!("Child cleanup failed: {cleanup}")))
+                    }
+                    Err(_) => {
+                        Err(error.context("Child cleanup did not settle within five seconds"))
+                    }
+                }
+            }
+        }
     }
     pub fn terminate(&mut self, child: &mut Child) {
         self.close();
@@ -659,7 +748,7 @@ mod tests {
         command.arg("-c").arg("exit 0");
         ProcessTree::prepare(&mut command);
         let mut child = command.spawn().unwrap();
-        let mut tree = ProcessTree::attach(&child).unwrap();
+        let mut tree = ProcessTree::attach(&mut child).await.unwrap();
         assert!(child.wait().await.unwrap().success());
         tree.reaped();
         assert!(tree.pid.is_none());
@@ -681,7 +770,7 @@ mod tests {
         ProcessTree::prepare(&mut command);
         let mut child = command.spawn().unwrap();
         let mut output = child.stdout.take().unwrap();
-        let mut tree = ProcessTree::attach(&child).unwrap();
+        let mut tree = ProcessTree::attach(&mut child).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if std::fs::read_to_string(&child_pid_path)
@@ -718,3 +807,7 @@ mod tests {
         tree.terminate(&mut child); // Cleanup is idempotent after the child is reaped.
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "platform_windows_process_tests.rs"]
+mod windows_process_tests;

@@ -353,7 +353,7 @@ impl Client {
         let mut child = cmd
             .spawn()
             .context("The ACP command could not be started")?;
-        let process_tree = crate::platform::ProcessTree::attach(&child)?;
+        let process_tree = crate::platform::ProcessTree::attach(&mut child).await?;
         let input = child.stdin.take().context("Missing agent input")?;
         let output = child.stdout.take().context("Missing agent output")?;
         Ok(Self {
