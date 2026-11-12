@@ -268,6 +268,18 @@ pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
             &service,
         )?;
     }
+    // A previous bootstrap may have published the private binary before its
+    // execute permission was applied. Only the verified selected bytes reach
+    // this point; finish that step durably before committing the receipt.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&service, fs::Permissions::from_mode(0o700))
+            .context("Cannot finish native service executable permissions")?;
+        File::open(&service)?
+            .sync_all()
+            .context("Cannot persist native service executable permissions")?;
+    }
     if let Some(bytes) = after {
         config::private_write(&home.join("companion.json"), &bytes)
             .context("Cannot commit Companion bundle bindings")?;
