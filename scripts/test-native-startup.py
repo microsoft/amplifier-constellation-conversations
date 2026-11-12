@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OPT_IN = "CONSTELLATION_NATIVE_STARTUP_TEST"
 RETAIN = ".retain-after-uncertain-cleanup"
 TASK_QUERY_STAGE_PREFIX = "CONSTELLATION_STARTUP_QUERY_STAGE:"
-TASK_QUERY_STAGES = {"started", "COMcreated", "connected", "folder", "task", "serialized"}
+TASK_QUERY_STAGES = {"started", "encodingConfigured", "utilityImporting", "utilityImported", "COMcreating", "COMcreated", "connected", "folder", "task", "serialized"}
 
 
 def task_query_timeout_stage(stderr) -> str:
@@ -159,6 +159,14 @@ class Startup:
         powershell = system32 / "WindowsPowerShell/v1.0/powershell.exe"
         script = r"""[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:started');
 $ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);
+[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:encodingConfigured');
+$PSModuleAutoLoadingPreference='None';
+$env:PSModulePath=[System.IO.Path]::Combine($PSHOME,'Modules');
+[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:utilityImporting');
+$utilityManifest=[System.IO.Path]::Combine($PSHOME,'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1');
+Import-Module -Name $utilityManifest -ErrorAction Stop;
+[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:utilityImported');
+[Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:COMcreating');
 $s=New-Object -ComObject 'Schedule.Service';
 [Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:COMcreated');
 $s.Connect(); [Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:connected');
@@ -168,6 +176,9 @@ catch {if ($_.Exception.HResult -eq -2147024894 -or $_.Exception.InnerException.
 $json=@{xml=$t.Xml; state=[int]$t.State; enabled=[bool]$t.Enabled; instances=[int]($t.GetInstances(0).Count)} | ConvertTo-Json -Compress;
 [Console]::Error.WriteLine('CONSTELLATION_STARTUP_QUERY_STAGE:serialized'); $json"""
         env = dict(self.env, CONSTELLATION_TEST_TASK_LABEL=self.label)
+        # Name-based module autoload can search user and machine directories,
+        # even with an isolated PATH. Load only the in-box Utility manifest above
+        # for New-Object/ConvertTo-Json; this does not change the application.
         # Only this independent controller query gets the fixed OS search path.
         # Application CLI calls retain their empty PATH and WSL exclusion; no
         # account/global manager environment or registration privilege changes.

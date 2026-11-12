@@ -77,6 +77,11 @@ class NativeStartupHarnessTests(unittest.TestCase):
             self.assertIs(manager.env, app_env)
             self.assertEqual(app_env, before)
             script = query.args[0][-1]
+            self.assertIn("$PSModuleAutoLoadingPreference='None'", script)
+            self.assertIn("[System.IO.Path]::Combine($PSHOME", script)
+            self.assertIn("Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1", script)
+            self.assertLess(script.index("$PSModuleAutoLoadingPreference='None'"), script.index("Import-Module -Name $utilityManifest"))
+            self.assertLess(script.index("Import-Module -Name $utilityManifest"), script.index("New-Object -ComObject"))
             for stage in startup.TASK_QUERY_STAGES:
                 self.assertIn("[Console]::Error.WriteLine('" + startup.TASK_QUERY_STAGE_PREFIX + stage + "')", script)
             # Later application commands still receive the original isolated
