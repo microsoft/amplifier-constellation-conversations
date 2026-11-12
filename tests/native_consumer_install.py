@@ -78,7 +78,8 @@ class ConsumerInstallation(lifecycle.Installation):
         try:
             config = read_json(self.home / "config.json")
             runtime = read_json(self.home / "runtime.json")
-            require(runtime["url"] == config["public_url"] and runtime["url"].startswith("http://127.0.0.1:"),
+            require(runtime["url"] == config["public_url"] == f"http://127.0.0.1:{runtime['port']}"
+                    and runtime["port"] == config["port"],
                     "Consumer fixture listener is not the saved literal loopback origin")
             with self.health.open(runtime["url"] + "/health", timeout=1) as response:
                 require(response.status == 200 and json.load(response)["ok"], "Invalid consumer health response")
@@ -87,8 +88,24 @@ class ConsumerInstallation(lifecycle.Installation):
         self.ports.add(runtime["port"])
         # The native CLI proves the listener before transmitting its credential.
         value = self.api()
-        require(value["id"] == config["id"] and value["pid"] == runtime["pid"]
-                and value["process_nonce"] == runtime["process_nonce"], "Consumer listener process identity differs")
+        require(value["id"] == config["id"], "Consumer listener installation identity differs")
+        try:
+            current_config = read_json(self.home / "config.json")
+            current = read_json(self.home / "runtime.json")
+        except (OSError, ValueError):
+            return None
+        require(all(current_config[key] == config[key] for key in ["id", "public_url", "port"]),
+                "Consumer fixture configuration identity changed")
+        require(current["url"] == config["public_url"] == f"http://127.0.0.1:{current['port']}"
+                and current["port"] == config["port"],
+                "Consumer fixture listener is not the saved literal loopback origin")
+        # A new server can publish its runtime after the first sample but before
+        # /health and the proved GET. Reobserve within the caller's existing
+        # readiness deadline; never compare its reply to an obsolete generation.
+        if any(current[key] != runtime[key] for key in ["pid", "process_nonce"]):
+            return None
+        require(value["pid"] == current["pid"] and value["process_nonce"] == current["process_nonce"],
+                "Consumer listener process identity differs")
         return value
 
     def api(self, method="GET", path="/api/v1/native-update/status", body=None):

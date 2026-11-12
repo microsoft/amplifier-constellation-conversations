@@ -1,5 +1,6 @@
 """Controller boundaries; actual native execution belongs to the package lane."""
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -12,6 +13,67 @@ spec.loader.exec_module(consumer)
 
 
 class ConsumerControllerTests(unittest.TestCase):
+    def readiness_fixture(self, root, *, after=None, response_change=None, config_change=None):
+        install = self.fixture(root)
+        config = {"id": "owned-installation", "public_url": "http://127.0.0.1:31471", "port": 31471}
+        before = {"url": config["public_url"], "port": config["port"], "pid": 101, "process_nonce": "fixture-generation-a"}
+        current = {**before, **(after or {})}
+        consumer.write_json(install.home / "config.json", config)
+        consumer.write_json(install.home / "runtime.json", before)
+
+        def health(*_args, **_kwargs):
+            # Publish the next generation after running() has read the old
+            # runtime, exactly when the new listener can answer /health.
+            replacement = install.home / "next-runtime.json"
+            consumer.write_json(replacement, current)
+            replacement.replace(install.home / "runtime.json")
+            if config_change:
+                consumer.write_json(install.home / "config.json", {**config, **config_change})
+            response = io.BytesIO(b'{"ok":true}')
+            response.status = 200
+            return response
+
+        install.health = Mock(open=Mock(side_effect=health))
+        install.ports = set()
+        value = {"id": config["id"], "pid": current["pid"], "process_nonce": current["process_nonce"], **(response_change or {})}
+        install.api = Mock(return_value=value)
+        return install, value
+
+    def test_runtime_generation_publication_is_pending_then_stable_without_relaunch(self):
+        for after in [{"pid": 202, "process_nonce": "fixture-generation-b"},
+                      {"process_nonce": "fixture-generation-b"}]:
+            with self.subTest(after=after), tempfile.TemporaryDirectory() as folder:
+                install, value = self.readiness_fixture(Path(folder), after=after)
+                with patch.object(consumer.subprocess, "Popen") as spawn:
+                    self.assertIsNone(install.running())
+                    self.assertIs(install.running(), value)
+                    spawn.assert_not_called()
+                self.assertEqual(install.api.call_count, 2)
+                self.assertTrue(all(not call.args and not call.kwargs for call in install.api.call_args_list))
+
+    def test_stable_runtime_identity_mismatch_still_refuses(self):
+        for changed in [{"id": "other-installation"}, {"pid": 303}, {"process_nonce": "fixture-wrong-generation"}]:
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as folder:
+                install, _ = self.readiness_fixture(Path(folder), response_change=changed)
+                with self.assertRaisesRegex(AssertionError, "identity differs"):
+                    install.running()
+                install.api.assert_called_once_with()
+
+    def test_generation_change_cannot_hide_wrong_installation_origin_port_or_config(self):
+        cases = [({"response_change": {"id": "other-installation"}}, "installation identity differs"),
+                 ({"after": {"url": "http://127.0.0.1:31472"}}, "saved literal loopback origin"),
+                 ({"after": {"port": 31472}}, "saved literal loopback origin"),
+                 ({"config_change": {"public_url": "http://127.0.0.1:31472"}}, "configuration identity changed"),
+                 ({"config_change": {"id": "other-installation"}}, "configuration identity changed"),
+                 ({"config_change": {"port": 31472}}, "configuration identity changed")]
+        for changes, message in cases:
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as folder:
+                after = {"pid": 202, "process_nonce": "fixture-generation-b", **changes.get("after", {})}
+                install, _ = self.readiness_fixture(Path(folder), **{**changes, "after": after})
+                with self.assertRaisesRegex(AssertionError, message):
+                    install.running()
+                install.api.assert_called_once_with()
+
     def fixture(self, root):
         install = object.__new__(consumer.ConsumerInstallation)
         install.root, install.home = root, root / "home"
