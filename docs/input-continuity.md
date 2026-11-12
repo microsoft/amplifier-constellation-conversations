@@ -39,7 +39,8 @@ other rooms can use the released execution capacity. Stop ends the wait without
 changing the accepted response or replaying it.
 
 Output EOF, cleanup failure, Stop or the deadline ends this best-effort opportunity:
-Conversations disposes the still-owned process group and reaps the child. EOF is
+Conversations terminates the child and, on Unix, its still-owned process group,
+then reaps the child. EOF is
 not proof of process exit or graceful agent retirement; an agent that closes
 stdout early gets no further execution grace. Auxiliary work is not guaranteed
 to finish. Failure and interrupted-prompt disposal otherwise remain unchanged.
