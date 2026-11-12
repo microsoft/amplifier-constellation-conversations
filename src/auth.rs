@@ -16,12 +16,54 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::ffi::{CStr, CString};
-use std::{fs, io::Read, path::Path, sync::Arc};
+use std::{
+    fs,
+    io::Read,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 use zeroize::Zeroizing;
 
 const LOCAL_PASSWORD_FILE: &str = "local-password.json";
 const FIRST_ACCOUNT_FILE: &str = "first-account.json";
 const SETUP_LIFETIME_MS: i64 = 15 * 60 * 1000;
+
+/// Authentication needs only existing account/session storage. The restricted
+/// recovery listener supplies these references without opening application work
+/// state, running migrations, refreshing tokens or recovering interrupted work.
+#[derive(Clone, Copy)]
+pub(crate) struct AccountContext<'a> {
+    pub home: &'a Path,
+    pub config: &'a Config,
+    pub db: &'a Mutex<rusqlite::Connection>,
+    pub login_gate: &'a Arc<tokio::sync::Semaphore>,
+    pub append_only_audit: bool,
+}
+impl<'a> AccountContext<'a> {
+    pub(crate) fn normal(state: &'a AppState) -> Self {
+        Self {
+            home: &state.home,
+            config: &state.config,
+            db: &state.db,
+            login_gate: &state.login_gate,
+            append_only_audit: false,
+        }
+    }
+    fn audit(self, kind: &str, data: Value) -> ApiResult<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO audit(at,kind,conversation_id,data) VALUES(?1,?2,NULL,?3)",
+            params![now_ms(), kind, data.to_string()],
+        )?;
+        if !self.append_only_audit {
+            db.execute(
+                "DELETE FROM audit WHERE seq <= (SELECT COALESCE(MAX(seq),0)-5000 FROM audit)",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -369,7 +411,10 @@ pub fn digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 pub fn cookie_name(state: &AppState) -> String {
-    format!("acv_{}", state.config.id.replace('-', ""))
+    cookie_name_config(&state.config)
+}
+fn cookie_name_config(config: &Config) -> String {
+    format!("acv_{}", config.id.replace('-', ""))
 }
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -384,7 +429,7 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
             (k == name).then(|| v.to_owned())
         })
 }
-fn constant_equal(a: &str, b: &str) -> bool {
+pub(crate) fn constant_equal(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())
@@ -405,7 +450,16 @@ pub fn check(
     scope: &str,
     mutation: bool,
 ) -> ApiResult<Principal> {
-    validate_host(&state.config, headers)?;
+    check_account(AccountContext::normal(state), headers, scope, mutation)
+}
+
+pub(crate) fn check_account(
+    state: AccountContext<'_>,
+    headers: &HeaderMap,
+    scope: &str,
+    mutation: bool,
+) -> ApiResult<Principal> {
+    validate_host(state.config, headers)?;
     if let Some(value) = headers.get(header::AUTHORIZATION) {
         let token = value
             .to_str()
@@ -438,7 +492,8 @@ pub fn check(
             session_hash: None,
         });
     }
-    let token = cookie_value(headers, &cookie_name(state)).ok_or_else(ApiError::unauthorized)?;
+    let token = cookie_value(headers, &cookie_name_config(state.config))
+        .ok_or_else(ApiError::unauthorized)?;
     let hash = digest(&token);
     let row: Option<(String, String)> = state
         .db
@@ -463,7 +518,7 @@ pub fn check(
         return Err(ApiError::forbidden());
     }
     if mutation {
-        same_origin(&state.config, headers)?;
+        same_origin(state.config, headers)?;
         if !headers
             .get("x-csrf-token")
             .and_then(|v| v.to_str().ok())
@@ -534,7 +589,15 @@ pub async fn login(
     headers: HeaderMap,
     Json(login): Json<Login>,
 ) -> ApiResult<Response> {
-    same_origin(&state.config, &headers)?;
+    login_account(AccountContext::normal(&state), headers, login).await
+}
+
+pub(crate) async fn login_account(
+    state: AccountContext<'_>,
+    headers: HeaderMap,
+    login: Login,
+) -> ApiResult<Response> {
+    same_origin(state.config, &headers)?;
     if login.username.len() > 100 || login.password.len() > 1024 || login.password.is_empty() {
         return Err(ApiError::unauthorized());
     }
@@ -570,7 +633,7 @@ pub async fn login(
     } else {
         crate::platform::auth_method()
     };
-    let home = state.home.clone();
+    let home = state.home.to_path_buf();
     let mut allowed = vec![config.owner.clone()];
     allowed.extend(config.allowed_users.iter().cloned());
     let worker = tokio::task::spawn_blocking(move || {
@@ -597,14 +660,14 @@ pub async fn login(
         .flatten();
     let Some(owner) = actor else {
         state.db.lock().unwrap().execute("INSERT INTO login_attempts(key,failures,locked_until) VALUES('owner',1,0) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN locked_until>0 AND locked_until<?1 THEN 1 ELSE failures+1 END, locked_until=CASE WHEN failures>=4 THEN ?1+60000 ELSE 0 END",[now_ms()])?;
-        state.audit("auth.failed", None, json!({"method":method}))?;
+        state.audit("auth.failed", json!({"method":method}))?;
         return Err(ApiError::unauthorized());
     };
-    signed_in(&state, &owner, method, None)
+    signed_in_account(state, &owner, method, None)
 }
 
-fn secure_cookie(state: &AppState) -> &'static str {
-    if state.config.transport == Transport::LocalHttp {
+fn secure_cookie(config: &Config) -> &'static str {
+    if config.transport == Transport::LocalHttp {
         ""
     } else {
         "; Secure"
@@ -613,6 +676,15 @@ fn secure_cookie(state: &AppState) -> &'static str {
 
 fn signed_in(
     state: &AppState,
+    owner: &str,
+    method: &str,
+    startup: Option<Value>,
+) -> ApiResult<Response> {
+    signed_in_account(AccountContext::normal(state), owner, method, startup)
+}
+
+fn signed_in_account(
+    state: AccountContext<'_>,
     owner: &str,
     method: &str,
     startup: Option<Value>,
@@ -627,16 +699,12 @@ fn signed_in(
             params![digest(&token), owner, csrf, now_ms() + 8 * 3600 * 1000],
         )?;
     }
-    state.audit(
-        "auth.signed_in",
-        None,
-        json!({"actor":owner,"method":method}),
-    )?;
+    state.audit("auth.signed_in", json!({"actor":owner,"method":method}))?;
     let cookie = format!(
         "{}={}{}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800",
-        cookie_name(state),
+        cookie_name_config(state.config),
         token,
-        secure_cookie(state)
+        secure_cookie(state.config)
     );
     let mut body = json!({"authenticated":true,"owner":owner,"admin":owner == state.config.owner,"csrf":csrf,
         "auth_mode":state.config.auth_mode.as_str(),"first_account_needed":false});
@@ -650,20 +718,31 @@ pub async fn session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    match check(&state, &headers, "observe", false) {
+    session_account(AccountContext::normal(&state), headers)
+}
+
+pub(crate) fn session_account(
+    state: AccountContext<'_>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    match check_account(state, &headers, "observe", false) {
         Ok(p) => Ok(Json(
             json!({"authenticated":true,"owner":p.actor,"admin":p.admin,"csrf":p.csrf,
                 "auth_mode":state.config.auth_mode.as_str(),"first_account_needed":false}),
         )),
         Err(e) if e.0 == StatusCode::UNAUTHORIZED => Ok(Json(
             json!({"authenticated":false,"owner":state.config.owner,"csrf":null,
-                "auth_mode":state.config.auth_mode.as_str(),"first_account_needed":first_account_needed(&state.home)?}),
+                "auth_mode":state.config.auth_mode.as_str(),"first_account_needed":first_account_needed(state.home)?}),
         )),
         Err(e) => Err(e),
     }
 }
 pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
-    let p = check(&state, &headers, "observe", true)?;
+    logout_account(AccountContext::normal(&state), headers)
+}
+
+pub(crate) fn logout_account(state: AccountContext<'_>, headers: HeaderMap) -> ApiResult<Response> {
+    let p = check_account(state, &headers, "observe", true)?;
     if let Some(hash) = p.session_hash {
         state
             .db
@@ -671,14 +750,14 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> A
             .unwrap()
             .execute("DELETE FROM browser_sessions WHERE hash=?1", [hash])?;
     }
-    state.audit("auth.signed_out", None, json!({"actor":p.actor}))?;
+    state.audit("auth.signed_out", json!({"actor":p.actor}))?;
     Ok((
         [(
             header::SET_COOKIE,
             format!(
                 "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-                cookie_name(&state),
-                secure_cookie(&state)
+                cookie_name_config(state.config),
+                secure_cookie(state.config)
             ),
         )],
         Json(json!({"ok":true})),

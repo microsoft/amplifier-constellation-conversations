@@ -25,6 +25,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     crate::delivery::resume(&state);
     Router::new()
         .merge(crate::native_update::router())
+        .merge(crate::native_browser_update::router())
+        .merge(crate::native_browser_update::assets())
         .route(
             "/markdown-notices.txt",
             get(|| async {
@@ -438,6 +440,14 @@ async fn headers(
     }
     let companion_page = request.uri().path() == "/companion";
     let mut response = next.run(request).await;
+    secure_response(&mut response, &state.config.embed_origins, companion_page);
+    response
+}
+pub(crate) fn secure_response(
+    response: &mut Response,
+    embed_origins: &[String],
+    companion_page: bool,
+) {
     let h = response.headers_mut();
     h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
@@ -447,9 +457,9 @@ async fn headers(
     } else {
         "img-src 'self' data:;"
     };
-    h.insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; {media_policy} object-src 'none'; base-uri 'none'; frame-ancestors 'self' {}; form-action 'self'",state.config.embed_origins.join(" ")).parse().unwrap());
-    response
+    h.insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; {media_policy} object-src 'none'; base-uri 'none'; frame-ancestors 'self' {}; form-action 'self'",embed_origins.join(" ")).parse().unwrap());
 }
+
 async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
     let name = state
         .config
@@ -1298,6 +1308,14 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 pub async fn serve(home: std::path::PathBuf) -> anyhow::Result<()> {
+    if let Some(journal) = crate::native_update::recovery_snapshot(&home)?
+        && journal.phase != "restored"
+        && (crate::native_update::managed_startup_ticket(&home)?.is_none()
+            || crate::native_browser_update::owns_pending_transaction(&home, &journal.transaction)?
+                && !crate::native_browser_update::worker_active(&home)?)
+    {
+        return crate::desktop::launch(home, false).await;
+    }
     serve_inner(home, None, None).await
 }
 pub async fn serve_update(

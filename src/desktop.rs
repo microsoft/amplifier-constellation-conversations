@@ -63,6 +63,26 @@ fn downloaded_bundle(executable: &Path) -> Result<PathBuf> {
     Ok(bundle)
 }
 
+/// The browser selects a complete extracted package folder. On macOS the
+/// ordinary app itself is that folder; its fixed native launcher must still
+/// equal the fully verified Resources bundle service.
+pub(crate) fn checked_package_folder(folder: &Path) -> Result<PathBuf> {
+    ensure!(
+        folder.is_absolute() && folder.is_dir(),
+        "Choose an absolute extracted package folder"
+    );
+    let executable = if cfg!(target_os = "macos")
+        && folder
+            .extension()
+            .is_some_and(|extension| extension == "app")
+    {
+        folder.join("Contents/MacOS/agent-conversations")
+    } else {
+        folder.join(crate::platform::executable("agent-conversations"))
+    };
+    downloaded_bundle(&executable)
+}
+
 /// Publish only a new private identity. Package installation follows publication
 /// so immutable receipts always contain final home paths. If bootstrap is
 /// interrupted, the saved identity remains and the existing bootstrap can resume.
@@ -99,6 +119,26 @@ pub async fn launch(home: PathBuf, open_browser: bool) -> Result<()> {
     }
     let home = dunce::canonicalize(home)?;
     let config = Config::load(&home)?;
+    // A retained switch may intentionally have binary B with receipt A. Its
+    // restricted recovery helper is verified from the immutable journal package,
+    // before normal selected-installation validation or any AppState open.
+    if native_update::recovery_snapshot(&home)?.is_some_and(|j| j.phase != "restored") {
+        let package = native_update::recovery_package(&home)?;
+        let helper = native_update::verify_helper_package(&package)?;
+        if dunce::canonicalize(std::env::current_exe()?)? != dunce::canonicalize(&helper)? {
+            let mut command = tokio::process::Command::new(helper);
+            command.arg("--home").arg(&home);
+            if !open_browser {
+                command.arg("--no-browser");
+            }
+            ensure!(
+                command.status().await?.success(),
+                "The retained recovery application could not open"
+            );
+            return Ok(());
+        }
+        return crate::native_recovery::serve(home, open_browser).await;
+    }
     let service = native_update::lock(&home, "service.lock");
     if service.is_err() {
         // A lock error is never permission to start another service. Reopening

@@ -80,6 +80,13 @@ enum Action {
         transaction: String,
         nonce: String,
     },
+    #[command(hide = true)]
+    NativeUpdateBrowserWorker {
+        #[arg(long)]
+        operation: String,
+        #[arg(long)]
+        attempt: String,
+    },
     /// Retain, update or recover this complete installation without agent work.
     NativeUpdate {
         #[command(subcommand)]
@@ -391,6 +398,9 @@ async fn run(cli: Cli) -> Result<()> {
         Action::Serve => server::serve(home).await?,
         Action::ServeUpdate { transaction, nonce } => {
             server::serve_update(home, transaction, nonce).await?
+        }
+        Action::NativeUpdateBrowserWorker { operation, attempt } => {
+            agent_conversations::native_browser_update::worker(&home, &operation, &attempt).await?;
         }
         Action::NativeUpdate { action } => {
             let value = match action {
