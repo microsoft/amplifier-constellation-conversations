@@ -65,7 +65,10 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
             suffix: '.exe'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # Native builds plus multiple whole-bundle/OS-startup rollback transactions
+    # need a separate CI wall clock. Participant prepare/restore still use 30s,
+    # and verification 300s; no application or agent-work allowance is extended.
+    timeout-minutes: 75
     defaults:
       run:
         shell: bash
