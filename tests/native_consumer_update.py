@@ -217,7 +217,8 @@ def fingerprint(value):
 
 
 def private_inputs(install):
-    return [consumer.PASSWORD, consumer.FIXTURE_KEY, *(cookie.value for cookie in install.cookies)]
+    return [value for value in [consumer.PASSWORD, consumer.FIXTURE_KEY, install.csrf,
+                               *(cookie.value for cookie in install.cookies)] if value]
 
 
 def protected_receipt(install):
