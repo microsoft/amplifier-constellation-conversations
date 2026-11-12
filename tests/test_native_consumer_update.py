@@ -1,14 +1,18 @@
 """Controller failure boundaries; these do not claim native lifetime proof."""
 import importlib.util
+import http.server
 import io
 import json
 from pathlib import Path
 import queue
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 import urllib.error
+import urllib.request
 
 spec = importlib.util.spec_from_file_location("native_consumer_update", Path(__file__).with_name("native_consumer_update.py"))
 controller = importlib.util.module_from_spec(spec)
@@ -16,6 +20,76 @@ spec.loader.exec_module(controller)
 
 
 class ConsumerUpdateControllerTests(unittest.TestCase):
+    def test_check_accepts_one_reply_after_ordinary_http_limit_within_ui_allowance(self):
+        requests = []
+        checked = {"check": {"available": True, "id": "checked"}, "actions": {"apply": True}}
+
+        class DelayedCheck(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                requests.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                # Exercise a real delayed HTTP status, beyond the former 15s
+                # fixture limit but within the update page's existing 40s.
+                time.sleep(16)
+                body = json.dumps(checked).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        with tempfile.TemporaryDirectory() as directory, http.server.HTTPServer(("127.0.0.1", 0), DelayedCheck) as server:
+            server.timeout = 20
+            home = Path(directory)
+            (home / "config.json").write_text(json.dumps({"public_url": f"http://127.0.0.1:{server.server_port}"}))
+            install = controller.consumer.ConsumerInstallation.__new__(controller.consumer.ConsumerInstallation)
+            install.home, install.csrf, install.result, install.checkpoint = home, None, {}, Mock()
+            install.browser = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            thread = threading.Thread(target=server.handle_request)
+            thread.start()
+            try:
+                self.assertEqual(controller.check_once(install, Path("candidate")), checked)
+            finally:
+                thread.join(timeout=20)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(requests, [(controller.API + "/check", {"package_path": "candidate"})])
+            self.assertEqual(install.result["check_request"]["response"], "received")
+            self.assertGreaterEqual(install.result["check_request"]["elapsed_seconds"], 15)
+            self.assertLess(install.result["check_request"]["elapsed_seconds"], 40)
+
+    def test_unknown_check_retains_only_bounded_ledger_evidence_without_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "native-browser-update").mkdir()
+            (home / "config.json").write_text(json.dumps({"id": "installation"}))
+            check_id = "f9b9dd53-f007-4d83-b4e8-90d56046e943"
+            ledger = home / "native-browser-update/control.json"
+            ledger.write_text(json.dumps({"schema": 1, "installation_id": "installation",
+                "current_check": check_id, "checks": {check_id: {"plan": "private-package-path"}},
+                "current_operation": None, "operations": {}, "private": "secret-nonce"}))
+            install = SimpleNamespace(home=home, result={}, checkpoint=Mock(),
+                browser_request=Mock(side_effect=TimeoutError("private socket error")))
+            with patch.object(controller, "request_status", return_value={"owner": "standalone", "mode": "normal", "actions": {"check": True}}), patch.object(controller, "submit_once") as submit:
+                with self.assertRaises(TimeoutError):
+                    controller.exercise_api(install, Path("a"), Path("b"), Mock())
+                submit.assert_not_called()
+            install.browser_request.assert_called_once()
+            row = install.result["check_request"]
+            self.assertEqual(row["response"], "transport_unknown")
+            self.assertEqual(row["mutation_retries"], 0)
+            self.assertEqual(row["ledger_after_failure"]["current_check_id"], check_id)
+            self.assertTrue(row["ledger_after_failure"]["current_check_record_present"])
+            self.assertNotIn("private", json.dumps(row))
+            self.assertNotIn("secret-nonce", json.dumps(row))
+            ledger.write_text(json.dumps({"schema": 1, "installation_id": "installation",
+                "current_check": "private-malformed-id", "current_operation": None}))
+            self.assertEqual(controller.check_failure_ledger(home),
+                {"status": "unavailable", "code": "browser_ledger_observation_failed"})
+
     def test_task_engine_without_actual_worker_cannot_prove_survival(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -118,7 +192,7 @@ class ConsumerUpdateControllerTests(unittest.TestCase):
                 install.browser.open.assert_called_once()
 
     def test_apply_uncertainty_enters_original_uuid_reconciliation_before_any_rollback(self):
-        install = SimpleNamespace(browser_request=Mock(return_value={"check": {"available": True, "id": "checked"}, "actions": {"apply": True}}))
+        install = SimpleNamespace(result={}, checkpoint=Mock(), browser_request=Mock(return_value={"check": {"available": True, "id": "checked"}, "actions": {"apply": True}}))
         with patch.object(controller, "request_status", return_value={"owner": "standalone", "mode": "normal", "actions": {"check": True}}), patch.object(controller, "submit_once") as submit, patch.object(controller, "await_operation", side_effect=TimeoutError("outcome unknown")) as reconcile:
             with self.assertRaises(TimeoutError):
                 controller.exercise_api(install, Path("a"), Path("b"), Mock())

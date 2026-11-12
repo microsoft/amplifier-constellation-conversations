@@ -19,6 +19,7 @@ import platform
 import queue
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -35,6 +36,9 @@ lifecycle = consumer.lifecycle
 require, read_json = consumer.require, consumer.read_json
 API = "/api/v1/companion/update"
 MAX_FRAME_BYTES = 32768
+# Match the shipped update page's POST allowance. CHECK verifies and stages the
+# complete package before replying; ordinary controller requests retain 15s.
+CHECK_REPLY_SECONDS = 40
 
 
 class PrivateCapture:
@@ -368,11 +372,75 @@ def submit_once(install, action, payload):
         install.checkpoint()
 
 
+def check_failure_ledger(home):
+    """One bounded local observation, without publishing paths or launch data."""
+    path = home / "native-browser-update/control.json"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"status": "absent"}
+    except OSError:
+        return {"status": "unavailable", "code": "browser_ledger_observation_failed"}
+    try:
+        require(stat.S_ISREG(metadata.st_mode) and not getattr(metadata, "st_file_attributes", 0) & 0x400,
+                "Unexpected browser ledger file type")
+        with path.open("rb") as stream:
+            raw = stream.read(4 * 1024 * 1024 + 1)
+        require(len(raw) <= 4 * 1024 * 1024, "Browser ledger exceeds observation bound")
+        ledger = json.loads(raw)
+        require(ledger["schema"] == 1 and ledger["installation_id"] == read_json(home / "config.json")["id"],
+                "Browser ledger identity differs")
+        for field in ["current_check", "current_operation"]:
+            value = ledger[field]
+            require(value is None or isinstance(value, str) and str(uuid.UUID(value)) == value,
+                    "Invalid current browser identity")
+        operation = ledger["operations"].get(ledger["current_operation"])
+        stage = None
+        if operation is not None:
+            require(operation["id"] == ledger["current_operation"] and operation["state"] in
+                    ["accepted", "running", "completed", "deferred", "failed", "unknown"], "Invalid browser operation")
+            stage = operation["state"]
+        return {"status": "observed", "sha256": hashlib.sha256(raw).hexdigest(),
+                "current_check_id": ledger["current_check"],
+                "current_check_record_present": ledger["current_check"] in ledger["checks"],
+                "current_operation_present": ledger["current_operation"] is not None,
+                "current_operation_state": stage}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, AssertionError):
+        return {"status": "unavailable", "code": "browser_ledger_observation_failed"}
+
+
+def check_once(install, candidate):
+    # A timeout does not establish whether staging/check publication finished.
+    # Never retry CHECK or continue to APPLY after an unobserved reply.
+    row = {"timeout_seconds": CHECK_REPLY_SECONDS, "response": "pending", "mutation_retries": 0}
+    install.result["check_request"] = row
+    install.checkpoint()
+    started = time.monotonic()
+    try:
+        checked = install.browser_request("POST", API + "/check", {"package_path": str(candidate)},
+                                          timeout=CHECK_REPLY_SECONDS)
+        row["elapsed_seconds"] = time.monotonic() - started
+        row["response"] = "received"
+        return checked
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
+        row["elapsed_seconds"] = time.monotonic() - started
+        row["response"] = "transport_unknown"
+        row["ledger_after_failure"] = check_failure_ledger(install.home)
+        raise
+    except Exception:
+        row["elapsed_seconds"] = time.monotonic() - started
+        row["response"] = "failed"
+        row["ledger_after_failure"] = check_failure_ledger(install.home)
+        raise
+    finally:
+        install.checkpoint()
+
+
 def exercise_api(install, a, b, observer):
     before = request_status(install)
     require(before["owner"] == "standalone" and before["mode"] == "normal" and before["actions"]["check"],
             "Disposable installation cannot check a standalone candidate")
-    checked = install.browser_request("POST", API + "/check", {"package_path": str(b)})
+    checked = check_once(install, b)
     require(checked["check"]["available"] and checked["actions"]["apply"], "Actual complete bundle is not available for apply")
     request_id = str(uuid.uuid4())
     observer.begin("applied")

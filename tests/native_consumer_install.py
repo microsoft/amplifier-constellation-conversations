@@ -99,7 +99,7 @@ class ConsumerInstallation(lifecycle.Installation):
             arguments += ["--body-file", payload]
         return self.command(arguments, timeout=30)
 
-    def browser_request(self, method, path, body=None, *, expected=200, headers=None):
+    def browser_request(self, method, path, body=None, *, expected=200, headers=None, timeout=15):
         origin = read_json(self.home / "config.json")["public_url"]
         request_headers = {"Origin": origin, **(headers or {})}
         if self.csrf:
@@ -110,7 +110,7 @@ class ConsumerInstallation(lifecycle.Installation):
             data = json.dumps(body).encode()
         request = urllib.request.Request(origin + path, data=data, headers=request_headers, method=method)
         try:
-            response = self.browser.open(request, timeout=15)
+            response = self.browser.open(request, timeout=timeout)
         except urllib.error.HTTPError as error:
             response = error
         with response:
