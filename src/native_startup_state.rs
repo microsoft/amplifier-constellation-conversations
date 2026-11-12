@@ -238,6 +238,24 @@ fn linux_command(args: &[&str]) -> Result<Command> {
         .args(["--user", "--no-pager"])
         .args(args)
         .env("LC_ALL", "C");
+    // Native apps launched from a GUI or a clean application environment need
+    // not inherit a shell's D-Bus variables. Bind the fallback to this OS UID's
+    // existing manager endpoint; never create a bus or select another account.
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })));
+    if runtime.is_dir() {
+        command.env("XDG_RUNTIME_DIR", &runtime);
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none_or(|s| s.is_empty())
+            && runtime.join("bus").exists()
+        {
+            command.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", runtime.join("bus").display()),
+            );
+        }
+    }
     Ok(command)
 }
 #[cfg(target_os = "linux")]
