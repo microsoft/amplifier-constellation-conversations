@@ -18,6 +18,7 @@ pub mod config;
 pub mod context;
 pub mod credentials;
 pub mod delivery;
+pub mod desktop;
 pub mod driver;
 pub mod elicitation;
 pub mod error;

@@ -1,3 +1,4 @@
+import {installSetup} from './companion-setup.mjs';
 import {ConversationFloor} from './companion-floor.mjs';
 import {safeCardLink, renderCardText, savedCardTime} from './companion-cards.mjs';
 import {createHuddles} from './huddles.mjs';
@@ -14,12 +15,13 @@ const element = (tag, className, text) => {
 const initials = label => (label || 'Agent').trim().split(/\s+/).map(p => p[0]).slice(0, 2).join('').toUpperCase();
 const state = {session:null, contacts:[], available:false, call:null, generation:0, authGeneration:0, recovery:null, voiceContact:null, finalizingCalls:new Set()};
 const audio = $('remote-audio');
+const setup = installSetup({api,getSession:()=>state.session,signedIn:async session=>{state.session=session;await openContacts();},refreshContacts:openContacts,showLogin:session=>{state.session=session;showLogin();},notice});
 
 async function api(path, method = 'GET', body, options = {}) {
   const headers = body === undefined ? {} : {'Content-Type':'application/json'};
   if (method !== 'GET' && state.session?.csrf) headers['X-CSRF-Token'] = state.session.csrf;
   const {signal, ...fetchOptions} = options;
-  const abort = new AbortController(), timer = setTimeout(() => abort.abort(), path === '/api/v1/companion/calls' ? 40000 : 10000);
+  const abort = new AbortController(), timer = setTimeout(() => abort.abort(), ['/api/v1/companion/calls','/api/v1/companion/local-agent'].includes(path) ? 40000 : 10000);
   const cancel = () => abort.abort();
   if (signal?.aborted) abort.abort(); else signal?.addEventListener('abort', cancel, {once:true});
   try {
@@ -91,6 +93,7 @@ async function openContacts() {
       && prior && typeof prior.id === 'string' && !['closed','interrupted'].includes(prior.state)) {
     state.recovery = {callId:prior.id,conversationId:prior.conversation_id,request:null,discovered:true};
   }
+  $('first-account').hidden = true;
   $('loading').hidden = true; $('login').hidden = true; $('app').hidden = false; $('sign-out').hidden = false;
   $('availability').hidden = state.available;
   $('availability').textContent = config.reason || 'Voice calling has not been enabled on this installation yet.';
@@ -108,6 +111,7 @@ async function openContacts() {
   }));
   showRecovery();
   checkRecovery();
+  await setup.refresh();
 }
 function showLogin() {
   if (state.call) endCall('Your sign-in expired. Your microphone and camera are off.',true,true,'auth_expired');
@@ -123,6 +127,7 @@ function showLogin() {
   for (const id of ['continue-work','ended-work-link','recovery-work-link']) { $(id).hidden = true; $(id).href = '/'; }
   $('loading').hidden = true; $('app').hidden = true; $('login').hidden = false; $('sign-out').hidden = true;
   $('username').value = state.session?.owner || ''; $('password').value = '';
+  setup.signedOut(state.session);
 }
 async function start() {
   try {

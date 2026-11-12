@@ -41,7 +41,9 @@ pub fn migrate(db: &rusqlite::Connection, config: &crate::config::Config) -> any
         CREATE TABLE IF NOT EXISTS agent_endpoints(id TEXT PRIMARY KEY,config TEXT NOT NULL,updated_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS room_agents(conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, agent_id TEXT NOT NULL REFERENCES agent_endpoints(id), session_id TEXT, endpoint TEXT, last_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(conversation_id,agent_id));
         CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,name TEXT NOT NULL,mime_type TEXT NOT NULL,data BLOB NOT NULL,bytes INTEGER NOT NULL,created_by TEXT NOT NULL,created_at INTEGER NOT NULL,message_id TEXT REFERENCES messages(id) ON DELETE CASCADE);")?;
-    db.execute("INSERT INTO agent_endpoints(id,config,updated_at) VALUES('default',?1,?2) ON CONFLICT(id) DO UPDATE SET config=excluded.config,updated_at=excluded.updated_at",params![serde_json::to_string(&config.agent)?,now_ms()])?;
+    if let Some(agent) = &config.agent {
+        db.execute("INSERT INTO agent_endpoints(id,config,updated_at) VALUES('default',?1,?2) ON CONFLICT(id) DO UPDATE SET config=excluded.config,updated_at=excluded.updated_at",params![serde_json::to_string(agent)?,now_ms()])?;
+    }
     let migrated: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM migrations WHERE name='shared-rooms')",
         [],
@@ -54,9 +56,16 @@ pub fn migrate(db: &rusqlite::Connection, config: &crate::config::Config) -> any
             [&config.owner],
         )?;
         tx.execute("UPDATE views SET owner=?1 WHERE owner=''", [&config.owner])?;
-        tx.execute("UPDATE messages SET actor=CASE WHEN role='user' THEN ?1 ELSE ?2 END,agent_id=CASE WHEN role='assistant' THEN 'default' ELSE NULL END WHERE actor=''",params![config.owner,config.agent.label])?;
+        if let Some(agent) = &config.agent {
+            tx.execute("UPDATE messages SET actor=CASE WHEN role='user' THEN ?1 ELSE ?2 END,agent_id=CASE WHEN role='assistant' THEN 'default' ELSE NULL END WHERE actor=''",params![config.owner,agent.label])?;
+            tx.execute("INSERT OR IGNORE INTO room_agents(conversation_id,agent_id,session_id,endpoint,last_seq) SELECT id,'default',session_id,endpoint,COALESCE((SELECT MAX(seq) FROM messages WHERE conversation_id=conversations.id),0) FROM conversations WHERE read_only=0",[])?;
+        } else {
+            tx.execute(
+                "UPDATE messages SET actor=?1 WHERE role='user' AND actor=''",
+                [&config.owner],
+            )?;
+        }
         tx.execute("INSERT OR IGNORE INTO room_members(conversation_id,username,role,joined_at) SELECT id,?1,'owner',created_at FROM conversations",[&config.owner])?;
-        tx.execute("INSERT OR IGNORE INTO room_agents(conversation_id,agent_id,session_id,endpoint,last_seq) SELECT id,'default',session_id,endpoint,COALESCE((SELECT MAX(seq) FROM messages WHERE conversation_id=conversations.id),0) FROM conversations WHERE read_only=0",[])?;
         // Existing grants were owner-only. Revoking them makes upgraded behavior explicit.
         tx.execute("DELETE FROM grants", [])?;
         tx.execute("INSERT INTO migrations(name) VALUES('shared-rooms')", [])?;
@@ -71,7 +80,9 @@ pub fn migrate(db: &rusqlite::Connection, config: &crate::config::Config) -> any
         let tx = db.unchecked_transaction()?;
         // Existing import bridges carry the original default agent's public
         // transcript. Add only source membership; retain history and sessions.
-        tx.execute("INSERT OR IGNORE INTO room_agents(conversation_id,agent_id) SELECT c.id,'default' FROM conversations c JOIN imports i ON i.conversation_id=c.id WHERE c.read_only=1",[])?;
+        if config.agent.is_some() {
+            tx.execute("INSERT OR IGNORE INTO room_agents(conversation_id,agent_id) SELECT c.id,'default' FROM conversations c JOIN imports i ON i.conversation_id=c.id WHERE c.read_only=1",[])?;
+        }
         tx.execute(
             "INSERT INTO migrations(name) VALUES('default-agent-import-sources')",
             [],
@@ -350,7 +361,7 @@ pub async fn add_agent(
     }
     if a.id == "default" {
         let mut c = crate::config::Config::load(&s.home)?;
-        c.agent = a.config.clone();
+        c.agent = Some(a.config.clone());
         c.save(&s.home)?;
     }
     {
@@ -484,4 +495,101 @@ pub async fn detach_agent(
     s.audit("room.agent_removed", Some(&id), json!({"agent_id":agent}))?;
     s.changed();
     Ok(Json(json!({"removed":true})))
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::config::{AuthMode, Config, Transport};
+
+    #[test]
+    fn fresh_local_home_has_no_synthetic_endpoint_or_room_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        Config::local(dir.path(), "Fresh", 54127)
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+        let state = AppState::open(dir.path().to_path_buf()).unwrap();
+        let db = state.db.lock().unwrap();
+        for table in ["agent_endpoints", "room_agents", "conversations"] {
+            assert_eq!(
+                db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn installed_legacy_home_retains_history_grants_members_and_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::local(dir.path(), "Legacy", 54127).unwrap();
+        config.auth_mode = AuthMode::OsAccount;
+        config.transport = Transport::Https;
+        config.public_url = "https://fixture.example".into();
+        config.agent = Some(serde_json::from_value(json!({"label":"Original agent","command":"fixture-agent","args":[],"cwd":dir.path(),"timeout_seconds":60})).unwrap());
+        config.save(dir.path()).unwrap();
+        let state = AppState::open(dir.path().to_path_buf()).unwrap();
+        let room = state
+            .create_room("Retained history", "owner", &["default".into()])
+            .unwrap();
+        let id = room["id"].as_str().unwrap();
+        {
+            let db = state.db.lock().unwrap();
+            db.execute("UPDATE room_agents SET session_id='original-session',endpoint='original-endpoint',last_seq=123 WHERE conversation_id=?1", [id]).unwrap();
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor,agent_id) VALUES('history',?1,'assistant','Original transcript','complete',1,2,'Historical label','default')", [id]).unwrap();
+            db.execute("INSERT INTO grants(hash,conversation_id,expires_at,owner_scope) VALUES('retained-grant',?1,9999999999999,1)", [id]).unwrap();
+            db.execute("INSERT INTO browser_sessions(hash,owner,csrf,expires_at) VALUES('retained-browser','owner','retained-csrf',9999999999999)", []).unwrap();
+        }
+        drop(state);
+        let reopened = AppState::open(dir.path().to_path_buf()).unwrap();
+        let db = reopened.db.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT session_id,endpoint,last_seq FROM room_agents WHERE conversation_id=?1",
+                [id],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?
+                ))
+            )
+            .unwrap(),
+            ("original-session".into(), "original-endpoint".into(), 123)
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT text,actor,agent_id FROM messages WHERE id='history'",
+                [],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+            (
+                "Original transcript".into(),
+                "Historical label".into(),
+                "default".into()
+            )
+        );
+        assert_eq!(db.query_row("SELECT count(*) FROM grants WHERE hash='retained-grant' AND expires_at=9999999999999 AND owner_scope=1", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(db.query_row("SELECT count(*) FROM browser_sessions WHERE hash='retained-browser' AND csrf='retained-csrf'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(db.query_row("SELECT count(*) FROM room_members WHERE conversation_id=?1 AND username='owner' AND role='owner'", [id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let endpoint: Agent = serde_json::from_str(
+            &db.query_row(
+                "SELECT config FROM agent_endpoints WHERE id='default'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(endpoint).unwrap(),
+            serde_json::to_value(config.agent.as_ref().unwrap()).unwrap()
+        );
+    }
 }

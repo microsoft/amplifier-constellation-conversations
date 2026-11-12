@@ -83,7 +83,9 @@ fn fixture() -> Fixture {
         tls_ca: None,
         import_source: "toad".into(),
         import_surface: "toad".into(),
-        agent: Agent {
+        auth_mode: Default::default(),
+        transport: Default::default(),
+        agent: Some(Agent {
             label: "Existing individual".into(),
             command: "python3".into(),
             args: vec![format!(
@@ -98,7 +100,7 @@ fn fixture() -> Fixture {
             ],
             timeout_seconds: 30,
             client: Default::default(),
-        },
+        }),
     };
     c.save(home.path()).unwrap();
     let state = AppState::open(home.path().to_owned()).unwrap();
@@ -469,7 +471,7 @@ async fn assert_acp_restore(mode: &str, method: &str) {
     assert_eq!(load["params"]["cwd"], new["params"]["cwd"]);
     assert_eq!(
         new["params"]["mcpServers"],
-        json!(f.state.config.agent.mcp_servers)
+        json!(f.state.config.agent.as_ref().unwrap().mcp_servers)
     );
     assert_eq!(load["params"]["mcpServers"], new["params"]["mcpServers"]);
     assert_eq!(
@@ -1631,7 +1633,7 @@ async fn rooms_do_not_expose_private_history_views_activity_or_context() {
 #[tokio::test]
 async fn independent_agents_have_independent_room_sessions_and_selective_group_participation() {
     let f = fixture();
-    let mut agent = f.state.config.agent.clone();
+    let mut agent = f.state.config.agent.clone().unwrap();
     agent.label = "Listening reviewer".into();
     agent.env.insert("FIXTURE_AMBIENT_PASS".into(), "1".into());
     assert_eq!(
@@ -2265,7 +2267,7 @@ async fn provider_search_uses_room_scoped_history_cursors() {
 #[tokio::test]
 async fn agent_context_sources_intersect_membership_and_every_grant_scope() {
     let f = fixture();
-    let agent = f.state.config.agent.clone();
+    let agent = f.state.config.agent.clone().unwrap();
     assert_eq!(
         request(
             &f.app,
@@ -2538,7 +2540,7 @@ async fn agent_context_sources_intersect_membership_and_every_grant_scope() {
 #[tokio::test]
 async fn agent_context_credential_lifecycle_is_private_persistent_and_revocable() {
     let f = fixture();
-    let agent = f.state.config.agent.clone();
+    let agent = f.state.config.agent.clone().unwrap();
     assert_eq!(
         request(
             &f.app,
@@ -2728,7 +2730,7 @@ async fn agent_context_credential_lifecycle_is_private_persistent_and_revocable(
 #[tokio::test]
 async fn legacy_default_context_excludes_native_only_rooms_and_preserves_imports() {
     let f = fixture();
-    let agent = f.state.config.agent.clone();
+    let agent = f.state.config.agent.clone().unwrap();
     assert_eq!(
         request(
             &f.app,
@@ -3094,7 +3096,7 @@ async fn agent_withdrawal_and_turn_cancellation_remove_unanswered_forms() {
 async fn request_scoped_forms_work_during_initialization_creation_and_loading() {
     for phase in ["initialize", "session/new", "session/load"] {
         let f = fixture();
-        let mut agent = f.state.config.agent.clone();
+        let mut agent = f.state.config.agent.clone().unwrap();
         agent.env.insert("FIXTURE_FORM_PHASE".into(), phase.into());
         assert_eq!(
             request(
@@ -3167,7 +3169,7 @@ async fn request_scoped_forms_work_during_initialization_creation_and_loading() 
 async fn interactive_agent_auth_is_requester_bound_and_retries_only_setup() {
     for decision in ["accept", "decline", "cancel"] {
         let f = fixture();
-        let mut agent = f.state.config.agent.clone();
+        let mut agent = f.state.config.agent.clone().unwrap();
         agent.env.insert("FIXTURE_AUTH".into(), "1".into());
         assert_eq!(
             request(

@@ -43,7 +43,9 @@ fn fixture() -> Fixture {
         tls_ca: None,
         import_source: "fixture".into(),
         import_surface: "fixture".into(),
-        agent: Agent {
+        auth_mode: Default::default(),
+        transport: Default::default(),
+        agent: Some(Agent {
             label: "Coach".into(),
             command: "/bin/true".into(),
             args: vec![],
@@ -53,7 +55,7 @@ fn fixture() -> Fixture {
             mcp_servers: vec![],
             timeout_seconds: 30,
             client: Default::default(),
-        },
+        }),
     };
     c.save(home.path()).unwrap();
     std::fs::write(home.path().join("helper.py"),r#"import json,pathlib,sys

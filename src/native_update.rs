@@ -236,6 +236,12 @@ fn installed(home: &Path) -> Result<Value> {
     Ok(v)
 }
 
+/// Read-only validation for desktop reopen: verify the complete selected bundle,
+/// its receipt, and the installed executable before choosing a launch target.
+pub fn verify_installed(home: &Path) -> Result<Value> {
+    installed(home)
+}
+
 /// Explicit first-install adoption while stopped. Does not register startup or
 /// enable voice/updates, and never replaces a different existing application.
 pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
@@ -343,6 +349,21 @@ pub async fn local_api(
 ) -> Result<Value> {
     crate::native_update_clock::check()?;
     let c = Config::load(home)?;
+    if c.transport == crate::config::Transport::LocalHttp {
+        let token = fs::read_to_string(home.join("secrets/control-token"))?;
+        return tokio::time::timeout(
+            crate::native_update_clock::cap(Duration::from_secs(3))?,
+            crate::desktop::proved_local_api(
+                &c,
+                token.trim(),
+                method,
+                &format!("/api/v1/native-update/{endpoint}"),
+                body,
+            ),
+        )
+        .await
+        .context("Local lifecycle listener did not respond in time")?;
+    }
     let r = read(&home.join("runtime.json"))?;
     let port = r["port"].as_u64().context("No recorded listener")?;
     ensure!((1..=65535).contains(&port), "Invalid local listener");

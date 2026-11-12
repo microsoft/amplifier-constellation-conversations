@@ -21,7 +21,16 @@
     <section id="loading" class="loading" role="status"><span class="quiet-dot" aria-hidden="true"></span> Opening your contacts…</section>
     <section id="login" class="login-layout" hidden>
       <div class="login-intro"><p class="eyebrow">ROOM TO THINK TOGETHER</p><h1>A familiar voice.<br>Wherever you are.</h1><p>Call your agent, talk something through, and give your hands a little freedom.</p></div>
-      <form id="login-form" class="login-card"><h2>Welcome back.</h2><p>Sign in with your account on this service’s host.</p><label for="username">Username</label><input id="username" autocomplete="username" required><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required><p id="login-error" class="error-text" role="alert" hidden></p><button id="sign-in" class="primary" type="submit">Sign in <span aria-hidden="true">→</span></button></form>
+      <form id="login-form" class="login-card"><h2 id="login-title">Welcome back.</h2><p id="login-description">Sign in with your account on this service’s host.</p><label id="username-label" for="username">Username</label><input id="username" autocomplete="username" required><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required><p id="login-error" class="error-text" role="alert" hidden></p><button id="sign-in" class="primary" type="submit">Sign in <span aria-hidden="true">→</span></button></form>
+    </section>
+    <section id="first-account" class="login-layout" hidden>
+      <div class="login-intro"><h1>Your place to talk.</h1><p>Keep your agent contacts and conversations together on this computer.</p></div>
+      <form id="first-account-form" class="login-card"><h2>Create your local account</h2><p>Choose a password for Companion on this computer. It is separate from your computer’s sign-in.</p>
+        <label for="new-password">Password</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required aria-describedby="new-password-hint"><p id="new-password-hint" class="small">Use at least 12 characters.</p>
+        <label for="confirm-password">Confirm password</label><input id="confirm-password" type="password" autocomplete="new-password" required>
+        <label class="setup-check"><input id="start-at-signin" type="checkbox"> Open Companion when I sign in to this computer</label>
+        <p id="first-account-error" class="error-text" role="alert" hidden></p><button id="create-account" class="primary" type="submit">Create account</button>
+      </form>
     </section>
     <div id="app" hidden>
       <div id="notice" class="notice" role="alert" hidden><p id="notice-text"></p><button id="dismiss-notice" class="text-button" aria-label="Dismiss notice">Dismiss</button></div>
@@ -33,7 +42,19 @@
         <div class="phonebook-heading"><div><p class="eyebrow">YOUR AGENTS, A CALL AWAY</p><h1 id="phonebook-title">Who’s on your mind?</h1><p class="lede">A conversation for the desk, the workbench, or wherever the day takes you.</p></div><span class="private-badge"><span aria-hidden="true">◌</span> One person. One agent.</span></div>
         <div id="availability" class="availability" role="status" hidden></div>
         <div id="contacts" class="contacts" aria-label="Your agent contacts"></div>
-        <p id="empty-contacts" class="empty-state" hidden>No contacts are configured yet. Your installation’s owner can connect an existing agent.</p>
+        <p id="empty-contacts" class="empty-state" hidden>Add an agent to your contacts to start a conversation.</p>
+        <details id="contact-setup" class="contact-setup" hidden><summary>Add an agent</summary>
+          <form id="contact-setup-form"><h2>Choose a saved connection</h2><label for="setup-agent">Agent</label><select id="setup-agent" required></select><p id="setup-agent-note" class="small"></p>
+            <label for="setup-voice">Voice</label><select id="setup-voice" required></select>
+            <div id="setup-key-fields"><label for="setup-openai-key">OpenAI API key</label><input id="setup-openai-key" type="password" autocomplete="off" maxlength="8192" spellcheck="false" aria-describedby="setup-key-note"></div><p id="setup-key-note" class="small"></p>
+            <p class="small">Voice uses OpenAI GPT-Live. Saving a contact does not start a call or test your key.</p><button id="save-contact" class="primary" type="submit">Add contact</button><p id="contact-setup-status" role="status"></p>
+          </form>
+          <details id="local-agent-setup"><summary>Connect an agent on this computer</summary><form id="local-agent-form"><p>Choose an existing Instance installation. Agents already connected elsewhere can be selected from the saved list above.</p>
+            <label for="local-agent-label">Agent name</label><input id="local-agent-label" required maxlength="200" autocomplete="off">
+            <label for="local-agent-id">Connection name</label><input id="local-agent-id" required maxlength="80" pattern="[A-Za-z0-9_-]+" autocomplete="off" aria-describedby="local-agent-id-note"><p id="local-agent-id-note" class="small">A short name using letters, numbers or hyphens.</p>
+            <label for="local-agent-home">Installed agent folder</label><input id="local-agent-home" required autocomplete="off" spellcheck="false"><p class="small">The folder containing the agent’s configuration and launcher. The connection check does not start agent work.</p>
+            <button id="connect-local-agent" class="secondary" type="submit">Check and save connection</button><p id="local-agent-status" role="status"></p></form></details>
+        </details>
         <section class="call-note" aria-label="Before you call"><span class="note-icon" aria-hidden="true">↗</span><div><h2>The same agent. A place to talk.</h2><p>Voice is processed by OpenAI GPT-Live. Your selected agent handles delegated work through its configured runtime. Even an agent with local reasoning uses cloud audio on this call.</p><p class="small">Keep this page open during a call. Your microphone starts only when you choose Call. Camera use is always optional.</p></div></section>
       </section>
       <section id="call-screen" class="call-layout" aria-labelledby="call-name" hidden>

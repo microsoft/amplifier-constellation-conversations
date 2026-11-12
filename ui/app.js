@@ -57,17 +57,17 @@ async function api(path,method='GET',body,options={}){
 }
 function showLogin(){clearHuddles();voice.close();ui.eventSource?.close();ui.eventSource=null;$('loading').hidden=true;$('app').hidden=true;$('login').hidden=false;$('username').value=ui.session?.owner||'';$('password').value='';}
 async function start(){
-  try{ui.session=await api('/auth/session');if(!ui.session.authenticated){showLogin();return;}await openApp();}catch(e){$('loading').hidden=true;$('app').hidden=true;$('login').hidden=false;$('login-error').hidden=false;$('login-error').textContent=e.message;}
+  try{ui.session=await api('/auth/session');if(ui.session.first_account_needed){location.replace('/companion');return;}if(!ui.session.authenticated){showLogin();return;}await openApp();}catch(e){$('loading').hidden=true;$('app').hidden=true;$('login').hidden=false;$('login-error').hidden=false;$('login-error').textContent=e.message;}
 }
 async function openApp(){
   [ui.meta,ui.view]=await Promise.all([api('/api/v1/meta'),api(`/api/v1/views/${viewId}`)]);
   const desired=new URL(location.href).searchParams.get('conversation');
   if(desired&&desired!==ui.view.state.selected_conversation_id){try{await api(`/api/v1/conversations/${encodeURIComponent(desired)}`);await saveView({selected_conversation_id:desired,panel:'conversation',draft:'',attachment_ids:[],target_agent_ids:[],history_search:'',history_before:null,participants_open:false,share_history:false,elicitation_drafts:{}});}catch{history.replaceState({},'','/');}}
   $('loading').hidden=true;$('login').hidden=true;$('app').hidden=false;
-  $('agent-name').textContent=ui.meta.agent.label;$('agent-initial').textContent=initials(ui.meta.agent.label);$('owner-name').textContent=ui.session.owner;$('agent-registry').hidden=!ui.meta.admin;$('check').hidden=!ui.meta.admin;$('view-label').textContent=`View ${viewId.slice(0,6)}`;$('message').placeholder=`Message ${ui.meta.agent.label}…`;
-  $('connection-title').textContent=`Connected to ${ui.meta.agent.label}.`;$('connection-agent').textContent=ui.meta.agent.label;
-  document.title=`${ui.meta.agent.label}: Conversations`;
-  const details=[['ACP command',[ui.meta.agent.command,...(ui.meta.agent.args||[])].filter(Boolean).join(' ')||'Managed by the service owner'],['Working folder',ui.meta.agent.cwd],['Context provider',ui.meta.provider.id],['View ID',viewId],['Version',ui.meta.version]];
+  $('agent-name').textContent=(ui.meta.agent?.label||'your agent');$('agent-initial').textContent=initials((ui.meta.agent?.label||'your agent'));$('owner-name').textContent=ui.session.owner;$('agent-registry').hidden=!ui.meta.admin;$('check').hidden=!ui.meta.admin||!ui.meta.agent;$('view-label').textContent=`View ${viewId.slice(0,6)}`;$('message').placeholder=`Message ${(ui.meta.agent?.label||'your agent')}…`;
+  $('connection-title').textContent=`Connected to ${(ui.meta.agent?.label||'your agent')}.`;$('connection-agent').textContent=(ui.meta.agent?.label||'your agent');
+  document.title=`${(ui.meta.agent?.label||'your agent')}: Conversations`;
+  const details=[['ACP command',[ui.meta.agent?.command,...(ui.meta.agent?.args||[])].filter(Boolean).join(' ')||'Managed by the service owner'],['Working folder',ui.meta.agent?.cwd],['Context provider',ui.meta.provider.id],['View ID',viewId],['Version',ui.meta.version]];
   $('connection-details').replaceChildren(...details.flatMap(([k,v])=>[el('dt',null,k),el('dd',null,v)]));
   applyView();await refresh();connectEvents();
 }
@@ -134,7 +134,7 @@ function renderList(){
   if(!list.length)$('conversation-list').append(el('p','list-empty',query?'No matching conversations.':'Your conversations will appear here.'));
 }
 function renderChat(){
-  const c=ui.conversation;const agent=ui.meta.agent.label;
+  const c=ui.conversation;const agent=(ui.meta.agent?.label||'your agent');
   $('conversation-title').textContent=c?.title||'Pick up the conversation.';$('rename').hidden=!c||c.read_only||c.owner!==ui.session.owner;$('participants-toggle').hidden=!c||c.read_only;$('history-tools').hidden=!c;$('older-messages').hidden=!ui.historyCursor;$('latest-messages').hidden=!ui.view.state.history_before&&!ui.view.state.history_search;$('audience-label').textContent=c?.shared?'Shared room':'Private to you';$('conversation-eyebrow').textContent=c?.surface&&c.surface!=='web'?`${c.surface.toUpperCase()} CONVERSATION · READ ONLY`:'WEB CONVERSATION';
   const container=$('messages');const nearBottom=container.scrollHeight-container.scrollTop-container.clientHeight<120;const previousId=container.dataset.conversation;container.dataset.conversation=c?.id||'';
   const openDetails=new Set([...container.querySelectorAll('.message-details[open]')].map(n=>n.dataset.messageId));
@@ -240,7 +240,7 @@ function renderParticipants(){
   options($('invite-agent-id'),ui.agents.filter(a=>!c?.agents?.some(m=>m.id===a.id)),'id','label','Choose an agent…',v.invite_agent_id);
   options($('reply-target'),c?.agents||[],'id','label',(c?.members?.length||0)+(c?.agents?.length||0)>2?'Everyone here · agents decide when to help':'Your agent',v.target_agent_ids?.[0]);
   if((v.target_agent_ids||[]).length>1){const label=(c?.agents||[]).filter(a=>v.target_agent_ids.includes(a.id)).map(a=>a.label).join(', ');$('reply-target').add(new Option(label,'__selected'));$('reply-target').value='__selected';}
-  const named=(c?.agents||[]).filter(a=>(v.target_agent_ids||[]).includes(a.id));$('message').placeholder=named.length===1?`Message ${named[0].label}…`:(c?.shared?'Message this conversation…':`Message ${ui.meta.agent.label}…`);
+  const named=(c?.agents||[]).filter(a=>(v.target_agent_ids||[]).includes(a.id));$('message').placeholder=named.length===1?`Message ${named[0].label}…`:(c?.shared?'Message this conversation…':`Message ${(ui.meta.agent?.label||'your agent')}…`);
   $('room-explainer').textContent=c?.status==='working'?'Wait for this turn to finish before changing the audience.':`${c?.members?.length||0} ${(c?.members?.length||0)===1?'person':'people'} and ${c?.agents?.length||0} ${(c?.agents?.length||0)===1?'agent':'agents'} can participate here.`;
   for(const id of ['invite-person','invite-agent'])$(id).disabled=c?.status==='working'||!v.share_history;
   $('draft-attachments').replaceChildren(...(v.attachment_ids||[]).map(id=>{const f=ui.files.find(f=>f.id===id);const chip=el('span','attachment-chip',f?.name||'Attached file');const b=el('button',null,'×');b.type='button';b.setAttribute('aria-label','Remove '+(f?.name||'attachment'));b.onclick=()=>api(`/api/v1/conversations/${c.id}/attachments/${id}`,'DELETE').then(()=>saveView({attachment_ids:v.attachment_ids.filter(x=>x!==id)})).then(refresh).catch(e=>error(e.message));chip.append(b);return chip;}));

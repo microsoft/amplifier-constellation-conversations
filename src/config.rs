@@ -14,6 +14,10 @@ pub struct Config {
     pub label: String,
     pub owner: String,
     #[serde(default)]
+    pub auth_mode: AuthMode,
+    #[serde(default)]
+    pub transport: Transport,
+    #[serde(default)]
     pub allowed_users: Vec<String>,
     #[serde(default)]
     pub embed_origins: Vec<String>,
@@ -29,7 +33,30 @@ pub struct Config {
     pub import_source: String,
     #[serde(default = "default_import")]
     pub import_surface: String,
-    pub agent: Agent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Agent>,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    #[default]
+    OsAccount,
+    LocalPassword,
+}
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OsAccount => "os_account",
+            Self::LocalPassword => "local_password",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    #[default]
+    Https,
+    LocalHttp,
 }
 fn default_import() -> String {
     "toad".into()
@@ -37,6 +64,63 @@ fn default_import() -> String {
 #[cfg(test)]
 mod platform_tests {
     use super::*;
+
+    #[test]
+    fn local_configuration_is_explicit_loopback_and_can_start_without_an_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let local = Config::local(home.path(), "Fresh desktop", 54127).unwrap();
+        assert!(local.agent.is_none());
+        assert_eq!(local.auth_mode, AuthMode::LocalPassword);
+        assert_eq!(local.transport, Transport::LocalHttp);
+        local.save(home.path()).unwrap();
+        assert!(Config::load(home.path()).unwrap().agent.is_none());
+        for (bind, url, port) in [
+            ("0.0.0.0", "http://0.0.0.0:54127", 54127),
+            ("127.0.0.1", "http://localhost:54127", 54127),
+            ("127.0.0.1", "http://127.0.0.1:54128", 54127),
+            ("127.0.0.1", "http://127.0.0.1:0", 0),
+            ("127.0.0.1", "http://127.0.0.1:54127/path", 54127),
+        ] {
+            let mut invalid = local.clone();
+            invalid.bind = bind.into();
+            invalid.public_url = url.into();
+            invalid.port = port;
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = local.clone();
+        invalid.allowed_users.push("other".into());
+        assert!(invalid.validate().is_err());
+        invalid = local;
+        invalid.auth_mode = AuthMode::OsAccount;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_serde_defaults_preserve_os_account_https_and_default_endpoint() {
+        let home = tempfile::tempdir().unwrap();
+        let mut value =
+            serde_json::to_value(Config::local(home.path(), "Legacy", 54127).unwrap()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("auth_mode");
+        object.remove("transport");
+        object.insert(
+            "public_url".into(),
+            serde_json::json!("https://conversations.example"),
+        );
+        object.insert("agent".into(), serde_json::json!({"label":"Original agent","command":"fixture-command","args":[],"cwd":home.path(),"timeout_seconds":60}));
+        let config: Config = serde_json::from_value(value.clone()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.auth_mode, AuthMode::OsAccount);
+        assert_eq!(config.transport, Transport::Https);
+        assert_eq!(config.agent.as_ref().unwrap().label, "Original agent");
+        value.as_object_mut().unwrap().remove("agent");
+        assert!(
+            serde_json::from_value::<Config>(value)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
 
     #[test]
     fn account_names_keep_platform_identity_and_reject_wildcards() {
@@ -82,6 +166,30 @@ pub struct Agent {
     pub client: ClientPolicy,
 }
 impl Config {
+    /// Build a fresh desktop configuration; publication belongs to the launcher.
+    pub fn local(home: &Path, label: &str, port: u16) -> Result<Self> {
+        let config = Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            label: label.into(),
+            owner: "owner".into(),
+            auth_mode: AuthMode::LocalPassword,
+            transport: Transport::LocalHttp,
+            allowed_users: vec![],
+            embed_origins: vec![],
+            bind: "127.0.0.1".into(),
+            port,
+            public_url: format!("http://127.0.0.1:{port}"),
+            pam_service: "agent-conversations".into(),
+            tls_cert: home.join("tls/cert.pem"),
+            tls_key: home.join("tls/key.pem"),
+            tls_ca: None,
+            import_source: default_import(),
+            import_surface: default_import(),
+            agent: None,
+        };
+        config.validate()?;
+        Ok(config)
+    }
     pub fn load(home: &Path) -> Result<Self> {
         let c: Self = serde_json::from_slice(&std::fs::read(home.join("config.json"))?)?;
         c.validate()?;
@@ -89,7 +197,25 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         uuid::Uuid::parse_str(&self.id)?;
-        self.bind.parse::<IpAddr>()?;
+        let bind = self.bind.parse::<IpAddr>()?;
+        ensure!(
+            (self.auth_mode == AuthMode::LocalPassword) == (self.transport == Transport::LocalHttp),
+            "Local passwords require the explicit local HTTP mode"
+        );
+        if self.transport == Transport::LocalHttp {
+            let authority = match bind {
+                IpAddr::V4(ip) => format!("{ip}:{}", self.port),
+                IpAddr::V6(ip) => format!("[{ip}]:{}", self.port),
+            };
+            ensure!(
+                bind.is_loopback()
+                    && self.port != 0
+                    && self.public_url == format!("http://{authority}")
+                    && self.allowed_users.is_empty()
+                    && self.embed_origins.is_empty(),
+                "Local HTTP requires one exact saved loopback origin and local account"
+            );
+        }
         ensure!(
             !self.import_source.is_empty()
                 && self.import_source.len() <= 80
@@ -147,8 +273,15 @@ impl Config {
                 }),
             "Embedding origins must be explicit HTTPS origins"
         );
-        self.agent.validate()?;
-        if !self.public_url.is_empty() {
+        if let Some(agent) = &self.agent {
+            agent.validate()?;
+        } else {
+            ensure!(
+                self.auth_mode == AuthMode::LocalPassword,
+                "Configure the legacy default agent"
+            );
+        }
+        if self.transport == Transport::Https && !self.public_url.is_empty() {
             let u = reqwest::Url::parse(&self.public_url)?;
             ensure!(
                 u.scheme() == "https"

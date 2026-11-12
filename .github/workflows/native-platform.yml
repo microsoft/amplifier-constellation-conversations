@@ -98,7 +98,7 @@ jobs:
       - name: Build the native executable and run platform unit tests
         run: |
           python scripts/run-native-rust-tests.py --target '${{ matrix.rust_target }}' --output '${{ runner.temp }}/native-rust-tests.json'
-          cargo test --locked --target '${{ matrix.rust_target }}' --test native_update_bundle --test native_update_admission
+          cargo test --locked --target '${{ matrix.rust_target }}' --test native_update_bundle --test native_update_admission --test native_consumer_setup
           cargo build --locked --target '${{ matrix.rust_target }}' --release
       - name: Acquire locked build-time dependencies
         run: |
@@ -129,6 +129,20 @@ jobs:
           import json
           receipt = json.loads(receipts[0].read_text())
           module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/clean-path-install.json').resolve())
+          PY
+      - name: Verify consumer first launch, local account, contact setup and update continuity
+        run: |
+          python - <<'PY'
+          import importlib.util, json
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('consumer_install', 'tests/native_consumer_install.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          receipts = list(Path('dist').glob('conversations-*.json'))
+          assert len(receipts) == 1, 'Expected one immutable package receipt'
+          receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
+          result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/native-consumer-install.json').resolve())
+          assert result['status'] == 'passed', 'Consumer setup qualification did not pass'
           PY
       - name: Verify standalone and enrolled whole-bundle update and rollback
         run: |

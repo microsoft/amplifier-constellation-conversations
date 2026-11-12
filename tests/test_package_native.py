@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import plistlib
 import shutil
 import stat
 import struct
@@ -147,6 +148,47 @@ class PackageTests(unittest.TestCase):
         second, two = self.build(spec, "two")
         self.assertEqual(first.read_bytes(), second.read_bytes())
         self.assertEqual(one, two)
+
+    def test_mac_application_contains_verified_native_launcher_and_complete_bundle(self):
+        for target in ["macos-x64", "macos-arm64"]:
+            with self.subTest(target=target):
+                archive, receipt = self.build(self.spec(target), target)
+                manifest, cli_files = package_native.inspect_archive(archive, receipt["archive_sha256"])
+                application = receipt["application"]
+                app_path = archive.parent / application["archive"]
+                app_manifest, files = package_native.inspect_application_archive(app_path, application["archive_sha256"])
+                self.assertEqual(app_manifest, manifest)
+                self.assertEqual(files[application["launcher"]], cli_files[manifest["entrypoints"]["service"]])
+                prefix = application["bundle"] + "/"
+                self.assertEqual({name.removeprefix(prefix): data for name, data in files.items() if name.startswith(prefix)}, cli_files)
+                info = plistlib.loads(files["Companion.app/Contents/Info.plist"])
+                self.assertEqual(info["CFBundleExecutable"], "agent-conversations")
+                self.assertEqual(info["CFBundlePackageType"], "APPL")
+                self.assertNotIn("NSAppleScriptEnabled", info)
+                self.assertEqual(application["ordinary_launch"], "not_established_by_packaging")
+                with zipfile.ZipFile(app_path) as zipped:
+                    self.assertEqual(stat.S_IMODE(zipped.getinfo(application["launcher"]).external_attr >> 16), 0o755)
+
+    def test_mac_application_is_reproducible_and_never_replaces_an_artifact(self):
+        spec = self.spec("macos-arm64")
+        first, one = self.build(spec, "one")
+        second, two = self.build(spec, "two")
+        self.assertEqual(one, two)
+        self.assertEqual((first.parent / one["application"]["archive"]).read_bytes(),
+                         (second.parent / two["application"]["archive"]).read_bytes())
+        with self.assertRaisesRegex(ValueError, "replace"):
+            package_native.build_bundle(spec, first.parent)
+
+    def test_mac_application_rejects_changed_launcher(self):
+        archive, receipt = self.build(self.spec("macos-x64"))
+        application = receipt["application"]
+        path = archive.parent / application["archive"]
+        _, files = package_native.inspect_application_archive(path, application["archive_sha256"])
+        files[application["launcher"]] += b"changed"
+        changed = self.root / "changed.app.zip"
+        package_native.write_zip(changed, files, {application["launcher"]})
+        with self.assertRaisesRegex(ValueError, "launcher or metadata"):
+            package_native.inspect_application_archive(changed, package_native.sha(changed.read_bytes()))
 
     def test_input_hash_mismatch_refuses_output(self):
         spec = self.spec()

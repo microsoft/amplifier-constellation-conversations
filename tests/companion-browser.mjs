@@ -5,7 +5,7 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const files = new Map(await Promise.all(['companion.html','companion.js','companion.css','companion-floor.mjs','companion-cards.mjs','markdown.js','markdown-renderer.js','markdown.css','huddles.mjs','huddles-api.mjs','huddles.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
+const files = new Map(await Promise.all(['companion.html','companion.js','companion-setup.mjs','companion.css','companion-floor.mjs','companion-cards.mjs','markdown.js','markdown-renderer.js','markdown.css','huddles.mjs','huddles-api.mjs','huddles.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
 files.set('markdown.js', Buffer.concat([files.get('markdown.js'),files.get('markdown-renderer.js')]));
 files.set('companion.css', Buffer.concat([files.get('markdown.css'),files.get('companion.css')]));
 const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
@@ -26,7 +26,7 @@ const csrf = 'fixture-csrf';
 const server = createServer(async (request,response) => {
   const url = new URL(request.url,'http://fixture');
   const send = (status,value) => { response.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'}); response.end(JSON.stringify(value)); };
-  if (['/companion','/companion.html','/companion.js','/companion.css','/companion-floor.mjs','/companion-cards.mjs','/markdown.js','/huddles.mjs','/huddles-api.mjs','/huddles.css'].includes(url.pathname)) {
+  if (['/companion','/companion.html','/companion.js','/companion-setup.mjs','/companion.css','/companion-floor.mjs','/companion-cards.mjs','/markdown.js','/huddles.mjs','/huddles-api.mjs','/huddles.css'].includes(url.pathname)) {
     const name = url.pathname === '/companion' ? 'companion.html' : url.pathname.slice(1);
     response.writeHead(200,{'Content-Type':name.endsWith('.html')?'text/html':name.endsWith('.css')?'text/css':'text/javascript'}); response.end(files.get(name)); return;
   }

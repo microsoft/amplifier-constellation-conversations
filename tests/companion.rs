@@ -144,7 +144,9 @@ for line in sys.stdin:
         tls_ca: None,
         import_source: "fixture".into(),
         import_surface: "fixture".into(),
-        agent: Agent {
+        auth_mode: Default::default(),
+        transport: Default::default(),
+        agent: Some(Agent {
             label: "Coach".into(),
             command: python.clone(),
             args: vec![format!(
@@ -160,7 +162,7 @@ for line in sys.stdin:
             mcp_servers: vec![],
             timeout_seconds: 30,
             client: Default::default(),
-        },
+        }),
     };
     c.save(home.path()).unwrap();
     std::fs::write(home.path().join("bridge-mode"), mode).unwrap();

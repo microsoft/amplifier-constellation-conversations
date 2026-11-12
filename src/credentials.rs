@@ -1,4 +1,4 @@
-//! Installation-owned provider credentials. No HTTP API or configuration field
+//! Installation-owned provider credentials. No response or configuration field
 //! exposes the value; only already-authorized provider children receive it.
 use anyhow::{Result, anyhow, ensure};
 use std::{ffi::OsStr, fs, io::Read, path::Path};
@@ -178,6 +178,19 @@ fn apply_with_environment(
 pub fn apply_openai_environment(command: &mut Command, home: &Path) -> Result<CredentialSource> {
     let value = std::env::var_os("OPENAI_API_KEY");
     apply_with_environment(command, home, value.as_deref())
+}
+
+/// Presence only: saving a key does not prove that a provider will accept it.
+pub fn openai_status(home: &Path) -> Result<serde_json::Value> {
+    if let Some(value) = std::env::var_os("OPENAI_API_KEY") {
+        return Ok(
+            serde_json::json!({"configured":!value.is_empty(),"source":"environment","environment_override":true,"provider_verified":false}),
+        );
+    }
+    let configured = stored_openai(home)?.is_some();
+    Ok(
+        serde_json::json!({"configured":configured,"source":if configured {"installation"} else {"absent"},"environment_override":false,"provider_verified":false}),
+    )
 }
 
 #[cfg(test)]
