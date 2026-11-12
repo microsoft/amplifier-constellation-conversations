@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import locale
 import os
 from pathlib import Path
 import platform
@@ -82,6 +83,12 @@ def physically_inside(path: Path, home: Path) -> bool:
     return any(parent.samefile(home) for parent in path.resolve(strict=True).parents)
 
 
+def read_utf8(path: Path) -> str:
+    # Rust and Node emit UTF-8 regardless of the Windows user's ANSI codepage.
+    # Locale-default reads can corrupt the configured child cwd before spawning.
+    return path.read_text(encoding="utf-8")
+
+
 def run(command: list, env: dict, cwd: Path, *, timeout: int = 60, input_text: str | None = None) -> subprocess.CompletedProcess:
     result = subprocess.run([str(v) for v in command], env=env, cwd=cwd,
                             capture_output=True, text=True, encoding="utf-8", timeout=timeout, input=input_text)
@@ -92,7 +99,7 @@ def run(command: list, env: dict, cwd: Path, *, timeout: int = 60, input_text: s
 
 def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
     package = package_module()
-    provenance = json.loads(receipt.read_text())
+    provenance = json.loads(read_utf8(receipt))
     manifest, contents = package.inspect_archive(archive, provenance["archive_sha256"])
     require(manifest["target"] == native_target(), "Package target is not the native test host architecture")
     require(hashlib.sha256(contents["manifest.json"]).hexdigest() == provenance["manifest_sha256"],
@@ -101,7 +108,7 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
     result = {"schema_version": 1, "target": manifest["target"], "source_revision": manifest["source_revision"],
               "archive_sha256": provenance["archive_sha256"], "manifest_sha256": provenance["manifest_sha256"],
               "host": {"system": platform.system(), "release": platform.release(), "version": platform.version(),
-                       "machine": platform.machine()}, "checks": checks,
+                       "machine": platform.machine(), "controller_text_encoding": locale.getencoding()}, "checks": checks,
               "scope": "native CI host with isolated application HOME and developer-tools-absent child PATH",
               "fresh_consumer_os": "not_tested", "os_password_sign_in": "not_tested",
               "physical_browser_microphone_camera": "not_tested", "signing_notarization": "not_tested",
@@ -165,18 +172,26 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
                        input_text=fixture_key + "\n")
         require(json.loads(imported.stdout) == {"stored": True, "provider": "openai"}, "Invalid credential import receipt")
         require(fixture_key not in imported.stdout + imported.stderr, "Credential import exposed its input")
-        require((home / "secrets/openai-api-key").read_text() == fixture_key, "Installation credential was not retained")
+        require(read_utf8(home / "secrets/openai-api-key") == fixture_key, "Installation credential was not retained")
         require(config_path.read_bytes() == config_before and not (home / "companion.json").exists(),
                 "Credential import changed configuration or enabled voice")
         checks.append("native stdin credential import preserves configuration, exposes no key and enables no voice")
-        config = json.loads(config_path.read_text())
+        config = json.loads(read_utf8(config_path))
+        require(Path(config["agent"]["cwd"]).samefile(workspace), "Initialization changed the ACP workspace")
+        require(Path(config["agent"]["command"]).samefile(installed_node), "Initialization changed the ACP executable")
         log = root / "ACP initialized.jsonl"
         config["agent"]["env"]["NATIVE_FIXTURE_LOG"] = str(log)
         # This is disposable owner configuration, never a production installation.
         config_path.write_text(json.dumps(config), encoding="utf-8")
+        require(json.loads(config_path.read_bytes()) == config, "Fixture configuration changed during UTF-8 round-trip")
+        result["probe_boundary"] = {"workspace": str(workspace), "configured_cwd": config["agent"]["cwd"],
+            "command": config["agent"]["command"], "workspace_is_directory": workspace.is_dir(),
+            "configured_workspace_matches": True, "configured_executable_matches": True,
+            "controller_text_encoding": locale.getencoding()}
+        output.with_name("probe-boundary.json").write_text(json.dumps(result["probe_boundary"], indent=2) + "\n", encoding="utf-8")
         probe = json.loads(run([installed_service, "--home", home, "probe"], env, root).stdout)
         require(probe["ok"] and probe["agent_info"]["name"] == "native-package-fixture", "Official SDK initialize did not complete")
-        events = [json.loads(line) for line in log.read_text().splitlines()]
+        events = [json.loads(line) for line in read_utf8(log).splitlines()]
         require([event["method"] for event in events] == ["initialize"], "Installation probe created a session or prompt")
         require(Path(events[0]["node"]).samefile(installed_node), "ACP fixture used an ambient Node installation")
         require(events[0]["provider_key_present"] is False, "Voice provider key leaked into the ACP child")
@@ -198,7 +213,7 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
                     require(server.poll() is None, "Disposable HTTPS service exited before readiness: "
                             + (root / "server.log").read_text(encoding="utf-8")[-3000:])
                     try:
-                        runtime = json.loads((home / "runtime.json").read_text())
+                        runtime = json.loads(read_utf8(home / "runtime.json"))
                         with urllib.request.urlopen(runtime["url"] + "/health", context=context, timeout=1) as response:
                             require(response.status == 200 and json.load(response)["ok"], "Invalid health response")
                         break
@@ -242,7 +257,7 @@ def qualify(archive: Path, receipt: Path, output: Path) -> dict:
         # only disposable credentials and no provider account or live session.
         output.write_text(json.dumps({"schema_version": 1, "status": "failed",
             "error": str(error), "host": {"system": platform.system(), "release": platform.release(),
-                "machine": platform.machine()}, "scope": "native CI clean-path install",
+                "machine": platform.machine(), "controller_text_encoding": locale.getencoding()}, "scope": "native CI clean-path install",
             "model_requests": 0, "speech_release": "unchanged_paused"}, indent=2) + "\n", encoding="utf-8")
         raise
 

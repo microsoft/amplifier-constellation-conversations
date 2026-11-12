@@ -31,6 +31,28 @@ rust_tests = load("native_rust_tests", ROOT / "scripts/run-native-rust-tests.py"
 
 
 class NativeBuildHarnessTests(unittest.TestCase):
+    def test_rust_config_and_node_events_keep_unicode_on_ansi_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            configured = {"agent": {"cwd": r"C:\Users\fixture\Native install café\Workspace",
+                                    "command": r"C:\Users\fixture\Companion 日本語\node.exe"}}
+            event = {"method": "initialize", "node": configured["agent"]["command"]}
+            config = root / "config.json"
+            log = root / "events.jsonl"
+            config.write_bytes(json.dumps(configured, ensure_ascii=False).encode("utf-8"))
+            log.write_bytes((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+            # Model a Windows ANSI default even when this regression runs on Linux.
+            original_read = Path.read_text
+            def ansi_read(path, encoding=None, errors=None, **kwargs):
+                return original_read(path, encoding=encoding or "cp1252", errors=errors, **kwargs)
+            with patch.object(Path, "read_text", ansi_read):
+                self.assertNotEqual(json.loads(config.read_text()), configured)
+                decoded = json.loads(clean.read_utf8(config))
+                self.assertEqual(decoded, configured)
+                config.write_text(json.dumps(decoded), encoding="utf-8")
+                self.assertEqual(json.loads(config.read_bytes()), configured)
+                self.assertEqual([json.loads(line) for line in clean.read_utf8(log).splitlines()], [event])
+
     def test_installed_paths_use_physical_ancestry_and_reject_outside_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
