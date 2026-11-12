@@ -181,8 +181,13 @@ speech does not retract an operation.
 ## Installation
 
 Use a separate Conversations installation for the preview. Existing text rooms
-and browser dictation remain available. Build Conversations normally, and install
-the bridge using Node 22.6 or later:
+and browser dictation remain available. Native package users should follow
+[native installation](native-installation.md): the private Node runtime, locked
+SDK dependencies, disabled voice template and instructions are included. No npm,
+Python or compiler is required on that path.
+
+The following commands are for a **source development checkout** only. Build
+Conversations normally, and install the bridge using Node 22.6 or later:
 
 ```sh
 cd bridge
@@ -191,8 +196,10 @@ npm test
 ```
 
 Keep the bridge and its locked dependencies in an installation-owned directory.
-Set `OPENAI_API_KEY` in the service environment, preferably through a private
-credential file. It is not sent to the browser or copied into the ACP agent's
+Use native `credential import-openai` to import the key from standard input into
+the installation's protected credential file, or explicitly set `OPENAI_API_KEY`
+in the service environment. The environment takes precedence; an interactive
+shell export is not persisted by sign-in startup. It is not sent to the browser or copied into the ACP agent's
 environment. The official OpenAI SDK owns provider transport. The Rust client uses
 the official ACP SDK through `amplifier-acp-connection`; Companion adds no ACP wire
 methods.

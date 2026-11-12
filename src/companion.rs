@@ -1005,7 +1005,7 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
     let result:Result<bool>=async {
         let mut cmd=Command::new(&c.node); cmd.arg(&c.bridge).env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
         crate::platform::child_environment(&mut cmd);
-        if let Some(v)=std::env::var_os("OPENAI_API_KEY") { cmd.env("OPENAI_API_KEY",v); }
+        crate::credentials::apply_openai_environment(&mut cmd,&s.home)?;
         crate::platform::ProcessTree::prepare(&mut cmd);
         let mut child=cmd.spawn().context("Voice bridge unavailable")?;
         let mut process_tree=crate::platform::ProcessTree::attach(&child)?;

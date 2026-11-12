@@ -134,6 +134,51 @@ fn native_executable(path: &Path) -> Result<()> {
                 && u16::from_le_bytes([header[18], header[19]]) == if arm { 183 } else { 62 },
             "Executable is not native 64-bit ELF"
         );
+        // ET_DYN includes ordinary shared libraries as well as PIE executables.
+        // A real entrypoint must lie in file-backed executable loadable bytes.
+        let entry = u64::from_le_bytes(header[24..32].try_into()?);
+        let offset = u64::from_le_bytes(header[32..40].try_into()?);
+        let stride = u16::from_le_bytes(header[54..56].try_into()?);
+        let count = u16::from_le_bytes(header[56..58].try_into()?);
+        let length = file.metadata()?.len();
+        ensure!(
+            entry != 0
+                && offset >= 64
+                && stride == 56
+                && (1..=4096).contains(&count)
+                && offset
+                    .checked_add(u64::from(stride) * u64::from(count))
+                    .is_some_and(|end| end <= length),
+            "ELF executable has no valid entrypoint or program headers"
+        );
+        let mut entry_is_executable = false;
+        file.seek(SeekFrom::Start(offset))?;
+        for _ in 0..count {
+            let mut program = [0u8; 56];
+            file.read_exact(&mut program)?;
+            let kind = u32::from_le_bytes(program[..4].try_into()?);
+            let flags = u32::from_le_bytes(program[4..8].try_into()?);
+            let file_start = u64::from_le_bytes(program[8..16].try_into()?);
+            let virtual_start = u64::from_le_bytes(program[16..24].try_into()?);
+            let file_size = u64::from_le_bytes(program[32..40].try_into()?);
+            let memory_size = u64::from_le_bytes(program[40..48].try_into()?);
+            if kind == 1
+                && flags & 1 != 0
+                && file_size <= memory_size
+                && file_start
+                    .checked_add(file_size)
+                    .is_some_and(|end| end <= length)
+                && entry
+                    .checked_sub(virtual_start)
+                    .is_some_and(|at| at < file_size)
+            {
+                entry_is_executable = true;
+            }
+        }
+        ensure!(
+            entry_is_executable,
+            "ELF entrypoint is not executable file-backed code"
+        );
     } else if cfg!(target_os = "macos") {
         ensure!(
             &header[..4] == b"\xcf\xfa\xed\xfe"
@@ -363,7 +408,16 @@ mod tests {
             let mut content = vec![0u8; 128];
             if executable {
                 let arm = cfg!(target_arch="aarch64");
-                if cfg!(target_os="linux") { content[..6].copy_from_slice(b"\x7fELF\x02\x01"); content[16]=2; content[18..20].copy_from_slice(&(if arm {183u16} else {62u16}).to_le_bytes()); }
+                if cfg!(target_os="linux") {
+                    content[..6].copy_from_slice(b"\x7fELF\x02\x01"); content[16]=2; content[18..20].copy_from_slice(&(if arm {183u16} else {62u16}).to_le_bytes());
+                    content[24..32].copy_from_slice(&0x400078u64.to_le_bytes());
+                    content[32..40].copy_from_slice(&64u64.to_le_bytes());
+                    content[54..56].copy_from_slice(&56u16.to_le_bytes()); content[56]=1;
+                    content[64]=1; content[68]=5;
+                    content[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+                    content[96..104].copy_from_slice(&128u64.to_le_bytes());
+                    content[104..112].copy_from_slice(&128u64.to_le_bytes());
+                }
                 else if cfg!(target_os="macos") { content[..4].copy_from_slice(b"\xcf\xfa\xed\xfe"); content[4..8].copy_from_slice(&(if arm {0x0100000cu32} else {0x01000007u32}).to_le_bytes()); content[12]=2; }
                 else if cfg!(windows) { content[..2].copy_from_slice(b"MZ"); content[60]=64; content[64..68].copy_from_slice(b"PE\0\0"); content[68..70].copy_from_slice(&(if arm {0xaa64u16} else {0x8664u16}).to_le_bytes()); content[86]=2; content[88..90].copy_from_slice(&0x20bu16.to_le_bytes()); }
             }
@@ -434,5 +488,26 @@ mod tests {
                 .unwrap();
             assert!(verify(tmp.path()).is_err());
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn elf_requires_executable_entrypoint_but_accepts_static_pie() {
+        let temp = tempfile::tempdir().unwrap();
+        fixture(temp.path());
+        let path = temp.path().join("agent-conversations");
+        let mut pie = fs::read(&path).unwrap();
+        pie[16] = 3; // ET_DYN, with no PT_INTERP: a static PIE is valid.
+        fs::write(&path, &pie).unwrap();
+        native_executable(&path).unwrap();
+        for range in [24..32, 68..72, 96..104] {
+            let mut invalid = pie.clone();
+            invalid[range].fill(0);
+            fs::write(&path, invalid).unwrap();
+            assert!(native_executable(&path).is_err());
+        }
+        pie[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        fs::write(&path, pie).unwrap();
+        assert!(native_executable(&path).is_err());
     }
 }

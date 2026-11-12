@@ -9,6 +9,8 @@ import time
 
 SELECTIONS = [
     ("platform::", False),
+    ("config::platform_tests::", False),
+    ("credentials::", False),
     ("native_bundle::", False),
     ("companion_awareness::process_tests::stalled_observer_and_descendant_are_stopped_without_facts", True),
 ]

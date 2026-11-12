@@ -5,7 +5,8 @@ import { Readable, Writable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
 
 const record = (method) => appendFileSync(process.env.NATIVE_FIXTURE_LOG,
-  `${JSON.stringify({method, pid: process.pid, node: process.execPath})}\n`);
+  `${JSON.stringify({method, pid: process.pid, node: process.execPath,
+    provider_key_present: Object.hasOwn(process.env, 'OPENAI_API_KEY')})}\n`);
 const agent = acp.agent({name: 'native-package-fixture'})
   .onRequest(acp.methods.agent.initialize, () => {
     record('initialize');

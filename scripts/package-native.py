@@ -30,6 +30,7 @@ TARGETS = {
 }
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?\Z")
+SUPPORT_FILES = {"docs/native-installation.md", "ops/pam-agent-conversations", "ops/companion.example.json"}
 
 
 def require(condition: bool, message: str) -> None:
@@ -79,6 +80,20 @@ def executable_identity(data: bytes) -> tuple[str, str]:
         kind, machine = struct.unpack_from("<HH", data, 16)
         require(kind in {2, 3}, "ELF is not an executable/PIE")
         require(machine in {62, 183}, "unsupported ELF architecture")
+        entry, headers = struct.unpack_from("<QQ", data, 24)
+        header_size, count = struct.unpack_from("<HH", data, 54)
+        require(entry != 0 and header_size == 56 and 0 < count < 1000
+                and 64 <= headers <= len(data) and count * header_size <= len(data) - headers,
+                "ELF has no valid executable entrypoint/program headers")
+        executable_entry = False
+        for index in range(count):
+            kind, flags, offset, address, _, size, memory_size, _ = struct.unpack_from(
+                "<IIQQQQQQ", data, headers + index * header_size)
+            if kind == 1 and flags & 1 and memory_size >= size and offset <= len(data) and size <= len(data) - offset:
+                executable_entry |= address <= entry and entry - address < size
+        # Static PIE need not have PT_INTERP. The entry must nevertheless point
+        # into executable, file-backed load bytes; a generic ET_DYN DSO is not a launcher.
+        require(executable_entry, "ELF entrypoint is not in an executable load segment")
         return "linux", {62: "x64", 183: "arm64"}[machine]
     if len(data) >= 32 and data[:4] == b"\xcf\xfa\xed\xfe":
         cpu, _, kind = struct.unpack_from("<III", data, 4)
@@ -260,9 +275,18 @@ def validate_app_imports(bridge: dict[str, bytes], installed: dict[str, bytes], 
             require(any(name + "/" + p in installed for p in candidates), f"missing used package entrypoint: {specifier}")
 
 
+def output_inside_input(output: Path, source: Path) -> bool:
+    """Resolve aliases, including /var -> /private/var and case aliases."""
+    destination, source = output.resolve(), source.resolve(strict=True)
+    if destination.is_relative_to(source):
+        return True
+    return any(parent.exists() and os.path.samefile(parent, source)
+               for parent in (destination, *destination.parents))
+
+
 def build_bundle(spec: dict, output: Path) -> dict:
     require(isinstance(spec, dict) and set(spec) == {"schema_version", "target", "version", "source_revision",
-            "service", "node", "bridge", "license", "third_party_notices"}, "invalid package input fields")
+            "service", "node", "bridge", "license", "third_party_notices", "support_files"}, "invalid package input fields")
     require(spec["schema_version"] == 1 and spec["target"] in TARGETS, "unsupported package target/schema")
     require(isinstance(spec["version"], str) and VERSION.fullmatch(spec["version"]), "invalid release version")
     require(re.fullmatch(r"[0-9a-f]{40}", spec["source_revision"]), "full source revision required")
@@ -288,6 +312,16 @@ def build_bundle(spec: dict, output: Path) -> dict:
              "licenses/THIRD-PARTY-NOTICES.txt": pinned_file(spec["third_party_notices"]),
              "licenses/npm-dependencies.json": encode(inventory)}
     require(all(files[p].strip() for p in files if p.startswith("licenses/")), "empty license/notice input")
+    support = spec["support_files"]
+    require(isinstance(support, dict) and set(support) == SUPPORT_FILES, "fixed native support files required")
+    for path, record in support.items():
+        files[path] = pinned_file(record)
+        require(files[path].strip(), "empty native installation support file")
+    template = json.loads(files["ops/companion.example.json"])
+    require(isinstance(template, dict) and set(template) == {"enabled", "node", "bridge", "profiles"}
+            and template["enabled"] is False and template["profiles"] == {}
+            and isinstance(template["node"], str) and isinstance(template["bridge"], str),
+            "Companion template must be disabled, empty of accounts and contain no credentials")
     files.update({"bridge/" + path: data for path, data in sources.items()})
     files.update({"bridge/node_modules/" + path: data for path, data in production.items()})
     for path in files:
@@ -307,8 +341,8 @@ def build_bundle(spec: dict, output: Path) -> dict:
                 "files": [{"path": p, "sha256": sha(data), "bytes": len(data), "executable": p in executables}
                           for p, data in sorted(files.items())]}
     files["manifest.json"] = encode(manifest)
-    output = output.absolute()
-    require(not any(output.is_relative_to(Path(p).resolve()) for p in [source["path"], source["node_modules"]]),
+    output = output.resolve()
+    require(not any(output_inside_input(output, Path(p)) for p in [source["path"], source["node_modules"]]),
             "output cannot mutate an input tree")
     output.mkdir(parents=True, exist_ok=True)
     name = f"conversations-{spec['version']}-{spec['target']}"

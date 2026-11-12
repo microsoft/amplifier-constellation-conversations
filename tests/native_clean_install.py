@@ -61,9 +61,22 @@ def package_module():
     return module
 
 
-def run(command: list, env: dict, cwd: Path, *, timeout: int = 60) -> subprocess.CompletedProcess:
+def strict_tls_context(cafile: Path) -> ssl.SSLContext:
+    context = ssl.create_default_context(cafile=str(cafile))
+    # Python 3.13 enables strict X.509 verification by default. Apply the same
+    # qualification on older controllers so malformed chains cannot pass locally.
+    context.verify_flags |= ssl.VERIFY_X509_STRICT
+    return context
+
+
+def certificate_failure(error: Exception) -> bool:
+    return isinstance(error, ssl.SSLCertVerificationError) or isinstance(
+        getattr(error, "reason", None), ssl.SSLCertVerificationError)
+
+
+def run(command: list, env: dict, cwd: Path, *, timeout: int = 60, input_text: str | None = None) -> subprocess.CompletedProcess:
     result = subprocess.run([str(v) for v in command], env=env, cwd=cwd,
-                            capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+                            capture_output=True, text=True, encoding="utf-8", timeout=timeout, input=input_text)
     require(result.returncode == 0,
             f"Native operation failed ({Path(str(command[0])).name}): {result.stderr[-3000:]}")
     return result
@@ -137,6 +150,16 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
              "--agent-command", installed_node, "--agent-arg", fixture / "fixture.mjs",
              "--agent-cwd", workspace], env, root)
         config_path = home / "config.json"
+        config_before = config_path.read_bytes()
+        fixture_key = "fixture-native-key-not-a-real-provider-credential"
+        imported = run([installed_service, "--home", home, "credential", "import-openai"], env, root,
+                       input_text=fixture_key + "\n")
+        require(json.loads(imported.stdout) == {"stored": True, "provider": "openai"}, "Invalid credential import receipt")
+        require(fixture_key not in imported.stdout + imported.stderr, "Credential import exposed its input")
+        require((home / "secrets/openai-api-key").read_text() == fixture_key, "Installation credential was not retained")
+        require(config_path.read_bytes() == config_before and not (home / "companion.json").exists(),
+                "Credential import changed configuration or enabled voice")
+        checks.append("native stdin credential import preserves configuration, exposes no key and enables no voice")
         config = json.loads(config_path.read_text())
         log = root / "ACP initialized.jsonl"
         config["agent"]["env"]["NATIVE_FIXTURE_LOG"] = str(log)
@@ -147,6 +170,7 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
         events = [json.loads(line) for line in log.read_text().splitlines()]
         require([event["method"] for event in events] == ["initialize"], "Installation probe created a session or prompt")
         require(Path(events[0]["node"]).resolve() == installed_node.resolve(), "ACP fixture used an ambient Node installation")
+        require(events[0]["provider_key_present"] is False, "Voice provider key leaked into the ACP child")
         checks.append("official ACP SDK initialize through installed private Node; no session or model prompt")
         bridge = Path(entrypoints["bridge"])
         import_script = """const {createRequire}=require('node:module'); const {pathToFileURL}=require('node:url');
@@ -154,12 +178,13 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
         run([installed_node, "-e", import_script, bridge], env, root)
         run([installed_node, "--check", bridge], env, root)
         checks.append("private bridge SDK dependencies import without npm or ambient node_modules")
-        context = ssl.create_default_context(cafile=str(home / "tls/root-ca.crt"))
+        context = strict_tls_context(home / "tls/root-ca.crt")
         with (root / "server.log").open("w", encoding="utf-8") as stream:
             server = subprocess.Popen([str(installed_service), "--home", str(home), "serve"],
                                       env=env, cwd=root, stdout=stream, stderr=stream)
             try:
                 deadline = time.monotonic() + 30
+                last_readiness_error = None
                 while time.monotonic() < deadline:
                     require(server.poll() is None, "Disposable HTTPS service exited before readiness: "
                             + (root / "server.log").read_text(encoding="utf-8")[-3000:])
@@ -168,10 +193,14 @@ def _qualify(archive: Path, receipt: Path, output: Path) -> dict:
                         with urllib.request.urlopen(runtime["url"] + "/health", context=context, timeout=1) as response:
                             require(response.status == 200 and json.load(response)["ok"], "Invalid health response")
                         break
-                    except (OSError, ValueError):
+                    except (OSError, ValueError) as error:
+                        if certificate_failure(error):
+                            raise AssertionError(f"Generated TLS certificate failed strict verification: {error}") from error
+                        last_readiness_error = str(error)
                         time.sleep(0.1)
                 else:
-                    raise AssertionError("Native HTTPS service did not become healthy")
+                    raise AssertionError(f"Native HTTPS service did not become healthy: {last_readiness_error}; "
+                                         + (root / "server.log").read_text(encoding="utf-8")[-3000:])
                 run([installed_service, "--home", home, "api", "GET", "/api/v1/conversations"], env, root)
                 try:
                     urllib.request.urlopen(runtime["url"] + "/api/v1/conversations", context=context, timeout=5)

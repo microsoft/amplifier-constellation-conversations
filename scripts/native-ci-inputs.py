@@ -133,7 +133,8 @@ def main() -> None:
     inputs = {"schema_version": 1, "target": args.target, "version": current["version"],
               "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
               "service": digest(args.service), "node": node, "bridge": source,
-              "license": digest(ROOT / "LICENSE"), "third_party_notices": digest(rust_notices(args.output))}
+              "license": digest(ROOT / "LICENSE"), "third_party_notices": digest(rust_notices(args.output)),
+              "support_files": {path: digest(ROOT / path) for path in sorted(package.SUPPORT_FILES)}}
     (args.output / "inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
     triple = package.TARGETS[args.target][2]
     target_flags = "CARGO_TARGET_" + triple.upper().replace("-", "_") + "_RUSTFLAGS"

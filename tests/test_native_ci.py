@@ -4,6 +4,8 @@ import importlib.util
 import io
 import json
 import os
+import ssl
+import urllib.error
 from pathlib import Path
 import tarfile
 import tempfile
@@ -129,6 +131,12 @@ class NativeBuildHarnessTests(unittest.TestCase):
                          {"passed": 1, "failed": 0, "ignored": 0})
         with self.assertRaisesRegex(ValueError, "successful"):
             rust_tests.passed_counts("test result: FAILED. 0 passed; 1 failed; 0 ignored;")
+
+    def test_certificate_failures_are_not_retried_as_startup_delays(self):
+        error = ssl.SSLCertVerificationError(1, "Missing Authority Key Identifier")
+        self.assertTrue(clean.certificate_failure(error))
+        self.assertTrue(clean.certificate_failure(urllib.error.URLError(error)))
+        self.assertFalse(clean.certificate_failure(urllib.error.URLError(ConnectionRefusedError())))
 
 
 if __name__ == "__main__":

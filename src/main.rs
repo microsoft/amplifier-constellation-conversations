@@ -1,6 +1,6 @@
 use agent_conversations::{
     config::{self, Agent, Config},
-    driver, native_bundle, platform, server,
+    credentials, driver, native_bundle, platform, server,
     state::AppState,
 };
 use anyhow::{Context, Result, ensure};
@@ -34,6 +34,11 @@ enum Action {
     Bundle {
         #[command(subcommand)]
         action: BundleAction,
+    },
+    /// Import an installation-owned provider credential without exposing it in arguments.
+    Credential {
+        #[command(subcommand)]
+        action: CredentialAction,
     },
     Init {
         #[arg(long, default_value = "Conversations")]
@@ -106,6 +111,11 @@ enum BundleAction {
     },
 }
 #[derive(Subcommand)]
+enum CredentialAction {
+    /// Read one OpenAI API key from standard input; never print or test it.
+    ImportOpenai,
+}
+#[derive(Subcommand)]
 enum ConfigAction {
     Get,
     Set {
@@ -159,6 +169,19 @@ async fn main() -> Result<()> {
         None => amplifier_native_platform::default_home(&native_bundle::APPLICATION, "default")?,
     };
     match cli.command {
+        Action::Credential {
+            action: CredentialAction::ImportOpenai,
+        } => {
+            use std::io::IsTerminal;
+            Config::load(&home)?;
+            let input = std::io::stdin();
+            ensure!(
+                !input.is_terminal(),
+                "Supply the key through protected standard input; do not type it into an echoing terminal"
+            );
+            credentials::import_openai(&home, input.lock())?;
+            println!("{}", json!({"stored":true,"provider":"openai"}));
+        }
         Action::Open => {
             // No bearer or control token is placed in a URL. Authentication stays
             // in the browser's existing HTTPS/CSRF flow.
@@ -531,7 +554,7 @@ fn generate_tls(home: &std::path::Path) -> Result<(PathBuf, PathBuf, Option<Path
     )?;
     let issuer = Issuer::new(ca, ca_key);
     let mut names = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
-    if let Ok(entries) = get_if_addrs::get_if_addrs() {
+    if let Ok(entries) = if_addrs::get_if_addrs() {
         names.extend(entries.into_iter().map(|a| a.ip().to_string()));
     }
     names.sort();
@@ -543,6 +566,8 @@ fn generate_tls(home: &std::path::Path) -> Result<(PathBuf, PathBuf, Option<Path
     leaf.not_after = now + Duration::days(365);
     leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    // Identify the issuing local CA for strict RFC 5280 path validation.
+    leaf.use_authority_key_identifier_extension = true;
     let key = KeyPair::generate()?;
     let cert = leaf.signed_by(&key, &issuer)?;
     config::private_write(&home.join("tls/cert.pem"), cert.pem().as_bytes())?;

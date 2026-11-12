@@ -28,28 +28,34 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: linux-x64
+            architecture: x64
             rust_target: x86_64-unknown-linux-gnu
             suffix: ''
           - runner: ubuntu-24.04-arm
             target: linux-arm64
+            architecture: arm64
             rust_target: aarch64-unknown-linux-gnu
             suffix: ''
           - runner: macos-15-intel
             target: macos-x64
+            architecture: x64
             rust_target: x86_64-apple-darwin
             suffix: ''
           - runner: macos-15
             target: macos-arm64
+            architecture: arm64
             rust_target: aarch64-apple-darwin
             suffix: ''
           # This is native x64 Windows Server build/launch coverage. A separate
           # Windows 11 x64 consumer-machine receipt is still required.
           - runner: windows-2025
             target: windows-x64
+            architecture: x64
             rust_target: x86_64-pc-windows-msvc
             suffix: '.exe'
           - runner: windows-11-arm
             target: windows-arm64
+            architecture: arm64
             rust_target: aarch64-pc-windows-msvc
             suffix: '.exe'
     runs-on: ${{ matrix.runner }}
@@ -75,9 +81,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+          architecture: ${{ matrix.architecture }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22.23.5'
+          architecture: ${{ matrix.architecture }}
       - name: Build the native executable and run platform unit tests
         run: |
           python scripts/run-native-rust-tests.py --target '${{ matrix.rust_target }}' --output '${{ runner.temp }}/native-rust-tests.json'
@@ -110,6 +118,22 @@ jobs:
           receipt = json.loads(receipts[0].read_text())
           module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/clean-path-install.json').resolve())
           PY
+      - name: Test minimal Ubuntu userland without installed developer tools
+        if: runner.os == 'Linux'
+        run: |
+          python - <<'PY'
+          import importlib.util, json, subprocess
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('clean_userland', 'tests/native_clean_userland.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          receipts = list(Path('dist').glob('conversations-*.json'))
+          assert len(receipts) == 1, 'Expected one immutable package receipt'
+          receipt = json.loads(receipts[0].read_text())
+          subprocess.run(['docker', 'pull', '--platform', module.PLATFORMS[receipt['target']][0], module.IMAGE], check=True)
+          result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/clean-userland.json').resolve())
+          assert result['status'] == 'passed', 'Inspect retained clean-userland receipt'
+          PY
       - name: Retain exact build and qualification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -124,7 +148,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-# These lanes use native hosted runners. They do not install onto a newly
+# These lanes use native hosted runners; Linux additionally exercises an isolated
+# Ubuntu userland with no developer tools installed. They do not install onto a newly
 # provisioned consumer machine, enroll OS certificate trust, test an OS password,
 # exercise a physical microphone/camera, sign artifacts, publish a release or
 # adopt a package on any existing installation. In particular this workflow does

@@ -50,7 +50,12 @@ digests or select dependencies at application launch.
     "node_modules_sha256": "DIGEST_OUTPUT_NODE_MODULES_SHA256"
   },
   "license": {"path": "/absolute/source/LICENSE", "sha256": "SHA256"},
-  "third_party_notices": {"path": "/absolute/build/RUST-NOTICES.txt", "sha256": "SHA256"}
+  "third_party_notices": {"path": "/absolute/build/RUST-NOTICES.txt", "sha256": "SHA256"},
+  "support_files": {
+    "docs/native-installation.md": {"path": "/absolute/source/docs/native-installation.md", "sha256": "SHA256"},
+    "ops/pam-agent-conversations": {"path": "/absolute/source/ops/pam-agent-conversations", "sha256": "SHA256"},
+    "ops/companion.example.json": {"path": "/absolute/source/ops/companion.example.json", "sha256": "SHA256"}
+  }
 }
 ```
 
@@ -74,6 +79,9 @@ licenses/Conversations-LICENSE
 licenses/Node-LICENSE
 licenses/THIRD-PARTY-NOTICES.txt
 licenses/npm-dependencies.json
+docs/native-installation.md
+ops/pam-agent-conversations
+ops/companion.example.json
 ```
 
 The generated package receipt names the archive and binds its SHA-256 plus the
@@ -92,6 +100,11 @@ to the existing service configuration. It does not discover a system Node or
 change the selected agent engine. Optional Python domain helper source remains
 available for separately owned connector installation; this package does not
 claim an included Python interpreter or portable Minecraft installation.
+
+The fixed support files are pinned package inputs, just like the executable and
+licenses. They provide native-consumer setup instructions, the Ubuntu PAM policy
+for an administrator to review, and a disabled credential-free voice template.
+They are not applied to an installation or to `/etc` by packaging or extraction.
 
 ## Qualification layers
 
@@ -114,3 +127,26 @@ installer owns the independent end-user implementation.
 Real microphone/camera/playback, trusted HTTPS, recovery, signed Windows
 distribution and Apple signing/notarization need separate platform evidence.
 A successful compile or dependency-free smoke test establishes none of those.
+
+The separate `tests/native_clean_userland.py` controller extends Linux launch
+coverage to a checksum-bound official Ubuntu 24.04 container with no development
+runtimes installed. CI must acquire the fixed image digest first; the harness
+never pulls images or installs packages. It checks the native Docker engine/image
+architecture, safely verifies/extracts the archive, mounts only package and fixture
+readonly, and runs as UID 1000 with no network, no capabilities, a readonly root,
+and disposable executable home. The package's private Node drives native install,
+ACP initialize, bundled SDK imports and CA-verified HTTPS/API checks. Host Python
+and Docker are CI tools, not application requirements. Only labeled owned
+containers and temporary extraction are removed. The receipt binds artifact,
+source, image and fixture hashes, including failed output and cleanup results.
+
+```sh
+python tests/native_clean_userland.py \
+  --archive /absolute/dist/conversations-VERSION-linux-ARCH.tar.gz \
+  --receipt /absolute/dist/conversations-VERSION-linux-ARCH.json \
+  --output /absolute/results/clean-userland.json
+```
+
+This is native Linux **userland** evidence sharing the host kernel, not a fresh
+desktop VM, physical browser/media test, PAM password check, or six-platform
+consumer qualification. Ubuntu 24.04 is the explicit Linux baseline.

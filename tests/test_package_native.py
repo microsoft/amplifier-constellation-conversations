@@ -25,6 +25,9 @@ def synthetic_header(target):
     if operating_system == "linux":
         data[:6] = b"\x7fELF\x02\x01"
         struct.pack_into("<HH", data, 16, 3, 62 if arch == "x64" else 183)
+        struct.pack_into("<QQ", data, 24, 128, 64)
+        struct.pack_into("<HH", data, 54, 56, 1)
+        struct.pack_into("<IIQQQQQQ", data, 64, 1, 5, 0, 0, 0, len(data), len(data), 4096)
     elif operating_system == "macos":
         data[:4] = b"\xcf\xfa\xed\xfe"
         struct.pack_into("<III", data, 4, 0x01000007 if arch == "x64" else 0x0100000C, 0, 2)
@@ -83,7 +86,13 @@ class PackageTests(unittest.TestCase):
                 "bridge": {"path": str(self.bridge), "source_sha256": package_native.tree_digest(package_native.bridge_files(self.bridge)),
                            "node_modules": str(self.modules), "node_modules_sha256": package_native.tree_digest(package_native.tree_files(self.modules))},
                 "license": self.pinned("license", b"Microsoft MIT\n"),
-                "third_party_notices": self.pinned("notices", b"Rust dependencies and license texts\n")}
+                "third_party_notices": self.pinned("notices", b"Rust dependencies and license texts\n"),
+                "support_files": {
+                    "docs/native-installation.md": self.pinned("installation.md", b"Native installation instructions\n"),
+                    "ops/pam-agent-conversations": self.pinned("pam-policy", b"# Reviewed platform authentication policy\n"),
+                    "ops/companion.example.json": self.pinned("companion-template.json", json.dumps({"enabled": False,
+                        "node": "<bundle>/runtime/node", "bridge": "<bundle>/bridge/live.mjs", "profiles": {}}).encode()),
+                }}
 
     def build(self, spec=None, name="dist"):
         output = self.root / name
@@ -324,6 +333,54 @@ class PackageTests(unittest.TestCase):
             self.build(spec)
         with self.assertRaisesRegex(ValueError, "mutate an input"):
             package_native.build_bundle(spec, self.bridge / "dist")
+
+    def test_output_alias_cannot_bypass_input_containment(self):
+        spec = self.spec()
+        alias = self.bridge.parent / "bridge-alias"
+        try:
+            alias.symlink_to(self.bridge, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Directory symlinks require OS privileges unavailable on this runner")
+        with self.assertRaisesRegex(ValueError, "mutate an input"):
+            package_native.build_bundle(spec, alias / "nested-output")
+        self.assertFalse((self.bridge / "nested-output").exists())
+
+    def test_shared_library_is_not_an_executable_and_static_pie_is(self):
+        for target in ["linux-x64", "linux-arm64"]:
+            data = bytearray(synthetic_header(target))
+            # The valid fixture is a static PIE without an interpreter segment.
+            self.assertEqual(package_native.executable_identity(data), package_native.TARGETS[target][:2])
+            struct.pack_into("<Q", data, 24, 0)
+            with self.assertRaisesRegex(ValueError, "entrypoint"):
+                package_native.executable_identity(data)
+            struct.pack_into("<Q", data, 24, 128)
+            struct.pack_into("<I", data, 68, 4)  # Readable but not executable.
+            with self.assertRaisesRegex(ValueError, "executable load"):
+                package_native.executable_identity(data)
+            struct.pack_into("<I", data, 68, 5)
+            struct.pack_into("<Q", data, 96, 127)  # Entry is outside file-backed bytes.
+            with self.assertRaisesRegex(ValueError, "executable load"):
+                package_native.executable_identity(data)
+
+    def test_support_files_are_bundled_and_cannot_enable_calls_or_ship_accounts(self):
+        spec = self.spec()
+        archive, receipt = self.build(spec)
+        _, files = package_native.inspect_archive(archive, receipt["archive_sha256"])
+        self.assertTrue(package_native.SUPPORT_FILES <= files.keys())
+        self.assertFalse(json.loads(files["ops/companion.example.json"])["enabled"])
+        for field, value in [("enabled", True), ("profiles", {"owner": {"api_key": "not-real"}}), ("api_key", "not-real")]:
+            template = {"enabled": False, "node": "<bundle>/runtime/node", "bridge": "<bundle>/bridge/live.mjs", "profiles": {}}
+            template[field] = value
+            invalid = copy.deepcopy(spec)
+            invalid["support_files"]["ops/companion.example.json"] = self.pinned("bad-template.json", json.dumps(template).encode())
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "template must be disabled"):
+                self.build(invalid, "invalid-" + field)
+
+    def test_missing_support_input_is_rejected_before_archive_creation(self):
+        spec = self.spec()
+        del spec["support_files"]["ops/pam-agent-conversations"]
+        with self.assertRaisesRegex(ValueError, "support files"):
+            self.build(spec)
 
 
 if __name__ == "__main__":

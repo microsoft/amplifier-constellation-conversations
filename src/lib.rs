@@ -16,6 +16,7 @@ pub mod companion_surface;
 pub mod companion_tools;
 pub mod config;
 pub mod context;
+pub mod credentials;
 pub mod delivery;
 pub mod driver;
 pub mod elicitation;

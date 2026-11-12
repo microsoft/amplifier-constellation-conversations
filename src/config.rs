@@ -175,45 +175,10 @@ impl Config {
     }
 }
 pub fn private_dir(path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = path;
-        anyhow::bail!("Native private storage is not configured for this build");
-    }
-    #[cfg(unix)]
-    {
-        std::fs::create_dir_all(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(())
-    }
+    amplifier_native_platform::private_dir(path)
 }
 pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = (path, bytes);
-        anyhow::bail!("Native private storage is not configured for this build");
-    }
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(tmp, path)?;
-        Ok(())
-    }
+    amplifier_native_platform::private_write(path, bytes)
 }
 
 pub fn valid_user(user: &str) -> bool {
