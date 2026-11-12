@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 import xml.etree.ElementTree as ET
@@ -26,6 +27,30 @@ class NativeStartupHarnessTests(unittest.TestCase):
             self.assertEqual(value["status"], "not_tested")
             self.assertEqual(value["model_requests"], 0)
             self.assertEqual(value["fresh_consumer_os"], "not_tested")
+
+    def test_windows_startup_path_excludes_system32_developer_tools(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            system = root / "Windows"
+            def which(tool, *, path):
+                return str(system / "System32/wsl.exe") if tool == "wsl" and "System32" in path else None
+            with patch.object(startup, "os", SimpleNamespace(name="nt", environ={"SYSTEMROOT": str(system)})), \
+                    patch.object(startup.shutil, "which", side_effect=which):
+                env = startup.startup_environment(root)
+            self.assertEqual(env["PATH"], str(root / "OS tools only"))
+            self.assertEqual(env["SYSTEMROOT"], str(system))
+            self.assertEqual(list((root / "OS tools only").iterdir()), [])
+
+    def test_windows_start_uses_absolute_os_command_outside_application_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(startup.platform, "system", return_value="Windows"):
+                manager = startup.Startup(root / "home", "owned-task", root / "app.exe",
+                    {"HOME": str(root), "USERPROFILE": str(root), "SYSTEMROOT": str(root / "Windows"), "PATH": "empty"})
+            with patch.object(manager, "inspect"), patch.object(startup, "command") as command:
+                manager.start()
+            self.assertEqual(command.call_args.args[0],
+                [root / "Windows/System32/schtasks.exe", "/Run", "/TN", "owned-task"])
 
     def test_windows_task_identity_uses_actual_executable_and_unicode_argv(self):
         with tempfile.TemporaryDirectory() as temp:

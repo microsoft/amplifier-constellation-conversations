@@ -23,6 +23,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import time
@@ -63,6 +64,16 @@ def failure_summary(stdout, stderr) -> dict:
         return value[:8192]
     text = (prefix(stdout) + "\n" + prefix(stderr)).lower()
     reasons = {
+        "cannot_commit_private_state": ("cannot commit private state",),
+        "native_update_journal_commit": ("cannot publish native update journal",),
+        "installed_bundle_receipt_commit": ("cannot commit installed bundle receipt",),
+        "native_installation_receipt_commit": ("cannot persist native installation receipt",),
+        "native_service_executable_replace": ("cannot replace native service executable",),
+        "companion_bundle_bindings_commit": ("cannot commit companion bundle bindings",),
+        "immutable_native_bundle_stage": ("cannot stage immutable native bundle",),
+        "rollback_bundle_switch_failed": ("update failed; rollback bundle switch also failed",),
+        "previous_bundle_verification_failed": ("update failed; previous bundle verification also failed",),
+        "previous_availability_restoration_failed": ("update failed; previous availability restoration also failed",),
         "private_storage_policy": ("cannot create private storage policy",),
         "private_storage_permissions": ("cannot restrict application storage to this windows user",),
         "existing_executable_preserved": ("existing executable preserved",),
@@ -97,6 +108,140 @@ def digest(data: bytes) -> str:
 
 def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def diagnostic_json(path: Path) -> tuple[str, dict]:
+    """Read one fixed ordinary file, retaining neither its text nor errors."""
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return "not_regular", {}
+        with path.open("rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return "not_regular", {}
+            data = stream.read(1024 * 1024 + 1)
+        if len(data) > 1024 * 1024:
+            return "too_large", {}
+        value = json.loads(data)
+        return ("available", value) if type(value) is dict else ("invalid", {})
+    except FileNotFoundError:
+        return "absent", {}
+    except (ValueError, UnicodeError):
+        return "invalid", {}
+    except Exception:
+        return "unavailable", {}
+
+
+def failure_state_snapshot(home: Path, service_name: str) -> dict:
+    """Best-effort fixed-state reads only; never invoke an installed service."""
+    status, journal = diagnostic_json(home / "native-update.json")
+    summary = {"status": status}
+    for field, choices in {
+        "phase": {"intent", "deferred", "preparing", "prepared", "switching", "applied",
+                  "verifying", "verified", "restoring", "restored"},
+        "direction": {"unchanged", "applied", "rolled_back"},
+        "selected": {"previous", "candidate"},
+        "restore_outcome": {"unchanged", "applied", "rolled_back"},
+    }.items():
+        value = journal.get(field)
+        summary[field] = value if type(value) is str and value in choices else None
+    for field in ["restore_started", "rollback_aborted"]:
+        value = journal.get(field)
+        summary[field] = value if type(value) is bool else None
+    child = journal.get("child_pid")
+    summary["child_pid_present"] = (child > 0 if type(child) is int else
+                                    False if child is None and status == "available" else None)
+    exit_status, exit_receipt = diagnostic_json(home / "native-update-process-exit.json")
+    confirmed = exit_receipt.get("exit_confirmed")
+    result = {"consistency": "best_effort_read_only_snapshot", "journal": summary,
+              "process_exit_receipt": {"status": exit_status,
+                  "exit_confirmed": confirmed if type(confirmed) is bool else None},
+              "admission": {"status": "unavailable", "closed": None},
+              "installed_binary": {"status": "unavailable", "matches_previous": None,
+                                   "matches_candidate": None}}
+    db = None
+    try:
+        database = home / "state.sqlite3"
+        if not stat.S_ISREG(database.lstat().st_mode):
+            result["admission"]["status"] = "not_regular"
+        else:
+            # mode=ro prevents writes to application data. Do not use immutable:
+            # admission may still be in WAL, which immutable connections ignore.
+            db = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
+            deadline = time.monotonic() + 1
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA trusted_schema=OFF")
+            ordinary_table = db.execute("SELECT type FROM sqlite_schema WHERE name='native_update_admission'").fetchone()
+            if ordinary_table != ("table",):
+                result["admission"]["status"] = "invalid"
+            else:
+                row = db.execute("SELECT EXISTS(SELECT 1 FROM native_update_admission WHERE phase='prepared')").fetchone()
+                if row and type(row[0]) is int and row[0] in (0, 1):
+                    result["admission"].update(status="available", closed=bool(row[0]))
+    except FileNotFoundError:
+        result["admission"]["status"] = "absent"
+    except Exception:
+        pass
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+    try:
+        # The name comes from the inspected package entrypoint, never journal
+        # paths. Reject malformed names and nonordinary files before hashing.
+        if not service_name or Path(service_name).name != service_name:
+            raise ValueError("Invalid fixed service filename")
+        binary = home / "bin" / service_name
+        if not stat.S_ISDIR(binary.parent.lstat().st_mode) or not stat.S_ISREG(binary.lstat().st_mode):
+            result["installed_binary"]["status"] = "not_regular"
+        else:
+            with binary.open("rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    result["installed_binary"]["status"] = "not_regular"
+                elif info.st_size > 512 * 1024 * 1024:
+                    result["installed_binary"]["status"] = "too_large"
+                else:
+                    value = hashlib.sha256()
+                    remaining = info.st_size
+                    deadline = time.monotonic() + 2
+                    while remaining:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Binary snapshot allowance exceeded")
+                        chunk = stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise ValueError("Binary changed during snapshot")
+                        value.update(chunk)
+                        remaining -= len(chunk)
+                    after = os.fstat(stream.fileno())
+                    if (after.st_size, after.st_mtime_ns) != (info.st_size, info.st_mtime_ns):
+                        raise ValueError("Binary changed during snapshot")
+                    actual = value.hexdigest()
+                    result["installed_binary"]["status"] = "available"
+                    for role in ["previous", "candidate"]:
+                        captured = journal.get(role)
+                        expected = captured.get("binary_sha256") if type(captured) is dict else None
+                        if type(expected) is str and re.fullmatch(r"[0-9a-f]{64}", expected):
+                            result["installed_binary"]["matches_" + role] = actual == expected
+    except FileNotFoundError:
+        result["installed_binary"]["status"] = "absent"
+    except Exception:
+        pass
+    return result
+
+
+def capture_failure_snapshots(installations: list) -> dict:
+    snapshots = {}
+    for name, installation in installations:
+        try:
+            snapshots[name] = installation.failure_snapshot()
+        except Exception:
+            # Even an unexpected diagnostic failure must not bypass cleanup or
+            # expose an exception carrying source paths or private state.
+            snapshots[name] = {"status": "unavailable"}
+    return snapshots
 
 
 def write_json(path: Path, value) -> None:
@@ -301,6 +446,9 @@ class Installation:
 
     def journal(self):
         return read_json(self.home / "native-update.json")
+
+    def failure_snapshot(self):
+        return failure_state_snapshot(self.home, self.worker.name)
 
     def protocol(self, mode: str, action: str, *, transaction=None, envelope=None, outcome="unchanged", expect_success=True):
         extra = {}
@@ -747,6 +895,12 @@ def qualify(archive: Path, receipt: Path, output: Path) -> dict:
         failure = error
         result.update(status="failed", error=str(error))
     finally:
+        if failure is not None:
+            result["failure_installation_snapshots"] = capture_failure_snapshots(installations)
+            try:
+                persist_checkpoint(output, result)
+            except Exception:
+                result["failure_snapshot_checkpoint"] = "unavailable"
         try:
             cleanup_errors = []
             cleanup_receipts = {}

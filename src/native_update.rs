@@ -71,7 +71,12 @@ fn save(path: &Path, v: &Value) -> Result<()> {
     } else {
         None
     };
-    config::private_write(path, &serde_json::to_vec_pretty(v)?)
+    let context = match path.file_name().and_then(|v| v.to_str()) {
+        Some(JOURNAL) => "Cannot publish native update journal",
+        Some(INSTALLED) => "Cannot commit installed bundle receipt",
+        _ => "Cannot persist native installation receipt",
+    };
+    config::private_write(path, &serde_json::to_vec_pretty(v)?).context(context)
 }
 fn id(value: &str) -> Result<()> {
     uuid::Uuid::parse_str(value)?;
@@ -169,7 +174,8 @@ pub fn startup_change_guard(home: &Path) -> Result<InstallationLock> {
 fn write_binary(from: &Path, to: &Path) -> Result<()> {
     ordinary(from)?;
     config::private_dir(to.parent().context("Missing binary folder")?)?;
-    config::private_write(to, &fs::read(from)?)?;
+    let bytes = fs::read(from).context("Cannot read selected native service executable")?;
+    config::private_write(to, &bytes).context("Cannot replace native service executable")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -237,7 +243,9 @@ pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
     let _service = lock(home, "service.lock")?;
     let c = Config::load(home)?;
     let incoming = package_record(native_bundle::verify(package)?)?;
-    let selected = package_record(native_bundle::install(package, home)?)?;
+    let selected = package_record(
+        native_bundle::install(package, home).context("Cannot stage immutable native bundle")?,
+    )?;
     if home.join(INSTALLED).exists() {
         let old = installed(home)?;
         ensure!(
@@ -261,7 +269,8 @@ pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
         )?;
     }
     if let Some(bytes) = after {
-        config::private_write(&home.join("companion.json"), &bytes)?;
+        config::private_write(&home.join("companion.json"), &bytes)
+            .context("Cannot commit Companion bundle bindings")?;
     }
     let record = json!({"schema":1,"id":c.id,"package":selected});
     save(&home.join(INSTALLED), &record)?;
@@ -277,7 +286,9 @@ pub fn plan(home: &Path, package: &Path) -> Result<Value> {
             "Finish the retained update before planning another"
         );
     }
-    let candidate = package_record(native_bundle::install(package, home)?)?;
+    let candidate = package_record(
+        native_bundle::install(package, home).context("Cannot stage immutable native bundle")?,
+    )?;
     let before = companion(home)?;
     let _ = rebind(before.as_deref(), &old["package"], &candidate)?;
     Ok(
@@ -618,7 +629,8 @@ fn switch(home: &Path, j: &Value, rollback: bool) -> Result<()> {
         &binary(home),
     )?;
     if let Some(bytes) = if rollback { old } else { new } {
-        config::private_write(&home.join("companion.json"), &bytes)?;
+        config::private_write(&home.join("companion.json"), &bytes)
+            .context("Cannot commit Companion bundle bindings")?;
     }
     save(
         &home.join(INSTALLED),
@@ -1015,9 +1027,15 @@ pub async fn run(home: &Path, package: &Path) -> Result<Value> {
     }
     .await
     {
-        apply(home, &transaction, &p, true).await?;
-        verify(home, &transaction).await?;
-        restore(home, &transaction, "rolled_back").await?;
+        apply(home, &transaction, &p, true)
+            .await
+            .context("Update failed; rollback bundle switch also failed")?;
+        verify(home, &transaction)
+            .await
+            .context("Update failed; previous bundle verification also failed")?;
+        restore(home, &transaction, "rolled_back")
+            .await
+            .context("Update failed; previous availability restoration also failed")?;
         anyhow::bail!("Update failed and previous bundle was restored: {error}");
     }
     restore(home, &transaction, "applied").await

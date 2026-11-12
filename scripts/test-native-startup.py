@@ -89,13 +89,13 @@ def startup_environment(root: Path) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key.upper() in keep}
     tools = root / "OS tools only"
     tools.mkdir()
-    if os.name == "nt":
-        env["PATH"] = str(Path(env["SYSTEMROOT"]) / "System32")
-    else:
+    if os.name != "nt":
         systemctl = shutil.which("systemctl") if platform.system() == "Linux" else None
         if systemctl:
             (tools / "systemctl").symlink_to(Path(systemctl).resolve())
-        env["PATH"] = str(tools)
+    # System32 can expose wsl.exe on Windows 11. Keep the application PATH
+    # isolated on Windows too; this controller names required OS tools exactly.
+    env["PATH"] = str(tools)
     for tool in clean.TOOLS:
         require(shutil.which(tool, path=env["PATH"]) is None,
                 f"Developer tool is present in startup CLI PATH: {tool}")
@@ -241,7 +241,7 @@ catch {if ($_.Exception.HResult -eq -2147024894 -or $_.Exception.InnerException.
         elif self.system == "Darwin":
             command(["/bin/launchctl", "bootstrap", self.domain, self.path], env=self.env)
         else:
-            command(["schtasks.exe", "/Run", "/TN", self.label], env=self.env)
+            command([Path(self.env["SYSTEMROOT"]) / "System32/schtasks.exe", "/Run", "/TN", self.label], env=self.env)
 
     def stop(self) -> None:
         # Inspect the complete fixed command before affecting a registration.
@@ -262,7 +262,7 @@ catch {if ($_.Exception.HResult -eq -2147024894 -or $_.Exception.InnerException.
         else:
             task = self.task()
             if task is not None and task["state"] in {2, 4}:
-                command(["schtasks.exe", "/End", "/TN", self.label], env=self.env)
+                command([Path(self.env["SYSTEMROOT"]) / "System32/schtasks.exe", "/End", "/TN", self.label], env=self.env)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 task = self.task()

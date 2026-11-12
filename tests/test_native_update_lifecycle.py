@@ -98,6 +98,156 @@ class LifecycleControllerTests(unittest.TestCase):
         self.assertEqual(diagnostic["reason_tags"], [])
         self.assertTrue(diagnostic["stderr"]["sample_truncated"])
 
+    def test_atomic_write_and_rollback_contexts_have_fixed_reason_tags(self):
+        contexts = {
+            "Cannot commit private state": "cannot_commit_private_state",
+            "Cannot publish native update journal": "native_update_journal_commit",
+            "Cannot commit installed bundle receipt": "installed_bundle_receipt_commit",
+            "Cannot persist native installation receipt": "native_installation_receipt_commit",
+            "Cannot replace native service executable": "native_service_executable_replace",
+            "Cannot commit companion bundle bindings": "companion_bundle_bindings_commit",
+            "Cannot stage immutable native bundle": "immutable_native_bundle_stage",
+            "Update failed; rollback bundle switch also failed": "rollback_bundle_switch_failed",
+            "Update failed; previous bundle verification also failed": "previous_bundle_verification_failed",
+            "Update failed; previous availability restoration also failed": "previous_availability_restoration_failed",
+        }
+        for context, tag in contexts.items():
+            with self.subTest(tag=tag):
+                diagnostic = lifecycle.failure_summary(None, context + ": secret-path secret-nonce (os error 5)")
+                self.assertEqual(diagnostic["reason_tags"], [tag])
+                self.assertEqual(diagnostic["os_error_codes"], [5])
+                self.assertNotIn("secret", json.dumps(diagnostic))
+
+    def test_failure_snapshot_retains_only_allowlisted_state_and_digest_comparisons(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            binary = home / "bin/app"
+            binary.parent.mkdir()
+            binary.write_bytes(b"secret-executable-bytes")
+            previous = lifecycle.digest(binary.read_bytes())
+            candidate = lifecycle.digest(b"candidate-secret")
+            journal = {"phase": "switching", "direction": "rolled_back", "selected": "previous",
+                "restore_started": False, "rollback_aborted": True, "restore_outcome": "unchanged",
+                "child_pid": 19790212, "previous": {"binary_sha256": previous, "bundle": "secret-previous-path"},
+                "candidate": {"binary_sha256": candidate, "bundle": "secret-candidate-path"},
+                "context": {"token": "secret-token"}, "launch_nonce": "secret-nonce"}
+            lifecycle.write_json(home / "native-update.json", journal)
+            lifecycle.write_json(home / "native-update-process-exit.json", {
+                "exit_confirmed": False, "pid": 19790212, "process_birth": "secret-birth", "process_nonce": "secret-nonce"})
+            database = lifecycle.sqlite3.connect(home / "state.sqlite3")
+            try:
+                database.execute("PRAGMA journal_mode=WAL")
+                database.execute("CREATE TABLE native_update_admission(transaction_id TEXT, phase TEXT)")
+                database.execute("INSERT INTO native_update_admission VALUES('secret-transaction', 'prepared')")
+                database.commit()
+                before = (home / "native-update.json").read_bytes()
+                with patch.object(lifecycle.subprocess, "Popen", side_effect=AssertionError("No subprocess allowed")), \
+                        patch.object(lifecycle.urllib.request, "urlopen", side_effect=AssertionError("No service query allowed")):
+                    snapshot = lifecycle.failure_state_snapshot(home, "app")
+                self.assertEqual((home / "native-update.json").read_bytes(), before)
+                self.assertEqual(database.execute("SELECT phase FROM native_update_admission").fetchall(), [("prepared",)])
+            finally:
+                database.close()
+            self.assertEqual(snapshot["journal"], {"status": "available", "phase": "switching",
+                "direction": "rolled_back", "selected": "previous", "restore_outcome": "unchanged",
+                "restore_started": False, "rollback_aborted": True, "child_pid_present": True})
+            self.assertEqual(snapshot["admission"], {"status": "available", "closed": True})
+            self.assertEqual(snapshot["installed_binary"], {"status": "available", "matches_previous": True,
+                "matches_candidate": False})
+            self.assertEqual(snapshot["process_exit_receipt"], {"status": "available", "exit_confirmed": False})
+            text = json.dumps(snapshot)
+            for sensitive in ["secret", previous, candidate, "19790212", str(home)]:
+                self.assertNotIn(sensitive, text)
+
+    def test_failure_snapshot_absent_state_does_not_create_installation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "absent-secret-home"
+            snapshot = lifecycle.failure_state_snapshot(home, "app")
+            self.assertFalse(home.exists())
+            for name in ["journal", "admission", "installed_binary", "process_exit_receipt"]:
+                self.assertEqual(snapshot[name]["status"], "absent")
+                self.assertTrue(all(value is None for key, value in snapshot[name].items() if key != "status"))
+            self.assertNotIn("secret", json.dumps(snapshot))
+
+    def test_failure_snapshot_rejects_malformed_values_without_coercion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            lifecycle.write_json(home / "native-update.json", {"phase": ["secret-phase"],
+                "direction": {"secret-direction": True}, "selected": "secret-path", "restore_outcome": 1,
+                "restore_started": 1, "rollback_aborted": "true", "child_pid": True,
+                "previous": {"binary_sha256": "secret-digest"}, "candidate": ["secret"]})
+            lifecycle.write_json(home / "native-update-process-exit.json", {"exit_confirmed": "secret-value"})
+            (home / "state.sqlite3").write_bytes(b"secret malformed database")
+            (home / "bin").mkdir()
+            (home / "bin/app").write_bytes(b"secret")
+            snapshot = lifecycle.failure_state_snapshot(home, "app")
+            self.assertTrue(all(value is None for key, value in snapshot["journal"].items() if key != "status"))
+            self.assertEqual(snapshot["admission"], {"status": "unavailable", "closed": None})
+            self.assertEqual(snapshot["installed_binary"], {"status": "available", "matches_previous": None,
+                "matches_candidate": None})
+            self.assertIsNone(snapshot["process_exit_receipt"]["exit_confirmed"])
+            self.assertNotIn("secret", json.dumps(snapshot))
+            for malformed in [b'{"secret":', b'["secret"]', b'\xffsecret']:
+                (home / "native-update.json").write_bytes(malformed)
+                self.assertEqual(lifecycle.failure_state_snapshot(home, "app")["journal"]["status"], "invalid")
+
+    def test_failure_snapshot_bounds_files_and_rejects_admission_views(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / "native-update.json").write_bytes(b"x" * (1024 * 1024 + 1))
+            (home / "bin").mkdir()
+            with (home / "bin/app").open("wb") as stream:
+                stream.truncate(512 * 1024 * 1024 + 1)
+            database = lifecycle.sqlite3.connect(home / "state.sqlite3")
+            try:
+                database.execute("CREATE VIEW native_update_admission AS SELECT 'prepared' AS phase")
+                database.commit()
+            finally:
+                database.close()
+            snapshot = lifecycle.failure_state_snapshot(home, "app")
+            self.assertEqual(snapshot["journal"]["status"], "too_large")
+            self.assertEqual(snapshot["installed_binary"]["status"], "too_large")
+            self.assertEqual(snapshot["admission"], {"status": "invalid", "closed": None})
+
+    def test_precleanup_snapshot_errors_do_not_skip_either_owned_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = {"target": "fixture-target", "source_revision": "fixture-revision", "files": []}
+            manifest_bytes = json.dumps(manifest).encode()
+            receipt, output = root / "receipt.json", root / "result.json"
+            lifecycle.write_json(receipt, {"archive_sha256": "fixture-archive",
+                "manifest_sha256": lifecycle.digest(manifest_bytes)})
+            primary, secondary = Mock(), Mock()
+            primary.failure_snapshot.return_value = {"journal": {"phase": "restored"}}
+            secondary.failure_snapshot.side_effect = RuntimeError("secret-diagnostic-error")
+            cleanup_order = []
+            def cleanup(name):
+                snapshots = lifecycle.read_json(output)["failure_installation_snapshots"]
+                self.assertEqual(snapshots["primary"], {"journal": {"phase": "restored"}})
+                self.assertEqual(snapshots["explicit_rollback_failure"], {"status": "unavailable"})
+                cleanup_order.append(name)
+                return {"owned_children_reaped": True}
+            primary.cleanup.side_effect = lambda candidate: cleanup("primary")
+            secondary.cleanup.side_effect = lambda candidate: cleanup("secondary")
+            def derive(source, destination, label, **kwargs):
+                destination.mkdir()
+                (destination / "manifest.json").write_bytes(manifest_bytes)
+            package = Mock()
+            package.inspect_archive.return_value = manifest, {"manifest.json": manifest_bytes}
+            with patch.object(lifecycle.clean, "package_module", return_value=package), \
+                    patch.object(lifecycle.clean, "native_target", return_value="fixture-target"), \
+                    patch.object(lifecycle, "derive_bundle", side_effect=derive), \
+                    patch.object(lifecycle, "Installation", side_effect=[primary, secondary]), \
+                    patch.object(lifecycle, "exercise"), \
+                    patch.object(lifecycle, "exercise_failed_explicit_rollback", side_effect=RuntimeError("fixture failed")):
+                with self.assertRaisesRegex(RuntimeError, "fixture failed"):
+                    lifecycle.qualify(root / "archive", receipt, output)
+            self.assertEqual(cleanup_order, ["secondary", "primary"])
+            result = lifecycle.read_json(output)
+            self.assertTrue(result["temporary_installation_removed"])
+            self.assertEqual(result["status"], "failed")
+            self.assertNotIn("secret", output.read_text())
+
     def test_fixture_path_evidence_counts_unicode_without_retaining_paths(self):
         root = PureWindowsPath(r"C:\secret-user\fixture café 🧪")
         home = root / "Companion installation 日本語"
