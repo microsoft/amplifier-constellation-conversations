@@ -226,12 +226,13 @@ fn manager_identity<'a>(service: &Service, native: &'a Value) -> Result<&'a Valu
     );
     let manager = &processes[0];
     let manager_pid = pid(&manager["identity"])?;
+    let manager_pid_text = manager_pid.to_string();
     match service.manager {
         ServiceManager::SystemdUser => {
             ensure!(
                 manager["role"] == "MainPID"
                     && native["native"]["Id"] == service.name
-                    && native["native"]["MainPID"] == manager_pid.to_string()
+                    && native["native"]["MainPID"].as_str() == Some(manager_pid_text.as_str())
                     && native["native"]["ControlPID"] == "0",
                 "Systemd application generation is not confirmed"
             );
@@ -248,7 +249,8 @@ fn manager_identity<'a>(service: &Service, native: &'a Value) -> Result<&'a Valu
         ServiceManager::LaunchAgent => {
             ensure!(
                 manager["role"] == "launchd_pid"
-                    && native["native"]["properties"]["pid"] == manager_pid.to_string(),
+                    && native["native"]["properties"]["pid"].as_str()
+                        == Some(manager_pid_text.as_str()),
                 "LaunchAgent application generation is not confirmed"
             );
         }

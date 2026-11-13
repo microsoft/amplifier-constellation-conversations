@@ -42,11 +42,12 @@ impl Fixture {
             "enabled":true,"start_allowed":true,"masked":false,"loaded":true,
             "active":true,"transitioning":false,
             "processes":[{"role":"MainPID","identity":process}],
-            "native":{"Id":service.name,"Names":service.name,"UnitFileState":"enabled",
+            "native":{"Id":service.name,"Names":service.name,"LoadState":"loaded","UnitFileState":"enabled",
                 "MainPID":std::process::id().to_string(),"ControlPID":"0",
                 "FragmentPath":"fixed fixture","SourcePath":"","DropInPaths":"",
                 "NeedDaemonReload":"no","RefuseManualStart":"no","RefuseManualStop":"no",
-                "ExecStart":"fixed fixture","ExecStop":"","Restart":"no","KillMode":"control-group",
+                "ExecStart":format!("{{ path=/fixture/Companion café 日本語 ; argv[]=/fixture/Companion café 日本語 --home /fixture/home serve ; ignore_errors=no ; start_time=[Thu 2026-11-12 21:46:12 PST] ; stop_time=[n/a] ; pid={} ; code=(null) ; status=0/0 }}",std::process::id()),
+                "Restart":"no","KillMode":"control-group",
                 "Type":"simple","InvocationID":"a".repeat(32)}
         });
         match service.manager {
@@ -89,9 +90,12 @@ impl Fixture {
         let mut native = j["launch_cleanup"]["authority"]["native_snapshot"].clone();
         native["active"] = json!(false);
         native["processes"] = json!([]);
-        native["native"]["MainPID"] = json!("0");
-        native["native"]["instances"] = json!([]);
-        native["native"]["properties"] = json!({});
+        match native["service"]["manager"].as_str().unwrap() {
+            "systemd_user" => native["native"]["MainPID"] = json!("0"),
+            "launch_agent" => native["native"]["properties"] = json!({}),
+            "scheduled_task" => native["native"]["instances"] = json!([]),
+            manager => panic!("Unexpected fixture manager {manager}"),
+        }
         j["launch_cleanup"]["revoked"] = json!(true);
         j["launch_cleanup"]["stop"] = json!({"status":"accepted"});
         j["launch_cleanup"]["exit_before_switch"] = json!({
@@ -301,6 +305,7 @@ fn systemd_policy_fields_must_remain_present_strings_even_when_both_sides_match(
     for field in [
         "Id",
         "Names",
+        "LoadState",
         "UnitFileState",
         "FragmentPath",
         "SourcePath",
@@ -309,7 +314,6 @@ fn systemd_policy_fields_must_remain_present_strings_even_when_both_sides_match(
         "RefuseManualStart",
         "RefuseManualStop",
         "ExecStart",
-        "ExecStop",
         "Restart",
         "KillMode",
         "Type",
@@ -367,6 +371,110 @@ fn systemd_invocation_absence_or_malformed_value_is_not_a_settled_empty_id() {
         assert!(same_policy(&malformed, &settled).is_err());
         assert!(same_policy(&malformed, &malformed).is_err());
     }
+}
+
+// Captured systemctl rendering from the failed, retained actual manager run.
+// These are fixture paths and times, not a live service lookup.
+const ACCEPTED_EXEC_START: &str = "{ path=/tmp/Companion prestatus café 7sb2vefn/managed/Companion installation 日本語/bin/agent-conversations ; argv[]=/tmp/Companion prestatus café 7sb2vefn/managed/Companion installation 日本語/bin/agent-conversations --home /tmp/Companion prestatus café 7sb2vefn/managed/Companion installation 日本語 serve ; ignore_errors=no ; start_time=[Thu 2026-11-12 21:46:12 PST] ; stop_time=[n/a] ; pid=2553397 ; code=(null) ; status=0/0 }";
+const STOPPED_EXEC_START: &str = "{ path=/tmp/Companion prestatus café 7sb2vefn/managed/Companion installation 日本語/bin/agent-conversations ; argv[]=/tmp/Companion prestatus café 7sb2vefn/managed/Companion installation 日本語/bin/agent-conversations --home /tmp/Companion prestatus café 7sb2vefn/managed/Companion installation 日本語 serve ; ignore_errors=no ; start_time=[Thu 2026-11-12 21:46:12 PST] ; stop_time=[Thu 2026-11-12 21:46:44 PST] ; pid=2553397 ; code=killed ; status=15/TERM }";
+
+#[test]
+fn actual_advertised_execstart_shape_accepts_termination_without_inventing_execstop() {
+    let fixture = Fixture::new();
+    let mut before = fixture.journal["launch_cleanup"]["authority"]["native_snapshot"].clone();
+    before["service"]["manager"] = json!("systemd_user");
+    before["native"]["ExecStart"] = json!(ACCEPTED_EXEC_START);
+    assert!(before["native"].get("ExecStop").is_none());
+    let mut stopped = before.clone();
+    stopped["active"] = json!(false);
+    stopped["processes"] = json!([]);
+    stopped["native"]["MainPID"] = json!("0");
+    stopped["native"]["ActiveState"] = json!("inactive");
+    stopped["native"]["SubState"] = json!("dead");
+    stopped["native"]["ExecStart"] = json!(STOPPED_EXEC_START);
+    same_policy(&before, &stopped).unwrap();
+    assert_eq!(stopped["native"]["ExecStart"], STOPPED_EXEC_START);
+    assert!(stopped["native"].get("ExecStop").is_none());
+    // Ordinary exit has a different known result, but is still not health.
+    stopped["native"]["ExecStart"] = json!(STOPPED_EXEC_START.replace(
+        "code=killed ; status=15/TERM",
+        "code=exited ; status=0/SUCCESS"
+    ));
+    same_policy(&before, &stopped).unwrap();
+    stopped["effective_definition"]["text"] = json!("changed loaded command");
+    assert!(same_policy(&before, &stopped).is_err());
+}
+
+#[test]
+fn execstart_command_and_accepted_execution_identity_cannot_change_during_stop() {
+    let fixture = Fixture::new();
+    let mut before = fixture.journal["launch_cleanup"]["authority"]["native_snapshot"].clone();
+    before["service"]["manager"] = json!("systemd_user");
+    before["native"]["ExecStart"] = json!(ACCEPTED_EXEC_START);
+    same_policy(&before, &before).unwrap();
+    for (old, new) in [
+        ("path=/tmp/", "path=/different/"),
+        (" serve ; ignore_errors", " serve --other ; ignore_errors"),
+        ("ignore_errors=no", "ignore_errors=yes"),
+        (
+            "start_time=[Thu 2026-11-12 21:46:12 PST]",
+            "start_time=[Thu 2026-11-12 21:46:13 PST]",
+        ),
+        ("pid=2553397", "pid=2553398"),
+    ] {
+        let mut changed = before.clone();
+        changed["native"]["ExecStart"] = json!(STOPPED_EXEC_START.replace(old, new));
+        assert!(same_policy(&before, &changed).is_err(), "{old}");
+    }
+}
+
+#[test]
+fn unknown_or_malformed_execstart_renderer_records_are_not_normalized() {
+    for text in [
+        String::new(),
+        "fixed fixture".into(),
+        ACCEPTED_EXEC_START.replace("/tmp/", "tmp/"),
+        format!("{ACCEPTED_EXEC_START} {ACCEPTED_EXEC_START}"),
+        ACCEPTED_EXEC_START.replace(" ; code=(null)", " ; unknown_runtime=0 ; code=(null)"),
+        ACCEPTED_EXEC_START.replace(" ; code=(null)", " ; code=(null) ; code=killed"),
+        ACCEPTED_EXEC_START.replace("stop_time=[n/a]", "stop_time=n/a"),
+        ACCEPTED_EXEC_START.replace("stop_time=[n/a]", "stop_time=[[n/a]]"),
+        ACCEPTED_EXEC_START.replace("pid=2553397", "pid=0"),
+        ACCEPTED_EXEC_START.replace("pid=2553397", "pid=02553397"),
+        ACCEPTED_EXEC_START.replace("code=(null)", "code=unknown"),
+        ACCEPTED_EXEC_START.replace("status=0/0", "status=0"),
+        ACCEPTED_EXEC_START.replace("status=0/0", "status=0/UNKNOWN/EXTRA"),
+        ACCEPTED_EXEC_START.replace("status=0/0", "status=0/"),
+        ACCEPTED_EXEC_START.replace("status=0/0", "status=-1/UNKNOWN"),
+        ACCEPTED_EXEC_START.replace("ignore_errors=no", "ignore_errors=unknown"),
+        ACCEPTED_EXEC_START.replace(" ; pid=", "\n ; pid="),
+    ] {
+        assert!(systemd_exec_identity(&json!(text)).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn optional_execstop_and_unknown_native_properties_remain_preserved() {
+    let fixture = Fixture::new();
+    let mut before = fixture.journal["launch_cleanup"]["authority"]["native_snapshot"].clone();
+    before["service"]["manager"] = json!("systemd_user");
+    same_policy(&before, &before).unwrap();
+    let mut changed = before.clone();
+    changed["native"]["ExecStop"] = json!("");
+    assert!(same_policy(&before, &changed).is_err());
+    same_policy(&changed, &changed).unwrap();
+    changed["native"]["ExecStop"] = Value::Null;
+    assert!(same_policy(&changed, &changed).is_err());
+    before["native"]["FutureStaticPolicy"] = json!("retained unknown value");
+    same_policy(&before, &before).unwrap();
+    changed = before.clone();
+    changed["native"]["FutureStaticPolicy"] = json!("different");
+    assert!(same_policy(&before, &changed).is_err());
+    changed["native"]
+        .as_object_mut()
+        .unwrap()
+        .remove("FutureStaticPolicy");
+    assert!(same_policy(&before, &changed).is_err());
 }
 
 #[test]

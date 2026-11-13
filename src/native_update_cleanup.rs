@@ -304,6 +304,102 @@ pub(super) fn revoke(j: &mut Value) -> Result<()> {
     Ok(())
 }
 
+/// systemctl renders ExecStart as one command followed by execution results.
+/// Preserve the command and accepted execution identity; a successful Stop may
+/// change only the known terminal fields. Unknown/multiple renderer records are
+/// refused, never stripped from the retained native evidence.
+#[derive(Debug, PartialEq, Eq)]
+struct SystemdExecIdentity<'a> {
+    path: &'a str,
+    argv: &'a str,
+    ignore_errors: &'a str,
+    start_time: &'a str,
+    pid: u32,
+}
+
+fn systemd_exec_identity(value: &Value) -> Result<SystemdExecIdentity<'_>> {
+    let text = value.as_str().context("Missing effective ExecStart")?;
+    ensure!(
+        !text.chars().any(char::is_control),
+        "Malformed effective ExecStart"
+    );
+    let record = text
+        .strip_prefix("{ ")
+        .and_then(|s| s.strip_suffix(" }"))
+        .context("Malformed effective ExecStart record")?;
+    let fields: Vec<_> = record.split(" ; ").collect();
+    ensure!(
+        fields.len() == 8,
+        "Unknown or multiple effective ExecStart records"
+    );
+    let field = |index: usize, name: &str| -> Result<&str> {
+        fields[index]
+            .strip_prefix(name)
+            .filter(|s| !s.is_empty())
+            .context("Malformed effective ExecStart field")
+    };
+    let path = field(0, "path=")?;
+    let argv = field(1, "argv[]=")?;
+    let ignore_errors = field(2, "ignore_errors=")?;
+    ensure!(
+        // This is systemd's POSIX rendering, even when reviewed on Windows.
+        path.starts_with('/')
+            && (argv == path || argv.strip_prefix(path).is_some_and(|s| s.starts_with(' ')))
+            && matches!(ignore_errors, "no" | "yes"),
+        "Malformed effective ExecStart command"
+    );
+    let timestamp = |value: &str| -> Result<()> {
+        let inner = value
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .context("Malformed effective ExecStart timestamp")?;
+        ensure!(
+            !inner.is_empty() && !inner.contains(['[', ']']),
+            "Malformed effective ExecStart timestamp"
+        );
+        Ok(())
+    };
+    let start_time = field(3, "start_time=")?;
+    timestamp(start_time)?;
+    timestamp(field(4, "stop_time=")?)?;
+    let pid_text = field(5, "pid=")?;
+    let pid: u32 = pid_text
+        .parse()
+        .context("Malformed effective ExecStart PID")?;
+    ensure!(
+        pid > 0 && pid.to_string() == pid_text,
+        "Missing effective ExecStart generation"
+    );
+    ensure!(
+        matches!(
+            field(6, "code=")?,
+            "(null)" | "exited" | "killed" | "dumped" | "trapped" | "stopped" | "continued"
+        ),
+        "Unknown effective ExecStart result code"
+    );
+    let (status, name) = field(7, "status=")?
+        .split_once('/')
+        .context("Malformed effective ExecStart status")?;
+    let number: u8 = status
+        .parse()
+        .context("Malformed effective ExecStart status number")?;
+    ensure!(
+        number.to_string() == status
+            && !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b"_+-".contains(&b)),
+        "Malformed effective ExecStart status name"
+    );
+    Ok(SystemdExecIdentity {
+        path,
+        argv,
+        ignore_errors,
+        start_time,
+        pid,
+    })
+}
+
 fn same_policy(before: &Value, after: &Value) -> Result<()> {
     for field in [
         "schema",
@@ -327,6 +423,7 @@ fn same_policy(before: &Value, after: &Value) -> Result<()> {
         for field in [
             "Id",
             "Names",
+            "LoadState",
             "UnitFileState",
             "FragmentPath",
             "SourcePath",
@@ -334,8 +431,6 @@ fn same_policy(before: &Value, after: &Value) -> Result<()> {
             "NeedDaemonReload",
             "RefuseManualStart",
             "RefuseManualStop",
-            "ExecStart",
-            "ExecStop",
             "Restart",
             "KillMode",
             "Type",
@@ -346,6 +441,42 @@ fn same_policy(before: &Value, after: &Value) -> Result<()> {
                     && before["native"][field] == after["native"][field],
                 "Effective service policy changed: {field}"
             );
+        }
+        let previous_exec = systemd_exec_identity(&before["native"]["ExecStart"])?;
+        let current_exec = systemd_exec_identity(&after["native"]["ExecStart"])?;
+        ensure!(
+            previous_exec == current_exec,
+            "Effective ExecStart command or accepted generation changed"
+        );
+        // ExecStop is requested by the shared observer, but systemd omits it
+        // when empty. Preserve it if present, as well as any future native
+        // properties, instead of manufacturing a required empty string.
+        let previous_native = before["native"]
+            .as_object()
+            .context("Missing native policy")?;
+        let current_native = after["native"]
+            .as_object()
+            .context("Missing native policy")?;
+        for key in previous_native.keys().chain(current_native.keys()) {
+            if !matches!(
+                key.as_str(),
+                "ExecStart"
+                    | "InvocationID"
+                    | "ActiveState"
+                    | "SubState"
+                    | "MainPID"
+                    | "ControlPID"
+            ) {
+                ensure!(
+                    previous_native.get(key) == current_native.get(key),
+                    "Native service property changed: {key}"
+                );
+            }
+        }
+        for native in [previous_native, current_native] {
+            if let Some(stop) = native.get("ExecStop") {
+                ensure!(stop.is_string(), "Malformed effective ExecStop");
+            }
         }
         let invocation = after["native"]["InvocationID"]
             .as_str()
