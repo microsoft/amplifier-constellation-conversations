@@ -1,6 +1,11 @@
 # Shared conversations
 
-Agent Conversations owns its browser conversations. An ACP connection identifies an existing independently running agent or an attach command; the service does not install agents, read their private state, or share Slack storage. The same endpoint may also be attached to Slack, Zed, or a fleet experience.
+Agent Conversations is the source for its rooms, membership and messages;
+browser and other authorized experiences use those same records. External
+platforms retain ownership of their conversations. An ACP connection identifies
+an existing independently running agent or an attach command; the service does
+not install agents, read their private state, or share Slack storage. The same
+endpoint may also be attached to Slack, Zed, or a fleet experience.
 
 The [shared agreements](README.md#shared-agreements) define cross-component
 ownership. This document defines local participation and access behavior; screen
@@ -44,6 +49,10 @@ Send that to `POST /api/v1/agents`, or use `agent-conversations --home … api P
 The UI puts connection setup in an advanced section. Browser view state accepts non-secret connection drafts; environment values, MCP credentials, passwords and tokens belong in protected operator configuration, not drafts. Ordinary members receive labels and IDs only, never endpoint commands or MCP/environment settings.
 
 ## Conversation and participation
+
+The [Conversation boundary](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/conversation.md)
+keeps the source-owned exchange distinct from an agent's execution session. The
+following room-to-session mapping is this service's ACP implementation contract.
 
 Each `(conversation, agent connection)` has its own resumable ACP session and public-message cursor. No session is reused across rooms or between agents. Changing an audience revokes source grants and resets working sessions. Sharing a formerly private conversation never carries its previous private ACP working context into the room.
 

@@ -23,8 +23,15 @@ where several people and agents can think and work together. Each agent should
 remain a recognizable individual, with its own identity and voice, and everyone
 should be able to understand who is contributing.
 
-Companion is the product experience; Conversations supplies reusable conversation
-services that can support it and other experiences. This vision leaves devices
-and interaction design open. The [current call service and reference client](companion.md)
-describe implemented support and its limits. The [shared agreements](README.md#shared-agreements)
-define the commitments between the services behind these experiences.
+Companion is an [Experience](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/experience.md)
+presenting Conversations. It can compose voice, visual tools and agent behavior
+around the exchange. These choices belong to this experience; they do not require
+other experiences to add another reasoning agent or prescribe how an
+[Agent Instance](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/agent-instance.md)
+works inside. Conversations supplies reusable services that Companion and other
+experiences can use independently.
+
+This vision leaves devices and interaction design open. The
+[current call service and reference client](companion.md) describe implemented
+support and its limits. The [shared agreements](README.md#shared-agreements)
+define the commitments between the parts behind these experiences.

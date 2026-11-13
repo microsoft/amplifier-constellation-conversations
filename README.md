@@ -5,13 +5,16 @@ agents**, part of [Amplifier Constellation](https://github.com/microsoft/amplifi
 
 Conversations supplies rooms, membership, messages, authorized source context and
 observable work huddles. Experience builders use these services through their
-APIs and tools. Current browser screens provide developer, administrator and
-reference access; products choose their own interaction.
+APIs and tools. These are source-owned conversations, distinct from the execution
+sessions of their participating agents. Current browser screens provide developer,
+administrator and reference access; products choose their own interaction.
 
 This repository also contains the current Companion call implementation.
 Companion is a distinct product for bringing an agent into the physical world
-through live talk, seeing and sharing. Its vision is separate from the services
-it uses and from the current preview's layout.
+through live talk, seeing and sharing. It is an Experience presenting Conversations
+in the family's [five-primitives model](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/README.md).
+Its vision is separate from the services it uses and from the current preview's
+layout. This repository remains the serving home for its current call interface.
 
 - [Conversations vision](docs/VISION.md): reusable conversation and coordination services.
 - [Companion vision](docs/companion-vision.md): live interaction in the physical world.
