@@ -179,6 +179,17 @@ diagnostic writes. It includes an opaque observation ID, process ID and a hash
 of the runtime generation when that generation can be read safely. Paths,
 credentials, package contents and raw error messages are excluded.
 
+Within a CHECK, each full bundle verification also records four fixed subphases: manifest and
+path validation, complete directory inventory, file metadata and content hashes,
+and executable entrypoint validation. These retain the same checks and order.
+Content verification still uses at most four joined workers. Subphase records
+contain no filenames or per-file events. They do not add records or I/O to
+standalone bundle verification or first launch. A normal three-scan CHECK fits within
+the existing 64-event bound; additional phase sequences retain explicit truncation.
+A slow content phase alone does not distinguish file metadata, reads, hashing,
+worker imbalance or operating-system inspection costs. A slow inventory phase
+does not establish antivirus or filesystem causation.
+
 This snapshot is observational only. `returned` means the synchronous CHECK
 function returned; it does not establish that the HTTP reply reached the caller.
 `unwound`, missing, stale, truncated or mismatched observations do not prove

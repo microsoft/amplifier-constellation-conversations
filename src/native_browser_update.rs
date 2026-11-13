@@ -1606,6 +1606,31 @@ mod tests {
         assert_eq!(observation["pid"], std::process::id());
         assert_eq!(observation["process_nonce_sha256"], auth::digest(&nonce));
         let events = observation["events"].as_array().unwrap();
+        assert_eq!(observation["truncated"], false);
+        assert_eq!(
+            events.len(),
+            58,
+            "all three verification scans and final response fit the unchanged 64-event bound"
+        );
+        for phase in [
+            "bundle_manifest",
+            "bundle_inventory",
+            "bundle_content",
+            "bundle_entrypoints",
+        ] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["phase"] == phase
+                        && event["state"] == "returned"
+                        && event["result"] == "ok")
+                    .count(),
+                3,
+                "previous, source and staged verification must each retain {phase}"
+            );
+        }
+        assert_eq!(events.last().unwrap()["phase"], "check_response");
+        assert_eq!(events.last().unwrap()["state"], "returned");
         for phase in [
             "check_cleanup",
             "check_previous_verify",

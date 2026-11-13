@@ -1,6 +1,7 @@
 //! Installation of an already acquired, immutable native bundle. This does not
 //! enroll updates, change an agent, replace configuration, or start a service.
 use crate::config;
+use crate::native_check_diagnostics::{Stage as CheckStage, observe as observe_check};
 use crate::native_installation_diagnostics::{Phase, observe};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -309,100 +310,109 @@ pub(crate) fn count_verifications<T>(operation: impl FnOnce() -> T) -> (T, usize
 fn load(root: &Path) -> Result<(Manifest, Vec<u8>, String)> {
     #[cfg(test)]
     VERIFICATION_COUNT.set(VERIFICATION_COUNT.get() + 1);
-    let root_meta = fs::symlink_metadata(root)?;
-    ensure!(
-        ordinary(&root_meta) && root_meta.file_type().is_dir(),
-        "Use a real bundle directory"
-    );
-    let path = root.join("manifest.json");
-    let meta = fs::symlink_metadata(&path)?;
-    ensure!(
-        ordinary(&meta) && meta.file_type().is_file() && meta.len() <= 16 * 1024 * 1024,
-        "Invalid bundle manifest"
-    );
-    let bytes = fs::read(path)?;
-    let m: Manifest = serde_json::from_slice(&bytes)?;
-    ensure!(
-        m.schema_version == 1 && m.component == "conversations",
-        "Unsupported bundle manifest"
-    );
-    ensure!(
-        m.target == target()?,
-        "This package is for {}, not this computer",
-        m.target
-    );
-    ensure!(
-        !m.version.is_empty()
-            && m.source_revision.len() == 40
-            && m.source_revision.bytes().all(|v| v.is_ascii_hexdigit()),
-        "Missing package provenance"
-    );
-    ensure!(
-        !m.files.is_empty() && m.files.len() <= 100_000,
-        "Invalid bundle file list"
-    );
-    let mut expected = BTreeSet::from(["manifest.json".to_owned()]);
-    let mut folded = BTreeSet::from(["manifest.json".to_owned()]);
-    for file in &m.files {
-        relative(&file.path)?;
+    let (m, bytes, expected) = observe_check(CheckStage::BundleManifest, || {
+        let root_meta = fs::symlink_metadata(root)?;
         ensure!(
-            file.sha256.len() == 64
-                && file.sha256.bytes().all(|v| v.is_ascii_hexdigit())
-                && expected.insert(file.path.clone()),
-            "Invalid or duplicate bundle file"
+            ordinary(&root_meta) && root_meta.file_type().is_dir(),
+            "Use a real bundle directory"
+        );
+        let path = root.join("manifest.json");
+        let meta = fs::symlink_metadata(&path)?;
+        ensure!(
+            ordinary(&meta) && meta.file_type().is_file() && meta.len() <= 16 * 1024 * 1024,
+            "Invalid bundle manifest"
+        );
+        let bytes = fs::read(path)?;
+        let m: Manifest = serde_json::from_slice(&bytes)?;
+        ensure!(
+            m.schema_version == 1 && m.component == "conversations",
+            "Unsupported bundle manifest"
         );
         ensure!(
-            folded.insert(file.path.to_lowercase()),
-            "Case-colliding bundle file"
+            m.target == target()?,
+            "This package is for {}, not this computer",
+            m.target
         );
-    }
-    let mut actual = BTreeSet::new();
-    enumerate(root, root, &mut actual)?;
-    ensure!(actual == expected, "Bundle has missing or unexpected files");
-    verify_files(root, &m.files)?;
-    for path in [
-        &m.entrypoints.service,
-        &m.entrypoints.node,
-        &m.entrypoints.bridge,
-        &m.entrypoints.mcp,
-    ] {
-        relative(path)?;
         ensure!(
-            m.files.iter().any(|v| &v.path == path),
-            "Missing bundle entrypoint"
+            !m.version.is_empty()
+                && m.source_revision.len() == 40
+                && m.source_revision.bytes().all(|v| v.is_ascii_hexdigit()),
+            "Missing package provenance"
         );
-    }
-    let windows = cfg!(windows);
-    ensure!(
-        m.entrypoints.service
-            == if windows {
-                "agent-conversations.exe"
-            } else {
-                "agent-conversations"
-            },
-        "Unexpected service entrypoint"
-    );
-    ensure!(
-        m.entrypoints.node
-            == if windows {
-                "runtime/node.exe"
-            } else {
-                "runtime/node"
-            },
-        "Unexpected Node entrypoint"
-    );
-    ensure!(
-        m.entrypoints.bridge == "bridge/live.mjs"
-            && m.entrypoints.mcp == "bridge/companion-mcp.mjs",
-        "Unexpected bridge entrypoint"
-    );
-    for path in [&m.entrypoints.service, &m.entrypoints.node] {
         ensure!(
-            m.files.iter().any(|v| &v.path == path && v.executable),
-            "Entrypoint is not executable"
+            !m.files.is_empty() && m.files.len() <= 100_000,
+            "Invalid bundle file list"
         );
-        native_executable(&root.join(path))?;
-    }
+        let mut expected = BTreeSet::from(["manifest.json".to_owned()]);
+        let mut folded = BTreeSet::from(["manifest.json".to_owned()]);
+        for file in &m.files {
+            relative(&file.path)?;
+            ensure!(
+                file.sha256.len() == 64
+                    && file.sha256.bytes().all(|v| v.is_ascii_hexdigit())
+                    && expected.insert(file.path.clone()),
+                "Invalid or duplicate bundle file"
+            );
+            ensure!(
+                folded.insert(file.path.to_lowercase()),
+                "Case-colliding bundle file"
+            );
+        }
+        Ok((m, bytes, expected))
+    })?;
+    observe_check(CheckStage::BundleInventory, || {
+        let mut actual = BTreeSet::new();
+        enumerate(root, root, &mut actual)?;
+        ensure!(actual == expected, "Bundle has missing or unexpected files");
+        Ok(())
+    })?;
+    observe_check(CheckStage::BundleContent, || verify_files(root, &m.files))?;
+    observe_check(CheckStage::BundleEntrypoints, || {
+        for path in [
+            &m.entrypoints.service,
+            &m.entrypoints.node,
+            &m.entrypoints.bridge,
+            &m.entrypoints.mcp,
+        ] {
+            relative(path)?;
+            ensure!(
+                m.files.iter().any(|v| &v.path == path),
+                "Missing bundle entrypoint"
+            );
+        }
+        let windows = cfg!(windows);
+        ensure!(
+            m.entrypoints.service
+                == if windows {
+                    "agent-conversations.exe"
+                } else {
+                    "agent-conversations"
+                },
+            "Unexpected service entrypoint"
+        );
+        ensure!(
+            m.entrypoints.node
+                == if windows {
+                    "runtime/node.exe"
+                } else {
+                    "runtime/node"
+                },
+            "Unexpected Node entrypoint"
+        );
+        ensure!(
+            m.entrypoints.bridge == "bridge/live.mjs"
+                && m.entrypoints.mcp == "bridge/companion-mcp.mjs",
+            "Unexpected bridge entrypoint"
+        );
+        for path in [&m.entrypoints.service, &m.entrypoints.node] {
+            ensure!(
+                m.files.iter().any(|v| &v.path == path && v.executable),
+                "Entrypoint is not executable"
+            );
+            native_executable(&root.join(path))?;
+        }
+        Ok(())
+    })?;
     let hash = hex(&Sha256::digest(&bytes));
     Ok((m, bytes, hash))
 }
@@ -592,6 +602,66 @@ mod tests {
         }).collect();
         fs::write(root.join("manifest.json"), serde_json::to_vec(&json!({"schema_version":1,"component":"conversations","version":"fixture","source_revision":"a".repeat(40),"target":target().unwrap(),"entrypoints":{"service":service,"node":node,"bridge":paths[2],"mcp":paths[3]},"files":files})).unwrap()).unwrap();
     }
+    #[test]
+    fn verification_trace_identifies_real_refusal_stage_without_private_details() {
+        let phases = [
+            "bundle_manifest",
+            "bundle_inventory",
+            "bundle_content",
+            "bundle_entrypoints",
+        ];
+        for failed in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("private-source-sentinel");
+            fs::create_dir(&source).unwrap();
+            fixture(&source);
+            match failed {
+                Some(0) => fs::write(source.join("manifest.json"), b"{").unwrap(),
+                Some(1) => fs::write(source.join("private-extra-sentinel"), b"unexpected").unwrap(),
+                Some(2) => fs::write(source.join("bridge/live.mjs"), [1u8; 128]).unwrap(),
+                Some(3) => {
+                    let path = source.join("manifest.json");
+                    let mut value: Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    value["entrypoints"]["bridge"] = json!("bridge/companion-mcp.mjs");
+                    fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                _ => (),
+            }
+            // Compare with the same real verifier without an observation scope.
+            let expected_error = load(&source).err().map(|error| error.to_string());
+            let home = temp.path().join("observation");
+            amplifier_native_platform::private_create_dir(&home).unwrap();
+            let result = crate::native_check_diagnostics::run_for_test(&home, || load(&source));
+            assert_eq!(result.err().map(|error| error.to_string()), expected_error);
+            let raw = fs::read(home.join("native-browser-update/check-observation.json")).unwrap();
+            let value: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(value["state"], "returned");
+            assert_eq!(
+                value["result"],
+                if failed.is_some() { "error" } else { "ok" }
+            );
+            assert_eq!(value["truncated"], false);
+            let events = value["events"].as_array().unwrap();
+            let count = failed.map_or(4, |index| index + 1);
+            assert_eq!(events.len(), count * 2);
+            for (index, phase) in phases.iter().take(count).enumerate() {
+                assert_eq!(events[index * 2]["phase"], *phase);
+                assert_eq!(events[index * 2]["state"], "started");
+                assert_eq!(events[index * 2 + 1]["phase"], *phase);
+                assert_eq!(events[index * 2 + 1]["state"], "returned");
+                assert_eq!(
+                    events[index * 2 + 1]["result"],
+                    if failed == Some(index) { "error" } else { "ok" }
+                );
+            }
+            let text = String::from_utf8(raw).unwrap();
+            assert!(!text.contains("private-source-sentinel"));
+            assert!(!text.contains("private-extra-sentinel"));
+            assert!(!text.contains(source.to_str().unwrap()));
+        }
+    }
+
     #[test]
     fn install_relocates_and_preserves_existing_state() {
         let tmp = tempfile::tempdir().unwrap();
