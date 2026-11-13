@@ -1393,3 +1393,17 @@ video.shared-media,audio.shared-media {width:100%}
 /* Long discussion and composer content stays reachable inside a fixed call. */
 .call-active .linked-huddles[open] {min-height:0;overflow-y:auto;overscroll-behavior:contain}
 .call-active .linked-huddles[open]>summary {position:sticky;top:0;z-index:1;background:var(--paper)}
+
+/* Consumer setup follows the contact surface and its existing palette. */
+.contact-setup{max-width:42rem;margin-block:2rem;padding-block:1.25rem;border-block:1px solid var(--line,#d8d7d1)}
+.contact-setup summary{cursor:pointer;font-weight:600;padding-block:.5rem;min-height:44px}
+.contact-setup form{display:grid;gap:.65rem;padding-block:1rem;max-width:34rem}
+.contact-setup h2{margin-block:.5rem}
+.contact-setup input,.contact-setup select{width:100%;min-height:44px;font:inherit;padding:.7rem;border:1px solid var(--line,#aaa);border-radius:.5rem;background:var(--paper,#fff);color:inherit}
+.contact-setup button{justify-self:start;min-height:44px;margin-top:.5rem}
+.contact-setup p{margin-block:.25rem .6rem;max-width:65ch}
+.login-card .setup-check{display:flex;align-items:start;gap:.6rem;margin-block:1rem;line-height:1.5;min-height:44px;font-weight:400}
+.setup-check input{width:auto;min-width:1.2rem;height:1.2rem;margin-top:.15rem}
+#setup-voice-fields:not([hidden]){display:grid;gap:.65rem}
+
+.contact-setup select:focus-visible{outline:3px solid #6b8cbb;outline-offset:4px}

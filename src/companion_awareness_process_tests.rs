@@ -81,7 +81,9 @@ async fn stalled_observer_and_descendant_are_stopped_without_facts() {
         tls_ca: None,
         import_source: "fixture".into(),
         import_surface: "fixture".into(),
-        agent: Agent {
+        auth_mode: Default::default(),
+        transport: Default::default(),
+        agent: Some(Agent {
             label: "Fixture".into(),
             command: executable.to_str().unwrap().into(),
             args: vec![],
@@ -91,7 +93,7 @@ async fn stalled_observer_and_descendant_are_stopped_without_facts() {
             mcp_servers: vec![],
             timeout_seconds: 30,
             client: Default::default(),
-        },
+        }),
     }
     .save(home.path())
     .unwrap();

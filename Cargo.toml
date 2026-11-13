@@ -10,7 +10,7 @@ description = "Browser conversations, people and agents, threads, approvals, and
 
 [dependencies]
 amplifier-acp-connection = { git = "https://github.com/microsoft/amplifier-constellation", rev = "fd95c20a5773a739c8a1c99fb69713a2f0849bf3" }
-amplifier-native-platform = { git = "https://github.com/microsoft/amplifier-constellation", rev = "2d8f4a3dba21631a4fefea00303d8c9b78a46e43" }
+amplifier-native-platform = { git = "https://github.com/microsoft/amplifier-constellation", rev = "02b79049e7da9e393463363782e07b89431f8617", features = ["local-auth", "installation"] }
 anyhow = "1"
 base64 = "0.22"
 axum = { version = "0.8.9", features = ["macros"] }
@@ -19,6 +19,9 @@ clap = { version = "4", features = ["derive"] }
 dunce = "1"
 futures-util = "0.3"
 fs2 = "0.4"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 if-addrs = { version = "0.15", features = ["link-local"] }
 libc = "0.2"
 rand = "0.8"

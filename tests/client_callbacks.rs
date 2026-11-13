@@ -79,7 +79,9 @@ for line in sys.stdin:
         tls_ca: None,
         import_source: "fixture".into(),
         import_surface: "fixture".into(),
-        agent: Agent {
+        auth_mode: Default::default(),
+        transport: Default::default(),
+        agent: Some(Agent {
             label: "ACP fixture".into(),
             command: "/usr/bin/python3".into(),
             args: vec![script.to_string_lossy().into_owned()],
@@ -89,7 +91,7 @@ for line in sys.stdin:
             mcp_servers: vec![],
             timeout_seconds: 30,
             client: ClientPolicy::default(),
-        },
+        }),
     };
     config.save(&home).unwrap();
     let state = AppState::open(home).unwrap();

@@ -58,7 +58,9 @@ fn fixture() -> Fixture {
         tls_ca: None,
         import_source: "fixture".into(),
         import_surface: "fixture".into(),
-        agent: Agent {
+        auth_mode: Default::default(),
+        transport: Default::default(),
+        agent: Some(Agent {
             label: "Coach".into(),
             command: "must-not-launch-an-agent-in-this-test".into(),
             args: vec![],
@@ -68,7 +70,7 @@ fn fixture() -> Fixture {
             mcp_servers: vec![],
             timeout_seconds: 30,
             client: Default::default(),
-        },
+        }),
     }
     .save(home.path())
     .unwrap();

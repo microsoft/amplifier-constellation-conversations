@@ -1,6 +1,7 @@
 use agent_conversations::{
-    config::{self, Agent, Config},
-    credentials, driver, native_bundle, native_update, native_update_protocol, platform, server,
+    config::{self, Agent, AuthMode, Config, Transport},
+    credentials, desktop, driver, native_bundle, native_update, native_update_protocol, platform,
+    server,
     state::AppState,
 };
 use anyhow::{Context, Result, ensure};
@@ -16,8 +17,11 @@ use std::{collections::BTreeMap, path::PathBuf};
 struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+    /// Start the desktop interface without opening a browser.
+    #[arg(long, global = true)]
+    no_browser: bool,
     #[command(subcommand)]
-    command: Action,
+    command: Option<Action>,
 }
 #[derive(Subcommand)]
 // One command is parsed once at startup; boxing individual CLI fields adds no value.
@@ -75,6 +79,13 @@ enum Action {
     ServeUpdate {
         transaction: String,
         nonce: String,
+    },
+    #[command(hide = true)]
+    NativeUpdateBrowserWorker {
+        #[arg(long)]
+        operation: String,
+        #[arg(long)]
+        attempt: String,
     },
     /// Retain, update or recover this complete installation without agent work.
     NativeUpdate {
@@ -207,13 +218,29 @@ enum ContextAction {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
+    let show_error = cli.command.is_none() && !cli.no_browser;
+    if let Err(error) = run(cli).await {
+        if show_error {
+            amplifier_native_platform::show_launch_error(
+                &native_bundle::APPLICATION,
+                &error.to_string(),
+            );
+        }
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+async fn run(cli: Cli) -> Result<()> {
     let home = match cli.home {
         Some(home) => home,
         None => amplifier_native_platform::default_home(&native_bundle::APPLICATION, "default")?,
     };
-    match cli.command {
+    let Some(command) = cli.command else {
+        return desktop::launch(home, !cli.no_browser).await;
+    };
+    match command {
         Action::Credential {
             action: CredentialAction::ImportOpenai,
         } => {
@@ -231,6 +258,9 @@ async fn main() -> Result<()> {
             // No bearer or control token is placed in a URL. Authentication stays
             // in the browser's existing HTTPS/CSRF flow.
             let config = Config::load(&home)?;
+            if config.transport == Transport::LocalHttp {
+                return desktop::launch(home, !cli.no_browser).await;
+            }
             let runtime: Value =
                 serde_json::from_slice(&std::fs::read(home.join("runtime.json"))?)?;
             let url = if config.public_url.is_empty() {
@@ -326,6 +356,8 @@ async fn main() -> Result<()> {
             };
             let c = Config {
                 id: uuid::Uuid::new_v4().to_string(),
+                auth_mode: AuthMode::OsAccount,
+                transport: Transport::Https,
                 label,
                 owner: match owner {
                     Some(owner) => owner,
@@ -342,7 +374,7 @@ async fn main() -> Result<()> {
                 tls_ca: ca,
                 import_source: "toad".into(),
                 import_surface: "toad".into(),
-                agent: Agent {
+                agent: Some(Agent {
                     label: agent_label,
                     command,
                     args,
@@ -352,7 +384,7 @@ async fn main() -> Result<()> {
                     mcp_servers: Vec::new(),
                     timeout_seconds: 900,
                     client: Default::default(),
-                },
+                }),
             };
             c.save(&home)?;
             let _ = AppState::open(home.clone())?;
@@ -366,6 +398,9 @@ async fn main() -> Result<()> {
         Action::Serve => server::serve(home).await?,
         Action::ServeUpdate { transaction, nonce } => {
             server::serve_update(home, transaction, nonce).await?
+        }
+        Action::NativeUpdateBrowserWorker { operation, attempt } => {
+            agent_conversations::native_browser_update::worker(&home, &operation, &attempt).await?;
         }
         Action::NativeUpdate { action } => {
             let value = match action {
@@ -416,13 +451,21 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &json!({"label":c.label,"agent":c.agent.label,"provider_id":c.provider_id(),"public_url":c.public_url,"last_runtime":runtime,"note":"Runtime information is the last recorded listener, not a health check."})
+                    &json!({"label":c.label,"agent":c.agent.as_ref().map(|a|&a.label),"provider_id":c.provider_id(),"public_url":c.public_url,"last_runtime":runtime,"note":"Runtime information is the last recorded listener, not a health check."})
                 )?
             );
         }
         Action::Probe => println!(
             "{}",
-            serde_json::to_string_pretty(&driver::probe(&Config::load(&home)?.agent).await?)?
+            serde_json::to_string_pretty(
+                &driver::probe(
+                    Config::load(&home)?
+                        .agent
+                        .as_ref()
+                        .context("Select a real agent before testing its connection")?
+                )
+                .await?
+            )?
         ),
         Action::ImportSource { action } => {
             let (method, path, body, token_out) = match action {
@@ -599,6 +642,9 @@ async fn api_request(
     body: Option<Value>,
 ) -> Result<Value> {
     let c = Config::load(home)?;
+    if c.transport == Transport::LocalHttp {
+        return desktop::local_api(home, method, path, body).await;
+    }
     let r: Value = serde_json::from_slice(&std::fs::read(home.join("runtime.json"))?)?;
     let port = r["port"].as_u64().context("Start the service first")?;
     let ca = reqwest::Certificate::from_pem(&std::fs::read(c.tls_ca.unwrap_or(c.tls_cert))?)?;

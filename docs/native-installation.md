@@ -3,7 +3,11 @@
 For whole-bundle updates, rollback and optional existing-updater enrollment, see
 [Native installation updates](native-updates.md).
 
-The native bundle is a self-contained hosting package for an existing ACP agent.
+The native bundle supports ordinary desktop setup and advanced hosting.
+For a new personal installation, start with [Open Companion](native-consumer-setup.md).
+No local Instance or agent is required to open it; connect an existing agent when ready.
+
+The advanced hosting path below supports an existing ACP agent.
 It contains the Conversations executable, a private Node runtime and the locked
 production voice/MCP SDK dependencies. It does not install an ACP engine, model,
 Minecraft server, developer toolchain, or a system-wide Node/Python installation.
@@ -15,7 +19,7 @@ Ubuntu 24.04 x64/ARM64, matching the native build and isolated userland checks.
 These packages do not claim compatibility with older glibc releases or arbitrary
 Linux distributions; other distributions require their own qualification.
 
-## Install without developer tools
+## Advanced hosting without developer tools
 
 1. Obtain the package and its checksum from the same trusted release. Verify the
    published checksum and publisher signature where provided, then extract it

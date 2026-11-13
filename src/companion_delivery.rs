@@ -250,7 +250,9 @@ mod tests {
             tls_ca: None,
             import_source: "fixture".into(),
             import_surface: "fixture".into(),
-            agent: Agent {
+            auth_mode: Default::default(),
+            transport: Default::default(),
+            agent: Some(Agent {
                 label: "Coach".into(),
                 command: "/bin/true".into(),
                 args: vec![],
@@ -260,7 +262,7 @@ mod tests {
                 mcp_servers: vec![],
                 timeout_seconds: 30,
                 client: Default::default(),
-            },
+            }),
         }
         .save(home.path())
         .unwrap();

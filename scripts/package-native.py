@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import plistlib
 import re
 import shutil
 import stat
@@ -30,7 +31,7 @@ TARGETS = {
 }
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?\Z")
-SUPPORT_FILES = {"docs/native-installation.md", "docs/native-updates.md", "ops/pam-agent-conversations", "ops/companion.example.json"}
+SUPPORT_FILES = {"docs/native-consumer-setup.md", "docs/native-installation.md", "docs/native-updates.md", "ops/pam-agent-conversations", "ops/companion.example.json"}
 
 
 def require(condition: bool, message: str) -> None:
@@ -284,6 +285,36 @@ def output_inside_input(output: Path, source: Path) -> bool:
                for parent in (destination, *destination.parents))
 
 
+def write_zip(path: Path, files: dict[str, bytes], executables: set[str]) -> None:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as target:
+        for name, data in sorted(files.items()):
+            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = ((stat.S_IFREG | (0o755 if name in executables else 0o644)) << 16)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            target.writestr(info, data)
+
+
+def mac_application(files: dict[str, bytes], manifest: dict) -> tuple[dict[str, bytes], set[str]]:
+    """Finder starts the native executable directly; no shell or developer tool."""
+    require(manifest["target"].startswith("macos-"), "Mac application requires a Mac native package")
+    require(isinstance(manifest["version"], str) and VERSION.fullmatch(manifest["version"]), "invalid application version")
+    bundle_version = re.match(r"[0-9]+\.[0-9]+\.[0-9]+", manifest["version"])[0]
+    resources = "Companion.app/Contents/Resources/bundle/"
+    launcher = "Companion.app/Contents/MacOS/agent-conversations"
+    payload = {resources + name: data for name, data in files.items()}
+    payload[launcher] = files[manifest["entrypoints"]["service"]]
+    payload["Companion.app/Contents/Info.plist"] = plistlib.dumps({
+        "CFBundleIdentifier": "com.microsoft.constellation.companion",
+        "CFBundleName": "Companion", "CFBundleDisplayName": "Companion",
+        "CFBundleExecutable": "agent-conversations", "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": bundle_version,
+        "CFBundleVersion": bundle_version, "NSHighResolutionCapable": True,
+    }, sort_keys=True)
+    executables = {launcher, *(resources + row["path"] for row in manifest["files"] if row["executable"])}
+    return payload, executables
+
+
 def build_bundle(spec: dict, output: Path) -> dict:
     require(isinstance(spec, dict) and set(spec) == {"schema_version", "target", "version", "source_revision",
             "service", "node", "bridge", "license", "third_party_notices", "support_files"}, "invalid package input fields")
@@ -349,17 +380,13 @@ def build_bundle(spec: dict, output: Path) -> dict:
     extension = ".zip" if operating_system == "windows" else ".tar.gz"
     archive = output / (name + extension)
     receipt = output / (name + ".json")
-    require(not archive.exists() and not receipt.exists(), "refusing to replace an existing release artifact")
+    application = output / f"companion-{spec['version']}-{spec['target']}.app.zip" if operating_system == "macos" else None
+    require(not archive.exists() and not receipt.exists() and (application is None or not application.exists()),
+            "refusing to replace an existing release artifact")
     with tempfile.TemporaryDirectory(prefix=".native-package-", dir=output) as scratch:
         staged = Path(scratch) / (name + extension)
         if operating_system == "windows":
-            with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as target:
-                for path, data in sorted(files.items()):
-                    info = zipfile.ZipInfo(path, (1980, 1, 1, 0, 0, 0))
-                    info.create_system = 3
-                    info.external_attr = ((stat.S_IFREG | (0o755 if path in executables else 0o644)) << 16)
-                    info.compress_type = zipfile.ZIP_DEFLATED
-                    target.writestr(info, data)
+            write_zip(staged, files, executables)
         else:
             import gzip
             import io
@@ -373,6 +400,18 @@ def build_bundle(spec: dict, output: Path) -> dict:
         result = {"schema_version": 1, "target": spec["target"], "archive": archive.name,
                   "archive_sha256": sha(staged.read_bytes()), "manifest_sha256": sha(files["manifest.json"]),
                   "source_revision": spec["source_revision"], "file_count": len(files)}
+        if application is not None:
+            application_files, application_executables = mac_application(files, manifest)
+            staged_application = Path(scratch) / application.name
+            write_zip(staged_application, application_files, application_executables)
+            result["application"] = {"archive": application.name,
+                "archive_sha256": sha(staged_application.read_bytes()),
+                "manifest_sha256": result["manifest_sha256"], "root": "Companion.app",
+                "launcher": "Companion.app/Contents/MacOS/agent-conversations",
+                "bundle": "Companion.app/Contents/Resources/bundle",
+                "ordinary_launch": "not_established_by_packaging", "signing": "not_established_by_packaging"}
+            with application.open("xb") as final, staged_application.open("rb") as source_stream:
+                shutil.copyfileobj(source_stream, final)
         # Only immutable output artifacts are installed; no application home exists here.
         with archive.open("xb") as final, staged.open("rb") as source_stream:
             shutil.copyfileobj(source_stream, final)
@@ -410,6 +449,10 @@ def inspect_archive(path: Path, expected_sha256: str) -> tuple[dict, dict[str, b
                 stream = archive.extractfile(item)
                 require(stream is not None, "archive member unreadable")
                 accept(item.name, stream.read())
+    return inspect_bundle_files(files)
+
+
+def inspect_bundle_files(files: dict[str, bytes]) -> tuple[dict, dict[str, bytes]]:
     require("manifest.json" in files, "archive manifest missing")
     manifest = json.loads(files["manifest.json"])
     require(manifest.get("schema_version") == 1 and manifest.get("component") == "conversations"
@@ -428,6 +471,33 @@ def inspect_archive(path: Path, expected_sha256: str) -> tuple[dict, dict[str, b
     target = TARGETS[manifest["target"]][:2]
     for entrypoint in ["service", "node"]:
         require(executable_identity(files[manifest["entrypoints"][entrypoint]]) == target, "manifest executable architecture mismatch")
+    return manifest, files
+
+
+def inspect_application_archive(path: Path, expected_sha256: str) -> tuple[dict, dict[str, bytes]]:
+    require(HEX.fullmatch(expected_sha256) is not None and sha(read_regular(path)) == expected_sha256,
+            "application archive digest mismatch")
+    files = {}
+    modes = {}
+    with zipfile.ZipFile(path) as archive:
+        for item in archive.infolist():
+            name = relative(item.filename)
+            require(not item.is_dir() and stat.S_IFMT(item.external_attr >> 16) == stat.S_IFREG,
+                    "application archive contains a nonregular member")
+            require(name.casefold() not in {key.casefold() for key in files}, "duplicate application member")
+            files[name] = archive.read(item)
+            modes[name] = stat.S_IMODE(item.external_attr >> 16)
+    prefix = "Companion.app/Contents/Resources/bundle/"
+    launcher = "Companion.app/Contents/MacOS/agent-conversations"
+    info = "Companion.app/Contents/Info.plist"
+    require({launcher, info} <= files.keys() and all(name in {launcher, info} or name.startswith(prefix) for name in files),
+            "unexpected application member")
+    manifest, payload = inspect_bundle_files({name.removeprefix(prefix): data for name, data in files.items() if name.startswith(prefix)})
+    require(manifest["target"].startswith("macos-"), "application bundle is not native Mac")
+    expected, executable_paths = mac_application(payload, manifest)
+    require(files == expected, "application launcher or metadata differs from verified bundle")
+    require(all(modes[name] == (0o755 if name in executable_paths else 0o644) for name in files),
+            "invalid application executable permissions")
     return manifest, files
 
 

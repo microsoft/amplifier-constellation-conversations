@@ -1,6 +1,8 @@
 //! A foreground voice call is an experience, not a replacement ACP runtime.
 //! Provider events are source facts; delegation, backend completion and playback
 //! are independent durable records. Closing media never cancels accepted work.
+#[path = "companion_setup.rs"]
+mod setup;
 #[path = "companion_transcript.rs"]
 mod transcript;
 use crate::{
@@ -17,6 +19,7 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
+pub use setup::{connect_local_agent, save_setup, setup_status};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,

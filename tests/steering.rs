@@ -54,7 +54,9 @@ impl Fixture {
             tls_ca: None,
             import_source: "fixture".into(),
             import_surface: "fixture".into(),
-            agent: Agent {
+            auth_mode: Default::default(),
+            transport: Default::default(),
+            agent: Some(Agent {
                 label: "Fixture".into(),
                 command: "python3".into(),
                 args: vec![format!(
@@ -67,7 +69,7 @@ impl Fixture {
                 mcp_servers: vec![],
                 timeout_seconds: 30,
                 client: Default::default(),
-            },
+            }),
         };
         config.save(home.path()).unwrap();
         let state = AppState::open(home.path().into()).unwrap();
@@ -806,7 +808,7 @@ async fn ambient_idle_race_reuses_only_the_explicitly_restored_admission() {
 #[tokio::test]
 async fn each_agent_receives_only_its_ordered_room_inputs() {
     let f = Fixture::new("native", false, false);
-    let mut other = f.state.config.agent.clone();
+    let mut other = f.state.config.agent.clone().unwrap();
     other.label = "Reviewer".into();
     other.env.insert("STEERING_MODE".into(), "generic".into());
     other.env.insert(

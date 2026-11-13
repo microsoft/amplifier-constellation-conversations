@@ -365,11 +365,15 @@ pub async fn put(
         tx.execute("INSERT OR IGNORE INTO room_members(conversation_id,username,role,joined_at) VALUES(?1,?2,'owner',?3)",params![conversation,s.config.owner,now_ms()])?;
         // Import connections currently represent the installation's default
         // agent. Keep that source ownership explicit for scoped retrieval.
-        tx.execute(
-            "INSERT OR IGNORE INTO room_agents(conversation_id,agent_id) VALUES(?1,'default')",
-            [&conversation],
-        )?;
-        tx.execute("UPDATE messages SET actor=CASE WHEN role='user' THEN ?2 ELSE ?3 END WHERE conversation_id=?1 AND actor=''",params![conversation,s.config.owner,s.config.agent.label])?;
+        if let Some(agent) = &s.config.agent {
+            tx.execute(
+                "INSERT OR IGNORE INTO room_agents(conversation_id,agent_id) VALUES(?1,'default')",
+                [&conversation],
+            )?;
+            tx.execute("UPDATE messages SET actor=CASE WHEN role='user' THEN ?2 ELSE ?3 END WHERE conversation_id=?1 AND actor=''",params![conversation,s.config.owner,agent.label])?;
+        } else {
+            tx.execute("UPDATE messages SET actor=?2 WHERE conversation_id=?1 AND role='user' AND actor=''",params![conversation,s.config.owner])?;
+        }
         if appended > 0 {
             tx.execute(
                 "UPDATE conversations SET updated_at=?2,title=?3 WHERE id=?1",

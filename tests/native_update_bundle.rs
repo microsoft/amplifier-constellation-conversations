@@ -136,7 +136,9 @@ impl Fixture {
             tls_ca: None,
             import_source: "fixture".into(),
             import_surface: "fixture".into(),
-            agent: Agent {
+            auth_mode: Default::default(),
+            transport: Default::default(),
+            agent: Some(Agent {
                 label: "Existing independently selected agent".into(),
                 command: std::env::current_exe()
                     .unwrap()
@@ -149,7 +151,7 @@ impl Fixture {
                 mcp_servers: vec![],
                 timeout_seconds: 30,
                 client: Default::default(),
-            },
+            }),
         }
         .save(&home)
         .unwrap();
@@ -350,6 +352,41 @@ fn bootstrap_is_idempotent_after_complete_and_lost_installation_receipt() {
     f.retained();
     assert!(!f.home.join("native-update-owner.json").exists());
     assert!(!f.home.join("native-update.json").exists());
+}
+
+#[test]
+fn desktop_reopen_verification_rejects_changed_binary_bundle_and_identity_without_repair() {
+    let f = Fixture::new();
+    assert_eq!(
+        native_update::verify_installed(&f.home).unwrap(),
+        f.original
+    );
+    let installed =
+        amplifier_native_platform::installed_binary(&native_bundle::APPLICATION, &f.home);
+    let original = fs::read(&installed).unwrap();
+    fs::write(&installed, b"changed installed executable").unwrap();
+    assert!(native_update::verify_installed(&f.home).is_err());
+    assert_eq!(
+        fs::read(&installed).unwrap(),
+        b"changed installed executable"
+    );
+    fs::write(&installed, original).unwrap();
+    let bridge = f.baseline_package().join("bridge/live.mjs");
+    let original = fs::read(&bridge).unwrap();
+    fs::write(&bridge, b"changed immutable support bytes").unwrap();
+    assert!(native_update::verify_installed(&f.home).is_err());
+    assert_eq!(
+        fs::read(&bridge).unwrap(),
+        b"changed immutable support bytes"
+    );
+    fs::write(&bridge, original).unwrap();
+    let receipt = f.home.join("native-installation.json");
+    let mut changed = f.original.clone();
+    changed["id"] = json!(uuid::Uuid::new_v4().to_string());
+    write_json(&receipt, &changed);
+    assert!(native_update::verify_installed(&f.home).is_err());
+    assert_eq!(read_json(&receipt), changed);
+    f.retained();
 }
 
 #[tokio::test]

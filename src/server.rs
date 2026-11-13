@@ -25,6 +25,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     crate::delivery::resume(&state);
     Router::new()
         .merge(crate::native_update::router())
+        .merge(crate::native_browser_update::router())
+        .merge(crate::native_browser_cleanup::router())
+        .merge(crate::native_browser_update::assets())
         .route(
             "/markdown-notices.txt",
             get(|| async {
@@ -167,6 +170,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(|| async { Json(json!({"ok":true})) }))
         .route("/auth/login", post(auth::login))
         .route("/auth/session", get(auth::session))
+        .route("/auth/first-account", post(auth::first_account))
+        .route("/auth/local-listener-proof", post(local_listener_proof))
+        .route(
+            "/api/v1/companion/setup",
+            get(crate::companion::setup_status).post(crate::companion::save_setup),
+        )
+        .route(
+            "/api/v1/companion/local-agent",
+            post(crate::companion::connect_local_agent),
+        )
+        .route(
+            "/companion-setup.mjs",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/companion-setup.mjs"),
+                )
+            }),
+        )
         .route("/auth/logout", post(auth::logout))
         .route("/api/v1/companion", get(crate::companion::catalog))
         .route(
@@ -414,8 +436,19 @@ async fn headers(
     {
         request.headers_mut().insert(header::HOST, value);
     }
+    if let Err(error) = auth::validate_host(&state.config, request.headers()) {
+        return error.into_response();
+    }
     let companion_page = request.uri().path() == "/companion";
     let mut response = next.run(request).await;
+    secure_response(&mut response, &state.config.embed_origins, companion_page);
+    response
+}
+pub(crate) fn secure_response(
+    response: &mut Response,
+    embed_origins: &[String],
+    companion_page: bool,
+) {
     let h = response.headers_mut();
     h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
@@ -425,14 +458,16 @@ async fn headers(
     } else {
         "img-src 'self' data:;"
     };
-    h.insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; {media_policy} object-src 'none'; base-uri 'none'; frame-ancestors 'self' {}; form-action 'self'",state.config.embed_origins.join(" ")).parse().unwrap());
-    response
+    h.insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; {media_policy} object-src 'none'; base-uri 'none'; frame-ancestors 'self' {}; form-action 'self'",embed_origins.join(" ")).parse().unwrap());
 }
+
 async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
     let name = state
         .config
         .agent
-        .label
+        .as_ref()
+        .map(|a| a.label.as_str())
+        .unwrap_or("Companion")
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
@@ -459,12 +494,14 @@ async fn css() -> impl IntoResponse {
 }
 async fn meta(State(s): State<Arc<AppState>>, h: HeaderMap) -> ApiResult<Json<Value>> {
     let p = auth::check(&s, &h, "observe", false)?;
-    let agent = s.agent("default")?.ok_or_else(ApiError::missing)?;
-    let mut safe = json!({"label":agent.label});
-    if p.admin {
-        safe["command"] = json!(agent.command);
-        safe["args"] = json!(agent.args);
-        safe["cwd"] = json!(agent.cwd);
+    let mut safe = Value::Null;
+    if let Some(agent) = s.agent("default")? {
+        safe = json!({"label":agent.label});
+        if p.admin {
+            safe["command"] = json!(agent.command);
+            safe["args"] = json!(agent.args);
+            safe["cwd"] = json!(agent.cwd);
+        }
     }
     Ok(Json(
         json!({"id":s.config.id,"label":s.config.label,"owner":p.actor,"admin":p.admin,"agent":safe,"provider":{"id":s.config.provider_id(),"query_path":"/context/v1/query","surface":"web","access":"audience_scoped"},"public_url":s.config.public_url,"version":env!("CARGO_PKG_VERSION"),"approval_mode":"interactive","features":{"rooms":true,"multiple_agents":true,"attachments":true,"message_search":true,"huddles":true},"notice":"Conversations are private until their owner explicitly shares them. Managed agents keep separate room sessions; external huddle participants keep their existing session."}),
@@ -488,7 +525,11 @@ async fn config_put(
     Json(c): Json<crate::config::Config>,
 ) -> ApiResult<Json<Value>> {
     auth::check(&s, &h, "admin", true)?;
-    if c.id != s.config.id || c.owner != s.config.owner {
+    if c.id != s.config.id
+        || c.owner != s.config.owner
+        || c.auth_mode != s.config.auth_mode
+        || c.transport != s.config.transport
+    {
         return Err(ApiError::bad(
             "The instance ID and owner are installation settings",
         ));
@@ -1268,18 +1309,33 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 pub async fn serve(home: std::path::PathBuf) -> anyhow::Result<()> {
-    serve_inner(home, None).await
+    if let Some(journal) = crate::native_update::recovery_snapshot(&home)?
+        && journal.phase != "restored"
+        && (crate::native_update::managed_startup_ticket(&home)?.is_none()
+            || crate::native_browser_update::owns_pending_transaction(&home, &journal.transaction)?
+                && !crate::native_browser_update::worker_active(&home)?)
+    {
+        return crate::desktop::launch(home, false).await;
+    }
+    serve_inner(home, None, None).await
 }
 pub async fn serve_update(
     home: std::path::PathBuf,
     transaction: String,
     nonce: String,
 ) -> anyhow::Result<()> {
-    serve_inner(home, Some((transaction, nonce))).await
+    serve_inner(home, Some((transaction, nonce)), None).await
+}
+pub async fn serve_with_browser(
+    home: std::path::PathBuf,
+    open_browser: bool,
+) -> anyhow::Result<()> {
+    serve_inner(home, None, Some(open_browser)).await
 }
 async fn serve_inner(
     home: std::path::PathBuf,
     startup: Option<(String, String)>,
+    open_browser: Option<bool>,
 ) -> anyhow::Result<()> {
     use fs2::FileExt;
     let lock = std::fs::OpenOptions::new()
@@ -1303,19 +1359,30 @@ async fn serve_inner(
     let listener = std::net::TcpListener::bind((state.config.bind.as_str(), state.config.port))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-        &state.config.tls_cert,
-        &state.config.tls_key,
-    )
-    .await?;
+    let local_http = state.config.transport == crate::config::Transport::LocalHttp;
+    let tls = if local_http {
+        None
+    } else {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                &state.config.tls_cert,
+                &state.config.tls_key,
+            )
+            .await?,
+        )
+    };
+    let scheme = if local_http { "http" } else { "https" };
     crate::config::private_write(
         &state.home.join("runtime.json"),
         &serde_json::to_vec_pretty(
-            &json!({"port":port,"url":format!("https://127.0.0.1:{port}"),"public_url":state.config.public_url,"provider_id":state.config.provider_id(),"process_nonce":auth::random_token(),"transaction_id":startup.as_ref().map(|s|&s.0),"launch_nonce":startup.as_ref().map(|s|&s.1)}),
+            &json!({"port":port,"url":format!("{scheme}://127.0.0.1:{port}"),"pid":std::process::id(),"public_url":state.config.public_url,"provider_id":state.config.provider_id(),"process_nonce":auth::random_token(),"transaction_id":startup.as_ref().map(|s|&s.0),"launch_nonce":startup.as_ref().map(|s|&s.1)}),
         )?,
     )?;
-    println!("Agent Conversations is listening on HTTPS port {port}");
+    println!("Agent Conversations is listening on {scheme} port {port}");
+    if let Some(open_browser) = open_browser {
+        crate::desktop::ready(&state.home, &state.config, open_browser)?;
+    }
     if !state.config.public_url.is_empty() {
         println!("Open {}", state.config.public_url);
     }
@@ -1327,11 +1394,34 @@ async fn serve_inner(
             shutdown.graceful_shutdown(Some(Duration::from_secs(3)));
         }
     });
-    let result = axum_server::from_tcp_rustls(listener, tls)?
-        .handle(handle)
-        .serve(router(state).into_make_service())
-        .await;
+    let result = if let Some(tls) = tls {
+        axum_server::from_tcp_rustls(listener, tls)?
+            .handle(handle)
+            .serve(router(state).into_make_service())
+            .await
+    } else {
+        axum_server::from_tcp(listener)?
+            .handle(handle)
+            .serve(router(state).into_make_service())
+            .await
+    };
     waiter.abort();
     result?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListenerProof {
+    nonce: String,
+}
+async fn local_listener_proof(
+    State(s): State<Arc<AppState>>,
+    h: HeaderMap,
+    Json(body): Json<ListenerProof>,
+) -> ApiResult<Json<Value>> {
+    auth::validate_host(&s.config, &h)?;
+    crate::desktop::listener_proof(&s.home, &s.config, &body.nonce)
+        .map(Json)
+        .map_err(|_| ApiError::forbidden())
 }

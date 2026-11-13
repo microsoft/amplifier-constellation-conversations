@@ -461,7 +461,9 @@ pub(crate) mod tests {
             tls_ca: None,
             import_source: "test".into(),
             import_surface: "test".into(),
-            agent: Agent {
+            auth_mode: Default::default(),
+            transport: Default::default(),
+            agent: Some(Agent {
                 label: "Lead".into(),
                 command: "/usr/bin/python3".into(),
                 args: vec![format!(
@@ -477,7 +479,7 @@ pub(crate) mod tests {
                 mcp_servers: vec![],
                 timeout_seconds: 30,
                 client: Default::default(),
-            },
+            }),
         }
         .save(home.path())
         .unwrap();

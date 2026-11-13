@@ -1,3 +1,4 @@
+import {installSetup} from './companion-setup.mjs';
 import {ConversationFloor} from './companion-floor.mjs';
 import {safeCardLink, renderCardText, savedCardTime} from './companion-cards.mjs';
 import {createHuddles} from './huddles.mjs';
@@ -14,12 +15,13 @@ const element = (tag, className, text) => {
 const initials = label => (label || 'Agent').trim().split(/\s+/).map(p => p[0]).slice(0, 2).join('').toUpperCase();
 const state = {session:null, contacts:[], available:false, call:null, generation:0, authGeneration:0, recovery:null, voiceContact:null, finalizingCalls:new Set()};
 const audio = $('remote-audio');
+const setup = installSetup({api,getSession:()=>state.session,signedIn:async session=>{state.session=session;await openContacts();},refreshContacts:openContacts,showLogin:session=>{state.session=session;showLogin();},notice});
 
 async function api(path, method = 'GET', body, options = {}) {
   const headers = body === undefined ? {} : {'Content-Type':'application/json'};
   if (method !== 'GET' && state.session?.csrf) headers['X-CSRF-Token'] = state.session.csrf;
   const {signal, ...fetchOptions} = options;
-  const abort = new AbortController(), timer = setTimeout(() => abort.abort(), path === '/api/v1/companion/calls' ? 40000 : 10000);
+  const abort = new AbortController(), timer = setTimeout(() => abort.abort(), ['/api/v1/companion/calls','/api/v1/companion/local-agent'].includes(path) ? 40000 : 10000);
   const cancel = () => abort.abort();
   if (signal?.aborted) abort.abort(); else signal?.addEventListener('abort', cancel, {once:true});
   try {
@@ -91,7 +93,9 @@ async function openContacts() {
       && prior && typeof prior.id === 'string' && !['closed','interrupted'].includes(prior.state)) {
     state.recovery = {callId:prior.id,conversationId:prior.conversation_id,request:null,discovered:true};
   }
+  $('first-account').hidden = true;
   $('loading').hidden = true; $('login').hidden = true; $('app').hidden = false; $('sign-out').hidden = false;
+  $('app-updates-link').hidden = state.session?.admin !== true;
   $('availability').hidden = state.available;
   $('availability').textContent = config.reason || 'Voice calling has not been enabled on this installation yet.';
   $('empty-contacts').hidden = state.contacts.length !== 0;
@@ -108,6 +112,7 @@ async function openContacts() {
   }));
   showRecovery();
   checkRecovery();
+  await setup.refresh();
 }
 function showLogin() {
   if (state.call) endCall('Your sign-in expired. Your microphone and camera are off.',true,true,'auth_expired');
@@ -122,7 +127,9 @@ function showLogin() {
   $('call-ended').hidden = true; $('call-screen').hidden = true; $('phonebook').hidden = false; showRecovery();
   for (const id of ['continue-work','ended-work-link','recovery-work-link']) { $(id).hidden = true; $(id).href = '/'; }
   $('loading').hidden = true; $('app').hidden = true; $('login').hidden = false; $('sign-out').hidden = true;
+  $('app-updates-link').hidden = true;
   $('username').value = state.session?.owner || ''; $('password').value = '';
+  setup.signedOut(state.session);
 }
 async function start() {
   try {
@@ -1343,7 +1350,13 @@ $('login-form').onsubmit = async event => {
 };
 $('sign-out').onclick = async () => {
   if (state.call) endCall();
-  try { await api('/auth/logout','POST',{}); state.session = null; showLogin(); }
+  try {
+    await api('/auth/logout','POST',{});
+    // Retain only public sign-in presentation. A local account never requires
+    // the hidden OS-account username, and no authenticated state/CSRF survives.
+    state.session = {authenticated:false,auth_mode:state.session?.auth_mode,owner:state.session?.owner,first_account_needed:false};
+    showLogin();
+  }
   catch (error) { notice(error.message); }
 };
 document.addEventListener('visibilitychange', () => {

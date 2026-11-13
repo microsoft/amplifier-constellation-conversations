@@ -240,6 +240,12 @@ fn installed(home: &Path) -> Result<Value> {
     Ok(v)
 }
 
+/// Read-only validation for desktop reopen: verify the complete selected bundle,
+/// its receipt, and the installed executable before choosing a launch target.
+pub fn verify_installed(home: &Path) -> Result<Value> {
+    installed(home)
+}
+
 /// Explicit first-install adoption while stopped. Does not register startup or
 /// enable voice/updates, and never replaces a different existing application.
 pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
@@ -351,14 +357,184 @@ pub fn status(home: &Path) -> Result<Value> {
     )
 }
 
+/// A deliberately small internal view for browser reconciliation. The raw
+/// journal, package paths, captured context and launch nonces never form an HTTP
+/// response. Reading this does not repair, select or restore an installation.
+#[derive(Clone, Debug)]
+pub(crate) struct RecoverySnapshot {
+    pub transaction: String,
+    pub phase: String,
+    pub direction: String,
+    pub outcome: Option<String>,
+    pub restore_started: bool,
+    pub rollback_aborted: bool,
+    pub standalone: bool,
+}
+
+pub(crate) fn recovery_snapshot(home: &Path) -> Result<Option<RecoverySnapshot>> {
+    if !home.join(JOURNAL).exists() {
+        return Ok(None);
+    }
+    let value = read(&home.join(JOURNAL))?;
+    let transaction = value["transaction_id"]
+        .as_str()
+        .context("Missing update transaction")?;
+    id(transaction)?;
+    ensure!(
+        value["schema"] == 1 && value["installation_id"] == Config::load(home)?.id,
+        "Retained update belongs to another installation"
+    );
+    let phase = value["phase"].as_str().context("Missing update phase")?;
+    ensure!(
+        matches!(
+            phase,
+            "intent"
+                | "deferred"
+                | "preparing"
+                | "prepared"
+                | "switching"
+                | "applied"
+                | "verifying"
+                | "verified"
+                | "restoring"
+                | "restored"
+        ),
+        "Unrecognized retained update phase"
+    );
+    let direction = value["direction"]
+        .as_str()
+        .context("Missing update direction")?;
+    ensure!(
+        matches!(direction, "unchanged" | "applied" | "rolled_back"),
+        "Invalid update direction"
+    );
+    let outcome = value["restore_outcome"].as_str();
+    ensure!(
+        outcome.is_none_or(|value| matches!(value, "unchanged" | "applied" | "rolled_back")),
+        "Invalid update outcome"
+    );
+    Ok(Some(RecoverySnapshot {
+        transaction: transaction.into(),
+        phase: phase.into(),
+        direction: direction.into(),
+        outcome: outcome.map(str::to_owned),
+        restore_started: value["restore_started"] == true,
+        rollback_aborted: value["rollback_aborted"] == true,
+        standalone: value["context"]["owner"] == "standalone",
+    }))
+}
+
+pub(crate) fn verify_helper_package(record: &Value) -> Result<PathBuf> {
+    check_package(record)?;
+    path(&record["bundle"]["entrypoints"], "service")
+}
+
+/// Recovery must remain reachable during a binary/receipt switch. It verifies
+/// the retained immutable previous helper without requiring or repairing the
+/// stable installed executable, whose mismatch is the interrupted evidence.
+pub(crate) fn recovery_package(home: &Path) -> Result<Value> {
+    let snapshot = recovery_snapshot(home)?.context("No retained update")?;
+    let retained = journal(home, &snapshot.transaction)?;
+    check_package(&retained["previous"])?;
+    Ok(retained["previous"].clone())
+}
+
+/// A crashed worker may leave its selected normal listener alive. Reopening the
+/// update page proves that retained process without opening application state or
+/// requiring the stable binary/receipt pair to have completed its switch.
+pub(crate) fn verify_retained_listener(home: &Path, status: &Value) -> Result<()> {
+    let snapshot = recovery_snapshot(home)?.context("No retained update")?;
+    ensure!(
+        snapshot.phase != "restored",
+        "Recovery transaction is already settled"
+    );
+    let j = journal(home, &snapshot.transaction)?;
+    let runtime = read(&home.join("runtime.json"))?;
+    ensure!(
+        status["id"] == Config::load(home)?.id
+            && runtime["pid"]
+                .as_u64()
+                .is_some_and(|pid| (1..=u32::MAX as u64).contains(&pid))
+            && runtime["process_nonce"]
+                .as_str()
+                .is_some_and(|nonce| nonce.len() == 64)
+            && status["pid"] == runtime["pid"]
+            && status["process_nonce"] == runtime["process_nonce"],
+        "The retained listener process identity changed"
+    );
+    if status["transaction_id"] == snapshot.transaction
+        && !j["launch_nonce"].is_null()
+        && status["launch_nonce"] == j["launch_nonce"]
+    {
+        let selected = current_record(&j);
+        check_package(selected)?;
+        ensure!(
+            status["binary_sha256"] == selected["binary_sha256"],
+            "The retained listener differs from the selected bundle"
+        );
+    } else if !j["original_process"].is_null()
+        && matches!(
+            snapshot.phase.as_str(),
+            "intent" | "deferred" | "preparing" | "prepared"
+        )
+    {
+        check_package(&j["previous"])?;
+        ensure!(
+            status["binary_sha256"] == j["previous"]["binary_sha256"]
+                && status["pid"] == j["original_process"]["pid"]
+                && status["process_nonce"] == j["original_process"]["process_nonce"],
+            "The captured original listener changed"
+        );
+    } else {
+        ensure!(
+            matches!(snapshot.phase.as_str(), "intent" | "deferred"),
+            "No retained normal listener is authorized"
+        );
+        let selected = installed(home)?;
+        ensure!(
+            status["binary_sha256"] == selected["package"]["binary_sha256"],
+            "The original listener differs from the verified installation"
+        );
+    }
+    Ok(())
+}
+
 pub async fn local_api(
     home: &Path,
     method: &str,
     endpoint: &str,
     body: Option<Value>,
 ) -> Result<Value> {
+    request_path(
+        home,
+        method,
+        &format!("/api/v1/native-update/{endpoint}"),
+        body,
+    )
+    .await
+}
+
+pub(crate) async fn request_path(
+    home: &Path,
+    method: &str,
+    request_path: &str,
+    body: Option<Value>,
+) -> Result<Value> {
+    ensure!(
+        request_path.starts_with("/api/v1/") && !request_path.contains(".."),
+        "Use a fixed local control path"
+    );
     crate::native_update_clock::check()?;
     let c = Config::load(home)?;
+    if c.transport == crate::config::Transport::LocalHttp {
+        let token = fs::read_to_string(home.join("secrets/control-token"))?;
+        return tokio::time::timeout(
+            crate::native_update_clock::cap(Duration::from_secs(3))?,
+            crate::desktop::proved_local_api(&c, token.trim(), method, request_path, body),
+        )
+        .await
+        .context("Local lifecycle listener did not respond in time")?;
+    }
     let r = read(&home.join("runtime.json"))?;
     let port = r["port"].as_u64().context("No recorded listener")?;
     ensure!((1..=65535).contains(&port), "Invalid local listener");
@@ -372,9 +548,16 @@ pub async fn local_api(
     let mut req = client
         .request(
             method.parse()?,
-            format!("https://127.0.0.1:{port}/api/v1/native-update/{endpoint}"),
+            format!("https://127.0.0.1:{port}{request_path}"),
         )
         .bearer_auth(token.trim());
+    if let Some(authority) = c
+        .public_url
+        .strip_prefix("https://")
+        .map(|v| v.trim_end_matches('/'))
+    {
+        req = req.header(reqwest::header::HOST, authority);
+    }
     if let Some(body) = body {
         req = req.json(&body);
     }
@@ -811,6 +994,15 @@ fn validate_start_record(
     }
     Ok(())
 }
+#[derive(Debug)]
+struct UncertainReplacement;
+impl std::fmt::Display for UncertainReplacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Replacement manager dispatch is uncertain; explicit recovery is required")
+    }
+}
+impl std::error::Error for UncertainReplacement {}
+
 fn start(home: &Path, j: &mut Value) -> Result<Option<ServiceChild>> {
     let nonce = auth::random_token();
     j["launch_nonce"] = json!(nonce);
@@ -822,6 +1014,32 @@ fn start(home: &Path, j: &mut Value) -> Result<Option<ServiceChild>> {
     if j["managed_start_requested"] == true {
         native_startup_state::start(&j["startup"])?;
         return Ok(None);
+    }
+    let transaction = j["transaction_id"]
+        .as_str()
+        .context("Missing transaction")?;
+    if crate::native_browser_update::owns_pending_transaction(home, transaction)?
+        && crate::native_browser_update::worker_active(home)?
+    {
+        // A manager-owned worker's child would share its job/cgroup. The manual
+        // replacement gets an independent no-autostart profile, preserving the
+        // owner's sign-in preference. Intent precedes manager registration.
+        let prepared = crate::native_update_launch::prepare_replacement(
+            home,
+            &Config::load(home)?.id,
+            transaction,
+            &nonce,
+            &binary(home),
+        )?;
+        j["browser_replacement"] = serde_json::to_value(&prepared)?;
+        save(&home.join(JOURNAL), j)?;
+        match crate::native_update_launch::launch(&prepared) {
+            Ok(crate::native_update_launch::LaunchReceipt::Accepted) => return Ok(None),
+            Ok(crate::native_update_launch::LaunchReceipt::Refused { .. }) => {
+                anyhow::bail!("The native manager refused the fixed replacement profile")
+            }
+            _ => return Err(UncertainReplacement.into()),
+        }
     }
     let mut child = native_update_process::spawn_service(
         &binary(home),
@@ -1021,40 +1239,89 @@ fn standalone_worker(home: &Path) -> Result<()> {
 pub async fn run(home: &Path, package: &Path) -> Result<Value> {
     standalone_worker(home)?;
     let p = plan(home, package)?;
+    let transaction = uuid::Uuid::new_v4().to_string();
+    run_frozen(home, &transaction, &p).await
+}
+
+/// The browser's durable dispatch allocates this identity before launching its
+/// immutable worker. The lifecycle below is the same standalone implementation;
+/// an existing transaction must be reconciled through `recover`, never rerun.
+pub async fn run_frozen(home: &Path, transaction: &str, p: &Value) -> Result<Value> {
+    standalone_worker(home)?;
+    id(transaction)?;
+    {
+        let _owner = lock(home, "native-update.lock")?;
+        ensure!(
+            !home.join(JOURNAL).exists()
+                || read(&home.join(JOURNAL))?["transaction_id"] != transaction,
+            "This transaction already has a journal; recover it instead of dispatching again"
+        );
+        validate_frozen_plan(home, p)?;
+    }
     if p["available"] == false {
         return Ok(json!({"changed":false,"version":p["version"]}));
     }
-    let transaction = uuid::Uuid::new_v4().to_string();
     let ready = prepare(
         home,
-        &transaction,
-        &json!({"id":transaction,"owner":"standalone"}),
+        transaction,
+        &json!({"id":transaction,"owner":"standalone","checked_plan":p}),
     )
     .await?;
     if ready["ready"] != true {
-        verify(home, &transaction).await?;
-        restore(home, &transaction, "unchanged").await?;
+        verify(home, transaction).await?;
+        restore(home, transaction, "unchanged").await?;
         return Ok(ready);
     }
+    continue_checked_update(home, transaction, p).await
+}
+
+async fn continue_checked_update(home: &Path, transaction: &str, p: &Value) -> Result<Value> {
     if let Err(error) = async {
-        apply(home, &transaction, &p, false).await?;
-        verify(home, &transaction).await?;
+        apply(home, transaction, p, false).await?;
+        verify(home, transaction).await?;
         Ok::<_, anyhow::Error>(())
     }
     .await
     {
-        apply(home, &transaction, &p, true)
+        if error.downcast_ref::<UncertainReplacement>().is_some() {
+            return Err(error);
+        }
+        apply(home, transaction, p, true)
             .await
             .context("Update failed; rollback bundle switch also failed")?;
-        verify(home, &transaction)
+        verify(home, transaction)
             .await
             .context("Update failed; previous bundle verification also failed")?;
-        restore(home, &transaction, "rolled_back")
+        restore(home, transaction, "rolled_back")
             .await
             .context("Update failed; previous availability restoration also failed")?;
         anyhow::bail!("Update failed and previous bundle was restored: {error}");
     }
-    restore(home, &transaction, "applied").await
+    restore(home, transaction, "applied").await
+}
+
+pub(crate) fn validate_frozen_plan(home: &Path, plan: &Value) -> Result<()> {
+    let current = installed(home)?;
+    ensure!(
+        plan["schema"] == 1
+            && plan["installation_id"] == current["id"]
+            && plan["previous"] == current["package"]
+            && plan["available"].is_boolean()
+            && plan["config_sha256"] == digest(&home.join("config.json"))?
+            && plan["companion_sha256"]
+                == companion(home)?
+                    .as_ref()
+                    .map(|bytes| hash(bytes))
+                    .map_or(Value::Null, Value::String),
+        "The checked package no longer matches this installation; check it again"
+    );
+    check_package(&plan["previous"])?;
+    check_package(&plan["candidate"])?;
+    ensure!(
+        plan["available"] == (plan["previous"] != plan["candidate"]),
+        "Checked package availability changed"
+    );
+    Ok(())
 }
 
 /// Abort a standalone explicit B -> A rollback back to its captured B bundle.
@@ -1147,6 +1414,9 @@ async fn continue_explicit_rollback(home: &Path, transaction: &str) -> Result<Va
     }
     .await;
     if let Err(error) = result {
+        if error.downcast_ref::<UncertainReplacement>().is_some() {
+            return Err(error);
+        }
         restore_aborted_rollback(home, transaction, &error.to_string()).await?;
         anyhow::bail!(
             "Requested rollback failed; the pre-rollback bundle was verified and restored unchanged: {error}"
@@ -1158,7 +1428,21 @@ async fn continue_explicit_rollback(home: &Path, transaction: &str) -> Result<Va
 /// Deliberate rollback is a new idle transaction, never a rewind of accepted
 /// work or a retry of the already completed update.
 pub async fn rollback(home: &Path, previous_transaction: &str) -> Result<Value> {
+    let transaction = uuid::Uuid::new_v4().to_string();
+    rollback_with_transaction(home, &transaction, previous_transaction).await
+}
+
+pub async fn rollback_with_transaction(
+    home: &Path,
+    transaction: &str,
+    previous_transaction: &str,
+) -> Result<Value> {
     standalone_worker(home)?;
+    id(transaction)?;
+    ensure!(
+        transaction != previous_transaction,
+        "Rollback needs a fresh transaction"
+    );
     let previous = {
         let _owner = lock(home, "native-update.lock")?;
         let j = journal(home, previous_transaction)?;
@@ -1176,20 +1460,19 @@ pub async fn rollback(home: &Path, previous_transaction: &str) -> Result<Value> 
         );
         j
     };
-    let transaction = uuid::Uuid::new_v4().to_string();
     let ready = prepare(
         home,
-        &transaction,
+        transaction,
         &json!({"id":transaction,"owner":"standalone","plan":{"operation":"rollback"},
             "previous_transaction":previous_transaction,"rollback_plan":previous["frozen_plan"]}),
     )
     .await?;
     if ready["ready"] != true {
-        verify(home, &transaction).await?;
-        restore(home, &transaction, "unchanged").await?;
+        verify(home, transaction).await?;
+        restore(home, transaction, "unchanged").await?;
         return Ok(ready);
     }
-    continue_explicit_rollback(home, &transaction).await
+    continue_explicit_rollback(home, transaction).await
 }
 
 pub async fn recover(home: &Path, transaction: &str, rollback: bool) -> Result<Value> {
@@ -1241,6 +1524,9 @@ pub async fn recover(home: &Path, transaction: &str, rollback: bool) -> Result<V
         } else {
             continue_explicit_rollback(home, transaction).await
         };
+    }
+    if !rollback && j["phase"] == "prepared" && !j["context"]["checked_plan"].is_null() {
+        return continue_checked_update(home, transaction, &j["context"]["checked_plan"]).await;
     }
     if rollback || j["phase"] == "switching" {
         apply(home, transaction, &j["frozen_plan"], true).await?;

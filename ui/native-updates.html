@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <link rel="stylesheet" href="/companion.css">
+  <link rel="stylesheet" href="/native-updates.css">
+  <script type="module" src="/native-updates.mjs"></script>
+  <title>App updates · Companion</title>
+</head>
+<body>
+  <header class="masthead"><a id="updates-brand" class="brand" href="/updates">Companion</a><nav aria-label="App navigation"><a id="return-to-companion" href="/companion" hidden>Back to contacts</a><button id="update-sign-out" class="text-button" hidden>Sign out</button></nav></header>
+  <main class="updates-page">
+    <h1>App updates</h1>
+    <p id="updates-loading" role="status">Checking this installation…</p>
+    <form id="update-login" class="updates-login" hidden>
+      <h2>Sign in to Companion</h2><p id="update-login-description">Use your existing Companion account.</p>
+      <label id="update-username-label" for="update-username">Username</label><input id="update-username" autocomplete="username" required>
+      <label for="update-password">Password</label><input id="update-password" type="password" autocomplete="current-password" required>
+      <button id="update-sign-in" class="primary" type="submit">Sign in</button>
+    </form>
+    <p id="update-error" class="error-text" role="alert" hidden></p>
+    <div id="updates-content" hidden>
+      <p id="update-installed" class="updates-installed"></p>
+      <p id="update-owner" hidden></p>
+      <section id="update-progress" class="update-progress" aria-labelledby="update-progress-title" hidden>
+        <h2 id="update-progress-title"></h2><p id="update-progress-detail" role="status" aria-live="polite"></p>
+        <details id="update-reference"><summary>Operation reference</summary><p id="update-reference-value" class="update-reference"></p></details>
+      </section>
+      <form id="update-package-form" class="update-package" hidden>
+        <h2>Choose an update package</h2>
+        <p>Download and extract the complete Companion package for this computer, then enter its folder below.</p>
+        <label for="update-package-path">Extracted package folder</label><input id="update-package-path" autocomplete="off" spellcheck="false" required aria-describedby="update-package-note">
+        <p id="update-package-note" class="small">Use the complete folder, including its manifest and support files. Checking it does not stop Companion.</p>
+        <button id="update-check" class="secondary" type="submit">Check package</button>
+      </form>
+      <section id="update-candidate" class="update-candidate" aria-labelledby="update-candidate-title" hidden>
+        <h2 id="update-candidate-title"></h2><p id="update-candidate-summary"></p>
+        <p id="update-apply-note">Companion checks for active calls and work before installing. Your contacts and conversations stay in this installation.</p>
+        <button id="update-apply" class="primary" type="button" hidden>Install update</button>
+      </section>
+      <div class="update-actions">
+        <button id="update-refresh" class="secondary" type="button">Check status</button>
+        <button id="update-retry-request" class="secondary" type="button" hidden>Retry same request</button>
+        <button id="update-resume" class="primary" type="button" hidden>Continue recovery</button>
+        <button id="update-rollback" class="text-button" type="button" hidden>Restore previous version</button>
+      </div>
+      <form id="update-rollback-confirmation" class="update-confirmation" hidden>
+        <h2>Restore the previous app version?</h2><p>Your saved contacts, conversations and accepted work stay in this installation. Companion will check that it can restore the previous package safely.</p>
+        <div class="update-actions"><button id="update-confirm-rollback" class="primary" type="submit">Restore previous version</button><button id="update-cancel-rollback" class="text-button" type="button">Keep current version</button></div>
+      </form>
+    </div>
+    <noscript><p>Enable JavaScript to check this installation and use its update controls.</p></noscript>
+  </main>
+</body>
+</html>
