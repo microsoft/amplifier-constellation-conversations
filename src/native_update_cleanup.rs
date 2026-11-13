@@ -554,15 +554,29 @@ pub(super) fn revoke(j: &mut Value) -> Result<()> {
 
 /// systemctl renders ExecStart as one command followed by execution results.
 /// Preserve the command and accepted execution identity; a successful Stop may
-/// change only the known terminal fields. Unknown/multiple renderer records are
-/// refused, never stripped from the retained native evidence.
+/// change known terminal fields or clear the entire execution record after unit
+/// collection. The latter also requires an independently settled native snapshot.
+/// Unknown/multiple renderer records are never stripped from retained evidence.
 #[derive(Debug, PartialEq, Eq)]
 struct SystemdExecIdentity<'a> {
     path: &'a str,
     argv: &'a str,
     ignore_errors: &'a str,
     start_time: &'a str,
+    stop_time: &'a str,
     pid: u32,
+    code: &'a str,
+    status: &'a str,
+}
+
+impl SystemdExecIdentity<'_> {
+    fn cleared(&self) -> bool {
+        self.start_time == "[n/a]"
+            && self.stop_time == "[n/a]"
+            && self.pid == 0
+            && self.code == "(null)"
+            && self.status == "0/0"
+    }
 }
 
 fn systemd_exec_identity(value: &Value) -> Result<SystemdExecIdentity<'_>> {
@@ -608,24 +622,27 @@ fn systemd_exec_identity(value: &Value) -> Result<SystemdExecIdentity<'_>> {
         Ok(())
     };
     let start_time = field(3, "start_time=")?;
+    let stop_time = field(4, "stop_time=")?;
     timestamp(start_time)?;
-    timestamp(field(4, "stop_time=")?)?;
+    timestamp(stop_time)?;
     let pid_text = field(5, "pid=")?;
     let pid: u32 = pid_text
         .parse()
         .context("Malformed effective ExecStart PID")?;
     ensure!(
-        pid > 0 && pid.to_string() == pid_text,
-        "Missing effective ExecStart generation"
+        pid.to_string() == pid_text,
+        "Malformed effective ExecStart PID"
     );
+    let code = field(6, "code=")?;
     ensure!(
         matches!(
-            field(6, "code=")?,
+            code,
             "(null)" | "exited" | "killed" | "dumped" | "trapped" | "stopped" | "continued"
         ),
         "Unknown effective ExecStart result code"
     );
-    let (status, name) = field(7, "status=")?
+    let full_status = field(7, "status=")?;
+    let (status, name) = full_status
         .split_once('/')
         .context("Malformed effective ExecStart status")?;
     let number: u8 = status
@@ -639,13 +656,21 @@ fn systemd_exec_identity(value: &Value) -> Result<SystemdExecIdentity<'_>> {
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b"_+-".contains(&b)),
         "Malformed effective ExecStart status name"
     );
-    Ok(SystemdExecIdentity {
+    let result = SystemdExecIdentity {
         path,
         argv,
         ignore_errors,
         start_time,
+        stop_time,
         pid,
-    })
+        code,
+        status: full_status,
+    };
+    ensure!(
+        (pid > 0 && start_time != "[n/a]") || result.cleared(),
+        "Incomplete effective ExecStart generation or cleared execution record"
+    );
+    Ok(result)
 }
 
 fn unchanged_native_fields(before: &Value, after: &Value, dynamic: &[&str]) -> Result<()> {
@@ -849,9 +874,37 @@ fn same_policy(before: &Value, after: &Value) -> Result<()> {
         let previous_exec = systemd_exec_identity(&before["native"]["ExecStart"])?;
         let current_exec = systemd_exec_identity(&after["native"]["ExecStart"])?;
         ensure!(
-            previous_exec == current_exec,
-            "Effective ExecStart command or accepted generation changed"
+            previous_exec.pid > 0 && previous_exec.start_time != "[n/a]",
+            "Missing accepted effective ExecStart generation"
         );
+        ensure!(
+            previous_exec.path == current_exec.path
+                && previous_exec.argv == current_exec.argv
+                && previous_exec.ignore_errors == current_exec.ignore_errors,
+            "Effective ExecStart command changed"
+        );
+        if current_exec.cleared() {
+            // A stopped no-autostart unit may be collected and lose all five
+            // execution fields. This is not evidence of process exit: the stop
+            // loop still checks the captured application generation and lock.
+            ensure!(
+                after["active"] == false
+                    && after["transitioning"] == false
+                    && after["processes"].as_array().is_some_and(Vec::is_empty)
+                    && after["native"]["ActiveState"] == "inactive"
+                    && after["native"]["SubState"] == "dead"
+                    && after["native"]["MainPID"] == "0"
+                    && after["native"]["ControlPID"] == "0"
+                    && after["native"]["InvocationID"] == "",
+                "Cleared effective ExecStart lacks a settled native observation"
+            );
+        } else {
+            ensure!(
+                previous_exec.start_time == current_exec.start_time
+                    && previous_exec.pid == current_exec.pid,
+                "Effective ExecStart accepted generation changed"
+            );
+        }
         // ExecStop is requested by the shared observer, but systemd omits it
         // when empty. Preserve it if present, as well as any future native
         // properties, instead of manufacturing a required empty string.

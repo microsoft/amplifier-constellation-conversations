@@ -465,6 +465,139 @@ fn execstart_command_and_accepted_execution_identity_cannot_change_during_stop()
     }
 }
 
+fn cleared_systemd_snapshots() -> (Value, Value) {
+    let fixture = Fixture::new();
+    let mut before = fixture.journal["launch_cleanup"]["authority"]["native_snapshot"].clone();
+    before["service"]["manager"] = json!("systemd_user");
+    before["native"]["ExecStart"] = json!(ACCEPTED_EXEC_START);
+    before["native"]["UnitFileState"] = json!("static");
+    before["enabled"] = Value::Null;
+    before["native"]["MainPID"] = json!("2553397");
+    before["native"]["ActiveState"] = json!("active");
+    before["native"]["SubState"] = json!("running");
+    let mut stopped = before.clone();
+    stopped["active"] = json!(false);
+    stopped["processes"] = json!([]);
+    stopped["native"]["MainPID"] = json!("0");
+    stopped["native"]["ActiveState"] = json!("inactive");
+    stopped["native"]["SubState"] = json!("dead");
+    stopped["native"]["InvocationID"] = json!("");
+    // Exact reset field values observed after the static replacement unit was
+    // stopped and collected. Command text stays on the existing fixture path.
+    stopped["native"]["ExecStart"] = json!(
+        ACCEPTED_EXEC_START
+            .replace(
+                "start_time=[Thu 2026-11-12 21:46:12 PST]",
+                "start_time=[n/a]"
+            )
+            .replace("pid=2553397", "pid=0")
+    );
+    (before, stopped)
+}
+
+#[test]
+fn actual_static_execstart_cleared_after_stop_is_not_a_new_generation() {
+    let (before, stopped) = cleared_systemd_snapshots();
+    let retained = before.clone();
+    same_policy(&before, &stopped).unwrap();
+    assert_eq!(before, retained); // Never rewrite the accepted launch generation.
+    // Policy comparison is not an exit proof and cannot create one.
+    assert!(stopped.get("application_exited").is_none());
+    assert!(stopped.get("service_lock_acquired").is_none());
+}
+
+#[test]
+fn cleared_execstart_requires_complete_settled_native_observation() {
+    let (before, stopped) = cleared_systemd_snapshots();
+    for (field, values) in [
+        ("active", vec![json!(true), Value::Null]),
+        ("transitioning", vec![json!(true), Value::Null]),
+        (
+            "processes",
+            vec![before["processes"].clone(), Value::Null, json!({})],
+        ),
+    ] {
+        for value in values {
+            let mut changed = stopped.clone();
+            changed[field] = value;
+            assert!(same_policy(&before, &changed).is_err(), "{field}");
+        }
+        let mut missing = stopped.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(same_policy(&before, &missing).is_err(), "missing {field}");
+    }
+    for (field, value) in [
+        ("MainPID", json!("2553397")),
+        ("MainPID", json!(0)),
+        ("ControlPID", json!("7")),
+        ("ControlPID", json!(0)),
+        ("ActiveState", json!("active")),
+        ("ActiveState", json!("failed")),
+        ("SubState", json!("stop")),
+        ("InvocationID", before["native"]["InvocationID"].clone()),
+        ("InvocationID", json!("b".repeat(32))),
+    ] {
+        let mut changed = stopped.clone();
+        changed["native"][field] = value;
+        assert!(same_policy(&before, &changed).is_err(), "{field}");
+    }
+    for field in [
+        "MainPID",
+        "ControlPID",
+        "ActiveState",
+        "SubState",
+        "InvocationID",
+    ] {
+        for value in [Value::Null, json!(false), json!([]), json!({})] {
+            let mut changed = stopped.clone();
+            changed["native"][field] = value;
+            assert!(same_policy(&before, &changed).is_err(), "malformed {field}");
+        }
+        let mut missing = stopped.clone();
+        missing["native"].as_object_mut().unwrap().remove(field);
+        assert!(same_policy(&before, &missing).is_err(), "missing {field}");
+    }
+}
+
+#[test]
+fn partial_clearing_or_command_and_policy_drift_cannot_use_reset_case() {
+    let (before, stopped) = cleared_systemd_snapshots();
+    let cleared = stopped["native"]["ExecStart"].as_str().unwrap();
+    for (old, new) in [
+        ("path=/tmp/", "path=/different/"),
+        (
+            " serve ; ignore_errors",
+            " serve --different ; ignore_errors",
+        ),
+        ("ignore_errors=no", "ignore_errors=yes"),
+        (
+            "start_time=[n/a]",
+            "start_time=[Thu 2026-11-12 21:46:12 PST]",
+        ),
+        ("stop_time=[n/a]", "stop_time=[Thu 2026-11-12 21:46:44 PST]"),
+        ("pid=0", "pid=2553397"),
+        ("code=(null)", "code=killed"),
+        ("status=0/0", "status=0/SUCCESS"),
+        ("status=0/0", "status=15/TERM"),
+    ] {
+        let mut changed = stopped.clone();
+        changed["native"]["ExecStart"] = json!(cleared.replace(old, new));
+        assert!(same_policy(&before, &changed).is_err(), "{old} -> {new}");
+    }
+    for field in ["UnitFileState", "Restart", "KillMode", "DropInPaths"] {
+        let mut changed = stopped.clone();
+        changed["native"][field] = json!("changed");
+        assert!(same_policy(&before, &changed).is_err(), "{field}");
+    }
+    let mut changed = stopped.clone();
+    changed["effective_definition"]["text"] = json!("changed policy");
+    assert!(same_policy(&before, &changed).is_err());
+    // An already-cleared record cannot replace the original accepted evidence,
+    // even if the two compared values are otherwise identical.
+    assert!(same_policy(&stopped, &stopped).is_err());
+    assert!(same_policy(&stopped, &before).is_err());
+}
+
 #[test]
 fn unknown_or_malformed_execstart_renderer_records_are_not_normalized() {
     for text in [
