@@ -9,6 +9,7 @@ no empty-HOME, fresh consumer OS, physical media or provider readiness claim.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import http.client
 import importlib.util
@@ -831,6 +832,94 @@ def launch_keys(home):
     return expected
 
 
+def await_cleanup_stopped(install, *, stage):
+    """Prove post-Stop disappearance without requesting a dying HTTP server.
+
+    The caller already stopped the exact manager generation, or waited for its
+    own foreground Popen child. This is only the final listener/lock check; it
+    cannot authorize Stop, prove updater health, or tolerate an API/auth error.
+    """
+    require(stage in {"manager_stop", "maintenance_exit"}, "Unknown cleanup observation stage")
+    started = time.monotonic()
+    deadline = started + 15
+    row = {"stage": stage, "status": "observing", "timeout_seconds": 15,
+           "authenticated_requests": 0, "samples": 0}
+    install.result["cleanup"].setdefault("listener_closure", []).append(row)
+    install.checkpoint()
+
+    def identity():
+        for name in ["config.json", "runtime.json"]:
+            require(stat.S_ISREG((install.home / name).lstat().st_mode),
+                    "Cleanup identity file is not an ordinary file")
+        config, runtime = read_json(install.home / "config.json"), read_json(install.home / "runtime.json")
+        port = config.get("port")
+        require(type(port) is int and 1 <= port <= 65535 and config.get("transport") == "local_http"
+                and isinstance(config.get("id"), str) and bool(config["id"]),
+                "Cleanup local installation identity is invalid")
+        origin = f"http://127.0.0.1:{port}"
+        require(config.get("public_url") == runtime.get("url") == runtime.get("public_url") == origin
+                and type(runtime.get("port")) is int and runtime["port"] == port
+                and runtime.get("provider_id") == "web:" + config["id"]
+                and type(runtime.get("pid")) is int and runtime["pid"] > 0
+                and isinstance(runtime.get("process_nonce"), str) and bool(runtime["process_nonce"]),
+                "Cleanup runtime differs from the saved literal loopback identity")
+        return {"id": config["id"], "origin": origin, "port": port,
+                "pid": runtime["pid"], "process_nonce": runtime["process_nonce"]}
+
+    def lock_identity():
+        value = (install.home / "service.lock").lstat()
+        require(stat.S_ISREG(value.st_mode), "Cleanup service.lock is not an ordinary file")
+        return value.st_dev, value.st_ino
+
+    try:
+        expected = identity()
+        expected_lock = lock_identity()
+        row["identity_sha256"] = fingerprint(expected)
+        install.ports.add(expected["port"])
+        while time.monotonic() < deadline:
+            require(identity() == expected and lock_identity() == expected_lock,
+                    "Cleanup listener or lock identity changed")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                connection.settimeout(min(0.2, remaining))
+                try:
+                    code = connection.connect_ex(("127.0.0.1", expected["port"]))
+                except TimeoutError:
+                    code = errno.ETIMEDOUT
+            # Only an explicit refused connection establishes a closed socket.
+            # Timeout is pending; access/network/reset errors remain errors.
+            if code == 0:
+                state = "open"
+            elif code in {errno.ECONNREFUSED, getattr(errno, "WSAECONNREFUSED", 10061)}:
+                state = "refused"
+            elif code in {errno.ETIMEDOUT, getattr(errno, "WSAETIMEDOUT", 10060)}:
+                state = "pending"
+            else:
+                row["socket_error"] = code
+                raise AssertionError("Cleanup listener closure is unknown after socket error")
+            row.update(samples=row["samples"] + 1, listener=state)
+            free = install.service_lock_available()
+            row["service_lock_available"] = free
+            require(identity() == expected and lock_identity() == expected_lock,
+                    "Cleanup listener or lock identity changed")
+            remaining = deadline - time.monotonic()
+            if state == "refused" and free and remaining > 0:
+                row.update(status="stopped", listener_closed=True, service_lock_released=True)
+                return row
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
+        raise AssertionError("Owned cleanup listener did not close or retained service.lock within 15 seconds")
+    except Exception as error:
+        row.update(status="unknown", error_type=type(error).__name__)
+        raise
+    finally:
+        row["elapsed_seconds"] = time.monotonic() - started
+        install.checkpoint()
+
+
 def cleanup_case(install, observer, registration, controller_environment):
     """Separate post-proof teardown; it cannot manufacture update success."""
     require(len(install.result.get("phase_snapshots", [])) == 2, "Cleanup cannot precede both settled lifetime proofs")
@@ -853,7 +942,7 @@ def cleanup_case(install, observer, registration, controller_environment):
         time.sleep(0.1)
     else:
         raise TimeoutError("Exact fixture manager Stop remains unobserved; no cleanup retry")
-    install.await_stopped()
+    await_cleanup_stopped(install, stage="manager_stop")
     require(retained_operations(install.home) == ledger_before, "Teardown Stop changed the native operation ledger")
     maintenance, _ = install.start()
     cleanup["maintenance"] = "separate controller-owned foreground process, not updater lifetime proof"
@@ -897,7 +986,7 @@ def cleanup_case(install, observer, registration, controller_environment):
     require(maintenance.poll() is None, "Foreground cleanup process exited unexpectedly")
     maintenance.terminate()
     maintenance.wait(timeout=12)
-    install.await_stopped()
+    await_cleanup_stopped(install, stage="maintenance_exit")
     if registration is not None:
         original = observer.call({"kind": "original"})
         require(observer.preference(original) == observer.baseline_startup and original.get("active") is False,
