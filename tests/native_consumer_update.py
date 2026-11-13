@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import select
 import shutil
 import socket
 import stat
@@ -843,7 +844,7 @@ def await_cleanup_stopped(install, *, stage):
     started = time.monotonic()
     deadline = started + 15
     row = {"stage": stage, "status": "observing", "timeout_seconds": 15,
-           "authenticated_requests": 0, "samples": 0}
+           "authenticated_requests": 0, "samples": 0, "connection_attempts": 0, "poll_slices": 0}
     install.result["cleanup"].setdefault("listener_closure", []).append(row)
     install.checkpoint()
 
@@ -871,6 +872,9 @@ def await_cleanup_stopped(install, *, stage):
         require(stat.S_ISREG(value.st_mode), "Cleanup service.lock is not an ordinary file")
         return value.st_dev, value.st_ino
 
+    connection, pending = None, False
+    refused = {errno.ECONNREFUSED, getattr(errno, "WSAECONNREFUSED", 10061)}
+    in_progress = {errno.EINPROGRESS, errno.EWOULDBLOCK, getattr(errno, "WSAEWOULDBLOCK", 10035)}
     try:
         expected = identity()
         expected_lock = lock_identity()
@@ -882,45 +886,74 @@ def await_cleanup_stopped(install, *, stage):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
-                connection.settimeout(min(0.2, remaining))
-                try:
-                    code = connection.connect_ex(("127.0.0.1", expected["port"]))
-                except TimeoutError:
-                    code = errno.ETIMEDOUT
-            # Only an explicit refused connection establishes a closed socket.
-            # Timeout is pending; access/network/reset errors remain errors.
-            if code == 0:
-                state = "open"
-            elif code in {errno.ECONNREFUSED, getattr(errno, "WSAECONNREFUSED", 10061)}:
-                state = "refused"
-            elif code in {errno.ETIMEDOUT, getattr(errno, "WSAETIMEDOUT", 10060),
-                          errno.EWOULDBLOCK, getattr(errno, "WSAEWOULDBLOCK", 10035)}:
-                # CPython connect_ex returns EWOULDBLOCK/WSAEWOULDBLOCK when
-                # its own select timeout expires. No refusal was observed.
-                state = "pending"
-            else:
-                row["socket_error"] = code
-                raise AssertionError("Cleanup listener closure is unknown after socket error")
+            if connection is None:
+                connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                connection.setblocking(False)
+                row["connection_attempts"] += 1
+                code = connection.connect_ex(("127.0.0.1", expected["port"]))
+                pending = code in in_progress
+                if code == 0:
+                    state = "open"
+                elif code in refused:
+                    state = "refused"
+                elif not pending:
+                    row["socket_error"] = code
+                    raise AssertionError("Cleanup listener closure is unknown after socket error")
+            if pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Preserve this one outstanding connect across short observation
+                # slices. Replacing it after each timeout can discard its result.
+                readable, writable, exceptional = select.select([], [connection], [connection], min(0.2, remaining))
+                row["poll_slices"] += 1
+                require(not readable and all(item is connection for item in writable + exceptional),
+                        "Cleanup connection readiness is ambiguous")
+                if not writable and not exceptional:
+                    state = "pending"
+                else:
+                    code = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    pending = False
+                    if code in refused:
+                        state = "refused"
+                    elif code == 0 and writable and not exceptional:
+                        state = "open"
+                    else:
+                        row["socket_error"] = code
+                        raise AssertionError("Cleanup listener closure is unknown after socket readiness")
             row.update(samples=row["samples"] + 1, listener=state)
             free = install.service_lock_available()
             row["service_lock_available"] = free
             require(identity() == expected and lock_identity() == expected_lock,
                     "Cleanup listener or lock identity changed")
             remaining = deadline - time.monotonic()
+            if not pending:
+                # OPEN is not evidence about the next listener state. A later
+                # observation needs a new attempt; never reuse a prior refusal
+                # after waiting for a held service.lock either.
+                connection.close()
+                connection = None
             if state == "refused" and free and remaining > 0:
                 row.update(status="stopped", listener_closed=True, service_lock_released=True)
                 return row
             if remaining <= 0:
                 break
-            time.sleep(min(0.1, remaining))
+            if not pending:
+                time.sleep(min(0.1, remaining))
         raise AssertionError("Owned cleanup listener did not close or retained service.lock within 15 seconds")
     except Exception as error:
         row.update(status="unknown", error_type=type(error).__name__)
         raise
     finally:
-        row["elapsed_seconds"] = time.monotonic() - started
-        install.checkpoint()
+        try:
+            if connection is not None:
+                connection.close()
+        except Exception as error:
+            row.update(status="unknown", error_type=type(error).__name__)
+            raise
+        finally:
+            row["elapsed_seconds"] = time.monotonic() - started
+            install.checkpoint()
 
 
 def cleanup_case(install, observer, registration, controller_environment):
