@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import subprocess
@@ -36,10 +37,249 @@ require, read_json = lifecycle.require, lifecycle.read_json
 CONTROL = "native-prestatus-fixture-control.json"
 OBSERVATION = "native-prestatus-fixture-observation.json"
 MAX_OBSERVATION_BYTES = 16384
+DIAGNOSTIC_LAUNCH_CODES = frozenset({
+    "dispatch_or_retirement_in_progress", "dispatch_already_attempted", "outstanding_index_busy",
+    "dispatch_intent_unconfirmed", "dispatch_index_unconfirmed", "dispatch_authority_unconfirmed",
+    "fixed_profile_mismatch", "existing_or_transitioning_instance", "manager_dispatch_unconfirmed",
+    "dispatch_receipt_unconfirmed",
+})
 
 
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def diagnostic_uuid(value):
+    return isinstance(value, str) and len(value) == 36 and str(uuid.UUID(value)) == value
+
+
+def diagnostic_json(path, limit):
+    """Bounded fixed-file read; return no file text, path, or exception text."""
+    try:
+        parent = path.parent.lstat()
+        require(stat.S_ISDIR(parent.st_mode) and not getattr(parent, "st_file_attributes", 0) & 0x400,
+                "Diagnostic parent is not ordinary")
+        before = path.lstat()
+        require(stat.S_ISREG(before.st_mode) and not getattr(before, "st_file_attributes", 0) & 0x400,
+                "Diagnostic file is not ordinary")
+        if before.st_size > limit:
+            return "too_large", None, None
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            require(stat.S_ISREG(opened.st_mode) and not getattr(opened, "st_file_attributes", 0) & 0x400
+                    and (opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino),
+                    "Diagnostic file changed")
+            raw = stream.read(limit + 1)
+            after = os.fstat(stream.fileno())
+        if len(raw) > limit:
+            return "too_large", None, None
+        require((opened.st_size, opened.st_mtime_ns) == (after.st_size, after.st_mtime_ns),
+                "Diagnostic file changed")
+        value = json.loads(raw)
+        require(type(value) is dict, "Diagnostic JSON is not an object")
+        return "available", value, hashlib.sha256(raw).hexdigest()
+    except FileNotFoundError:
+        return "absent", None, None
+    except (ValueError, UnicodeError, AssertionError):
+        return "invalid", None, None
+    except Exception:
+        return "unavailable", None, None
+
+
+def diagnostic_launch_receipt(value):
+    if value is None:
+        return {"status": "not_recorded"}
+    require(type(value) is dict and value.get("status") in {"accepted", "refused", "unknown"},
+            "Unknown launch receipt")
+    expected = {"status"} if value["status"] == "accepted" else {"status", "code"}
+    require(set(value) == expected, "Malformed launch receipt")
+    result = {"status": value["status"]}
+    if "code" in value:
+        require(isinstance(value["code"], str) and len(value["code"]) <= 1024, "Invalid receipt code")
+        result["code"] = value["code"] if value["code"] in DIAGNOSTIC_LAUNCH_CODES else "unknown"
+        result["code_sha256"] = fingerprint(value["code"])
+    return result
+
+
+def diagnostic_worker_observation(value):
+    """Project even unavailable native observations without private arguments."""
+    try:
+        require(type(value) is dict and value.get("status") in {"observed", "unavailable", "absent", "not_dispatched"},
+                "Unrecognized worker observation")
+        result = {"status": value["status"]}
+        for key in ("profile_matches", "active", "transitioning", "enabled", "masked", "definition_matches",
+                    "registered", "previous_process_alive", "actual_worker_alive"):
+            if key in value:
+                # Native snapshots and an unclaimed worker use null for an
+                # unknown optional flag. Preserve it without inferring false.
+                require(value[key] is None or type(value[key]) is bool, "Invalid observation flag")
+                result[key] = value[key]
+        for key in ("manager", "application_manager_binding", "actual_worker_manager_binding"):
+            if key in value:
+                require(value[key] in {None, "systemd_user", "launch_agent", "scheduled_task",
+                                      "same_process", "descendant_of_task_engine"}, "Invalid observation enum")
+                result[key] = value[key]
+        for key in ("code", "service_name", "actual_worker_identity"):
+            if key in value and value[key] is not None:
+                result[key + "_sha256"] = fingerprint(value[key])
+        if "launch_receipt" in value:
+            result["launch_receipt"] = diagnostic_launch_receipt(value["launch_receipt"])
+        if "processes" in value:
+            require(type(value["processes"]) is list and len(value["processes"]) <= 16,
+                    "Too many diagnostic processes")
+            result["processes"] = []
+            for item in value["processes"]:
+                require(type(item) is dict and type(item.get("identity")) is dict, "Invalid process identity")
+                result["processes"].append({"identity_sha256": fingerprint(item["identity"])})
+        return result
+    except Exception:
+        return {"status": "unknown", "reason": "invalid_native_observation"}
+
+
+class FaultObserver(consumer_update.NativeObserver):
+    """Retain results of existing inspections only; never make an extra call."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.diagnostic_observations = []
+        self.diagnostic_observation_count = 0
+        self.diagnostic_request_id = None
+        self.diagnostic_check_id = None
+
+    def call(self, target, **kwargs):
+        try:
+            value = super().call(target, **kwargs)
+        except BaseException:
+            self.retain_inspection(target, {"status": "unavailable", "code": "inspection_raised"})
+            raise
+        self.retain_inspection(target, value)
+        return value
+
+    def retain_inspection(self, target, value):
+        try:
+            if target.get("kind") != "worker":
+                return
+            require(diagnostic_uuid(target.get("operation")) and diagnostic_uuid(target.get("attempt")),
+                    "Invalid inspection identity")
+            row = {"operation_sha256": fingerprint(target["operation"]),
+                   "attempt_sha256": fingerprint(target["attempt"]),
+                   "observation": diagnostic_worker_observation(value)}
+            self.diagnostic_observation_count += 1
+            self.diagnostic_observations.append(row)
+            self.diagnostic_observations = self.diagnostic_observations[-8:]
+        except BaseException:
+            # Diagnostics must not change the existing observer call's result.
+            pass
+
+
+def capture_fault_diagnostics(install, observer):
+    """Failure-only attribution to the original request; no status/manager call."""
+    result = {"schema": 1, "status": "unknown", "consistency": "bounded_best_effort_local_reads",
+              "additional_native_or_http_calls": 0}
+    try:
+        request = observer.diagnostic_request_id
+        check = observer.diagnostic_check_id
+        require(diagnostic_uuid(request) and diagnostic_uuid(check), "No original apply identity")
+        result["request_id"] = request
+        home_metadata = install.home.lstat()
+        require(stat.S_ISDIR(home_metadata.st_mode)
+                and not getattr(home_metadata, "st_file_attributes", 0) & 0x400, "Diagnostic home is not ordinary")
+        config_status, config, config_hash = diagnostic_json(install.home / "config.json", 65536)
+        ledger_path = install.home / "native-browser-update" / "control.json"
+        ledger_status, ledger, ledger_hash = diagnostic_json(ledger_path, 4 * 1024 * 1024)
+        result["files"] = {"config": config_status, "browser_ledger": ledger_status}
+        require(config_status == ledger_status == "available", "Unavailable diagnostic binding")
+        installation_id = config.get("id")
+        require(diagnostic_uuid(installation_id) and type(ledger.get("schema")) is int and ledger["schema"] == 1
+                and ledger.get("installation_id") == installation_id, "Installation binding changed")
+        request_record = ledger["requests"][request]
+        operation_id = request_record["operation_id"]
+        attempt_id = request_record["attempt_id"]
+        require(operation_id == request and attempt_id == request
+                and ledger["current_operation"] == operation_id
+                and request_record["payload"] == {"kind": "apply", "check_id": check},
+                "Original request is not current")
+        operation = ledger["operations"][operation_id]
+        attempt = operation["attempt"]
+        transaction = operation["transaction_id"]
+        require(operation["id"] == operation_id and operation["request_id"] == request
+                and operation["kind"] == "apply" and attempt["id"] == attempt_id
+                and diagnostic_uuid(transaction) and type(attempt["claimed"]) is bool
+                and operation["state"] in {"accepted", "running", "completed", "deferred", "failed", "unknown"}
+                and operation["outcome"] in {None, "unchanged", "applied", "rolled_back"},
+                "Operation binding or state changed")
+        for attribute, expected in (("operation", operation_id), ("attempt", attempt_id), ("transaction", transaction)):
+            captured = getattr(observer, attribute, None)
+            require(captured is None or captured == expected, "Captured observer identity changed")
+        identities = {"operation_sha256": fingerprint(operation_id), "attempt_sha256": fingerprint(attempt_id),
+                      "transaction_sha256": fingerprint(transaction)}
+        launch = attempt.get("launch")
+        require(launch is None or type(launch) is dict, "Invalid launch profile")
+        process = attempt.get("worker_process")
+        require(process is None or type(process) is dict, "Invalid worker identity")
+        browser = {**identities, "state": operation["state"], "outcome": operation["outcome"],
+                   "claimed": attempt["claimed"], "launch_present": launch is not None,
+                   "worker_process_present": process is not None}
+        if process is not None:
+            browser["worker_process_sha256"] = fingerprint(process)
+        dispatch = {"status": "not_prepared"}
+        if launch is not None:
+            require(type(launch.get("schema")) is int and launch["schema"] == 1 and launch.get("installation_id") == installation_id
+                    and launch.get("home") == str(install.home.resolve())
+                    and launch.get("identity") == {"kind": "worker", "operation": operation_id, "attempt": attempt_id},
+                    "Prepared launch identity changed")
+            service = launch["service"]
+            manager = service["manager"]
+            name = service["name"]
+            require(manager in {"systemd_user", "launch_agent", "scheduled_task"}
+                    and isinstance(name, str) and re.fullmatch(r"agent-conversations-worker-[0-9a-f]{64}(?:\.service)?", name)
+                    and name.endswith(".service") == (manager == "systemd_user")
+                    and type(launch.get("profile")) is dict and launch["profile"].get("autostart") is False,
+                    "Invalid fixed worker profile")
+            browser["launch_sha256"] = fingerprint(launch)
+            browser["profile_sha256"] = fingerprint(launch["profile"])
+            marker_status, marker, marker_hash = diagnostic_json(
+                install.home / ("native-browser-launch-" + name + ".json"), 1024 * 1024)
+            dispatch = {"status": marker_status}
+            if marker_status == "available":
+                require(marker.get("prepared") == launch and type(marker.get("manager_attempted")) is bool,
+                        "Dispatch binding changed or lacks authority")
+                launch_receipt = diagnostic_launch_receipt(marker.get("receipt"))
+                require(launch_receipt["status"] != "accepted" or marker["manager_attempted"],
+                        "Accepted receipt contradicts dispatch authority")
+                dispatch.update(sha256=marker_hash, manager_attempted=marker["manager_attempted"],
+                                receipt=launch_receipt)
+        observations = getattr(observer, "diagnostic_observations", [])
+        count = getattr(observer, "diagnostic_observation_count", 0)
+        require(type(observations) is list and len(observations) <= 8 and type(count) is int and count >= len(observations),
+                "Invalid captured observations")
+        require(all(row.get("operation_sha256") == identities["operation_sha256"]
+                    and row.get("attempt_sha256") == identities["attempt_sha256"] for row in observations),
+                "Captured inspection belongs to another attempt")
+        # No liveness/health assertion: these are already observed native results.
+        observed = {"count": count, "last": observations, "additional_calls": 0,
+                    "last_worker": diagnostic_worker_observation(observer.worker_observation)
+                    if getattr(observer, "worker_observation", None) is not None else {"status": "not_captured"}}
+        again_status, _, again_hash = diagnostic_json(ledger_path, 4 * 1024 * 1024)
+        config_again_status, _, config_again_hash = diagnostic_json(install.home / "config.json", 65536)
+        require(again_status == config_again_status == "available" and config_hash == config_again_hash
+                and again_hash == ledger_hash, "Binding changed during diagnostic observation")
+        result.update(status="bound", installation_id_sha256=fingerprint(installation_id),
+                      browser_ledger_sha256=ledger_hash, browser=browser, dispatch=dispatch, observer=observed)
+    except BaseException:
+        result.update(status="unknown", reason="missing_invalid_or_changed_original_binding")
+    return result
+
+
+def retain_fault_diagnostics(install, observer):
+    try:
+        install.result["failure_request_diagnostics"] = capture_fault_diagnostics(install, observer)
+    except BaseException:
+        install.result["failure_request_diagnostics"] = {"schema": 1, "status": "unknown", "reason": "capture_failed"}
+    try:
+        install.checkpoint()
+    except BaseException:
+        pass  # Preserve the original fixture exception, including interrupts.
 
 
 def read_observation(home):
@@ -217,6 +457,17 @@ def teardown_restored_after_green(install, observer, journal):
 
 
 def exercise_fault(install, observer, a, b, fixture_sha, *, expect_gap):
+    try:
+        return exercise_fault_inner(install, observer, a, b, fixture_sha, expect_gap=expect_gap)
+    except BaseException:
+        try:
+            retain_fault_diagnostics(install, observer)
+        except BaseException:
+            pass
+        raise
+
+
+def exercise_fault_inner(install, observer, a, b, fixture_sha, *, expect_gap):
     before = consumer_update.protected_receipt(install)
     checked = consumer_update.check_once(install, b)
     require(checked["check"]["available"] and checked["actions"]["apply"], "Fault candidate was not checked")
@@ -224,6 +475,8 @@ def exercise_fault(install, observer, a, b, fixture_sha, *, expect_gap):
     lifecycle.write_json(install.home / CONTROL, {"schema": 1, "fixture_id": fixture_id,
                                                 "candidate_binary_sha256": fixture_sha})
     request_id = str(uuid.uuid4())
+    observer.diagnostic_request_id = request_id
+    observer.diagnostic_check_id = checked["check"]["id"]
     observer.begin("applied")
     consumer_update.submit_once(install, "apply", {"request_id": request_id, "check_id": checked["check"]["id"]})
     observed = observe_fault(install, observer, request_id, fixture_id, fixture_sha)
@@ -430,16 +683,22 @@ def qualify(archive, receipt, output, controller, fixture, *, topology="both", e
             install.controller_environment = consumer_update.manager_environment(install, consumer_update.startup_module())
             prepared = consumer.prepare_consumer_installation(install, managed_parent=managed)
             consumer_update.seed_retained_work(install, prepared["conversation_id"])
-            observer = consumer_update.NativeObserver(install, controller, managed=managed)
+            observer = FaultObserver(install, controller, managed=managed)
             case["status"] = exercise_fault(install, observer, a, b, fixture_sha, expect_gap=expect_gap)
             finish_disposal(install, observer)
             case["retained_directory"] = str(case_root)
             install.checkpoint()
         result["status"] = "gap_reproduced" if expect_gap else "recovery_passed_teardown_retained"
     except BaseException as error:
-        result.update(status="failed_or_interrupted", error_type=type(error).__name__,
-                      failure_installation_snapshots=lifecycle.capture_failure_snapshots(installations))
-        lifecycle.persist_checkpoint(output, result)
+        result.update(status="failed_or_interrupted", error_type=type(error).__name__)
+        try:
+            result["failure_installation_snapshots"] = lifecycle.capture_failure_snapshots(installations)
+        except BaseException:
+            result["failure_installation_snapshots"] = {"status": "unavailable"}
+        try:
+            lifecycle.persist_checkpoint(output, result)
+        except BaseException:
+            pass  # A diagnostic checkpoint cannot replace the original failure.
         raise
     lifecycle.persist_checkpoint(output, result)
     return result
