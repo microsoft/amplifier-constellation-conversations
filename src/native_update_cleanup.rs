@@ -76,12 +76,40 @@ struct ExitObservation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StatusProof {
+    id: String,
+    binary_sha256: String,
+    transaction_id: String,
+    launch_nonce: String,
+    pid: u32,
+    process_nonce: String,
+    admission_closed: bool,
+    process_birth: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AuthoritySource {
+    ProcessEntry,
+    AuthenticatedStatus {
+        first_status: Box<StatusProof>,
+        confirmed_status: Box<StatusProof>,
+        restore_started: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Receipt {
     schema: u32,
     binding: Binding,
     target: Target,
     start: Ack,
     authority: Option<StopAuthority>,
+    // Older unreleased receipts had no provenance. Preserve that absence rather
+    // than guessing an origin; every new capture writes an explicit source.
+    #[serde(default)]
+    authority_source: Option<AuthoritySource>,
     revoked: bool,
     stop: Option<Ack>,
     exit_before_switch: Option<ExitObservation>,
@@ -108,6 +136,22 @@ fn read_receipt(j: &Value) -> Result<Option<Receipt>> {
         );
         identity::validate_retained(a, &r.binding)?;
     }
+    if let Some(source) = &r.authority_source {
+        let authority = r
+            .authority
+            .as_ref()
+            .context("Authority source lacks captured generation")?;
+        if let AuthoritySource::AuthenticatedStatus {
+            first_status,
+            confirmed_status,
+            restore_started,
+        } = source
+        {
+            validate_status_proof(first_status, &r.binding, *restore_started)?;
+            validate_status_proof(confirmed_status, &r.binding, *restore_started)?;
+            validate_status_pair(first_status, confirmed_status, &authority.application)?;
+        }
+    }
     if let Some(exit) = &r.exit_before_switch {
         let a = r
             .authority
@@ -126,7 +170,8 @@ fn read_receipt(j: &Value) -> Result<Option<Receipt>> {
                 && exit.native_snapshot["transitioning"] == false
                 && exit.native_snapshot["processes"]
                     .as_array()
-                    .is_some_and(Vec::is_empty),
+                    .is_some_and(Vec::is_empty)
+                && native_instances_settled(&exit.native_snapshot)?,
             "Malformed or unbound application exit evidence"
         );
         same_policy(&a.native_snapshot, &exit.native_snapshot)?;
@@ -209,6 +254,7 @@ pub(super) fn start(home: &Path, j: &mut Value, target: Target) -> Result<()> {
         target,
         start: Ack::Intent,
         authority: None,
+        authority_source: None,
         revoked: false,
         stop: None,
         exit_before_switch: None,
@@ -283,9 +329,211 @@ pub(super) fn capture(home: &Path, j: &mut Value) -> Result<bool> {
     let native = installation::snapshot(&service)?;
     r.target.validate_profile(&native)?;
     r.authority = Some(identity::capture(&r.binding, &service, &native, &entry)?);
+    r.authority_source = Some(AuthoritySource::ProcessEntry);
     store(home, j, &r)?;
     crate::native_update_clock::check()?;
     Ok(true)
+}
+
+fn validate_status_proof(
+    proof: &StatusProof,
+    binding: &Binding,
+    restore_started: bool,
+) -> Result<()> {
+    ensure!(
+        proof.id == binding.installation_id
+            && proof.binary_sha256 == binding.package["binary_sha256"]
+            && proof.transaction_id == binding.transaction_id
+            && proof.launch_nonce == binding.nonce,
+        "Authenticated status belongs to another launch or package"
+    );
+    ensure!(
+        proof.pid > 0 && (16..=256).contains(&proof.process_nonce.len()),
+        "Authenticated status lacks application identity"
+    );
+    ensure!(
+        proof.admission_closed || restore_started,
+        "Authenticated status does not retain the existing admission boundary"
+    );
+    ensure!(
+        proof.process_birth.is_none_or(|birth| birth > 0),
+        "Invalid authenticated process birth"
+    );
+    Ok(())
+}
+
+fn status_proof(status: &Value, binding: &Binding, restore_started: bool) -> Result<StatusProof> {
+    let text = |field: &str| -> Result<String> {
+        Ok(status[field]
+            .as_str()
+            .context("Missing authenticated status binding")?
+            .into())
+    };
+    let proof = StatusProof {
+        id: text("id")?,
+        binary_sha256: text("binary_sha256")?,
+        transaction_id: text("transaction_id")?,
+        launch_nonce: text("launch_nonce")?,
+        pid: status["pid"]
+            .as_u64()
+            .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
+            .context("Invalid authenticated status PID")? as u32,
+        process_nonce: text("process_nonce")?,
+        admission_closed: status["admission"]["closed"]
+            .as_bool()
+            .context("Missing authenticated admission state")?,
+        process_birth: status
+            .get("process_birth")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .context("Malformed authenticated process birth")
+            })
+            .transpose()?,
+    };
+    validate_status_proof(&proof, binding, restore_started)?;
+    Ok(proof)
+}
+
+fn validate_status_pair(
+    first: &StatusProof,
+    confirmed: &StatusProof,
+    application: &Value,
+) -> Result<()> {
+    ensure!(
+        first.pid == confirmed.pid
+            && first.process_nonce == confirmed.process_nonce
+            && first.process_birth == confirmed.process_birth
+            && application["pid"] == first.pid,
+        "Authenticated application changed between status observations"
+    );
+    // Older Windows status already reports this actual process FILETIME. Keep
+    // that evidence distinct from a scheduler engine identity.
+    if let Some(birth) = application.get("creation_time_100ns") {
+        let birth: u64 = birth
+            .as_str()
+            .context("Invalid native process birth")?
+            .parse()?;
+        ensure!(
+            first.process_birth == Some(birth),
+            "Authenticated and native process birth differ"
+        );
+    }
+    Ok(())
+}
+
+fn validate_status_generation(application: &Value, current: Option<&Value>) -> Result<()> {
+    ensure!(
+        current == Some(application),
+        "Application generation changed during authenticated status"
+    );
+    Ok(())
+}
+
+fn status_capture_receipt(j: &Value) -> Result<Receipt> {
+    let r = read_receipt(j)?.context("No accepted manager launch for status capture")?;
+    ensure!(
+        !r.revoked
+            && r.start == Ack::Accepted
+            && r.stop.is_none()
+            && r.exit_before_switch.is_none()
+            && r.authority.is_none()
+            && j["launch_nonce"] == r.binding.nonce
+            && *current_record(j) == r.binding.package
+            && matches!(j["phase"].as_str(), Some("verifying" | "restoring")),
+        "Authenticated status cannot promote an uncertain or superseded launch"
+    );
+    Ok(r)
+}
+
+fn optional_entry(home: &Path, binding: &Binding) -> Result<Option<identity::Entry>> {
+    let path = identity::entry_path(home, binding)?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(_) => identity::read_entry(home, binding).map(Some),
+    }
+}
+
+/// Compatibility for an older, healthy application with no early publisher.
+/// Both status reads use the existing authenticated local API. A native process
+/// observation brackets the second response, so an earlier response's recycled
+/// numeric PID cannot become authority over a later application generation.
+/// No entry file, Start, session, prompt, or health claim is manufactured here.
+pub(super) async fn capture_authenticated_status(
+    home: &Path,
+    j: &mut Value,
+    first: &Value,
+) -> Result<Value> {
+    capture_authenticated_status_with(home, j, first, || local_api(home, "GET", "status", None))
+        .await
+}
+
+async fn capture_authenticated_status_with<F: std::future::Future<Output = Result<Value>>>(
+    home: &Path,
+    j: &mut Value,
+    first: &Value,
+    confirm: impl FnOnce() -> F,
+) -> Result<Value> {
+    let mut r = status_capture_receipt(j)?;
+    let restoring = j["restore_started"] == true;
+    let first_proof = status_proof(first, &r.binding, restoring)?;
+    crate::native_update_clock::check()?;
+    let initial_entry = optional_entry(home, &r.binding)?;
+    let application =
+        process::identity(first_proof.pid)?.context("Authenticated application is absent")?;
+    if let Some(entry) = &initial_entry {
+        ensure!(
+            entry.application == application,
+            "Present process entry differs from authenticated application"
+        );
+    }
+    let confirmed = confirm().await?;
+    crate::native_update_clock::check()?;
+    let confirmed_proof = status_proof(&confirmed, &r.binding, restoring)?;
+    validate_status_pair(&first_proof, &confirmed_proof, &application)?;
+    let current_application = process::identity(first_proof.pid)?;
+    validate_status_generation(&application, current_application.as_ref())?;
+    // A publisher may have reached entry after the caller's earlier absent
+    // observation. Prefer its actual evidence; malformed present evidence is
+    // never treated as permission to use the compatibility path.
+    let final_entry = optional_entry(home, &r.binding)?;
+    if let Some(initial) = &initial_entry {
+        ensure!(
+            final_entry.as_ref() == Some(initial),
+            "Process entry changed during status capture"
+        );
+    }
+    let service = r.target.service()?;
+    crate::native_update_clock::check()?;
+    let native = installation::snapshot(&service)?;
+    r.target.validate_profile(&native)?;
+    crate::native_update_clock::check()?;
+    let (authority, source) = if let Some(entry) = final_entry {
+        ensure!(
+            entry.application == application,
+            "Present process entry differs from authenticated generation"
+        );
+        (
+            identity::capture(&r.binding, &service, &native, &entry)?,
+            AuthoritySource::ProcessEntry,
+        )
+    } else {
+        (
+            identity::capture_process(&r.binding, &service, &native, &application)?,
+            AuthoritySource::AuthenticatedStatus {
+                first_status: Box::new(first_proof),
+                confirmed_status: Box::new(confirmed_proof),
+                restore_started: restoring,
+            },
+        )
+    };
+    crate::native_update_clock::check()?;
+    r.authority = Some(authority);
+    r.authority_source = Some(source);
+    store(home, j, &r)?;
+    crate::native_update_clock::check()?;
+    Ok(confirmed)
 }
 
 /// Preserve the exact revoked attempt before clearing the public startup nonce.
@@ -400,6 +648,162 @@ fn systemd_exec_identity(value: &Value) -> Result<SystemdExecIdentity<'_>> {
     })
 }
 
+fn unchanged_native_fields(before: &Value, after: &Value, dynamic: &[&str]) -> Result<()> {
+    let previous = before.as_object().context("Missing native policy map")?;
+    let current = after.as_object().context("Missing native policy map")?;
+    for key in previous.keys().chain(current.keys()) {
+        if !dynamic.contains(&key.as_str()) {
+            ensure!(
+                previous.get(key) == current.get(key),
+                "Native service property changed: {key}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn task_native_fields(native: &Value) -> Result<&Vec<Value>> {
+    for field in ["path", "xml", "owner_sid", "security_descriptor"] {
+        ensure!(
+            native[field].as_str().is_some_and(|s| !s.is_empty()),
+            "Malformed native task field: {field}"
+        );
+    }
+    ensure!(
+        native["enabled"].is_boolean()
+            && native["logon_type"].as_i64().is_some()
+            && native["actions"].is_array(),
+        "Malformed native task policy"
+    );
+    ensure!(
+        native["state"]
+            .as_u64()
+            .is_some_and(|state| (1..=4).contains(&state)),
+        "Unknown or malformed native task state"
+    );
+    native["instances"]
+        .as_array()
+        .context("Missing native task instances")
+}
+
+fn task_instance_fields(instance: &Value) -> Result<(&str, u64)> {
+    let guid = instance["instance_guid"]
+        .as_str()
+        .context("Missing native task GUID")?;
+    ensure!(
+        !uuid::Uuid::parse_str(guid)?.is_nil(),
+        "Invalid native task GUID"
+    );
+    let pid = instance["engine_pid"]
+        .as_u64()
+        .filter(|pid| *pid <= u32::MAX as u64)
+        .context("Invalid native task engine PID")?;
+    ensure!(
+        instance["state"]
+            .as_u64()
+            .is_some_and(|state| (1..=4).contains(&state))
+            && instance["current_action"].is_string()
+            && instance["engine_instance_guids"].is_array(),
+        "Malformed native task instance"
+    );
+    Ok((guid, pid))
+}
+
+fn same_task_policy(before: &Value, after: &Value) -> Result<()> {
+    let expected = task_native_fields(before)?;
+    let current = task_native_fields(after)?;
+    ensure!(
+        before["state"] == 4 && expected.len() == 1 && current.len() <= 1,
+        "Native task invocation is not uniquely retained"
+    );
+    unchanged_native_fields(before, after, &["state", "instances"])?;
+    let (expected_guid, expected_pid) = task_instance_fields(&expected[0])?;
+    ensure!(
+        expected_pid > 0 && expected[0]["engine_instance_guids"] == json!([expected_guid]),
+        "Accepted task engine association is not unique"
+    );
+    for instance in current {
+        let (guid, pid) = task_instance_fields(instance)?;
+        ensure!(
+            guid == expected_guid && (pid == expected_pid || pid == 0),
+            "A different task invocation appeared after Stop"
+        );
+        let associations = instance["engine_instance_guids"].as_array().unwrap();
+        ensure!(
+            (pid == 0 && associations.is_empty())
+                || (associations.len() == 1 && associations[0] == expected_guid),
+            "Task engine association changed after Stop"
+        );
+        unchanged_native_fields(
+            &expected[0],
+            instance,
+            &["state", "engine_pid", "engine_instance_guids"],
+        )?;
+    }
+    Ok(())
+}
+
+fn same_launch_agent_policy(before: &Value, after: &Value) -> Result<()> {
+    for snapshot in [before, after] {
+        ensure!(
+            snapshot["loaded"].is_boolean()
+                && snapshot["native"]["domain"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+            "Malformed native LaunchAgent domain or loaded state"
+        );
+        let disabled = snapshot["native"]
+            .get("disabled_override")
+            .context("Missing native disable override")?;
+        ensure!(
+            disabled.is_null() || disabled.is_boolean(),
+            "Malformed native disable override"
+        );
+        let properties = snapshot["native"]["properties"]
+            .as_object()
+            .context("Missing native LaunchAgent properties")?;
+        ensure!(
+            properties.values().all(Value::is_string),
+            "Malformed native LaunchAgent property"
+        );
+        if snapshot["loaded"] == true {
+            ensure!(
+                properties.get("state").is_some_and(Value::is_string)
+                    && properties.get("path").is_some_and(Value::is_string),
+                "Loaded LaunchAgent lacks effective state or path"
+            );
+        } else {
+            ensure!(
+                properties.is_empty(),
+                "Unloaded LaunchAgent retained unconfirmed properties"
+            );
+        }
+    }
+    ensure!(
+        before["loaded"] == true,
+        "Accepted LaunchAgent is not loaded"
+    );
+    unchanged_native_fields(&before["native"], &after["native"], &["properties"])?;
+    if after["loaded"] == true {
+        // Accepted shared observer already excludes counters and retains loaded
+        // command/environment/policy. Only state and PID are termination fields.
+        unchanged_native_fields(
+            &before["native"]["properties"],
+            &after["native"]["properties"],
+            &["state", "pid"],
+        )?;
+    }
+    Ok(())
+}
+
+fn native_instances_settled(snapshot: &Value) -> Result<bool> {
+    if snapshot["service"]["manager"] == "scheduled_task" {
+        return Ok(task_native_fields(&snapshot["native"])?.is_empty()
+            && matches!(snapshot["native"]["state"].as_u64(), Some(1 | 3)));
+    }
+    Ok(true)
+}
+
 fn same_policy(before: &Value, after: &Value) -> Result<()> {
     for field in [
         "schema",
@@ -491,6 +895,10 @@ fn same_policy(before: &Value, after: &Value) -> Result<()> {
                 "A different native invocation replaced the accepted launch"
             );
         }
+    } else if before["service"]["manager"] == "scheduled_task" {
+        same_task_policy(&before["native"], &after["native"])?;
+    } else if before["service"]["manager"] == "launch_agent" {
+        same_launch_agent_policy(before, after)?;
     }
     Ok(())
 }
@@ -602,6 +1010,7 @@ pub(super) async fn stop(home: &Path, j: &mut Value) -> Result<Option<Installati
         if current["active"] == false
             && current["transitioning"] == false
             && current["processes"].as_array().is_some_and(Vec::is_empty)
+            && native_instances_settled(&current)?
             && !process::matches(&authority.application)?
             && let Ok(service) = lock(home, "service.lock")
         {

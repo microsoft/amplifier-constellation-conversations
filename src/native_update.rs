@@ -1102,7 +1102,6 @@ async fn healthy(
         }
         let cleanup_captured = cleanup::capture(home, j)?;
         if let Ok(s) = local_api(home, "GET", "status", None).await
-            && cleanup_captured
             && s["id"] == j["installation_id"]
             && s["binary_sha256"] == current_record(j)["binary_sha256"]
             && s["transaction_id"] == j["transaction_id"]
@@ -1110,7 +1109,13 @@ async fn healthy(
             && (s["admission"]["closed"] == true
                 || (j["restore_started"] == true && s["admission"]["closed"] == false))
         {
-            return Ok(s);
+            if cleanup_captured {
+                return Ok(s);
+            }
+            // Previous bundles predate the early process-entry receipt. Keep
+            // their authenticated health path, binding a second status sample
+            // to the same native generation before retaining cleanup authority.
+            return cleanup::capture_authenticated_status(home, j, &s).await;
         }
         ensure!(
             std::time::Instant::now() < deadline,

@@ -12,6 +12,7 @@ impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let home = dunce::canonicalize(directory.path()).unwrap();
+        config::private_dir(&home).unwrap();
         let config = Config::local(&home, "Stop-only state fixture", 54127).unwrap();
         config.save(&home).unwrap();
         let binary =
@@ -54,14 +55,26 @@ impl Fixture {
             ServiceManager::SystemdUser => {}
             ServiceManager::LaunchAgent => {
                 native["processes"][0]["role"] = json!("launchd_pid");
-                native["native"]["properties"] = json!({"pid":std::process::id().to_string()});
+                native["native"]["domain"] = json!("gui/501");
+                native["native"]["disabled_override"] = Value::Null;
+                native["native"]["properties"] = json!({"pid":std::process::id().to_string(),
+                    "path":"/fixture.plist","state":"running","program":"/fixture/companion",
+                    "arguments":"{\n --home fixture\n}","environment":"{\n retained=value\n}"});
             }
             ServiceManager::ScheduledTask => {
                 let guid = uuid::Uuid::new_v4().to_string();
                 native["processes"][0]["role"] = json!("scheduled_task_engine");
                 native["processes"][0]["instance_guid"] = json!(guid);
+                native["native"]["path"] = json!("\\fixture-task");
+                native["native"]["xml"] = json!("<Task>fixture</Task>");
+                native["native"]["enabled"] = json!(true);
+                native["native"]["state"] = json!(4);
+                native["native"]["owner_sid"] = json!("S-1-5-21-fixture");
+                native["native"]["logon_type"] = json!(3);
+                native["native"]["security_descriptor"] = json!("O:fixtureD:P(A;;FA;;;fixture)");
+                native["native"]["actions"] = json!([{"type":0,"id":"","path":"fixture.exe","args":"--home fixture","cwd":"fixture"}]);
                 native["native"]["instances"] = json!([{"instance_guid":guid,
-                    "engine_pid":std::process::id(),"state":4,"engine_instance_guids":[guid]}]);
+                    "engine_pid":std::process::id(),"state":4,"current_action":"","engine_instance_guids":[guid]}]);
             }
         }
         let authority = StopAuthority {
@@ -92,8 +105,14 @@ impl Fixture {
         native["processes"] = json!([]);
         match native["service"]["manager"].as_str().unwrap() {
             "systemd_user" => native["native"]["MainPID"] = json!("0"),
-            "launch_agent" => native["native"]["properties"] = json!({}),
-            "scheduled_task" => native["native"]["instances"] = json!([]),
+            "launch_agent" => {
+                native["native"]["properties"] = json!({});
+                native["loaded"] = json!(false);
+            }
+            "scheduled_task" => {
+                native["native"]["instances"] = json!([]);
+                native["native"]["state"] = json!(3);
+            }
             manager => panic!("Unexpected fixture manager {manager}"),
         }
         j["launch_cleanup"]["revoked"] = json!(true);
@@ -104,6 +123,24 @@ impl Fixture {
         });
         j["phase"] = json!("switching");
         j["launch_nonce"] = Value::Null;
+        j
+    }
+    fn status(&self) -> Value {
+        let binding = &self.journal["launch_cleanup"]["binding"];
+        let application = &self.journal["launch_cleanup"]["authority"]["application"];
+        let mut status = json!({"id":binding["installation_id"],
+            "binary_sha256":binding["package"]["binary_sha256"],
+            "transaction_id":binding["transaction_id"],"launch_nonce":binding["nonce"],
+            "pid":application["pid"],"process_nonce":"c".repeat(64),"admission":{"closed":true}});
+        if let Some(birth) = application["creation_time_100ns"].as_str() {
+            status["process_birth"] = json!(birth.parse::<u64>().unwrap());
+        }
+        status
+    }
+    fn uncaptured(&self) -> Value {
+        let mut j = self.journal.clone();
+        j["launch_cleanup"]["authority"] = Value::Null;
+        j["launch_cleanup"]["authority_source"] = Value::Null;
         j
     }
 }
@@ -475,6 +512,357 @@ fn optional_execstop_and_unknown_native_properties_remain_preserved() {
         .unwrap()
         .remove("FutureStaticPolicy");
     assert!(same_policy(&before, &changed).is_err());
+}
+
+fn synthetic_task_snapshot() -> Value {
+    let fixture = Fixture::new();
+    let mut snapshot = fixture.journal["launch_cleanup"]["authority"]["native_snapshot"].clone();
+    snapshot["service"]["manager"] = json!("scheduled_task");
+    let guid = "11111111-2222-4333-8444-555555555555";
+    snapshot["native"] = json!({"path":"\\fixture-task","xml":"<Task>retained</Task>",
+        "enabled":true,"state":4,"owner_sid":"S-1-5-21-fixture","logon_type":3,
+        "security_descriptor":"O:fixtureD:P(A;;FA;;;fixture)",
+        "actions":[{"type":0,"id":"","path":"fixture.exe","args":"--home fixture","cwd":"fixture"}],
+        "instances":[{"instance_guid":guid,"engine_pid":123,"state":4,
+            "current_action":"","engine_instance_guids":[guid]}]});
+    snapshot
+}
+
+#[test]
+fn task_dacl_static_policy_and_unknown_native_keys_are_not_lost_after_stop() {
+    let before = synthetic_task_snapshot();
+    let mut stopped = before.clone();
+    stopped["native"]["state"] = json!(3);
+    stopped["native"]["instances"] = json!([]);
+    same_policy(&before, &stopped).unwrap();
+    for field in [
+        "path",
+        "xml",
+        "owner_sid",
+        "security_descriptor",
+        "enabled",
+        "logon_type",
+        "actions",
+    ] {
+        let mut changed = stopped.clone();
+        changed["native"][field] = Value::Null;
+        assert!(same_policy(&before, &changed).is_err(), "{field}");
+    }
+    let mut changed = stopped.clone();
+    changed["native"]["security_descriptor"] = json!("O:anotherD:P(A;;FA;;;another)");
+    assert!(same_policy(&before, &changed).is_err());
+    let mut extended = before.clone();
+    extended["native"]["unknown_native_policy"] = json!({"retained":true});
+    same_policy(&extended, &extended).unwrap();
+    for value in [json!({"retained":false}), Value::Null] {
+        let mut changed = extended.clone();
+        changed["native"]["unknown_native_policy"] = value;
+        assert!(same_policy(&extended, &changed).is_err());
+    }
+    assert!(same_policy(&extended, &before).is_err());
+    assert!(same_policy(&before, &extended).is_err());
+    for state in [
+        Value::Null,
+        json!("3"),
+        json!(false),
+        json!(-1),
+        json!(0),
+        json!(5),
+    ] {
+        let mut changed = stopped.clone();
+        changed["native"]["state"] = state;
+        assert!(same_policy(&before, &changed).is_err());
+        assert!(native_instances_settled(&changed).is_err());
+    }
+}
+
+#[test]
+fn task_instance_with_zero_engine_pid_still_blocks_exit_and_new_guid_is_refused() {
+    let before = synthetic_task_snapshot();
+    let mut stopping = before.clone();
+    stopping["active"] = json!(false);
+    stopping["processes"] = json!([]);
+    stopping["native"]["state"] = json!(3);
+    stopping["native"]["instances"][0]["state"] = json!(3);
+    stopping["native"]["instances"][0]["engine_pid"] = json!(0);
+    stopping["native"]["instances"][0]["engine_instance_guids"] = json!([]);
+    same_policy(&before, &stopping).unwrap();
+    assert!(!native_instances_settled(&stopping).unwrap());
+    for which in 0..4 {
+        let mut changed = stopping.clone();
+        match which {
+            0 => {
+                changed["native"]["instances"][0]["instance_guid"] =
+                    json!(uuid::Uuid::new_v4().to_string())
+            }
+            1 => changed["native"]["instances"][0]["engine_pid"] = json!(124),
+            2 => {
+                changed["native"]["instances"][0]["engine_instance_guids"] =
+                    json!([uuid::Uuid::new_v4().to_string()])
+            }
+            _ => {
+                changed["native"]["instances"] = json!([
+                    stopping["native"]["instances"][0],
+                    stopping["native"]["instances"][0]
+                ])
+            }
+        }
+        assert!(same_policy(&before, &changed).is_err(), "case{which}");
+    }
+    stopping["native"]["instances"] = json!([]);
+    same_policy(&before, &stopping).unwrap();
+    assert!(native_instances_settled(&stopping).unwrap());
+    for state in [2, 4] {
+        stopping["native"]["state"] = json!(state);
+        assert!(!native_instances_settled(&stopping).unwrap());
+    }
+}
+
+fn synthetic_launch_agent_snapshot() -> Value {
+    let fixture = Fixture::new();
+    let mut snapshot = fixture.journal["launch_cleanup"]["authority"]["native_snapshot"].clone();
+    snapshot["service"]["manager"] = json!("launch_agent");
+    snapshot["native"] = json!({"domain":"gui/501","disabled_override":null,
+        "properties":{"state":"running","pid":"123","path":"/fixture.plist",
+            "program":"/fixture/companion","arguments":"{\n --home fixture\n}",
+            "environment":"{\n retained=value\n}"}});
+    snapshot
+}
+
+#[test]
+fn launch_agent_loaded_effective_policy_and_unloaded_outer_policy_remain_exact() {
+    let before = synthetic_launch_agent_snapshot();
+    let mut loaded_stopped = before.clone();
+    loaded_stopped["native"]["properties"]["state"] = json!("waiting");
+    loaded_stopped["native"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pid");
+    same_policy(&before, &loaded_stopped).unwrap();
+    for field in ["program", "arguments", "environment"] {
+        let mut changed = loaded_stopped.clone();
+        changed["native"]["properties"][field] = json!("changed loaded policy");
+        assert!(same_policy(&before, &changed).is_err(), "{field}");
+    }
+    let mut unknown = before.clone();
+    unknown["native"]["properties"]["future_policy"] = json!("retained");
+    same_policy(&unknown, &unknown).unwrap();
+    assert!(same_policy(&unknown, &before).is_err());
+    assert!(same_policy(&before, &unknown).is_err());
+    let mut unloaded = before.clone();
+    unloaded["loaded"] = json!(false);
+    unloaded["native"]["properties"] = json!({});
+    same_policy(&before, &unloaded).unwrap();
+    for field in ["domain", "disabled_override"] {
+        let mut changed = unloaded.clone();
+        changed["native"][field] = if field == "domain" {
+            json!("gui/502")
+        } else {
+            json!(false)
+        };
+        assert!(same_policy(&before, &changed).is_err());
+        changed["native"].as_object_mut().unwrap().remove(field);
+        assert!(same_policy(&before, &changed).is_err());
+    }
+    unknown = before.clone();
+    unknown["native"]["future_policy"] = json!("retained");
+    assert!(same_policy(&unknown, &unloaded).is_err());
+    assert!(same_policy(&unloaded, &unknown).is_err());
+    unloaded["native"]["properties"] = json!({"program":"unconfirmed"});
+    assert!(same_policy(&before, &unloaded).is_err());
+}
+
+#[test]
+fn authenticated_status_proofs_bind_existing_fields_and_do_not_invent_legacy_provenance() {
+    let fixture = Fixture::new();
+    let r = read_receipt(&fixture.journal).unwrap().unwrap();
+    assert!(r.authority_source.is_none());
+    let proof = status_proof(&fixture.status(), &r.binding, false).unwrap();
+    let mut captured = fixture.journal.clone();
+    captured["launch_cleanup"]["authority_source"] =
+        serde_json::to_value(AuthoritySource::AuthenticatedStatus {
+            first_status: Box::new(proof.clone()),
+            confirmed_status: Box::new(proof),
+            restore_started: false,
+        })
+        .unwrap();
+    assert!(
+        read_receipt(&captured)
+            .unwrap()
+            .unwrap()
+            .authority_source
+            .is_some()
+    );
+    captured["launch_cleanup"]["authority_source"]["confirmed_status"]["process_nonce"] =
+        json!("d".repeat(64));
+    assert!(read_receipt(&captured).is_err());
+    captured["launch_cleanup"]["authority_source"] = json!({"kind":"process_entry"});
+    read_receipt(&captured).unwrap();
+    captured["launch_cleanup"]["authority"] = Value::Null;
+    assert!(read_receipt(&captured).is_err());
+}
+
+#[test]
+fn authenticated_status_rejects_incomplete_binding_and_changed_native_generation() {
+    let fixture = Fixture::new();
+    let r = read_receipt(&fixture.journal).unwrap().unwrap();
+    let status = fixture.status();
+    for field in [
+        "id",
+        "binary_sha256",
+        "transaction_id",
+        "launch_nonce",
+        "pid",
+        "process_nonce",
+        "admission",
+    ] {
+        let mut missing = status.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            status_proof(&missing, &r.binding, false).is_err(),
+            "{field}"
+        );
+    }
+    for pid in [
+        json!(0),
+        json!(u64::from(u32::MAX) + 1),
+        json!("1"),
+        Value::Null,
+    ] {
+        let mut changed = status.clone();
+        changed["pid"] = pid;
+        assert!(status_proof(&changed, &r.binding, false).is_err());
+    }
+    let mut open = status.clone();
+    open["admission"]["closed"] = json!(false);
+    assert!(status_proof(&open, &r.binding, false).is_err());
+    status_proof(&open, &r.binding, true).unwrap();
+    open["admission"]["closed"] = Value::Null;
+    assert!(status_proof(&open, &r.binding, true).is_err());
+
+    let application = &r.authority.as_ref().unwrap().application;
+    validate_status_generation(application, Some(application)).unwrap();
+    validate_status_pair(
+        &status_proof(&status, &r.binding, false).unwrap(),
+        &status_proof(&status, &r.binding, false).unwrap(),
+        application,
+    )
+    .unwrap();
+    let mut changed = application.clone();
+    let field = if cfg!(windows) {
+        "creation_time_100ns"
+    } else if cfg!(target_os = "macos") {
+        "start_microseconds"
+    } else {
+        "start_ticks"
+    };
+    changed[field] = json!(format!("{}1", application[field].as_str().unwrap()));
+    assert!(validate_status_generation(application, Some(&changed)).is_err());
+    assert!(validate_status_generation(application, None).is_err());
+}
+
+#[tokio::test]
+async fn uncertain_start_or_superseded_binding_never_reaches_status_confirmation() {
+    let fixture = Fixture::new();
+    for which in 0..6 {
+        let mut j = fixture.uncaptured();
+        match which {
+            0 => j["launch_cleanup"]["start"] = json!({"status":"unknown","code":"lost_reply"}),
+            1 => j["launch_cleanup"]["start"] = json!({"status":"intent"}),
+            2 => j["launch_cleanup"]["start"] = json!({"status":"refused","code":"changed"}),
+            3 => j["launch_cleanup"]["revoked"] = json!(true),
+            4 => j["launch_nonce"] = json!("superseded"),
+            _ => j["candidate"]["binary_sha256"] = json!("d".repeat(64)),
+        }
+        let before = j.clone();
+        let queried = std::cell::Cell::new(false);
+        let result =
+            capture_authenticated_status_with(&fixture.home, &mut j, &fixture.status(), || {
+                queried.set(true);
+                std::future::ready(Err(anyhow::anyhow!("must not query")))
+            })
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("uncertain or superseded"),
+            "case{which}"
+        );
+        assert!(!queried.get(), "case{which}");
+        assert_eq!(j, before);
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_stale_present_entry_never_falls_through_to_status_capture() {
+    for which in 0..3 {
+        let fixture = Fixture::new();
+        let mut j = fixture.uncaptured();
+        let before = j.clone();
+        let r = read_receipt(&j).unwrap().unwrap();
+        let path = identity::entry_path(&fixture.home, &r.binding).unwrap();
+        let mut entry = json!({"schema":1,"binding":r.binding,
+            "application":fixture.journal["launch_cleanup"]["authority"]["application"]});
+        let bytes = match which {
+            0 => b"{".to_vec(),
+            1 => {
+                entry["binding"]["nonce"] = json!("stale");
+                serde_json::to_vec(&entry).unwrap()
+            }
+            _ => {
+                entry["application"]["pid"] = json!(u64::from(std::process::id()) + 1);
+                serde_json::to_vec(&entry).unwrap()
+            }
+        };
+        amplifier_native_platform::private_create(&path, &bytes).unwrap();
+        let queried = std::cell::Cell::new(false);
+        let result =
+            capture_authenticated_status_with(&fixture.home, &mut j, &fixture.status(), || {
+                queried.set(true);
+                std::future::ready(Err(anyhow::anyhow!("must not query")))
+            })
+            .await;
+        assert!(result.is_err(), "case{which}");
+        assert!(!queried.get(), "case{which}");
+        assert_eq!(j, before);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[tokio::test]
+async fn changed_confirmation_refuses_before_native_manager_observation_or_publication() {
+    let fixture = Fixture::new();
+    let first = fixture.status();
+    for field in [
+        "id",
+        "binary_sha256",
+        "transaction_id",
+        "launch_nonce",
+        "pid",
+        "process_nonce",
+        "admission",
+    ] {
+        let mut j = fixture.uncaptured();
+        let before = j.clone();
+        let mut second = first.clone();
+        second[field] = match field {
+            "pid" => json!(first["pid"].as_u64().unwrap() + 1),
+            "admission" => json!({"closed":false}),
+            _ => json!("d".repeat(64)),
+        };
+        let queries = std::cell::Cell::new(0);
+        let result = capture_authenticated_status_with(&fixture.home, &mut j, &first, || {
+            queries.set(queries.get() + 1);
+            std::future::ready(Ok(second))
+        })
+        .await;
+        assert!(result.is_err(), "{field}");
+        assert_eq!(queries.get(), 1, "{field}");
+        assert_eq!(j, before);
+        let r = read_receipt(&j).unwrap().unwrap();
+        assert!(optional_entry(&fixture.home, &r.binding).unwrap().is_none());
+    }
 }
 
 #[test]

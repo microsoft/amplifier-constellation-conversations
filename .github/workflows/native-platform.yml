@@ -102,6 +102,7 @@ jobs:
         run: |
           python scripts/run-native-rust-tests.py --target '${{ matrix.rust_target }}' --output '${{ runner.temp }}/native-rust-tests.json'
           cargo test --locked --target '${{ matrix.rust_target }}' --test native_update_bundle --test native_update_admission --test native_consumer_setup
+          cargo test --locked --target '${{ matrix.rust_target }}' --example native-update-controller
           cargo build --locked --target '${{ matrix.rust_target }}' --release --bin agent-conversations --example native-update-controller --example native-prestatus-app
       - name: Acquire locked build-time dependencies
         run: |

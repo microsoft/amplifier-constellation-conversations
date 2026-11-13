@@ -359,13 +359,36 @@ fn capture_with(
         entry.schema == 1 && entry.binding == *binding,
         "Application entry belongs to another attempt"
     );
-    let ancestry = prove_chain(service, snapshot, &entry.application, processes)?;
+    capture_process_with(binding, service, snapshot, &entry.application, processes)
+}
+
+/// Bind an independently authenticated status process to the actual native
+/// generation. The caller retains the authenticated status and Start evidence;
+/// this does not fabricate a startup entry, acknowledge Start, or prove health.
+pub fn capture_process(
+    binding: &Binding,
+    service: &Service,
+    snapshot: &Value,
+    application: &Value,
+) -> Result<StopAuthority> {
+    capture_process_with(binding, service, snapshot, application, &NativeProcesses)
+}
+
+fn capture_process_with(
+    binding: &Binding,
+    service: &Service,
+    snapshot: &Value,
+    application: &Value,
+    processes: &dyn Processes,
+) -> Result<StopAuthority> {
+    binding.validate()?;
+    let ancestry = prove_chain(service, snapshot, application, processes)?;
     Ok(StopAuthority {
         schema: 1,
         binding: binding.clone(),
         service: service.clone(),
         native_snapshot: snapshot.clone(),
-        application: entry.application.clone(),
+        application: application.clone(),
         ancestry,
     })
 }
@@ -586,6 +609,30 @@ mod tests {
         p.identities.retain(|v| v != &e.application);
         p.identities.push(json!({"pid":123,"generation":"reused"}));
         assert!(validate_with(&authority, &b, &n, &p).is_err());
+    }
+    #[test]
+    fn authenticated_process_capture_preserves_the_same_native_generation_and_policy_proof() {
+        for windows in [false, true] {
+            let (b, s, n, e, p) = fixture(windows);
+            let from_entry = capture_with(&b, &s, &n, &e, &p).unwrap();
+            let from_status = capture_process_with(&b, &s, &n, &e.application, &p).unwrap();
+            assert_eq!(from_entry, from_status);
+            for (field, value) in [
+                ("masked", json!(true)),
+                ("definition_matches", json!(false)),
+                ("start_allowed", Value::Null),
+                ("processes", json!([])),
+            ] {
+                let mut changed = n.clone();
+                changed[field] = value;
+                assert!(
+                    capture_process_with(&b, &s, &changed, &e.application, &p).is_err(),
+                    "{field}"
+                );
+            }
+            let changed_generation = json!({"pid":e.application["pid"],"generation":"reused"});
+            assert!(capture_process_with(&b, &s, &n, &changed_generation, &p).is_err());
+        }
     }
     #[test]
     fn missing_or_cyclic_windows_ancestry_refuses() {

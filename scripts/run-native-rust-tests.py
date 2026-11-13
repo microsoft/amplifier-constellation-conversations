@@ -19,6 +19,8 @@ SELECTIONS = [
     ("native_update_clock::", False),
     ("native_update_process::", False),
     ("native_update::startup_tests::", False),
+    ("native_update::cleanup::", False),
+    ("native_update_identity::", False),
     ("native_browser_update::", False),
     ("native_browser_cleanup::", False),
     ("native_recovery::", False),
