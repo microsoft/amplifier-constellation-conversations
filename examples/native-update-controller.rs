@@ -1,6 +1,7 @@
 //! Disposable qualification controller; never part of the packaged application.
 //! Private stdin selects only this installation's original application or a
-//! fixed launch already recorded by its real updater. There is no delete action.
+//! fixed launch already recorded by its real updater. Original desktop startup
+//! removal is a separately checked post-proof test action, never one-shot cleanup.
 use agent_conversations::{
     config::Config, desktop, native_bundle, native_startup_state, native_update,
     native_update_launch,
@@ -11,6 +12,7 @@ use amplifier_native_platform::{
     registration::{self, Registration},
 };
 use anyhow::{Context, Result, ensure};
+use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -23,14 +25,22 @@ enum Action {
     Inspect,
     ObserveRetirement,
     Stop,
+    RemoveOriginal,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Target {
     Original,
-    Worker { operation: String, attempt: String },
-    Replacement { transaction: String },
+    Worker {
+        operation: String,
+        attempt: String,
+    },
+    Replacement {
+        transaction: String,
+        #[serde(default)]
+        nonce: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -41,6 +51,8 @@ struct Request {
     target: Target,
     previous_process: Option<Value>,
     setup_bundle: Option<PathBuf>,
+    #[serde(default)]
+    expected_original: Option<Value>,
 }
 
 fn digest(value: &Value) -> Result<String> {
@@ -106,8 +118,12 @@ fn saved_launch(request: &Request) -> Result<Option<native_update_launch::Prepar
                     && identity["operation"] == *operation
                     && identity["attempt"] == *attempt
             }
-            Target::Replacement { transaction } => {
-                identity["kind"] == "replacement" && identity["transaction"] == *transaction
+            Target::Replacement { transaction, nonce } => {
+                identity["kind"] == "replacement"
+                    && identity["transaction"] == *transaction
+                    && nonce
+                        .as_ref()
+                        .is_none_or(|expected| identity["nonce"] == *expected)
             }
             Target::Original => false,
         };
@@ -175,6 +191,25 @@ fn application_binding(application: &Value, processes: &Value) -> Result<Option<
     Ok(None)
 }
 
+fn required_application_matches(
+    expected: Option<&Value>,
+    snapshot: &Value,
+) -> Result<Option<ActionOutcome>> {
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    Ok(
+        (application_binding(expected, &snapshot["processes"])?.is_none()).then(|| {
+            ActionOutcome::Refused {
+                code: "changed_fixture_application".into(),
+                message:
+                    "Captured fixture application generation is no longer bound to this manager"
+                        .into(),
+            }
+        }),
+    )
+}
+
 fn actual_worker(request: &Request, installation_id: &str) -> Result<Option<Value>> {
     let Target::Worker { operation, attempt } = &request.target else {
         return Ok(None);
@@ -208,6 +243,188 @@ fn actual_worker(request: &Request, installation_id: &str) -> Result<Option<Valu
     Ok(Some(identity.clone()))
 }
 
+fn inactive(snapshot: &Value) -> Result<()> {
+    ensure!(
+        snapshot["active"] == false
+            && snapshot["transitioning"] == false
+            && snapshot["processes"].as_array().is_some_and(Vec::is_empty),
+        "Original fixture registration is active, transitioning, or unknown"
+    );
+    Ok(())
+}
+
+fn preference(value: &Value) -> Value {
+    let mut result = serde_json::Map::new();
+    for key in [
+        "registered",
+        "service_name",
+        "manager",
+        "enabled",
+        "masked",
+        "definition_sha256",
+        "effective_definition_sha256",
+        "startup_settings_sha256",
+    ] {
+        result.insert(key.into(), value[key].clone());
+    }
+    Value::Object(result)
+}
+
+fn fixture_lock(home: &std::path::Path, name: &str) -> Result<fs::File> {
+    let path = home.join(name);
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Fixture lock must already be ordinary"
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            metadata.file_attributes() & 0x400 == 0,
+            "Fixture lock cannot be a reparse point"
+        );
+    }
+    let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    file.try_lock_exclusive().context("Fixture remains owned")?;
+    Ok(file)
+}
+
+fn removed_state(
+    manager: &ServiceManager,
+    definition_absent: bool,
+    manager_present: bool,
+    cached: Option<&Value>,
+) -> Result<Value> {
+    ensure!(
+        definition_absent,
+        "Original definition remains after removal"
+    );
+    if !manager_present {
+        ensure!(
+            cached.is_none(),
+            "Absent manager must not have a fabricated snapshot"
+        );
+        return Ok(json!({"manager_present":false,"native_absence_proved":true,
+            "inactive_after":true,"cached_native_sha256":null}));
+    }
+    ensure!(
+        matches!(manager, ServiceManager::SystemdUser),
+        "Original native registration remains after removal"
+    );
+    let snapshot = cached.context("Retained systemd cache needs actual native inspection")?;
+    inactive(snapshot)?;
+    Ok(json!({"manager_present":true,"native_absence_proved":false,
+        "inactive_after":true,"cached_native_sha256":digest(snapshot)?}))
+}
+
+fn observe_original_removed(service: &Service) -> Result<Value> {
+    // Native registration absence is a distinct observation from a missing
+    // plist/unit file. In particular, never turn an absent Mac plist into
+    // permission to infer that its loaded manager service has disappeared.
+    let present = installation::manager_registration_exists(service)?;
+    let definition_absent = match &service.manager {
+        ServiceManager::ScheduledTask => !present,
+        _ => match fs::symlink_metadata(
+            service
+                .definition_path
+                .as_ref()
+                .context("Missing original definition path")?,
+        ) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(e.into()),
+            Ok(_) => false,
+        },
+    };
+    let cached = if present && matches!(service.manager, ServiceManager::SystemdUser) {
+        // The exact manager/name is unchanged. Its removed definition must not
+        // be reread as a required file; the remaining cache is only evidence of
+        // inactive/no-process state, never a claim of complete native absence.
+        let cached_service = Service {
+            manager: service.manager.clone(),
+            name: service.name.clone(),
+            definition_path: None,
+        };
+        Some(installation::snapshot(&cached_service)?)
+    } else {
+        None
+    };
+    removed_state(
+        &service.manager,
+        definition_absent,
+        present,
+        cached.as_ref(),
+    )
+}
+
+fn remove_original(request: &Request, config: &Config) -> Result<Value> {
+    ensure!(
+        matches!(&request.target, Target::Original)
+            && request.previous_process.is_none()
+            && request.setup_bundle.is_none(),
+        "Removal applies only to the inactive original desktop profile"
+    );
+    let expected = request
+        .expected_original
+        .as_ref()
+        .context("Missing captured original preference")?;
+    ensure!(
+        expected.is_object() && preference(expected) == *expected && expected["registered"] == true,
+        "Original removal requires the exact captured preference fields"
+    );
+    // These are the existing updater/application lock files, not a new product
+    // lock or permission bypass. Only this disposable controller uses them.
+    let _owner = fixture_lock(&request.home, "native-update.lock")?;
+    let _service_lock = fixture_lock(&request.home, "service.lock")?;
+    let original = native_startup_state::capture(&request.home, &config.id)?;
+    ensure!(
+        original["registered"] == true,
+        "No original desktop registration exists"
+    );
+    let service = original_service(&request.home, &config.id)?;
+    let before = installation::snapshot(&service)?;
+    inactive(&before)?;
+    native_startup_state::validate(&original)?;
+    let mut observed = sanitized(&service, &before, true)?;
+    observed["registered"] = json!(true);
+    observed["startup_settings_sha256"] = json!(digest(&original["settings"])?);
+    ensure!(
+        preference(&observed) == *expected,
+        "Original startup preference changed before removal"
+    );
+    let final_before = installation::snapshot(&service)?;
+    inactive(&final_before)?;
+    ensure!(
+        final_before == before,
+        "Original native snapshot changed before removal"
+    );
+    native_startup_state::validate(&original)?;
+    let id = uuid::Uuid::parse_str(&config.id)?;
+    if amplifier_native_platform::remove_startup(&native_bundle::APPLICATION, &request.home, &id)
+        .is_err()
+    {
+        return Ok(
+            json!({"status":"original_removal_unknown","dispatch":{"status":"unknown"},
+            "before":observed,"retry_permitted":false}),
+        );
+    }
+    let after = match observe_original_removed(&service) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(
+                json!({"status":"original_removal_unknown","dispatch":{"status":"unknown"},
+            "before":observed,"code":"post_remove_native_state_unknown","retry_permitted":false}),
+            );
+        }
+    };
+    Ok(
+        json!({"status":"original_removed", "dispatch":{"status":"accepted"},
+        "before":observed,"after":after,"original_definition_absent":true,
+        "inactive_after":true,"one_shot_registration_mutation":false,"retry_permitted":false,
+        "manager_cache_absence_claimed":false}),
+    )
+}
+
 fn run(mut request: Request) -> Result<Value> {
     ensure!(
         std::env::var("CONSTELLATION_NATIVE_STARTUP_TEST").as_deref() == Ok("1"),
@@ -216,6 +433,10 @@ fn run(mut request: Request) -> Result<Value> {
     ensure!(
         request.home.is_absolute(),
         "Installation home must be absolute"
+    );
+    ensure!(
+        matches!(request.action, Action::RemoveOriginal) || request.expected_original.is_none(),
+        "Expected original preference belongs only to removal"
     );
     if matches!(request.action, Action::PrepareManaged) {
         ensure!(
@@ -261,6 +482,13 @@ fn run(mut request: Request) -> Result<Value> {
     );
     request.home = dunce::canonicalize(&request.home)?;
     let config = Config::load(&request.home)?;
+    if matches!(request.action, Action::RemoveOriginal) {
+        return remove_original(&request, &config);
+    }
+    ensure!(
+        request.expected_original.is_none(),
+        "Expected original preference belongs only to removal"
+    );
     let mut result = match request.target {
         Target::Original => {
             ensure!(
@@ -286,9 +514,9 @@ fn run(mut request: Request) -> Result<Value> {
                         &service,
                         ServiceAction::Stop,
                         &snapshot,
-                        |_| {
+                        |current| {
                             native_startup_state::validate(&original)?;
-                            Ok(None)
+                            required_application_matches(request.previous_process.as_ref(), current)
                         },
                     )?;
                     value["dispatch"] = serde_json::to_value(outcome)?;
@@ -332,14 +560,13 @@ fn run(mut request: Request) -> Result<Value> {
                     ServiceAction::Stop,
                     &observation.snapshot,
                     |current| {
-                        Ok(
-                            (!registration::profile_matches(&service, &profile, current)?).then(
-                                || ActionOutcome::Refused {
-                                    code: "changed_profile".into(),
-                                    message: "Exact disposable profile changed before Stop".into(),
-                                },
-                            ),
-                        )
+                        if !registration::profile_matches(&service, &profile, current)? {
+                            return Ok(Some(ActionOutcome::Refused {
+                                code: "changed_profile".into(),
+                                message: "Exact disposable profile changed before Stop".into(),
+                            }));
+                        }
+                        required_application_matches(request.previous_process.as_ref(), current)
                     },
                 )?;
                 value["dispatch"] = serde_json::to_value(outcome)?;
@@ -360,7 +587,16 @@ fn run(mut request: Request) -> Result<Value> {
         result["actual_worker_manager_binding"] = json!(binding);
     }
     if let Some(previous) = request.previous_process {
-        result["previous_process_alive"] = json!(process::matches(&previous)?);
+        let alive = process::matches(&previous)?;
+        result["previous_process_alive"] = json!(alive);
+        // Read-only fault-fixture proof: a pre-status application has no new
+        // runtime.json yet. Bind its independently captured native generation
+        // through actual manager ancestry, not Task Scheduler EnginePID equality.
+        result["previous_process_manager_binding"] = json!(if alive {
+            application_binding(&previous, &result["processes"])?
+        } else {
+            None
+        });
     }
     let runtime = request.home.join("runtime.json");
     if runtime.is_file() {
@@ -395,6 +631,74 @@ fn main() {
                 json!({"status":"unavailable","code":"native_controller_observation_or_dispatch_failed"})
             );
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn original_disposal_refuses_missing_active_or_ambiguous_native_state() {
+        let settled = json!({"active":false,"transitioning":false,"processes":[]});
+        assert!(inactive(&settled).is_ok());
+        for changed in [
+            json!({}),
+            json!({"active":false,"transitioning":false}),
+            json!({"active":true,"transitioning":false,"processes":[]}),
+            json!({"active":false,"transitioning":true,"processes":[]}),
+            json!({"active":false,"transitioning":false,"processes":[{"identity":{"pid":1}}]}),
+        ] {
+            assert!(inactive(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn original_disposal_cannot_target_a_one_shot_or_silently_drop_policy_fields() {
+        let request: Request = serde_json::from_value(json!({"home":"/fixture",
+            "action":"remove_original","target":{"kind":"worker","operation":"x","attempt":"y"},
+            "previous_process":null,"setup_bundle":null,"expected_original":{"registered":true}}))
+        .unwrap();
+        assert!(!matches!(&request.target, Target::Original));
+        let missing = json!({"registered":true});
+        assert_ne!(preference(&missing), missing);
+        let mut full = preference(&missing);
+        full["registered"] = json!(true);
+        assert_eq!(preference(&full), full);
+        full["arbitrary_command"] = json!("never accepted");
+        assert_ne!(preference(&full), full);
+    }
+
+    #[test]
+    fn removed_definition_alone_never_proves_native_registration_absence() {
+        let inactive = json!({"active":false,"transitioning":false,"processes":[]});
+        assert!(removed_state(&ServiceManager::LaunchAgent, true, true, None).is_err());
+        assert!(removed_state(&ServiceManager::ScheduledTask, true, true, None).is_err());
+        assert!(removed_state(&ServiceManager::SystemdUser, true, true, None).is_err());
+        assert!(removed_state(&ServiceManager::SystemdUser, false, false, None).is_err());
+        let cache =
+            removed_state(&ServiceManager::SystemdUser, true, true, Some(&inactive)).unwrap();
+        assert_eq!(cache["native_absence_proved"], false);
+        assert_eq!(cache["inactive_after"], true);
+        assert!(
+            removed_state(
+                &ServiceManager::SystemdUser,
+                true,
+                true,
+                Some(&json!({"active":true,"transitioning":false,"processes":[]}))
+            )
+            .is_err()
+        );
+        for manager in [
+            ServiceManager::SystemdUser,
+            ServiceManager::LaunchAgent,
+            ServiceManager::ScheduledTask,
+        ] {
+            assert_eq!(
+                removed_state(&manager, true, false, None).unwrap()["native_absence_proved"],
+                true
+            );
         }
     }
 }

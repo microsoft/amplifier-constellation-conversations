@@ -9,6 +9,7 @@ no empty-HOME, fresh consumer OS, physical media or provider readiness claim.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import http.client
 import importlib.util
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import select
 import shutil
 import socket
 import stat
@@ -76,10 +78,11 @@ def public_observation(value):
 
 
 class NativeObserver:
-    def __init__(self, install, controller: Path, *, managed: bool):
+    def __init__(self, install, controller: Path, *, managed: bool, retain_application_identity=False):
         require(controller.is_absolute() and controller.is_file() and os.access(controller, os.X_OK),
                 "Native observer requires an explicit executable controller")
         self.install, self.controller, self.managed = install, controller, managed
+        self.retain_application_identity = retain_application_identity
         self.baseline_startup = None
         self.phase = None
 
@@ -228,16 +231,136 @@ class NativeObserver:
         require(healthy["process_nonce"] == running["process_nonce"], "Replacement restarted while proving worker-independent survival")
         original = self.call({"kind": "original"})
         require(self.preference(original) == self.baseline_startup, "Original definition, enabled or mask state changed")
-        return {"old_parent_exit_observed": True, "worker_survived_old_parent_exit": True,
+        result = {"old_parent_exit_observed": True, "worker_survived_old_parent_exit": True,
                 "worker_exit_observed": True, "replacement_survived_worker_exit": True,
                 "startup_preference_preserved": True, "survival_observation_seconds": 2,
                 "old_process_identity_sha256": fingerprint(self.old_identity),
                 "worker": public_observation(worker), "replacement": public_observation(after),
                 "original_startup": self.baseline_startup, "worker_observations": self.observations}
+        if self.retain_application_identity:
+            result["replacement_application_identity_sha256"] = fingerprint(application)
+        return result
 
 
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def explicit_candidate(package, baseline_manifest, baseline_contents, archive, receipt):
+    """Verify optional cross-version inputs before creating or starting a home."""
+    require((archive is None) == (receipt is None), "Candidate archive and receipt must be supplied together")
+    if archive is None:
+        return None
+    for path in (archive, receipt):
+        require(path.is_absolute(), "Explicit candidate paths must be absolute")
+        metadata = path.lstat()
+        require(stat.S_ISREG(metadata.st_mode) and not path.is_symlink()
+                and not getattr(metadata, "st_file_attributes", 0) & 0x400,
+                "Explicit candidate input must be an ordinary non-linked file")
+    require(receipt.stat().st_size <= 65536, "Candidate package receipt exceeded its bound")
+    provenance = read_json(receipt)
+    manifest, contents = package.inspect_archive(archive, provenance["archive_sha256"])
+    require(lifecycle.digest(contents["manifest.json"]) == provenance["manifest_sha256"],
+            "Explicit candidate manifest receipt differs")
+    require(manifest["target"] == baseline_manifest["target"] == provenance.get("target"),
+            "Explicit candidate package target differs from baseline")
+    require(manifest["source_revision"] == provenance.get("source_revision")
+            and isinstance(manifest["source_revision"], str) and len(manifest["source_revision"]) == 40
+            and all(c in "0123456789abcdef" for c in manifest["source_revision"])
+            and manifest["source_revision"] != baseline_manifest["source_revision"],
+            "Cross-version candidate must bind a distinct exact source revision")
+    before_service = baseline_contents[baseline_manifest["entrypoints"]["service"]]
+    candidate_service = contents[manifest["entrypoints"]["service"]]
+    require(candidate_service != before_service, "Cross-version candidate must contain a different actual service binary")
+    metadata = {"source_revision": manifest["source_revision"], "version": manifest["version"],
+                "archive_sha256": provenance["archive_sha256"], "manifest_sha256": provenance["manifest_sha256"],
+                "service_sha256": lifecycle.digest(candidate_service),
+                "receipt_sha256": lifecycle.digest(receipt.read_bytes()), "synthetic_candidate": False}
+    return manifest, contents, metadata
+
+
+def actual_helper_receipt(install, observer, expected_bundle):
+    """Bind the already-observed real worker to the package chosen by its app.
+
+    These helper/claim fields already exist in the old baseline protocol. This
+    reads their native evidence; it never substitutes a helper or writes intent.
+    """
+    manifest_bytes = (expected_bundle / "manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    service_bytes = (expected_bundle / manifest["entrypoints"]["service"]).read_bytes()
+    ledger = read_json(install.home / "native-browser-update/control.json")
+    operation = ledger["operations"][observer.operation]
+    require(operation["id"] == observer.operation and operation["transaction_id"] == observer.transaction
+            and operation["attempt"]["id"] == observer.attempt,
+            "Selected worker receipt changed operation/transaction/attempt")
+    helper = operation["helper"]
+    require(helper["binary_sha256"] == lifecycle.digest(service_bytes)
+            and helper["bundle"]["manifest_sha256"] == lifecycle.digest(manifest_bytes)
+            and helper["bundle"]["version"] == manifest["version"],
+            "Actual app selected a worker from another package")
+    executable = Path(helper["bundle"]["entrypoints"]["service"])
+    require(executable.is_absolute() and executable.is_file() and not executable.is_symlink()
+            and lifecycle.digest(executable.read_bytes()) == helper["binary_sha256"],
+            "Actual worker's immutable executable bytes changed")
+    require(operation["attempt"]["claimed"] is True
+            and isinstance(operation["attempt"]["worker_process"], dict)
+            and fingerprint(operation["attempt"]["worker_process"]) == observer.actual_worker_generation,
+            "Claimed helper differs from the independently observed native worker generation")
+    return {"source_revision": manifest["source_revision"], "version": manifest["version"],
+            "binary_sha256": helper["binary_sha256"], "manifest_sha256": helper["bundle"]["manifest_sha256"],
+            "actual_worker_identity_sha256": observer.actual_worker_generation,
+            "claimed_worker_matches_native_observation": True, "helper_override": False}
+
+
+def authenticated_previous_receipt(install, observer, expected_bundle, phase):
+    """Prove the new worker actually used authenticated status for old A."""
+    manifest_bytes = (expected_bundle / "manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    binary = lifecycle.digest((expected_bundle / manifest["entrypoints"]["service"]).read_bytes())
+    journal = read_json(install.home / "native-update.json")
+    require(journal["transaction_id"] == observer.transaction == phase["transaction_id"]
+            and journal["phase"] == "restored" and journal["restore_outcome"] == "rolled_back"
+            and phase["phase"] == "rolled_back"
+            and phase["selected_manifest_sha256"] == lifecycle.digest(manifest_bytes),
+            "Old-package status evidence is not followed by separately verified restoration")
+    receipt = journal["launch_cleanup"]
+    binding, authority, source = receipt["binding"], receipt["authority"], receipt["authority_source"]
+    require(source.get("kind") == "authenticated_status", "Actual old-package verification did not use authenticated status")
+    require(receipt["start"]["status"] == "accepted" and receipt["revoked"] is False
+            and receipt["stop"] is None and receipt["exit_before_switch"] is None,
+            "Restored application cleanup authority is uncertain or superseded")
+    require(journal["selected"] in {"candidate", "previous"}
+            and journal[journal["selected"]] == binding["package"]
+            and binding["installation_id"] == journal["installation_id"]
+            and binding["transaction_id"] == observer.transaction and binding["nonce"] == journal["launch_nonce"]
+            and binding["package"]["binary_sha256"] == binary == phase["process"]["binary_sha256"]
+            and binding["package"]["bundle"]["manifest_sha256"] == lifecycle.digest(manifest_bytes)
+            and authority["binding"] == binding,
+            "Authenticated previous-package authority differs from actual selection or launch")
+    first, confirmed = source["first_status"], source["confirmed_status"]
+    for status in (first, confirmed):
+        require(status["id"] == binding["installation_id"] and status["binary_sha256"] == binary
+                and status["transaction_id"] == binding["transaction_id"] and status["launch_nonce"] == binding["nonce"]
+                and status["pid"] == authority["application"]["pid"] == phase["process"]["pid"]
+                and fingerprint(status["process_nonce"]) == phase["process"]["process_nonce_sha256"]
+                and (status["admission_closed"] is True or source["restore_started"] is True),
+                "Authenticated status is not bound to the separately verified old application")
+    require(first["process_birth"] == confirmed["process_birth"], "Authenticated application birth changed between samples")
+    require(fingerprint(authority["application"]) == phase["lifetime"]["replacement_application_identity_sha256"],
+            "Authenticated authority differs from independently observed replacement generation")
+    entries = list(install.home.glob("native-update-entry-*.json"))
+    require(len(entries) <= 256, "Unexpected entry count while observing old application")
+    for path in entries:
+        metadata = path.lstat()
+        require(stat.S_ISREG(metadata.st_mode) and not path.is_symlink() and metadata.st_size <= 1024 * 1024,
+                "Uninspectable entry cannot prove absence of a manufactured receipt")
+        require(read_json(path).get("binding") != binding, "Old application has an entry despite authenticated-status provenance")
+    return {"kind": "authenticated_status", "source_revision": manifest["source_revision"],
+            "binary_sha256": binary, "manifest_sha256": lifecycle.digest(manifest_bytes),
+            "transaction_id": observer.transaction, "launch_nonce_sha256": fingerprint(binding["nonce"]),
+            "confirmed_status_sha256": fingerprint(confirmed), "first_status_sha256": fingerprint(first),
+            "application_identity_sha256": fingerprint(authority["application"]), "pid": confirmed["pid"],
+            "matching_early_entry_present": False, "previous_restoration_separately_verified": True}
 
 
 def private_inputs(install):
@@ -443,7 +566,7 @@ def check_once(install, candidate):
         install.checkpoint()
 
 
-def exercise_api(install, a, b, observer):
+def exercise_api(install, a, b, observer, *, verify_cross_version_workers=False):
     before = request_status(install)
     require(before["owner"] == "standalone" and before["mode"] == "normal" and before["actions"]["check"],
             "Disposable installation cannot check a standalone candidate")
@@ -455,7 +578,10 @@ def exercise_api(install, a, b, observer):
     # original request ID; no second POST is made or inferred from a timeout.
     submit_once(install, "apply", {"request_id": request_id, "check_id": checked["check"]["id"]})
     applied = await_operation(install, request_id, "applied", observer)
-    phase_checkpoint(install, b, "applied", applied, observer)
+    apply_phase = phase_checkpoint(install, b, "applied", applied, observer)
+    if verify_cross_version_workers:
+        apply_phase["actual_worker_package"] = actual_helper_receipt(install, observer, a)
+        install.checkpoint()
     reloaded = request_status(install, request_id)
     require(reloaded["operation"] == applied["operation"], "Read-only reload changed the completed apply receipt")
     require(reloaded["actions"]["rollback"], "Completed apply does not offer explicit rollback")
@@ -466,7 +592,11 @@ def exercise_api(install, a, b, observer):
     restored = await_operation(install, rollback_id, "rolled_back", observer)
     require(restored["operation"]["transaction_id"] != applied["operation"]["transaction_id"],
             "Explicit rollback reused the completed apply transaction")
-    phase_checkpoint(install, a, "rolled_back", restored, observer)
+    rollback_phase = phase_checkpoint(install, a, "rolled_back", restored, observer)
+    if verify_cross_version_workers:
+        rollback_phase["actual_worker_package"] = actual_helper_receipt(install, observer, b)
+        rollback_phase["previous_application_authority"] = authenticated_previous_receipt(install, observer, a, rollback_phase)
+        install.checkpoint()
     install.check("real authenticated API check/apply, discarded reply reconciliation and fresh rollback preserve original state",
                   apply_request_id=request_id, rollback_request_id=rollback_id, mutation_count=2)
     return {"status": "passed", "before": before, "checked": checked, "applied": applied, "restored": restored,
@@ -703,6 +833,129 @@ def launch_keys(home):
     return expected
 
 
+def await_cleanup_stopped(install, *, stage):
+    """Prove post-Stop disappearance without requesting a dying HTTP server.
+
+    The caller already stopped the exact manager generation, or waited for its
+    own foreground Popen child. This is only the final listener/lock check; it
+    cannot authorize Stop, prove updater health, or tolerate an API/auth error.
+    """
+    require(stage in {"manager_stop", "maintenance_exit"}, "Unknown cleanup observation stage")
+    started = time.monotonic()
+    deadline = started + 15
+    row = {"stage": stage, "status": "observing", "timeout_seconds": 15,
+           "authenticated_requests": 0, "samples": 0, "connection_attempts": 0, "poll_slices": 0}
+    install.result["cleanup"].setdefault("listener_closure", []).append(row)
+    install.checkpoint()
+
+    def identity():
+        for name in ["config.json", "runtime.json"]:
+            require(stat.S_ISREG((install.home / name).lstat().st_mode),
+                    "Cleanup identity file is not an ordinary file")
+        config, runtime = read_json(install.home / "config.json"), read_json(install.home / "runtime.json")
+        port = config.get("port")
+        require(type(port) is int and 1 <= port <= 65535 and config.get("transport") == "local_http"
+                and isinstance(config.get("id"), str) and bool(config["id"]),
+                "Cleanup local installation identity is invalid")
+        origin = f"http://127.0.0.1:{port}"
+        require(config.get("public_url") == runtime.get("url") == runtime.get("public_url") == origin
+                and type(runtime.get("port")) is int and runtime["port"] == port
+                and runtime.get("provider_id") == "web:" + config["id"]
+                and type(runtime.get("pid")) is int and runtime["pid"] > 0
+                and isinstance(runtime.get("process_nonce"), str) and bool(runtime["process_nonce"]),
+                "Cleanup runtime differs from the saved literal loopback identity")
+        return {"id": config["id"], "origin": origin, "port": port,
+                "pid": runtime["pid"], "process_nonce": runtime["process_nonce"]}
+
+    def lock_identity():
+        value = (install.home / "service.lock").lstat()
+        require(stat.S_ISREG(value.st_mode), "Cleanup service.lock is not an ordinary file")
+        return value.st_dev, value.st_ino
+
+    connection, pending = None, False
+    refused = {errno.ECONNREFUSED, getattr(errno, "WSAECONNREFUSED", 10061)}
+    in_progress = {errno.EINPROGRESS, errno.EWOULDBLOCK, getattr(errno, "WSAEWOULDBLOCK", 10035)}
+    try:
+        expected = identity()
+        expected_lock = lock_identity()
+        row["identity_sha256"] = fingerprint(expected)
+        install.ports.add(expected["port"])
+        while time.monotonic() < deadline:
+            require(identity() == expected and lock_identity() == expected_lock,
+                    "Cleanup listener or lock identity changed")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if connection is None:
+                connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                connection.setblocking(False)
+                row["connection_attempts"] += 1
+                code = connection.connect_ex(("127.0.0.1", expected["port"]))
+                pending = code in in_progress
+                if code == 0:
+                    state = "open"
+                elif code in refused:
+                    state = "refused"
+                elif not pending:
+                    row["socket_error"] = code
+                    raise AssertionError("Cleanup listener closure is unknown after socket error")
+            if pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Preserve this one outstanding connect across short observation
+                # slices. Replacing it after each timeout can discard its result.
+                readable, writable, exceptional = select.select([], [connection], [connection], min(0.2, remaining))
+                row["poll_slices"] += 1
+                require(not readable and all(item is connection for item in writable + exceptional),
+                        "Cleanup connection readiness is ambiguous")
+                if not writable and not exceptional:
+                    state = "pending"
+                else:
+                    code = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    pending = False
+                    if code in refused:
+                        state = "refused"
+                    elif code == 0 and writable and not exceptional:
+                        state = "open"
+                    else:
+                        row["socket_error"] = code
+                        raise AssertionError("Cleanup listener closure is unknown after socket readiness")
+            row.update(samples=row["samples"] + 1, listener=state)
+            free = install.service_lock_available()
+            row["service_lock_available"] = free
+            require(identity() == expected and lock_identity() == expected_lock,
+                    "Cleanup listener or lock identity changed")
+            remaining = deadline - time.monotonic()
+            if not pending:
+                # OPEN is not evidence about the next listener state. A later
+                # observation needs a new attempt; never reuse a prior refusal
+                # after waiting for a held service.lock either.
+                connection.close()
+                connection = None
+            if state == "refused" and free and remaining > 0:
+                row.update(status="stopped", listener_closed=True, service_lock_released=True)
+                return row
+            if remaining <= 0:
+                break
+            if not pending:
+                time.sleep(min(0.1, remaining))
+        raise AssertionError("Owned cleanup listener did not close or retained service.lock within 15 seconds")
+    except Exception as error:
+        row.update(status="unknown", error_type=type(error).__name__)
+        raise
+    finally:
+        try:
+            if connection is not None:
+                connection.close()
+        except Exception as error:
+            row.update(status="unknown", error_type=type(error).__name__)
+            raise
+        finally:
+            row["elapsed_seconds"] = time.monotonic() - started
+            install.checkpoint()
+
+
 def cleanup_case(install, observer, registration, controller_environment):
     """Separate post-proof teardown; it cannot manufacture update success."""
     require(len(install.result.get("phase_snapshots", [])) == 2, "Cleanup cannot precede both settled lifetime proofs")
@@ -725,7 +978,7 @@ def cleanup_case(install, observer, registration, controller_environment):
         time.sleep(0.1)
     else:
         raise TimeoutError("Exact fixture manager Stop remains unobserved; no cleanup retry")
-    install.await_stopped()
+    await_cleanup_stopped(install, stage="manager_stop")
     require(retained_operations(install.home) == ledger_before, "Teardown Stop changed the native operation ledger")
     maintenance, _ = install.start()
     cleanup["maintenance"] = "separate controller-owned foreground process, not updater lifetime proof"
@@ -769,7 +1022,7 @@ def cleanup_case(install, observer, registration, controller_environment):
     require(maintenance.poll() is None, "Foreground cleanup process exited unexpectedly")
     maintenance.terminate()
     maintenance.wait(timeout=12)
-    install.await_stopped()
+    await_cleanup_stopped(install, stage="maintenance_exit")
     if registration is not None:
         original = observer.call({"kind": "original"})
         require(observer.preference(original) == observer.baseline_startup and original.get("active") is False,
@@ -792,7 +1045,8 @@ def cleanup_case(install, observer, registration, controller_environment):
     install.checkpoint()
 
 
-def qualify(archive: Path, receipt: Path, output: Path, controller: Path, *, browser_test=None, browser_node=None, browser_artifacts=None):
+def qualify(archive: Path, receipt: Path, output: Path, controller: Path, *, browser_test=None, browser_node=None, browser_artifacts=None,
+            candidate_archive=None, candidate_receipt=None):
     require(os.environ.get("CONSTELLATION_NATIVE_STARTUP_TEST") == "1", "Explicit disposable-current-user manager opt-in required")
     require(controller.is_absolute() and controller.is_file() and os.access(controller, os.X_OK), "Native fixture requires an executable controller")
     if browser_test is not None:
@@ -804,23 +1058,36 @@ def qualify(archive: Path, receipt: Path, output: Path, controller: Path, *, bro
     manifest, contents = package.inspect_archive(archive, provenance["archive_sha256"])
     require(manifest["target"] == lifecycle.clean.native_target(), "Consumer update package target differs from actual host")
     require(lifecycle.digest(contents["manifest.json"]) == provenance["manifest_sha256"], "Consumer update manifest receipt differs")
+    candidate = explicit_candidate(package, manifest, contents, candidate_archive, candidate_receipt)
+    if candidate is not None:
+        require(browser_test is None, "Explicit cross-version qualification uses both API topologies; keep browser qualification separate")
+        require(output.is_absolute() and not output.exists(), "Cross-version qualification requires a fresh absolute receipt path")
+        require(provenance.get("source_revision") == manifest["source_revision"]
+                and provenance.get("target") == manifest["target"], "Baseline package source/target receipt differs")
     root = Path(tempfile.mkdtemp(prefix="Companion update café ")).resolve()
     result = {"schema": 1, "status": "running", "target": manifest["target"], "source_revision": manifest["source_revision"],
               "archive_sha256": provenance["archive_sha256"], "manifest_sha256": provenance["manifest_sha256"],
               "controller_sha256": hashlib.sha256(controller.read_bytes()).hexdigest(), "cases": {},
               "scope": "actual current-user manager parent/worker/replacement qualification on disposable installations",
               "model_requests": 0, "provider_requests": 0, "voice_calls": 0, "speech_release": "unchanged_paused",
+              "package_mode": "explicit_cross_version" if candidate is not None else "synthetic_same_binary",
+              "explicit_candidate": candidate[2] if candidate is not None else None,
               "limitations": ["Manager-bound fixture preserves actual user HOME and manager bus; separate clean-PATH/empty-HOME receipt applies",
-                  "A/B use identical tested executable/runtime bytes; B changes bundle version/support document",
+                  ("Explicit A/C source packages exercise old-worker apply and new-worker rollback; no journal/helper overrides"
+                   if candidate is not None else "A/B use identical tested executable/runtime bytes; B changes bundle version/support document"),
                   "No production installation, provider account, OS password sign-in, physical media or signing qualification",
                   "Foreground maintenance is post-proof teardown only; it is not updater lifetime proof"]}
     installations = []
     try:
-        a, b = root / "Release A", root / "Release B"
+        a, b = root / "Release A", root / ("Release C" if candidate is not None else "Release B")
         lifecycle.extract(contents, manifest, a)
-        lifecycle.derive_bundle(a, b, "browser-update-b")
+        if candidate is None:
+            lifecycle.derive_bundle(a, b, "browser-update-b")
+        else:
+            lifecycle.extract(candidate[1], candidate[0], b)
         startup = startup_module()
-        scenarios = [("managed_api", True)] + ([("manual_browser", False)] if browser_test is not None else [])
+        scenarios = ([("managed_api", True), ("manual_api", False)] if candidate is not None else
+                     [("managed_api", True)] + ([("manual_browser", False)] if browser_test is not None else []))
         for name, managed in scenarios:
             case_root = root / name
             case_root.mkdir()
@@ -834,10 +1101,10 @@ def qualify(archive: Path, receipt: Path, output: Path, controller: Path, *, bro
             prepared = consumer.prepare_consumer_installation(install, managed_parent=managed)
             seed_retained_work(install, prepared["conversation_id"])
             registration = install.registration
-            observer = NativeObserver(install, controller, managed=managed)
+            observer = NativeObserver(install, controller, managed=managed, retain_application_identity=candidate is not None)
             case["baseline"] = protected_receipt(install)
-            if managed:
-                case["api"] = exercise_api(install, a, b, observer)
+            if managed or candidate is not None:
+                case["api"] = exercise_api(install, a, b, observer, verify_cross_version_workers=candidate is not None)
             else:
                 case["browser"] = exercise_browser(install, a, b, observer, browser_test, browser_node, browser_artifacts)
             require([json.loads(line)["method"] for line in prepared["fixture_log"].read_text().splitlines()] == ["initialize"],
@@ -861,10 +1128,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["archive", "receipt", "output", "controller"]:
         parser.add_argument("--" + name, type=Path, required=True)
-    for name in ["browser-test", "browser-node", "browser-artifacts"]:
+    for name in ["browser-test", "browser-node", "browser-artifacts", "candidate-archive", "candidate-receipt"]:
         parser.add_argument("--" + name, type=Path)
     args = parser.parse_args()
     result = qualify(args.archive.resolve(), args.receipt.resolve(), args.output.resolve(), args.controller.resolve(),
-                     browser_test=args.browser_test, browser_node=args.browser_node, browser_artifacts=args.browser_artifacts)
+                     browser_test=args.browser_test, browser_node=args.browser_node, browser_artifacts=args.browser_artifacts,
+                     candidate_archive=args.candidate_archive, candidate_receipt=args.candidate_receipt)
     print(json.dumps({"status": result["status"], "cases": list(result["cases"]),
                       "temporary_installations_removed": result.get("temporary_installations_removed")}))

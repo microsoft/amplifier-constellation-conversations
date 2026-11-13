@@ -779,6 +779,59 @@ fn compare(saved: &Snapshot, current: &Snapshot) -> Result<()> {
 pub fn capture(home: &Path, id: &str) -> Result<Value> {
     Ok(serde_json::to_value(inspect(home, id)?)?)
 }
+/// Reconstruct the fixed native service for generation-aware stop-only cleanup.
+/// This does not validate current policy or confer dispatch authority; callers
+/// must also compare the original profile and an actual native snapshot.
+pub fn native_service(
+    snapshot: &Value,
+) -> Result<amplifier_native_platform::installation::Service> {
+    use amplifier_native_platform::installation::{Service, ServiceManager};
+    let saved = decode(snapshot)?;
+    ensure!(
+        saved.managed && saved.registered,
+        "No managed startup was captured"
+    );
+    let definition = saved
+        .definition
+        .as_ref()
+        .context("Missing startup definition")?;
+    let (manager, name, definition_path) = match saved.platform.as_str() {
+        "linux" => {
+            let name = format!("{}.service", saved.label);
+            let path = amplifier_native_platform::user_home()?
+                .join(".config/systemd/user")
+                .join(&name);
+            ensure!(
+                definition.kind == "file" && definition.path.as_ref() == Some(&path),
+                "Startup definition path changed"
+            );
+            (ServiceManager::SystemdUser, name, Some(path))
+        }
+        "macos" => {
+            let path = amplifier_native_platform::user_home()?
+                .join("Library/LaunchAgents")
+                .join(format!("{}.plist", saved.label));
+            ensure!(
+                definition.kind == "file" && definition.path.as_ref() == Some(&path),
+                "Startup definition path changed"
+            );
+            (ServiceManager::LaunchAgent, saved.label.clone(), Some(path))
+        }
+        "windows" => {
+            ensure!(
+                definition.kind == "task-xml" && definition.path.is_none(),
+                "Startup task definition changed"
+            );
+            (ServiceManager::ScheduledTask, saved.label.clone(), None)
+        }
+        _ => anyhow::bail!("Unsupported startup manager"),
+    };
+    Ok(Service {
+        manager,
+        name,
+        definition_path,
+    })
+}
 pub fn validate(snapshot: &Value) -> Result<()> {
     let saved = decode(snapshot)?;
     compare(&saved, &inspect(&saved.home, &saved.id)?)

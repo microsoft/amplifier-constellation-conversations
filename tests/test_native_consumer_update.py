@@ -20,6 +20,310 @@ spec.loader.exec_module(controller)
 
 
 class ConsumerUpdateControllerTests(unittest.TestCase):
+    def cleanup_fixture(self, home):
+        install = controller.consumer.ConsumerInstallation.__new__(controller.consumer.ConsumerInstallation)
+        install.home, install.ports, install.result = home, set(), {"cleanup": {}}
+        install.checkpoint = Mock()
+        install.api = Mock(side_effect=AssertionError("retained read-only API connection reset"))
+        install.running = Mock(side_effect=AssertionError("Cleanup must not request authenticated status"))
+        install.command = Mock(side_effect=AssertionError("Cleanup must not dispatch a command"))
+        config = {"id": "owned-installation", "transport": "local_http", "port": 31471,
+                  "public_url": "http://127.0.0.1:31471"}
+        runtime = {"url": config["public_url"], "public_url": config["public_url"], "port": config["port"],
+                   "provider_id": "web:" + config["id"], "pid": 101, "process_nonce": "retained-generation"}
+        controller.consumer.write_json(home / "config.json", config)
+        controller.consumer.write_json(home / "runtime.json", runtime)
+        (home / "service.lock").write_bytes(b"0")
+        return install
+
+    def cleanup_socket(self, codes, *, during=None):
+        connection = Mock()
+        connection.__enter__ = Mock(return_value=connection)
+        connection.__exit__ = Mock(return_value=False)
+        values = iter(codes)
+        def connect(_endpoint):
+            if during:
+                during()
+            return next(values)
+        connection.connect_ex.side_effect = connect
+        return connection
+
+    def test_cleanup_after_health_to_api_reset_uses_closed_socket_and_real_lock_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = self.cleanup_fixture(Path(directory))
+            connection = self.cleanup_socket([controller.errno.ECONNREFUSED])
+            # Use the real fixture's filesystem lock acquisition. The socket is
+            # deterministic; no manager, service, or authenticated API runs.
+            with patch.object(controller.socket, "socket", return_value=connection):
+                result = controller.await_cleanup_stopped(install, stage="manager_stop")
+            self.assertEqual(result["status"], "stopped")
+            self.assertEqual(result["samples"], 1)
+            self.assertTrue(result["listener_closed"] and result["service_lock_released"])
+            self.assertEqual(result["authenticated_requests"], 0)
+            install.running.assert_not_called()
+            install.api.assert_not_called()
+            install.command.assert_not_called()
+            connection.connect_ex.assert_called_once_with(("127.0.0.1", 31471))
+
+    def test_cleanup_waits_for_both_socket_refusal_and_lock_release(self):
+        scenarios = [([0, controller.errno.ECONNREFUSED], [True, True]),
+                     ([controller.errno.ECONNREFUSED] * 2, [False, True])]
+        for codes, locks in scenarios:
+            with self.subTest(codes=codes, locks=locks), tempfile.TemporaryDirectory() as directory:
+                install = self.cleanup_fixture(Path(directory))
+                install.service_lock_available = Mock(side_effect=locks)
+                connection = self.cleanup_socket(codes)
+                with patch.object(controller.socket, "socket", return_value=connection), patch.object(controller.time, "sleep"):
+                    value = controller.await_cleanup_stopped(install, stage="maintenance_exit")
+                self.assertEqual(value["status"], "stopped")
+                self.assertEqual(value["samples"], 2)
+                self.assertEqual(value["connection_attempts"], 2)
+                self.assertEqual(install.service_lock_available.call_count, 2)
+                install.running.assert_not_called()
+                connection.settimeout.assert_not_called()
+                self.assertTrue(all(call.args == (False,) for call in connection.setblocking.call_args_list))
+
+    def test_cleanup_open_or_locked_or_timed_out_never_becomes_absence(self):
+        for code, free in [(0, True), (controller.errno.ECONNREFUSED, False)]:
+            with self.subTest(code=code, free=free), tempfile.TemporaryDirectory() as directory:
+                install = self.cleanup_fixture(Path(directory))
+                install.service_lock_available = Mock(return_value=free)
+                connection = self.cleanup_socket([code])
+                with patch.object(controller.socket, "socket", return_value=connection), \
+                     patch.object(controller.time, "monotonic", side_effect=[0, 0, 0, 15, 15]), \
+                     self.assertRaisesRegex(AssertionError, "within 15 seconds"):
+                    controller.await_cleanup_stopped(install, stage="manager_stop")
+                row = install.result["cleanup"]["listener_closure"][0]
+                self.assertEqual(row["status"], "unknown")
+                self.assertNotIn("listener_closed", row)
+                self.assertEqual(row["timeout_seconds"], 15)
+
+    def test_cleanup_pending_then_open_cannot_prove_absence_before_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = self.cleanup_fixture(Path(directory))
+            install.service_lock_available = Mock(return_value=True)
+            first, second = self.cleanup_socket([10035]), self.cleanup_socket([0])
+            first.getsockopt.return_value = 0
+            with patch.object(controller.socket, "socket", side_effect=[first, second]), \
+                 patch.object(controller.select, "select", return_value=([], [first], [])), \
+                 patch.object(controller.time, "monotonic", side_effect=[0, 0, 0, 0, 1, 2, 2, 15, 15]), \
+                 patch.object(controller.time, "sleep"), \
+                 self.assertRaisesRegex(AssertionError, "within 15 seconds"):
+                controller.await_cleanup_stopped(install, stage="manager_stop")
+            row = install.result["cleanup"]["listener_closure"][0]
+            self.assertEqual(row["status"], "unknown")
+            self.assertEqual(row["listener"], "open")
+            self.assertEqual(row["samples"], 2)
+            self.assertEqual(row["connection_attempts"], 2)
+            self.assertNotIn("listener_closed", row)
+            install.api.assert_not_called()
+            first.connect_ex.assert_called_once()
+            second.connect_ex.assert_called_once()
+            first.close.assert_called_once()
+            second.close.assert_called_once()
+
+    def test_cleanup_delayed_refusal_retains_one_pending_attempt_across_slices(self):
+        for initial, ready_kind in [(10035, "exception"), (controller.errno.EINPROGRESS, "write"),
+                                    (controller.errno.EWOULDBLOCK, "write")]:
+            with self.subTest(initial=initial, ready_kind=ready_kind), tempfile.TemporaryDirectory() as directory:
+                install = self.cleanup_fixture(Path(directory))
+                connection = self.cleanup_socket([initial])
+                connection.getsockopt.return_value = 10061
+                clock = [0.0]
+                polls = []
+                def ready(readable, writable, exceptional, timeout):
+                    self.assertEqual((readable, writable, exceptional), ([], [connection], [connection]))
+                    self.assertGreater(timeout, 0)
+                    self.assertLessEqual(timeout, 0.2)
+                    connection.close.assert_not_called()
+                    clock[0] += timeout
+                    polls.append(timeout)
+                    if len(polls) < 3:
+                        return [], [], []
+                    return ([], [], [connection]) if ready_kind == "exception" else ([], [connection], [])
+                with patch.object(controller.socket, "socket", return_value=connection) as create, \
+                     patch.object(controller.select, "select", side_effect=ready), \
+                     patch.object(controller.time, "monotonic", side_effect=lambda: clock[0]):
+                    result = controller.await_cleanup_stopped(install, stage="manager_stop")
+                self.assertEqual(result["status"], "stopped")
+                self.assertEqual(result["connection_attempts"], 1)
+                self.assertEqual(result["poll_slices"], 3)
+                self.assertGreater(result["elapsed_seconds"], 0.2)
+                create.assert_called_once()
+                connection.connect_ex.assert_called_once()
+                connection.getsockopt.assert_called_once_with(controller.socket.SOL_SOCKET, controller.socket.SO_ERROR)
+                connection.close.assert_called_once()
+                install.api.assert_not_called()
+
+    def test_cleanup_pending_until_deadline_never_reads_error_or_proves_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = self.cleanup_fixture(Path(directory))
+            connection = self.cleanup_socket([10035])
+            clock = [0.0]
+            def no_readiness(_read, _write, _exception, timeout):
+                self.assertLessEqual(timeout, min(0.2, 15 - clock[0]))
+                clock[0] += timeout
+                return [], [], []
+            with patch.object(controller.socket, "socket", return_value=connection) as create, \
+                 patch.object(controller.select, "select", side_effect=no_readiness), \
+                 patch.object(controller.time, "monotonic", side_effect=lambda: clock[0]), \
+                 self.assertRaisesRegex(AssertionError, "within 15 seconds"):
+                controller.await_cleanup_stopped(install, stage="manager_stop")
+            row = install.result["cleanup"]["listener_closure"][0]
+            self.assertEqual(row["status"], "unknown")
+            self.assertEqual(row["listener"], "pending")
+            self.assertEqual(row["elapsed_seconds"], 15)
+            self.assertNotIn("listener_closed", row)
+            create.assert_called_once()
+            connection.connect_ex.assert_called_once()
+            connection.getsockopt.assert_not_called()
+            connection.close.assert_called_once()
+
+    def test_cleanup_ready_error_or_ambiguous_zero_remains_unknown(self):
+        for readiness, code in [("exception", 0), ("both", 0), ("write", 10054), ("exception", 10013), ("exception", 10035)]:
+            with self.subTest(readiness=readiness, code=code), tempfile.TemporaryDirectory() as directory:
+                install = self.cleanup_fixture(Path(directory))
+                connection = self.cleanup_socket([10035])
+                connection.getsockopt.return_value = code
+                ready = ([], [connection] if readiness in {"write", "both"} else [],
+                         [connection] if readiness in {"exception", "both"} else [])
+                with patch.object(controller.socket, "socket", return_value=connection), \
+                     patch.object(controller.select, "select", return_value=ready), \
+                     self.assertRaisesRegex(AssertionError, "unknown after socket readiness"):
+                    controller.await_cleanup_stopped(install, stage="manager_stop")
+                row = install.result["cleanup"]["listener_closure"][0]
+                self.assertEqual(row["status"], "unknown")
+                self.assertNotIn("listener_closed", row)
+                connection.connect_ex.assert_called_once()
+                connection.close.assert_called_once()
+                install.api.assert_not_called()
+
+    def test_cleanup_poll_or_error_query_failure_closes_only_owned_probe(self):
+        for failure in ["select", "socket_error"]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                install = self.cleanup_fixture(Path(directory))
+                connection = self.cleanup_socket([10035])
+                error = OSError(controller.errno.EACCES, "fixture observation refused")
+                if failure == "socket_error":
+                    connection.getsockopt.side_effect = error
+                with patch.object(controller.socket, "socket", return_value=connection), \
+                     patch.object(controller.select, "select", side_effect=error if failure == "select" else None,
+                                  return_value=([], [], [connection])), \
+                     self.assertRaises(OSError):
+                    controller.await_cleanup_stopped(install, stage="manager_stop")
+                self.assertEqual(install.result["cleanup"]["listener_closure"][0]["status"], "unknown")
+                connection.connect_ex.assert_called_once()
+                connection.close.assert_called_once()
+                install.api.assert_not_called()
+                install.command.assert_not_called()
+
+    def test_cleanup_identity_drift_during_pending_poll_retains_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = self.cleanup_fixture(Path(directory))
+            connection = self.cleanup_socket([10035])
+            def drift(*_args):
+                path = install.home / "runtime.json"
+                runtime = controller.read_json(path)
+                controller.consumer.write_json(path, {**runtime, "process_nonce": "changed"})
+                return [], [], []
+            with patch.object(controller.socket, "socket", return_value=connection), \
+                 patch.object(controller.select, "select", side_effect=drift), \
+                 self.assertRaisesRegex(AssertionError, "identity changed"):
+                controller.await_cleanup_stopped(install, stage="manager_stop")
+            self.assertEqual(install.result["cleanup"]["listener_closure"][0]["status"], "unknown")
+            connection.getsockopt.assert_not_called()
+            connection.close.assert_called_once()
+            install.api.assert_not_called()
+
+    def test_cleanup_actual_closed_loopback_endpoint_and_private_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # Release the reservation before observing a closed endpoint. A
+            # bound socket that remains open is not that fixture precondition.
+            # Port reuse remains a failure; no new port or retry is selected.
+            with controller.socket.socket() as reserved:
+                reserved.bind(("127.0.0.1", 0))
+                port = reserved.getsockname()[1]
+            self.assertEqual(reserved.fileno(), -1)
+            install = self.cleanup_fixture(Path(directory))
+            for name in ["config.json", "runtime.json"]:
+                path = install.home / name
+                value = controller.read_json(path)
+                value.update(port=port, public_url=f"http://127.0.0.1:{port}")
+                if name == "runtime.json":
+                    value["url"] = value["public_url"]
+                controller.consumer.write_json(path, value)
+            try:
+                result = controller.await_cleanup_stopped(install, stage="manager_stop")
+            except Exception as error:
+                rows = install.result["cleanup"].get("listener_closure", [])
+                row = rows[-1] if rows else {}
+                keys = ("stage", "status", "timeout_seconds", "elapsed_seconds",
+                        "samples", "connection_attempts", "poll_slices", "listener",
+                        "service_lock_available", "authenticated_requests", "socket_error",
+                        "listener_closed", "service_lock_released", "error_type")
+                evidence = {key: row[key] for key in keys if key in row}
+                error.add_note("Closed-loopback observation: " + json.dumps(evidence, sort_keys=True)[:1024])
+                raise
+            self.assertEqual(result["status"], "stopped")
+            self.assertEqual(result["listener"], "refused")
+            self.assertTrue(result["service_lock_available"])
+            self.assertEqual(result["authenticated_requests"], 0)
+            install.api.assert_not_called()
+            install.command.assert_not_called()
+
+    def test_cleanup_unknown_socket_error_is_not_swallowed_or_retried(self):
+        for code in [controller.errno.EACCES, controller.errno.ECONNRESET, controller.errno.ETIMEDOUT, 10013, 10054]:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                install = self.cleanup_fixture(Path(directory))
+                install.service_lock_available = Mock()
+                connection = self.cleanup_socket([code])
+                with patch.object(controller.socket, "socket", return_value=connection), \
+                     self.assertRaisesRegex(AssertionError, "unknown after socket error"):
+                    controller.await_cleanup_stopped(install, stage="manager_stop")
+                row = install.result["cleanup"]["listener_closure"][0]
+                self.assertEqual(row["status"], "unknown")
+                self.assertEqual(row["socket_error"], code)
+                self.assertEqual(connection.connect_ex.call_count, 1)
+                install.service_lock_available.assert_not_called()
+                install.api.assert_not_called()
+
+    def test_cleanup_missing_malformed_or_drifted_identity_cannot_prove_stopped(self):
+        cases = [("config.json", {"id": "another-installation"}),
+                 ("config.json", {"public_url": "http://example.invalid:31471"}),
+                 ("config.json", {"transport": "https"}),
+                 ("runtime.json", {"url": "http://localhost:31471"}),
+                 ("runtime.json", {"port": "31471"}),
+                 ("runtime.json", {"provider_id": "web:other"}),
+                 ("runtime.json", {"pid": 202}),
+                 ("runtime.json", {"process_nonce": "different-generation"}),
+                 ("runtime.json", None), ("service.lock", None)]
+        for name, changes in cases:
+            with self.subTest(name=name, changes=changes), tempfile.TemporaryDirectory() as directory:
+                install = self.cleanup_fixture(Path(directory))
+                def change():
+                    path = install.home / name
+                    if changes is None:
+                        path.unlink()
+                    else:
+                        value = controller.read_json(path)
+                        controller.consumer.write_json(path, {**value, **changes})
+                connection = self.cleanup_socket([controller.errno.ECONNREFUSED], during=change)
+                with patch.object(controller.socket, "socket", return_value=connection), \
+                     self.assertRaises((AssertionError, OSError)):
+                    controller.await_cleanup_stopped(install, stage="manager_stop")
+                self.assertEqual(install.result["cleanup"]["listener_closure"][0]["status"], "unknown")
+                install.running.assert_not_called()
+
+    def test_cleanup_deadline_cannot_dispatch_socket_after_slow_identity_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = self.cleanup_fixture(Path(directory))
+            with patch.object(controller.socket, "socket") as connection, \
+                 patch.object(controller.time, "monotonic", side_effect=[0, 0, 15, 15]), \
+                 self.assertRaisesRegex(AssertionError, "within 15 seconds"):
+                controller.await_cleanup_stopped(install, stage="manager_stop")
+            connection.assert_not_called()
+            self.assertEqual(install.result["cleanup"]["listener_closure"][0]["status"], "unknown")
+
     def test_check_accepts_one_reply_after_ordinary_http_limit_within_ui_allowance(self):
         requests = []
         checked = {"check": {"available": True, "id": "checked"}, "actions": {"apply": True}}

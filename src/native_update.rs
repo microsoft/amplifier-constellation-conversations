@@ -31,6 +31,9 @@ use std::{
 const JOURNAL: &str = "native-update.json";
 const INSTALLED: &str = "native-installation.json";
 
+#[path = "native_update_cleanup.rs"]
+mod cleanup;
+
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -597,7 +600,10 @@ async fn wait_stopped(home: &Path) -> Result<InstallationLock> {
         tokio::time::sleep(Duration::from_millis(75)).await;
     }
 }
-async fn stop_running(home: &Path, j: &Value) -> Result<InstallationLock> {
+async fn stop_running(home: &Path, j: &mut Value) -> Result<InstallationLock> {
+    if let Some(service) = cleanup::stop(home, j).await? {
+        return Ok(service);
+    }
     if let Ok(f) = lock(home, "service.lock") {
         if j["startup"]["managed"] == true {
             native_startup_state::stop(&j["startup"])?;
@@ -689,7 +695,7 @@ pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<
             }
         })
         .unwrap_or(Value::Null);
-    let mut j = if let Some(j) = existing.filter(|j| j["transaction_id"] == transaction) {
+    let mut j = if let Some(mut j) = existing.filter(|j| j["transaction_id"] == transaction) {
         ensure!(
             j["context_hash"] == context_hash && j["installation_id"] == Config::load(home)?.id,
             "Immutable update context or installation changed"
@@ -703,7 +709,7 @@ pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<
                 readiness["ready"] == true && readiness["transaction_id"] == transaction,
                 "The prepared admission boundary no longer matches; retained for recovery"
             );
-            let _service = stop_running(home, &j).await?;
+            let _service = stop_running(home, &mut j).await?;
             let mut j = j;
             phase(home, &mut j, "prepared")?;
             return Ok(json!({"ready":true,"transaction_id":transaction}));
@@ -796,7 +802,7 @@ pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<
     j["admission_result"] = readiness;
     phase(home, &mut j, "preparing")?;
     if running {
-        let _service = stop_running(home, &j).await?;
+        let _service = stop_running(home, &mut j).await?;
         phase(home, &mut j, "prepared")?;
     } else {
         phase(home, &mut j, "prepared")?;
@@ -919,9 +925,9 @@ pub async fn apply(home: &Path, transaction: &str, plan: &Value, rollback: bool)
     // Journal publication serializes revocation against the final startup
     // check/AppState initialization, then releases that guard BEFORE waiting
     // for service.lock. A revoked process still hashing its executable refuses.
-    j["launch_nonce"] = Value::Null;
+    cleanup::revoke(&mut j)?;
     phase(home, &mut j, "switching")?;
-    let _service = stop_running(home, &j).await?;
+    let _service = stop_running(home, &mut j).await?;
     switch(home, &j, previous)?;
     phase(home, &mut j, "applied")?;
     Ok(json!({"applied":!rollback,"rolled_back":rollback,"transaction_id":transaction}))
@@ -970,6 +976,9 @@ fn validate_start_with_digest(
     let actual = startup.map(|_| executable_digest()).transpose()?;
     let guard = launch_guard(home)?;
     validate_start_record(home, startup, actual.as_deref())?;
+    if startup.is_some() {
+        cleanup::publish_entry(home, &read(&home.join(JOURNAL))?)?;
+    }
     Ok(guard)
 }
 fn validate_start_record(
@@ -1015,6 +1024,8 @@ impl std::fmt::Display for UncertainReplacement {
 impl std::error::Error for UncertainReplacement {}
 
 fn start(home: &Path, j: &mut Value) -> Result<Option<ServiceChild>> {
+    cleanup::ensure_new_start(j)
+        .map_err(|error| anyhow::Error::new(UncertainReplacement).context(error.to_string()))?;
     let nonce = auth::random_token();
     j["launch_nonce"] = json!(nonce);
     j["child_pid"] = Value::Null;
@@ -1023,14 +1034,19 @@ fn start(home: &Path, j: &mut Value) -> Result<Option<ServiceChild>> {
         json!(j["original_running"] == true && j["startup"]["managed"] == true);
     save(&home.join(JOURNAL), j)?;
     if j["managed_start_requested"] == true {
-        native_startup_state::start(&j["startup"])?;
+        let target = cleanup::Target::Startup {
+            snapshot: j["startup"].clone(),
+        };
+        cleanup::start(home, j, target)
+            .map_err(|error| anyhow::Error::new(UncertainReplacement).context(error.to_string()))?;
         return Ok(None);
     }
     let transaction = j["transaction_id"]
         .as_str()
         .context("Missing transaction")?;
-    if crate::native_browser_update::owns_pending_transaction(home, transaction)?
-        && crate::native_browser_update::worker_active(home)?
+    if cleanup::retains_replacement(j)?
+        || (crate::native_browser_update::owns_pending_transaction(home, transaction)?
+            && crate::native_browser_update::worker_active(home)?)
     {
         // A manager-owned worker's child would share its job/cgroup. The manual
         // replacement gets an independent no-autostart profile, preserving the
@@ -1044,13 +1060,9 @@ fn start(home: &Path, j: &mut Value) -> Result<Option<ServiceChild>> {
         )?;
         j["browser_replacement"] = serde_json::to_value(&prepared)?;
         save(&home.join(JOURNAL), j)?;
-        match crate::native_update_launch::launch(&prepared) {
-            Ok(crate::native_update_launch::LaunchReceipt::Accepted) => return Ok(None),
-            Ok(crate::native_update_launch::LaunchReceipt::Refused { .. }) => {
-                anyhow::bail!("The native manager refused the fixed replacement profile")
-            }
-            _ => return Err(UncertainReplacement.into()),
-        }
+        cleanup::start(home, j, cleanup::Target::Replacement { prepared })
+            .map_err(|error| anyhow::Error::new(UncertainReplacement).context(error.to_string()))?;
+        return Ok(None);
     }
     let mut child = native_update_process::spawn_service(
         &binary(home),
@@ -1073,7 +1085,11 @@ fn stop_child(child: &mut ServiceChild) -> Result<()> {
     child.wait()?;
     Ok(())
 }
-async fn healthy(home: &Path, j: &Value, mut child: Option<&mut ServiceChild>) -> Result<Value> {
+async fn healthy(
+    home: &Path,
+    j: &mut Value,
+    mut child: Option<&mut ServiceChild>,
+) -> Result<Value> {
     let deadline =
         std::time::Instant::now() + crate::native_update_clock::cap(Duration::from_secs(30))?;
     loop {
@@ -1084,6 +1100,7 @@ async fn healthy(home: &Path, j: &Value, mut child: Option<&mut ServiceChild>) -
                 "Candidate exited before verification"
             );
         }
+        let cleanup_captured = cleanup::capture(home, j)?;
         if let Ok(s) = local_api(home, "GET", "status", None).await
             && s["id"] == j["installation_id"]
             && s["binary_sha256"] == current_record(j)["binary_sha256"]
@@ -1092,7 +1109,13 @@ async fn healthy(home: &Path, j: &Value, mut child: Option<&mut ServiceChild>) -
             && (s["admission"]["closed"] == true
                 || (j["restore_started"] == true && s["admission"]["closed"] == false))
         {
-            return Ok(s);
+            if cleanup_captured {
+                return Ok(s);
+            }
+            // Previous bundles predate the early process-entry receipt. Keep
+            // their authenticated health path, binding a second status sample
+            // to the same native generation before retaining cleanup authority.
+            return cleanup::capture_authenticated_status(home, j, &s).await;
         }
         ensure!(
             std::time::Instant::now() < deadline,
@@ -1148,7 +1171,7 @@ pub async fn verify(home: &Path, transaction: &str) -> Result<Value> {
             "Unexpected running application during verification"
         );
     }
-    let result = healthy(home, &j, child.as_mut()).await;
+    let result = healthy(home, &mut j, child.as_mut()).await;
     if let Err(e) = result {
         if let Some(c) = child.as_mut() {
             stop_child(c)?;
@@ -1156,7 +1179,7 @@ pub async fn verify(home: &Path, transaction: &str) -> Result<Value> {
         return Err(e);
     }
     if j["original_running"] == false {
-        let _stopped = stop_running(home, &j).await?;
+        let _stopped = stop_running(home, &mut j).await?;
         if let Some(c) = child.as_mut() {
             c.wait()?;
         }
@@ -1207,7 +1230,7 @@ pub async fn restore(home: &Path, transaction: &str, outcome: &str) -> Result<Va
         if lock(home, "service.lock").is_ok() {
             child = start(home, &mut j)?;
         }
-        healthy(home, &j, child.as_mut()).await?;
+        healthy(home, &mut j, child.as_mut()).await?;
         if j["restore_boundary_verified"] != true {
             if !j["startup"].is_null() {
                 native_startup_state::verify_restored(&j["startup"])?;
@@ -1388,9 +1411,9 @@ pub async fn abort_rollback(home: &Path, transaction: &str, reason: &str) -> Res
     }
     j["direction"] = json!("unchanged");
     j["selected"] = json!("previous");
-    j["launch_nonce"] = Value::Null;
+    cleanup::revoke(&mut j)?;
     phase(home, &mut j, "switching")?;
-    let _service = stop_running(home, &j).await?;
+    let _service = stop_running(home, &mut j).await?;
     switch(home, &j, true)?;
     phase(home, &mut j, "applied")?;
     Ok(json!({"selected_previous":true,"rollback_aborted":true,"transaction_id":transaction}))
