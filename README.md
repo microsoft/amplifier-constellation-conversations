@@ -49,6 +49,9 @@ their current behavior.
 
 ## Contributing
 
+Invited collaborators: follow [Join the work](https://github.com/microsoft/amplifier-constellation#join-the-work)
+within your agreed access and scope. The notice below covers general public intake.
+
 > [!NOTE]
 > This project is not currently accepting external contributions, but we're actively working toward opening this up. We value community input and look forward to collaborating in the future. For now, feel free to fork and experiment!
 
