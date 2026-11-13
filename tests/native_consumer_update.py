@@ -894,7 +894,10 @@ def await_cleanup_stopped(install, *, stage):
                 state = "open"
             elif code in {errno.ECONNREFUSED, getattr(errno, "WSAECONNREFUSED", 10061)}:
                 state = "refused"
-            elif code in {errno.ETIMEDOUT, getattr(errno, "WSAETIMEDOUT", 10060)}:
+            elif code in {errno.ETIMEDOUT, getattr(errno, "WSAETIMEDOUT", 10060),
+                          errno.EWOULDBLOCK, getattr(errno, "WSAEWOULDBLOCK", 10035)}:
+                # CPython connect_ex returns EWOULDBLOCK/WSAEWOULDBLOCK when
+                # its own select timeout expires. No refusal was observed.
                 state = "pending"
             else:
                 row["socket_error"] = code

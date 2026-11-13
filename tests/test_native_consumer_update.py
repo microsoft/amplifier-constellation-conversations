@@ -68,7 +68,9 @@ class ConsumerUpdateControllerTests(unittest.TestCase):
     def test_cleanup_waits_for_both_socket_refusal_and_lock_release(self):
         scenarios = [([0, controller.errno.ECONNREFUSED], [True, True]),
                      ([controller.errno.ECONNREFUSED] * 2, [False, True]),
-                     ([controller.errno.ETIMEDOUT, 10061], [True, True])]
+                     ([controller.errno.ETIMEDOUT, 10061], [True, True]),
+                     ([controller.errno.EWOULDBLOCK, controller.errno.ECONNREFUSED], [True, True]),
+                     ([10035, 10061], [True, True])]
         for codes, locks in scenarios:
             with self.subTest(codes=codes, locks=locks), tempfile.TemporaryDirectory() as directory:
                 install = self.cleanup_fixture(Path(directory))
@@ -83,7 +85,8 @@ class ConsumerUpdateControllerTests(unittest.TestCase):
                 self.assertTrue(all(call.args[0] <= 0.2 for call in connection.settimeout.call_args_list))
 
     def test_cleanup_open_or_locked_or_timed_out_never_becomes_absence(self):
-        for code, free in [(0, True), (controller.errno.ECONNREFUSED, False), (controller.errno.ETIMEDOUT, True)]:
+        for code, free in [(0, True), (controller.errno.ECONNREFUSED, False),
+                           (controller.errno.ETIMEDOUT, True), (controller.errno.EWOULDBLOCK, True), (10035, True)]:
             with self.subTest(code=code, free=free), tempfile.TemporaryDirectory() as directory:
                 install = self.cleanup_fixture(Path(directory))
                 install.service_lock_available = Mock(return_value=free)
@@ -97,8 +100,26 @@ class ConsumerUpdateControllerTests(unittest.TestCase):
                 self.assertNotIn("listener_closed", row)
                 self.assertEqual(row["timeout_seconds"], 15)
 
+    def test_cleanup_pending_then_open_cannot_prove_absence_before_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = self.cleanup_fixture(Path(directory))
+            install.service_lock_available = Mock(return_value=True)
+            connection = self.cleanup_socket([10035, 0])
+            with patch.object(controller.socket, "socket", return_value=connection), \
+                 patch.object(controller.time, "monotonic", side_effect=[0, 0, 0, 1, 2, 2, 15, 15]), \
+                 patch.object(controller.time, "sleep"), \
+                 self.assertRaisesRegex(AssertionError, "within 15 seconds"):
+                controller.await_cleanup_stopped(install, stage="manager_stop")
+            row = install.result["cleanup"]["listener_closure"][0]
+            self.assertEqual(row["status"], "unknown")
+            self.assertEqual(row["listener"], "open")
+            self.assertEqual(row["samples"], 2)
+            self.assertNotIn("listener_closed", row)
+            install.api.assert_not_called()
+            self.assertEqual(connection.connect_ex.call_count, 2)
+
     def test_cleanup_unknown_socket_error_is_not_swallowed_or_retried(self):
-        for code in [controller.errno.EACCES, controller.errno.ECONNRESET, 10054]:
+        for code in [controller.errno.EACCES, controller.errno.ECONNRESET, 10013, 10054]:
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
                 install = self.cleanup_fixture(Path(directory))
                 install.service_lock_available = Mock()
