@@ -38,7 +38,9 @@ their current behavior.
 
 ## Setup and technical references
 
-- [Installation and connection configuration](docs/installation.md): build, authentication, ACP endpoints and source credentials.
+- [Open Companion](docs/native-consumer-setup.md): open the native app and complete personal account, agent-contact and voice setup in the browser, without a local Instance or developer tools.
+- [Advanced native hosting](docs/native-installation.md): OS-account authentication, HTTPS and independently administered installations.
+- [Source installation and connection configuration](docs/installation.md): build, authentication, ACP endpoints and source credentials.
 - [Reference browser controls](docs/shared-rooms.md#reference-browser-phone-and-voice): text, voice, forms and shared-room presentation.
 - [Validation](docs/validation.md): reproducible checks and their limits.
 
