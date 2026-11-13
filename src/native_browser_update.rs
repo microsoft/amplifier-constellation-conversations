@@ -703,8 +703,10 @@ pub(crate) fn check(
         ));
     }
     crate::native_browser_cleanup::before_check(home)?;
-    let package = crate::desktop::checked_package_folder(&input.package_path)?;
-    let plan = native_update::plan(home, &package)?;
+    let package = crate::desktop::selected_package_folder(&input.package_path)?;
+    let checked = native_update::prepare_plan(home, &package.bundle)?;
+    package.verify_launcher(&checked)?;
+    let plan = checked.value();
     if !plan["version"]
         .as_str()
         .is_some_and(|version| !version.is_empty() && version.len() <= 128)
@@ -714,26 +716,30 @@ pub(crate) fn check(
         ));
     }
     {
-        let _guard = native_update::lock(home, "native-update.lock")?;
+        // The freshly verified plan retains this same installation lock through
+        // publication. Do not re-open full immutable bundles here; no saved or
+        // caller-provided plan can enter this path. APPLY still revalidates all
+        // package bytes before granting any worker or lifecycle authority.
         standalone(home)?;
         if worker_active(home)? {
             return Err(conflict("A native update worker is still running"));
         }
         let mut ledger = load(home)?;
         settle_current(home, &mut ledger)?;
-        native_update::validate_frozen_plan(home, &plan)?;
+        checked.validate_current()?;
         let id = uuid::Uuid::new_v4().to_string();
         ledger.checks.insert(
             id.clone(),
             CheckedPackage {
                 id: id.clone(),
                 helper: plan["previous"].clone(),
-                plan,
+                plan: plan.clone(),
             },
         );
         ledger.current_check = Some(id);
         save(home, &ledger)?;
     }
+    drop(checked);
     status(home, "normal", None, launch)
 }
 
@@ -1544,6 +1550,184 @@ mod tests {
                 .to_owned()
         }
     }
+    #[test]
+    fn fresh_check_verifies_each_required_bundle_once() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let (checked, scans) = native_bundle::count_verifications(|| fixture.check(&launch));
+        assert_eq!(
+            scans, 3,
+            "installed, source and staged candidate must each be fully verified once"
+        );
+        assert!(load(&fixture.home).unwrap().checks.contains_key(&checked));
+        assert_eq!(launch.calls.load(Ordering::SeqCst), 0);
+        assert!(!fixture.home.join("native-update.json").exists());
+    }
+
+    #[test]
+    fn check_rejects_corrupt_source_before_recording_any_candidate_or_operation() {
+        for relative in ["bridge/live.mjs", "manifest.json"] {
+            let fixture = Fixture::new();
+            let launch = LostReply::default();
+            fs::write(fixture.candidate.join(relative), b"corrupt source").unwrap();
+            assert!(
+                check(
+                    &fixture.home,
+                    CheckInput {
+                        package_path: fixture.candidate.clone()
+                    },
+                    &launch
+                )
+                .is_err()
+            );
+            assert!(!fixture.home.join(DIRECTORY).join(LEDGER).exists());
+            assert!(!fixture.home.join("native-update.json").exists());
+            assert_eq!(launch.calls.load(Ordering::SeqCst), 0);
+            assert!(native_update::lock(&fixture.home, "native-update.lock").is_ok());
+        }
+    }
+
+    #[test]
+    fn checked_plan_holds_owner_lock_and_rejects_binding_drift() {
+        for name in [
+            "native-installation.json",
+            "config.json",
+            "companion.json",
+            "binary",
+        ] {
+            let fixture = Fixture::new();
+            let checked = native_update::prepare_plan(&fixture.home, &fixture.candidate).unwrap();
+            assert!(native_update::lock(&fixture.home, "native-update.lock").is_err());
+            checked.validate_current().unwrap();
+            let path = if name == "binary" {
+                amplifier_native_platform::installed_binary(
+                    &native_bundle::APPLICATION,
+                    &fixture.home,
+                )
+            } else {
+                fixture.home.join(name)
+            };
+            let mut bytes = fs::read(&path).unwrap_or_else(|_| b"{}".to_vec());
+            bytes.push(b'\n');
+            fs::write(path, bytes).unwrap();
+            assert!(
+                checked.validate_current().is_err(),
+                "{name} drift was accepted"
+            );
+            assert!(!fixture.home.join(DIRECTORY).join(LEDGER).exists());
+            drop(checked);
+            assert!(native_update::lock(&fixture.home, "native-update.lock").is_ok());
+        }
+    }
+
+    #[test]
+    fn selected_launcher_is_compared_to_the_verified_staged_service() {
+        let fixture = Fixture::new();
+        let selected = crate::desktop::selected_package_folder(&fixture.candidate).unwrap();
+        let checked = native_update::prepare_plan(&fixture.home, &selected.bundle).unwrap();
+        selected.verify_launcher(&checked).unwrap();
+        fs::write(
+            fixture
+                .candidate
+                .join(crate::platform::executable("agent-conversations")),
+            b"changed launcher",
+        )
+        .unwrap();
+        assert!(selected.verify_launcher(&checked).is_err());
+        assert!(!fixture.home.join(DIRECTORY).join(LEDGER).exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn selected_app_requires_its_separate_launcher_to_match_the_staged_service() {
+        let fixture = Fixture::new();
+        let app = fixture.root.path().join("Candidate.app");
+        let bundle = app.join("Contents/Resources/bundle");
+        package(&bundle, "fixture-app");
+        let launcher = app.join("Contents/MacOS/agent-conversations");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        fs::copy(bundle.join("agent-conversations"), &launcher).unwrap();
+        let selected = crate::desktop::selected_package_folder(&app).unwrap();
+        let checked = native_update::prepare_plan(&fixture.home, &selected.bundle).unwrap();
+        selected.verify_launcher(&checked).unwrap();
+        fs::write(launcher, b"different outer launcher").unwrap();
+        assert!(selected.verify_launcher(&checked).is_err());
+    }
+
+    #[test]
+    fn checked_bundle_tampering_is_rejected_before_apply_records_or_launches() {
+        for role in ["previous", "candidate"] {
+            let fixture = Fixture::new();
+            let launch = LostReply::default();
+            let checked = fixture.check(&launch);
+            let before = fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap();
+            let ledger = load(&fixture.home).unwrap();
+            let bundle = Path::new(
+                ledger.checks[&checked].plan[role]["bundle"]["bundle"]
+                    .as_str()
+                    .unwrap(),
+            );
+            fs::write(bundle.join("bridge/live.mjs"), b"changed support content").unwrap();
+            assert!(
+                apply(
+                    &fixture.home,
+                    ApplyInput {
+                        request_id: id(),
+                        check_id: checked
+                    },
+                    &launch
+                )
+                .is_err()
+            );
+            assert_eq!(launch.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap(),
+                before
+            );
+            assert!(!fixture.home.join("native-update.json").exists());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoning_check_observation_does_not_release_its_running_owner() {
+        // Dropping the HTTP observer is not cancellation of spawn_blocking.
+        // Work and lock ownership settle together, without a second request or
+        // interpreting the missing reply as a failed/no-effect CHECK.
+        let fixture = Fixture::new();
+        let home = fixture.home.clone();
+        let candidate = fixture.candidate.clone();
+        let (prepared, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (settled, done) = tokio::sync::oneshot::channel();
+        let observer = tokio::spawn(async move {
+            blocking_control(move || {
+                let checked = native_update::prepare_plan(&home, &candidate)?;
+                prepared.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                checked.validate_current()?;
+                drop(checked);
+                settled.send(()).unwrap();
+                Ok(json!({"observed":true}))
+            })
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+        assert!(native_update::lock(&fixture.home, "native-update.lock").is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), done)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(native_update::lock(&fixture.home, "native-update.lock").is_ok());
+        assert!(!fixture.home.join("native-update.json").exists());
+    }
+
     #[derive(Default)]
     struct LostReply {
         calls: AtomicUsize,

@@ -71,24 +71,43 @@ fn downloaded_bundle_inner(executable: &Path) -> Result<PathBuf> {
     Ok(bundle)
 }
 
-/// The browser selects a complete extracted package folder. On macOS the
-/// ordinary app itself is that folder; its fixed native launcher must still
-/// equal the fully verified Resources bundle service.
-pub(crate) fn checked_package_folder(folder: &Path) -> Result<PathBuf> {
+/// Selection alone grants no integrity or execution authority. CHECK stages and
+/// fully verifies this bundle before comparing its service with the selected
+/// launcher. On macOS that launcher is separate from Resources/bundle.
+pub(crate) struct SelectedPackage {
+    pub(crate) bundle: PathBuf,
+    launcher: PathBuf,
+}
+impl SelectedPackage {
+    pub(crate) fn verify_launcher(&self, checked: &native_update::CheckedPlan) -> Result<()> {
+        ensure!(
+            file_digest(&self.launcher)? == checked.value()["candidate"]["binary_sha256"],
+            "Application launcher differs from its verified bundle"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn selected_package_folder(folder: &Path) -> Result<SelectedPackage> {
     ensure!(
         folder.is_absolute() && folder.is_dir(),
         "Choose an absolute extracted package folder"
     );
-    let executable = if cfg!(target_os = "macos")
+    let is_app = cfg!(target_os = "macos")
         && folder
             .extension()
-            .is_some_and(|extension| extension == "app")
-    {
+            .is_some_and(|extension| extension == "app");
+    let launcher = if is_app {
         folder.join("Contents/MacOS/agent-conversations")
     } else {
         folder.join(crate::platform::executable("agent-conversations"))
     };
-    downloaded_bundle(&executable)
+    let bundle = if is_app {
+        folder.join("Contents/Resources/bundle")
+    } else {
+        folder.to_owned()
+    };
+    Ok(SelectedPackage { bundle, launcher })
 }
 
 /// Publish only a new private identity. Package installation follows publication

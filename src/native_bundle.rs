@@ -294,7 +294,21 @@ fn enumerate(root: &Path, at: &Path, files: &mut BTreeSet<String>) -> Result<()>
     }
     Ok(())
 }
+#[cfg(test)]
+thread_local! {
+    static VERIFICATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_verifications<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+    let before = VERIFICATION_COUNT.get();
+    let result = operation();
+    (result, VERIFICATION_COUNT.get() - before)
+}
+
 fn load(root: &Path) -> Result<(Manifest, Vec<u8>, String)> {
+    #[cfg(test)]
+    VERIFICATION_COUNT.set(VERIFICATION_COUNT.get() + 1);
     let root_meta = fs::symlink_metadata(root)?;
     ensure!(
         ordinary(&root_meta) && root_meta.file_type().is_dir(),

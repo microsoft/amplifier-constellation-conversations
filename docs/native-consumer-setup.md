@@ -56,6 +56,13 @@ installing it. An active call or unsettled work can defer the change; the page
 does not force either to stop. An enrolled installation directs you to its existing
 updater instead of starting a second owner.
 
+Checking a package does not install it. It verifies and stages the complete
+bundle while retaining the installation's update lock through publication of the
+check result. Installing the selected package validates its bytes again. If the
+check reply times out or the tab closes, the check may still be running; neither
+event proves cancellation or permits an automatic retry. Read the saved status
+before selecting another package.
+
 The page reads the installation's saved operation while Companion restarts.
 Reloading the page does not submit the update again. If a request was not recorded,
 **Retry same request** deliberately reuses that request's identity and package
