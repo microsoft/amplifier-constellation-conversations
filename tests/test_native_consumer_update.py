@@ -236,11 +236,14 @@ class ConsumerUpdateControllerTests(unittest.TestCase):
             install.api.assert_not_called()
 
     def test_cleanup_actual_closed_loopback_endpoint_and_private_lock(self):
-        with tempfile.TemporaryDirectory() as directory, controller.socket.socket() as reserved:
-            # Bound but not listening reserves the port without accepting data.
-            # No application, native manager, or provider is started.
-            reserved.bind(("127.0.0.1", 0))
-            port = reserved.getsockname()[1]
+        with tempfile.TemporaryDirectory() as directory:
+            # Release the reservation before observing a closed endpoint. A
+            # bound socket that remains open is not that fixture precondition.
+            # Port reuse remains a failure; no new port or retry is selected.
+            with controller.socket.socket() as reserved:
+                reserved.bind(("127.0.0.1", 0))
+                port = reserved.getsockname()[1]
+            self.assertEqual(reserved.fileno(), -1)
             install = self.cleanup_fixture(Path(directory))
             for name in ["config.json", "runtime.json"]:
                 path = install.home / name
@@ -249,7 +252,18 @@ class ConsumerUpdateControllerTests(unittest.TestCase):
                 if name == "runtime.json":
                     value["url"] = value["public_url"]
                 controller.consumer.write_json(path, value)
-            result = controller.await_cleanup_stopped(install, stage="manager_stop")
+            try:
+                result = controller.await_cleanup_stopped(install, stage="manager_stop")
+            except Exception as error:
+                rows = install.result["cleanup"].get("listener_closure", [])
+                row = rows[-1] if rows else {}
+                keys = ("stage", "status", "timeout_seconds", "elapsed_seconds",
+                        "samples", "connection_attempts", "poll_slices", "listener",
+                        "service_lock_available", "authenticated_requests", "socket_error",
+                        "listener_closed", "service_lock_released", "error_type")
+                evidence = {key: row[key] for key in keys if key in row}
+                error.add_note("Closed-loopback observation: " + json.dumps(evidence, sort_keys=True)[:1024])
+                raise
             self.assertEqual(result["status"], "stopped")
             self.assertEqual(result["listener"], "refused")
             self.assertTrue(result["service_lock_available"])
