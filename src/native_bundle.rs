@@ -11,6 +11,7 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    thread,
 };
 
 pub const APPLICATION: amplifier_native_platform::Application =
@@ -77,6 +78,66 @@ fn digest(path: &Path) -> Result<String> {
         hash.update(&buf[..n]);
     }
     Ok(hex(&hash.finalize()))
+}
+
+const MAX_VERIFICATION_WORKERS: usize = 4;
+
+fn verify_files(root: &Path, files: &[File]) -> Result<()> {
+    let parallelism = thread::available_parallelism().map_or(1, usize::from);
+    verify_files_with(files, parallelism, |file| verify_file(root, file))
+}
+
+fn verify_file(root: &Path, file: &File) -> Result<()> {
+    let path = root.join(&file.path);
+    ensure!(
+        fs::metadata(&path)?.len() == file.bytes && digest(&path)? == file.sha256,
+        "Bundle file failed verification: {}",
+        file.path
+    );
+    Ok(())
+}
+
+fn verify_files_with(
+    files: &[File],
+    parallelism: usize,
+    verify: impl Fn(&File) -> Result<()> + Sync,
+) -> Result<()> {
+    let workers = parallelism
+        .clamp(1, MAX_VERIFICATION_WORKERS)
+        .min(files.len());
+    if workers <= 1 {
+        return files.iter().try_for_each(verify);
+    }
+    // Only the independent content checks run concurrently. Manifest/path and
+    // complete inventory validation precede this call; entrypoint validation
+    // follows it. All started workers are joined, including on an error, so no
+    // verification can outlive its caller or its installation locks.
+    thread::scope(|scope| {
+        let mut jobs = Vec::with_capacity(workers);
+        let mut spawn_error = None;
+        for chunk in files.chunks(files.len().div_ceil(workers)) {
+            let verify = &verify;
+            match thread::Builder::new()
+                .spawn_scoped(scope, move || chunk.iter().try_for_each(verify))
+            {
+                Ok(job) => jobs.push(job),
+                Err(error) => {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        }
+        // Collect every join before selecting the first failure in manifest
+        // order. Short-circuiting the joins could leave work running on error.
+        let results: Vec<_> = jobs.into_iter().map(|job| job.join()).collect();
+        if let Some(error) = spawn_error {
+            return Err(error).context("Cannot start bundle verification worker");
+        }
+        for result in results {
+            result.map_err(|_| anyhow::anyhow!("Bundle verification worker failed"))??;
+        }
+        Ok(())
+    })
 }
 fn relative(value: &str) -> Result<PathBuf> {
     ensure!(
@@ -284,14 +345,7 @@ fn load(root: &Path) -> Result<(Manifest, Vec<u8>, String)> {
     let mut actual = BTreeSet::new();
     enumerate(root, root, &mut actual)?;
     ensure!(actual == expected, "Bundle has missing or unexpected files");
-    for file in &m.files {
-        let path = root.join(&file.path);
-        ensure!(
-            fs::metadata(&path)?.len() == file.bytes && digest(&path)? == file.sha256,
-            "Bundle file failed verification: {}",
-            file.path
-        );
-    }
+    verify_files(root, &m.files)?;
     for path in [
         &m.entrypoints.service,
         &m.entrypoints.node,
@@ -501,6 +555,127 @@ mod tests {
         fs::write(path, v.to_string()).unwrap();
         assert!(verify(tmp.path()).is_err());
     }
+
+    #[test]
+    fn verifies_every_manifest_file_across_parallel_regions() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        let manifest_path = tmp.path().join("manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let contents = b"complete verified dependency";
+        for index in 0..20 {
+            let name = format!("bridge/dependency-{index}.js");
+            fs::write(tmp.path().join(&name), contents).unwrap();
+            manifest["files"].as_array_mut().unwrap().push(json!({
+                "path": name, "sha256": hex(&Sha256::digest(contents)),
+                "bytes": contents.len(), "executable": false
+            }));
+        }
+        fs::write(&manifest_path, manifest.to_string()).unwrap();
+        verify(tmp.path()).unwrap();
+        let parsed: Manifest = serde_json::from_value(manifest).unwrap();
+        for index in [0, 7, 13, 19] {
+            let path = tmp.path().join(format!("bridge/dependency-{index}.js"));
+            let mut corrupt = contents.to_vec();
+            corrupt[0] ^= 1;
+            fs::write(&path, &corrupt).unwrap();
+            // Force all four regions even on a single-core test runner. The
+            // actual filesystem, size check and SHA verifier remain in use.
+            assert!(
+                verify_files_with(&parsed.files, 4, |file| { verify_file(tmp.path(), file) })
+                    .is_err()
+            );
+            assert!(verify(tmp.path()).is_err());
+            fs::write(path, contents).unwrap();
+        }
+        fs::remove_file(tmp.path().join("bridge/dependency-19.js")).unwrap();
+        assert!(verify(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn verification_is_bounded_and_joins_other_workers_before_error_or_panic() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+
+        for panic_first in [false, true] {
+            let files: Vec<File> = (0..16)
+                .map(|index| File {
+                    path: index.to_string(),
+                    sha256: "0".repeat(64),
+                    bytes: 0,
+                    executable: false,
+                })
+                .collect();
+            let (entered, entries) = mpsc::channel();
+            let (finished, finishes) = mpsc::channel();
+            let (done, outcome) = mpsc::channel();
+            let mut releases = Vec::new();
+            let mut waits = Vec::new();
+            for _ in 0..16 {
+                let (release, wait) = mpsc::sync_channel(1);
+                releases.push(release);
+                waits.push(Mutex::new(wait));
+            }
+            let maximum = Arc::new(AtomicUsize::new(0));
+            let observed_maximum = maximum.clone();
+            let runner = thread::spawn(move || {
+                let active = AtomicUsize::new(0);
+                let result = verify_files_with(&files, usize::MAX, |file| {
+                    let index: usize = file.path.parse().unwrap();
+                    let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(running, Ordering::SeqCst);
+                    entered.send(index).unwrap();
+                    let released = waits[index]
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    finished.send(index).unwrap();
+                    released.context("Test controller did not release verifier")?;
+                    if index == 0 {
+                        assert!(!panic_first, "injected verification panic");
+                        anyhow::bail!("injected content verification failure");
+                    }
+                    Ok(())
+                });
+                done.send(result).unwrap();
+            });
+            let mut started = Vec::new();
+            for _ in 0..4 {
+                match entries.recv_timeout(Duration::from_secs(5)) {
+                    Ok(index) => started.push(index),
+                    Err(_) => break,
+                }
+            }
+            // The first worker fails while every other worker remains blocked.
+            let _ = releases[0].send(());
+            let first_finished = finishes.recv_timeout(Duration::from_secs(5));
+            let premature = outcome.recv_timeout(Duration::from_millis(100));
+            // Always release all test workers before making assertions.
+            for release in &releases[1..] {
+                let _ = release.send(());
+            }
+            runner.join().unwrap();
+            let returned_early = premature.is_ok();
+            let result = premature.unwrap_or_else(|_| outcome.recv().unwrap());
+            started.sort_unstable();
+            assert_eq!(started, [0, 4, 8, 12]);
+            assert_eq!(observed_maximum.load(Ordering::SeqCst), 4);
+            assert_eq!(first_finished.unwrap(), 0);
+            assert!(
+                !returned_early,
+                "Returned while another verifier was active"
+            );
+            assert!(result.is_err());
+            assert_eq!(finishes.iter().count(), 12);
+        }
+    }
+
     #[test]
     fn refuses_traversal_and_links() {
         for bad in [
