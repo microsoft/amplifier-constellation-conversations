@@ -688,6 +688,20 @@ pub fn prepare_replacement(
 }
 
 impl PreparedLaunch {
+    /// The fixed service identity, reconstructed from the saved operation.
+    /// This is not manager acceptance or application generation evidence.
+    pub fn service(&self) -> Result<Service> {
+        self.validate()?;
+        Ok(self.service.clone())
+    }
+
+    /// Check the fixed profile against an already obtained native snapshot.
+    /// Callers retain generation and dispatch authority separately.
+    pub fn profile_matches(&self, snapshot: &Value) -> Result<bool> {
+        self.validate()?;
+        registration::profile_matches(&self.service, &self.profile, snapshot)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             *self

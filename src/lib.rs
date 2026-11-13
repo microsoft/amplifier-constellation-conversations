@@ -33,6 +33,7 @@ mod native_installation_diagnostics;
 pub mod native_recovery;
 pub mod native_startup_state;
 pub mod native_update;
+pub mod native_update_identity;
 mod native_update_clock;
 pub mod native_update_launch;
 mod native_update_process;

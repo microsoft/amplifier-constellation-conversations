@@ -29,8 +29,15 @@ enum Action {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Target {
     Original,
-    Worker { operation: String, attempt: String },
-    Replacement { transaction: String },
+    Worker {
+        operation: String,
+        attempt: String,
+    },
+    Replacement {
+        transaction: String,
+        #[serde(default)]
+        nonce: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -106,8 +113,12 @@ fn saved_launch(request: &Request) -> Result<Option<native_update_launch::Prepar
                     && identity["operation"] == *operation
                     && identity["attempt"] == *attempt
             }
-            Target::Replacement { transaction } => {
-                identity["kind"] == "replacement" && identity["transaction"] == *transaction
+            Target::Replacement { transaction, nonce } => {
+                identity["kind"] == "replacement"
+                    && identity["transaction"] == *transaction
+                    && nonce
+                        .as_ref()
+                        .is_none_or(|expected| identity["nonce"] == *expected)
             }
             Target::Original => false,
         };
@@ -173,6 +184,25 @@ fn application_binding(application: &Value, processes: &Value) -> Result<Option<
         }
     }
     Ok(None)
+}
+
+fn required_application_matches(
+    expected: Option<&Value>,
+    snapshot: &Value,
+) -> Result<Option<ActionOutcome>> {
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    Ok(
+        (application_binding(expected, &snapshot["processes"])?.is_none()).then(|| {
+            ActionOutcome::Refused {
+                code: "changed_fixture_application".into(),
+                message:
+                    "Captured fixture application generation is no longer bound to this manager"
+                        .into(),
+            }
+        }),
+    )
 }
 
 fn actual_worker(request: &Request, installation_id: &str) -> Result<Option<Value>> {
@@ -286,9 +316,9 @@ fn run(mut request: Request) -> Result<Value> {
                         &service,
                         ServiceAction::Stop,
                         &snapshot,
-                        |_| {
+                        |current| {
                             native_startup_state::validate(&original)?;
-                            Ok(None)
+                            required_application_matches(request.previous_process.as_ref(), current)
                         },
                     )?;
                     value["dispatch"] = serde_json::to_value(outcome)?;
@@ -332,14 +362,13 @@ fn run(mut request: Request) -> Result<Value> {
                     ServiceAction::Stop,
                     &observation.snapshot,
                     |current| {
-                        Ok(
-                            (!registration::profile_matches(&service, &profile, current)?).then(
-                                || ActionOutcome::Refused {
-                                    code: "changed_profile".into(),
-                                    message: "Exact disposable profile changed before Stop".into(),
-                                },
-                            ),
-                        )
+                        if !registration::profile_matches(&service, &profile, current)? {
+                            return Ok(Some(ActionOutcome::Refused {
+                                code: "changed_profile".into(),
+                                message: "Exact disposable profile changed before Stop".into(),
+                            }));
+                        }
+                        required_application_matches(request.previous_process.as_ref(), current)
                     },
                 )?;
                 value["dispatch"] = serde_json::to_value(outcome)?;
@@ -360,7 +389,16 @@ fn run(mut request: Request) -> Result<Value> {
         result["actual_worker_manager_binding"] = json!(binding);
     }
     if let Some(previous) = request.previous_process {
-        result["previous_process_alive"] = json!(process::matches(&previous)?);
+        let alive = process::matches(&previous)?;
+        result["previous_process_alive"] = json!(alive);
+        // Read-only fault-fixture proof: a pre-status application has no new
+        // runtime.json yet. Bind its independently captured native generation
+        // through actual manager ancestry, not Task Scheduler EnginePID equality.
+        result["previous_process_manager_binding"] = json!(if alive {
+            application_binding(&previous, &result["processes"])?
+        } else {
+            None
+        });
     }
     let runtime = request.home.join("runtime.json");
     if runtime.is_file() {
