@@ -416,6 +416,78 @@ pub fn verify(root: &Path) -> Result<Value> {
     // removes it only when the ordinary spelling names the same filesystem path.
     Ok(result(&dunce::canonicalize(root)?, &m, &hash))
 }
+
+const MAX_COPY_WORKERS: usize = 4;
+
+fn copy_file(root: &Path, staged: &Path, file: &File) -> Result<()> {
+    let dest = staged.join(&file.path);
+    config::private_dir(dest.parent().context("Invalid package parent")?)?;
+    // Keep this protection for every file, including files sharing a parent.
+    fs::copy(root.join(&file.path), &dest)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            &dest,
+            fs::Permissions::from_mode(if file.executable { 0o700 } else { 0o600 }),
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_files(root: &Path, staged: &Path, files: &[File]) -> Result<()> {
+    let parallelism = thread::available_parallelism().map_or(1, usize::from);
+    copy_files_with(
+        files,
+        parallelism,
+        |file| copy_file(root, staged, file),
+        |_| Ok(()),
+    )
+}
+
+fn copy_files_with(
+    files: &[File],
+    parallelism: usize,
+    copy: impl Fn(&File) -> Result<()> + Sync,
+    // A private seam for deterministic spawn-refusal tests. Production has no
+    // alternate launch, retry or scheduling policy.
+    before_spawn: impl Fn(usize) -> std::io::Result<()>,
+) -> Result<()> {
+    let workers = parallelism.clamp(1, MAX_COPY_WORKERS).min(files.len());
+    if workers <= 1 {
+        return files.iter().try_for_each(copy);
+    }
+    // The complete source inventory and paths have already been validated.
+    // Only distinct file destinations run concurrently; per-file parent
+    // protection is unchanged even when workers share a directory.
+    thread::scope(|scope| {
+        let mut jobs = Vec::with_capacity(workers);
+        let mut spawn_error = None;
+        for (index, chunk) in files.chunks(files.len().div_ceil(workers)).enumerate() {
+            let copy = &copy;
+            match before_spawn(index).and_then(|()| {
+                thread::Builder::new().spawn_scoped(scope, move || chunk.iter().try_for_each(copy))
+            }) {
+                Ok(job) => jobs.push(job),
+                Err(error) => {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        }
+        // Never short-circuit joins: no worker may outlive manifest writing,
+        // copied verification, publication, failed-stage cleanup or its lock.
+        let results: Vec<_> = jobs.into_iter().map(|job| job.join()).collect();
+        if let Some(error) = spawn_error {
+            return Err(error).context("Cannot start bundle copy worker");
+        }
+        for result in results {
+            result.map_err(|_| anyhow::anyhow!("Bundle copy worker failed"))??;
+        }
+        Ok(())
+    })
+}
+
 pub fn install(root: &Path, home: &Path) -> Result<Value> {
     // Verify before creating installation state; extraction/download belongs to
     // the package acquisition surface, not to a remotely callable host API.
@@ -434,20 +506,7 @@ pub fn install(root: &Path, home: &Path) -> Result<Value> {
     config::private_dir(&staged)?;
     let attempt = (|| -> Result<()> {
         observe(Phase::BundleCopy, || {
-            for file in &m.files {
-                let dest = staged.join(&file.path);
-                config::private_dir(dest.parent().context("Invalid package parent")?)?;
-                // Copy into a private directory, then preserve executable identity.
-                fs::copy(root.join(&file.path), &dest)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(
-                        &dest,
-                        fs::Permissions::from_mode(if file.executable { 0o700 } else { 0o600 }),
-                    )?;
-                }
-            }
+            copy_files(root, &staged, &m.files)?;
             config::private_write(&staged.join("manifest.json"), &bytes)?;
             Ok(())
         })?;
@@ -467,6 +526,36 @@ pub fn install(root: &Path, home: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn directory_policy(path: &Path) -> Vec<u8> {
+        use std::ptr;
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetFileSecurityW, OWNER_SECURITY_INFORMATION,
+        };
+
+        let path = amplifier_native_platform::windows_native_path(path).unwrap();
+        let flags = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut needed = 0;
+        unsafe { GetFileSecurityW(path.as_ptr(), flags, ptr::null_mut(), 0, &mut needed) };
+        assert!(needed > 0 && needed <= 65536);
+        let mut storage = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetFileSecurityW(
+                    path.as_ptr(),
+                    flags,
+                    storage.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            },
+            0
+        );
+        unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), needed as usize) }
+            .to_vec()
+    }
+
     fn fixture(root: &Path) {
         let service = if cfg!(windows) {
             "agent-conversations.exe"
@@ -568,6 +657,340 @@ mod tests {
         v["target"] = json!("wrong-platform");
         fs::write(path, v.to_string()).unwrap();
         assert!(verify(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn copying_shared_and_nested_parents_matches_sequential_bytes_and_modes() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source 日本語");
+        fs::create_dir(&source).unwrap();
+        fixture(&source);
+        let manifest_path = source.join("manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        for index in 0..48 {
+            let parent = if index % 2 == 0 {
+                "shared"
+            } else {
+                "shared/nested/deep"
+            };
+            let name = format!("bridge/{parent}/file-{index}.js");
+            let contents = format!("dependency-{index}").into_bytes();
+            let path = source.join(&name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &contents).unwrap();
+            manifest["files"].as_array_mut().unwrap().push(json!({
+                "path": name, "sha256": hex(&Sha256::digest(&contents)),
+                "bytes": contents.len(), "executable": index % 3 == 0,
+            }));
+        }
+        fs::write(&manifest_path, manifest.to_string()).unwrap();
+        let (manifest, bytes, _) = load(&source).unwrap();
+        let sequential = temp.path().join("old sequential");
+        let parallel = temp.path().join("new parallel");
+        config::private_dir(&sequential).unwrap();
+        config::private_dir(&parallel).unwrap();
+        // Exact former copy body, retained as an independent sequential oracle.
+        for file in &manifest.files {
+            let dest = sequential.join(&file.path);
+            config::private_dir(dest.parent().context("Invalid package parent").unwrap()).unwrap();
+            fs::copy(source.join(&file.path), &dest).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    &dest,
+                    fs::Permissions::from_mode(if file.executable { 0o700 } else { 0o600 }),
+                )
+                .unwrap();
+            }
+        }
+        config::private_write(&sequential.join("manifest.json"), &bytes).unwrap();
+        let copied = AtomicUsize::new(0);
+        let names = Mutex::new(BTreeSet::new());
+        copy_files_with(
+            &manifest.files,
+            usize::MAX,
+            |file| {
+                assert!(names.lock().unwrap().insert(file.path.clone()));
+                copy_file(&source, &parallel, file)?;
+                copied.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        config::private_write(&parallel.join("manifest.json"), &bytes).unwrap();
+        assert_eq!(copied.load(Ordering::SeqCst), manifest.files.len());
+        assert_eq!(names.lock().unwrap().len(), manifest.files.len());
+        for file in &manifest.files {
+            let before = sequential.join(&file.path);
+            let after = parallel.join(&file.path);
+            assert_eq!(fs::read(&before).unwrap(), fs::read(&after).unwrap());
+            #[cfg(windows)]
+            {
+                // private_dir retains the OS-created owner and sets its DACL.
+                // Compare both actual policies; do not assume that an elevated
+                // Windows token creates directories with its user as owner.
+                assert_eq!(
+                    directory_policy(before.parent().unwrap()),
+                    directory_policy(after.parent().unwrap())
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                amplifier_native_platform::validate_private_directory(before.parent().unwrap())
+                    .unwrap();
+                amplifier_native_platform::validate_private_directory(after.parent().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    fs::metadata(&before).unwrap().permissions().mode() & 0o777,
+                    fs::metadata(&after).unwrap().permissions().mode() & 0o777
+                );
+            }
+        }
+        assert_eq!(load(&sequential).unwrap().1, load(&parallel).unwrap().1);
+        let home = temp.path().join("actual install");
+        config::private_dir(&home).unwrap();
+        fs::write(home.join("protected-state"), b"unchanged").unwrap();
+        let (installed, scans) = count_verifications(|| install(&source, &home));
+        assert_eq!(scans, 2, "source and copied bundle scans are both required");
+        let installed = installed.unwrap();
+        let installed_path = Path::new(installed["bundle"].as_str().unwrap());
+        assert_eq!(load(installed_path).unwrap().1, bytes);
+        assert_eq!(
+            fs::read(home.join("protected-state")).unwrap(),
+            b"unchanged"
+        );
+        // A changed support file is still rejected after the copy completes.
+        fs::write(parallel.join("bridge/shared/file-0.js"), b"corrupt").unwrap();
+        assert!(load(&parallel).is_err());
+    }
+
+    fn copy_fixture_files() -> Vec<File> {
+        (0..16)
+            .map(|index| File {
+                path: index.to_string(),
+                sha256: "0".repeat(64),
+                bytes: 0,
+                executable: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copying_is_bounded_and_joins_workers_before_error_panic_or_cleanup() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+
+        // The old sequential iteration admits one callback at a time. This is
+        // a concurrency oracle, not a wall-time performance assertion.
+        let baseline_active = AtomicUsize::new(0);
+        let baseline_maximum = AtomicUsize::new(0);
+        for _file in &copy_fixture_files() {
+            let active = baseline_active.fetch_add(1, Ordering::SeqCst) + 1;
+            baseline_maximum.fetch_max(active, Ordering::SeqCst);
+            baseline_active.fetch_sub(1, Ordering::SeqCst);
+        }
+        assert_eq!(baseline_maximum.load(Ordering::SeqCst), 1);
+
+        for panic_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let staged = temp.path().join("staged");
+            config::private_dir(&staged).unwrap();
+            let worker_stage = staged.clone();
+            let (entered, entries) = mpsc::channel();
+            let (finished, finishes) = mpsc::channel();
+            let (done, outcome) = mpsc::channel();
+            let mut releases = Vec::new();
+            let mut waits = Vec::new();
+            for _ in 0..16 {
+                let (release, wait) = mpsc::sync_channel(1);
+                releases.push(release);
+                waits.push(Mutex::new(wait));
+            }
+            let maximum = Arc::new(AtomicUsize::new(0));
+            let observed_maximum = maximum.clone();
+            let runner = thread::spawn(move || {
+                let active = AtomicUsize::new(0);
+                let result = copy_files_with(
+                    &copy_fixture_files(),
+                    usize::MAX,
+                    |file| {
+                        let index: usize = file.path.parse().unwrap();
+                        let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(running, Ordering::SeqCst);
+                        entered.send(index).unwrap();
+                        let released = waits[index]
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10));
+                        assert!(worker_stage.is_dir(), "cleanup raced a copy worker");
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        finished.send(index).unwrap();
+                        released.context("Test controller did not release copier")?;
+                        if index == 0 {
+                            assert!(!panic_first, "injected copy panic");
+                            anyhow::bail!("injected copy failure");
+                        }
+                        fs::write(worker_stage.join(&file.path), b"copied")?;
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                );
+                assert!(result.is_err());
+                assert!(!worker_stage.join("manifest.json").exists());
+                fs::remove_dir_all(&worker_stage).unwrap();
+                done.send(result).unwrap();
+            });
+            let mut started = Vec::new();
+            for _ in 0..4 {
+                match entries.recv_timeout(Duration::from_secs(5)) {
+                    Ok(index) => started.push(index),
+                    Err(_) => break,
+                }
+            }
+            let _ = releases[0].send(());
+            let first_finished = finishes.recv_timeout(Duration::from_secs(5));
+            let premature = outcome.recv_timeout(Duration::from_millis(100));
+            let stage_retained_while_blocked = staged.is_dir();
+            for release in &releases[1..] {
+                let _ = release.send(());
+            }
+            runner.join().unwrap();
+            let returned_early = premature.is_ok();
+            let result = premature.unwrap_or_else(|_| outcome.recv().unwrap());
+            started.sort_unstable();
+            assert_eq!(started, [0, 4, 8, 12]);
+            assert_eq!(observed_maximum.load(Ordering::SeqCst), 4);
+            assert_eq!(first_finished.unwrap(), 0);
+            assert!(
+                !returned_early,
+                "copy returned while another worker was active"
+            );
+            assert!(stage_retained_while_blocked);
+            assert!(result.is_err());
+            assert_eq!(finishes.iter().count(), 12);
+            assert!(!staged.exists());
+        }
+        eprintln!(
+            "bounded copy concurrency: retained sequential maximum=1, candidate maximum=4; not a timing comparison"
+        );
+    }
+
+    #[test]
+    fn copy_spawn_refusal_joins_started_worker_before_return_and_cleanup() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        config::private_dir(&staged).unwrap();
+        let worker_stage = staged.clone();
+        let (entered, entries) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (fail_spawn, fail_requested) = mpsc::channel();
+        let (refused, refusal) = mpsc::channel();
+        let (done, outcome) = mpsc::channel();
+        let runner = thread::spawn(move || {
+            let released = Mutex::new(released);
+            let copies = AtomicUsize::new(0);
+            let result = copy_files_with(
+                &copy_fixture_files(),
+                4,
+                |file| {
+                    if copies.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered.send(()).unwrap();
+                        released
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))?;
+                    }
+                    assert!(worker_stage.is_dir(), "cleanup raced the admitted worker");
+                    fs::write(worker_stage.join(&file.path), b"copied")?;
+                    Ok(())
+                },
+                |index| {
+                    if index == 1 {
+                        fail_requested
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                        refused.send(()).unwrap();
+                        return Err(std::io::Error::other("injected copy spawn refusal"));
+                    }
+                    Ok(())
+                },
+            );
+            let copies = copies.load(Ordering::SeqCst);
+            assert!(!worker_stage.join("manifest.json").exists());
+            fs::remove_dir_all(&worker_stage).unwrap();
+            done.send((result, copies)).unwrap();
+        });
+        let started = entries.recv_timeout(Duration::from_secs(5));
+        let _ = fail_spawn.send(());
+        let spawn_refused = refusal.recv_timeout(Duration::from_secs(5));
+        let premature = outcome.recv_timeout(Duration::from_millis(100));
+        let stage_retained_while_blocked = staged.is_dir();
+        let _ = release.send(());
+        runner.join().unwrap();
+        assert!(started.is_ok() && spawn_refused.is_ok());
+        assert!(
+            premature.is_err(),
+            "spawn refusal returned before joining the worker"
+        );
+        let (result, copied) = outcome.recv().unwrap();
+        assert_eq!(copied, 4, "only the first admitted chunk may copy");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot start bundle copy worker")
+        );
+        assert!(stage_retained_while_blocked);
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn copying_refuses_non_directory_parent_without_manifest_or_outside_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fixture(&source);
+        let (manifest, _, _) = load(&source).unwrap();
+        let staged = temp.path().join("staged");
+        config::private_dir(&staged).unwrap();
+        fs::write(staged.join("bridge"), b"refuse this ordinary file").unwrap();
+        let protected = temp.path().join("protected");
+        fs::write(&protected, b"unchanged").unwrap();
+        assert!(
+            copy_files_with(
+                &manifest.files,
+                4,
+                |file| copy_file(&source, &staged, file),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(!staged.join("manifest.json").exists());
+        assert_eq!(
+            fs::read(staged.join("bridge")).unwrap(),
+            b"refuse this ordinary file"
+        );
+        assert_eq!(fs::read(&protected).unwrap(), b"unchanged");
     }
 
     #[test]
