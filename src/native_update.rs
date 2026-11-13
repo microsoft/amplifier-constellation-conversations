@@ -5,6 +5,7 @@ use crate::{
     auth,
     config::{self, Config},
     native_bundle,
+    native_check_diagnostics::{self as check_diagnostics, Stage},
     native_installation_diagnostics::{Phase, observe},
     native_startup_state,
     native_update_process::{self, ServiceChild},
@@ -365,25 +366,32 @@ impl CheckedPlan {
 }
 
 pub(crate) fn prepare_plan(home: &Path, package: &Path) -> Result<CheckedPlan> {
-    let owner = lock(home, "native-update.lock")?;
-    let old = installed(home)?;
-    let installed_bytes = installed_snapshot(home)?;
-    ensure!(
-        serde_json::from_slice::<Value>(&installed_bytes)? == old,
-        "Installation receipt changed while checking this package"
-    );
-    if home.join(JOURNAL).exists() {
-        ensure!(
-            terminal(&read(&home.join(JOURNAL))?),
-            "Finish the retained update before planning another"
-        );
-    }
-    let config_sha256 = digest(&home.join("config.json"))?;
-    let before = companion(home)?;
-    let candidate = package_record(
-        native_bundle::install(package, home).context("Cannot stage immutable native bundle")?,
-    )?;
-    let _ = rebind(before.as_deref(), &old["package"], &candidate)?;
+    let owner = check_diagnostics::observe(Stage::Lock, || lock(home, "native-update.lock"))?;
+    let old = check_diagnostics::observe(Stage::PreviousVerify, || installed(home))?;
+    let (installed_bytes, config_sha256, before) =
+        check_diagnostics::observe(Stage::Inputs, || -> Result<_> {
+            let installed_bytes = installed_snapshot(home)?;
+            ensure!(
+                serde_json::from_slice::<Value>(&installed_bytes)? == old,
+                "Installation receipt changed while checking this package"
+            );
+            if home.join(JOURNAL).exists() {
+                ensure!(
+                    terminal(&read(&home.join(JOURNAL))?),
+                    "Finish the retained update before planning another"
+                );
+            }
+            let config_sha256 = digest(&home.join("config.json"))?;
+            let before = companion(home)?;
+            Ok((installed_bytes, config_sha256, before))
+        })?;
+    let staged = check_diagnostics::observe(Stage::Staging, || {
+        native_bundle::install(package, home).context("Cannot stage immutable native bundle")
+    })?;
+    let candidate = check_diagnostics::observe(Stage::PackageRecord, || package_record(staged))?;
+    let _ = check_diagnostics::observe(Stage::Rebind, || {
+        rebind(before.as_deref(), &old["package"], &candidate)
+    })?;
     Ok(CheckedPlan {
         _owner: owner,
         home: home.to_owned(),

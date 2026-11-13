@@ -170,6 +170,32 @@ does not modify those records. Outstanding native registrations use a separate
 bounded index; confirmed retirement removes index membership while preserving
 original launch and retirement evidence.
 
+### CHECK observations
+
+An authenticated browser CHECK retains a bounded, content-free diagnostic
+snapshot at `native-browser-update/check-observation.json`. It records fixed
+phase names, monotonic elapsed times, blocking-queue delay and the cost of prior
+diagnostic writes. It includes an opaque observation ID, process ID and a hash
+of the runtime generation when that generation can be read safely. Paths,
+credentials, package contents and raw error messages are excluded.
+
+This snapshot is observational only. `returned` means the synchronous CHECK
+function returned; it does not establish that the HTTP reply reached the caller.
+`unwound`, missing, stale, truncated or mismatched observations do not prove
+cancellation or absence of staging work. No update decision reads this file.
+The existing CHECK deadline and no-retry behavior remain unchanged.
+
+Only one CHECK in a process writes observations at a time. Another request runs
+under the existing control rules without waiting for diagnostics or replacing
+the active trace. Capture errors leave the product result unchanged. File flush
+latency is not bounded by the snapshot's size limit, and each snapshot excludes
+its initial setup and the duration of its own current write from
+`prior_observation_io_ms`. Nested phase durations overlap and can include
+diagnostic I/O; they must not be summed. These observations are localization
+evidence, not a controlled performance benchmark. Disposable qualification
+collects the fixed snapshot with runtime-generation brackets and preserves the
+original request error if secondary evidence collection fails.
+
 ## Qualification boundaries
 
 The six-target CI matrix exercises package installation with developer tools

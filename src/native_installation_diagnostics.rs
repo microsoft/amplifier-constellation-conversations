@@ -15,6 +15,7 @@ pub(crate) enum Phase {
     BundleVerify,
     BundleCopy,
     BundleVerifyCopied,
+    BundleVerifyExisting,
     BundlePublish,
     BinaryPublish,
     ReceiptPublish,
@@ -23,6 +24,7 @@ pub(crate) enum Phase {
 
 pub(crate) fn observe<T>(phase: Phase, operation: impl FnOnce() -> Result<T>) -> Result<T> {
     observe_with(phase, operation, |line| {
+        crate::native_check_diagnostics::capture_installation(line);
         // Each record owns the lock only while it is written. The operation may
         // contain nested observed phases and never runs under this stderr lock.
         let mut stderr = io::stderr().lock();
