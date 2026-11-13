@@ -51,7 +51,12 @@ These are the current serving interfaces, not a claim that every product vision
 scenario is implemented. Media transport is not a new ACP protocol; the technical
 documents retain capability requirements and unsupported cases.
 
-For setup, use [Installation and connection configuration](installation.md) and
-the relevant component's configuration above. [Validation](validation.md) describes reproducible
+For personal setup, start with [Open Companion](native-consumer-setup.md): open
+the native app and create your account in the browser, then choose an agent and
+add any missing voice credentials. No local Instance or developer tools are
+required. Existing administered installations can keep using
+[Advanced native hosting](native-installation.md); source builds use
+[Installation and connection configuration](installation.md).
+[Validation](validation.md) describes reproducible
 checks and their limits. [Release notes](releases/) retain historical changes;
 they do not define another roadmap or set of current promises.
