@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import subprocess
 import tempfile
 import time
 import uuid
@@ -283,6 +284,66 @@ def exercise_fault(install, observer, a, b, fixture_sha, *, expect_gap):
     return "recovery_passed"
 
 
+def remove_original_once(install, observer):
+    """Test-only desktop removal, with durable intent and no lost-ack retry.
+
+    The production CLI correctly rejects startup changes in a still-switching
+    red transaction. This controller uses the same accepted desktop primitive
+    only after exact child Stop and proof; it never handles a one-shot target.
+    """
+    started = time.monotonic()
+    deadline = started + 30
+    receipt_path = install.root / "original-startup-disposal.json"
+    require(not receipt_path.exists(), "Original removal was already attempted; observation only, never retry")
+    payload = {"home": str(install.home.resolve()), "action": "remove_original",
+               "target": {"kind": "original"}, "previous_process": None, "setup_bundle": None,
+               "expected_original": observer.baseline_startup}
+    receipt = {"schema": 1, "status": "intent", "target": "original_desktop_startup_only",
+               "captured_preference_sha256": fingerprint(observer.baseline_startup), "mutation_retries": 0,
+               "timeout_seconds": 30}
+    with receipt_path.open("x", encoding="utf-8") as stream:
+        json.dump(receipt, stream, sort_keys=True, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    child = None
+    try:
+        # The accepted desktop API uses fixed OS tool lookup. This is the same
+        # constrained fixture controller environment as its original install;
+        # the product environment and global manager environment stay unchanged.
+        require(time.monotonic() < deadline,
+                "Original-removal budget expired before dispatch; preserve intent without retry")
+        child = subprocess.Popen([str(observer.controller)], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 cwd=install.root, env=install.controller_environment)
+        stdout, _ = child.communicate(json.dumps(payload).encode(), timeout=max(0, deadline - time.monotonic()))
+        require(len(stdout) <= 65536, "Original-removal controller output exceeded bound")
+        value = json.loads(stdout)
+        require(isinstance(value, dict), "Original removal returned no structured acknowledgement")
+        receipt.update(status="observed", return_code=child.returncode, controller=value,
+                       elapsed_seconds=time.monotonic() - started)
+        lifecycle.write_json(receipt_path, receipt)
+        install.result["original_startup_disposal"] = receipt
+        install.checkpoint()
+        require(child.returncode == 0 and value.get("status") == "original_removed"
+                and value.get("dispatch", {}).get("status") == "accepted"
+                and value.get("original_definition_absent") is True and value.get("inactive_after") is True,
+                "Original removal refused or remains unknown; preserve its receipt without retry")
+    except BaseException as error:
+        if child is not None and child.poll() is None:
+            child.kill()
+            try:
+                child.communicate(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                install.unsettled_commands.append(child)
+        receipt.update(status="unknown_or_refused", error_type=type(error).__name__, retry_permitted=False,
+                       elapsed_seconds=time.monotonic() - started)
+        lifecycle.write_json(receipt_path, receipt)
+        install.result["original_startup_disposal"] = receipt
+        install.checkpoint()
+        raise
+
+
 def finish_disposal(install, observer):
     """Remove only the separately captured, stopped original startup profile.
 
@@ -304,7 +365,7 @@ def finish_disposal(install, observer):
                 and original.get("active") is False and original.get("transitioning") is False
                 and original.get("processes") == [], "Original startup changed or remains active before disposal")
         install.registration.inspect()
-        consumer_update.startup_command(install, install.controller_environment, "remove")
+        remove_original_once(install, observer)
         require(not install.registration.exists(), "Exact original fixture startup removal is unconfirmed")
         removed = True
     require(consumer_update.retained_operations(install.home) == ledger
