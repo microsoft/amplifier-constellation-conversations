@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -314,22 +315,81 @@ pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
 }
 
 pub fn plan(home: &Path, package: &Path) -> Result<Value> {
-    let _owner = lock(home, "native-update.lock")?;
+    let checked = prepare_plan(home, package)?;
+    checked.validate_current()?;
+    Ok(checked.value().clone())
+}
+
+/// A freshly verified plan and its still-held installation lock. This cannot be
+/// constructed from a saved plan or browser input. Only CHECK may reuse these
+/// same-operation verification results; APPLY and workers validate saved plans
+/// and complete package bytes again.
+pub(crate) struct CheckedPlan {
+    _owner: InstallationLock,
+    home: PathBuf,
+    installed_bytes: Vec<u8>,
+    value: Value,
+}
+
+fn installed_snapshot(home: &Path) -> Result<Vec<u8>> {
+    let record = home.join(INSTALLED);
+    ordinary(&record)?;
+    let mut bytes = Vec::new();
+    File::open(record)?
+        .take(1024 * 1024)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() < 1024 * 1024, "Installation record too large");
+    Ok(bytes)
+}
+
+impl CheckedPlan {
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub(crate) fn validate_current(&self) -> Result<()> {
+        ensure!(
+            installed_snapshot(&self.home)? == self.installed_bytes
+                && Config::load(&self.home)?.id == self.value["installation_id"]
+                && digest(&binary(&self.home))? == self.value["previous"]["binary_sha256"]
+                && digest(&self.home.join("config.json"))? == self.value["config_sha256"]
+                && companion(&self.home)?
+                    .as_ref()
+                    .map(|bytes| hash(bytes))
+                    .map_or(Value::Null, Value::String)
+                    == self.value["companion_sha256"],
+            "The installation changed while checking this package"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn prepare_plan(home: &Path, package: &Path) -> Result<CheckedPlan> {
+    let owner = lock(home, "native-update.lock")?;
     let old = installed(home)?;
+    let installed_bytes = installed_snapshot(home)?;
+    ensure!(
+        serde_json::from_slice::<Value>(&installed_bytes)? == old,
+        "Installation receipt changed while checking this package"
+    );
     if home.join(JOURNAL).exists() {
         ensure!(
             terminal(&read(&home.join(JOURNAL))?),
             "Finish the retained update before planning another"
         );
     }
+    let config_sha256 = digest(&home.join("config.json"))?;
+    let before = companion(home)?;
     let candidate = package_record(
         native_bundle::install(package, home).context("Cannot stage immutable native bundle")?,
     )?;
-    let before = companion(home)?;
     let _ = rebind(before.as_deref(), &old["package"], &candidate)?;
-    Ok(
-        json!({"schema":1,"installation_id":old["id"],"previous":old["package"],"candidate":candidate,"config_sha256":digest(&home.join("config.json"))?,"companion_sha256":before.as_ref().map(|b|hash(b)),"available":old["package"]!=candidate,"version":candidate["bundle"]["version"]}),
-    )
+    Ok(CheckedPlan {
+        _owner: owner,
+        home: home.to_owned(),
+        installed_bytes,
+        value: json!({"schema":1,"installation_id":old["id"],"previous":old["package"],"candidate":candidate,"config_sha256":config_sha256,"companion_sha256":before.as_ref().map(|b|hash(b)),"available":old["package"]!=candidate,"version":candidate["bundle"]["version"]}),
+    })
 }
 fn terminal(j: &Value) -> bool {
     j["phase"] == "restored"
