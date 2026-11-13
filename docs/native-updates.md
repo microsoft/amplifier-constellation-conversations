@@ -187,8 +187,10 @@ The existing CHECK deadline and no-retry behavior remain unchanged.
 
 Only one CHECK in a process writes observations at a time. Another request runs
 under the existing control rules without waiting for diagnostics or replacing
-the active trace. Capture errors leave the product result unchanged. File flush
-latency is not bounded by the snapshot's size limit, and each snapshot excludes
+the active trace. Capture errors leave the product result unchanged. An existing
+snapshot with unexpected ownership or access policy is left unchanged; capture
+is disabled without repairing that policy. File flush latency is not bounded by
+the snapshot's size limit, and each snapshot excludes
 its initial setup and the duration of its own current write from
 `prior_observation_io_ms`. Nested phase durations overlap and can include
 diagnostic I/O; they must not be summed. These observations are localization

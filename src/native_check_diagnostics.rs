@@ -510,6 +510,184 @@ fn ordinary(metadata: &Metadata) -> bool {
     true
 }
 
+#[cfg(windows)]
+mod windows_file_policy {
+    use std::{fs::File, os::windows::io::AsRawHandle, ptr};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+            Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, GetAce, IsValidAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
+            PSID,
+        },
+    };
+
+    struct Allocation(*mut core::ffi::c_void);
+    impl Drop for Allocation {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    unsafe fn sid_text(sid: PSID) -> Option<String> {
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return None;
+        }
+        let mut text = ptr::null_mut();
+        let converted = unsafe { ConvertSidToStringSidW(sid, &mut text) };
+        let _allocation = Allocation(text.cast());
+        if converted == 0 || text.is_null() {
+            return None;
+        }
+        // A SID has a bounded representation; never scan an arbitrary string.
+        for length in 0..256 {
+            if unsafe { *text.add(length) } == 0 {
+                return String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+                    .ok();
+            }
+        }
+        None
+    }
+
+    unsafe fn allowed(owner: PSID, acl: *mut ACL, current: &str) -> bool {
+        if unsafe { sid_text(owner) }.as_deref() != Some(current)
+            || acl.is_null()
+            || unsafe { IsValidAcl(acl) } == 0
+        {
+            return false;
+        }
+        let count = unsafe { (*acl).AceCount };
+        if !(1..=1024).contains(&count) {
+            return false;
+        }
+        for index in 0..count {
+            let mut entry = ptr::null_mut();
+            if unsafe { GetAce(acl, u32::from(index), &mut entry) } == 0 || entry.is_null() {
+                return false;
+            }
+            let header = unsafe { &*entry.cast::<ACE_HEADER>() };
+            let offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            if header.AceType != 0 || usize::from(header.AceSize) < offset + 8 {
+                return false;
+            }
+            let sid = unsafe { entry.cast::<u8>().add(offset) };
+            // Check the variable SID fits this ACE before calling SID helpers.
+            let needed = 8 + usize::from(unsafe { *sid.add(1) }) * 4;
+            if needed > usize::from(header.AceSize) - offset {
+                return false;
+            }
+            match unsafe { sid_text(sid.cast()) }.as_deref() {
+                Some(principal) if principal == current || principal == "S-1-5-18" => (),
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    pub(super) fn private(file: &File) -> bool {
+        let Ok(current) = amplifier_native_platform::current_user_sid() else {
+            return false;
+        };
+        let mut owner = ptr::null_mut();
+        let mut acl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        // Match accepted native-platform 02b79049's read-only private policy,
+        // on the already-open file. Its pinned windows-sys dependency enables
+        // Win32_Security_Authorization. No policy setter or repair belongs here.
+        let code = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut acl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        let _allocation = Allocation(descriptor);
+        code == 0 && !descriptor.is_null() && unsafe { allowed(owner, acl, &current) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        };
+
+        #[test]
+        fn descriptor_policy_rejects_foreign_owner_unsupported_or_missing_policy() {
+            let current = amplifier_native_platform::current_user_sid().unwrap();
+            let foreign = if current == "S-1-5-18" { "LS" } else { "SY" };
+            for (sddl, expected) in [
+                (
+                    format!("O:{current}D:P(A;;FA;;;{current})(A;;FA;;;SY)"),
+                    true,
+                ),
+                (
+                    format!("O:{foreign}D:P(A;;FA;;;{current})(A;;FA;;;SY)"),
+                    false,
+                ),
+                (
+                    format!("O:{current}D:P(D;;GR;;;WD)(A;;FA;;;{current})"),
+                    false,
+                ),
+                (
+                    format!("O:{current}D:P(A;;FA;;;{current})(A;;GR;;;BU)"),
+                    false,
+                ),
+                (format!("O:{current}D:P"), false),
+            ] {
+                let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+                let mut descriptor = ptr::null_mut();
+                assert_ne!(
+                    unsafe {
+                        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                            sddl.as_ptr(),
+                            SDDL_REVISION_1,
+                            &mut descriptor,
+                            ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+                let _allocation = Allocation(descriptor);
+                let mut owner = ptr::null_mut();
+                let mut acl = ptr::null_mut();
+                let mut present = 0;
+                let mut defaulted = 0;
+                assert_ne!(
+                    unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) },
+                    0
+                );
+                assert_ne!(
+                    unsafe {
+                        GetSecurityDescriptorDacl(
+                            descriptor,
+                            &mut present,
+                            &mut acl,
+                            &mut defaulted,
+                        )
+                    },
+                    0
+                );
+                assert_ne!(present, 0);
+                assert_eq!(unsafe { allowed(owner, acl, &current) }, expected);
+                assert!(!unsafe { allowed(ptr::null_mut(), acl, &current) });
+                assert!(!unsafe { allowed(owner, ptr::null_mut(), &current) });
+            }
+        }
+    }
+}
+
 fn bounded_file(path: &Path) -> Option<Vec<u8>> {
     let before = fs::symlink_metadata(path).ok()?;
     if !ordinary(&before) || before.len() > MAX_BYTES as u64 {
@@ -529,6 +707,10 @@ fn bounded_file(path: &Path) -> Option<Vec<u8>> {
     }
     let file = options.open(path).ok()?;
     if !ordinary(&file.metadata().ok()?) {
+        return None;
+    }
+    #[cfg(windows)]
+    if !windows_file_policy::private(&file) {
         return None;
     }
     let mut bytes = Vec::new();
@@ -632,6 +814,151 @@ mod tests {
     fn write(path: &Path, value: &Value) {
         amplifier_native_platform::private_write_data(path, &serde_json::to_vec(value).unwrap())
             .unwrap();
+    }
+
+    #[cfg(windows)]
+    mod file_policy_windows {
+        use super::*;
+        use std::ptr;
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                },
+                DACL_SECURITY_INFORMATION, GetFileSecurityW, OWNER_SECURITY_INFORMATION,
+                PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+            },
+        };
+
+        fn policy(path: &Path) -> Vec<u8> {
+            let path = amplifier_native_platform::windows_native_path(path).unwrap();
+            let flags = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+            let mut needed = 0;
+            unsafe { GetFileSecurityW(path.as_ptr(), flags, ptr::null_mut(), 0, &mut needed) };
+            assert!(needed > 0 && needed <= 65536);
+            let mut storage = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+            assert_ne!(
+                unsafe {
+                    GetFileSecurityW(
+                        path.as_ptr(),
+                        flags,
+                        storage.as_mut_ptr().cast(),
+                        needed,
+                        &mut needed,
+                    )
+                },
+                0
+            );
+            unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), needed as usize) }
+                .to_vec()
+        }
+
+        fn broaden_owned_test_file(path: &Path) {
+            // This setter is fixture-only and changes one owned disposable file,
+            // never its parents, an installed application or host policy.
+            let user = amplifier_native_platform::current_user_sid().unwrap();
+            let sddl: Vec<u16> = format!("D:P(A;;FA;;;{user})(A;;FA;;;SY)(A;;GR;;;BU)")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let name = amplifier_native_platform::windows_native_path(path).unwrap();
+            let mut descriptor = ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        sddl.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut descriptor,
+                        ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let changed = unsafe {
+                SetFileSecurityW(
+                    name.as_ptr(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    descriptor,
+                )
+            };
+            unsafe { LocalFree(descriptor) };
+            assert_ne!(changed, 0);
+        }
+
+        #[test]
+        fn current_user_private_snapshot_is_accepted_and_refreshes() {
+            let home = home();
+            let owner = AtomicBool::new(false);
+            run_with_token(home.path(), Instant::now(), &owner, || Ok::<_, ()>(())).unwrap();
+            let first = snapshot(home.path())["id"].clone();
+            let protected = policy(&path(home.path()));
+            let file = fs::File::open(path(home.path())).unwrap();
+            assert!(windows_file_policy::private(&file));
+            drop(file);
+            assert!(bounded_file(&path(home.path())).is_some());
+            run_with_token(home.path(), Instant::now(), &owner, || Ok::<_, ()>(())).unwrap();
+            assert_ne!(snapshot(home.path())["id"], first);
+            assert_eq!(policy(&path(home.path())), protected);
+        }
+
+        #[test]
+        fn valid_broad_snapshot_is_refused_without_repair_or_result_change() {
+            let home = home();
+            let owner = AtomicBool::new(false);
+            run_with_token(home.path(), Instant::now(), &owner, || Ok::<_, ()>(())).unwrap();
+            let target = path(home.path());
+            let bytes = fs::read(&target).unwrap();
+            let private = policy(&target);
+            let parent = policy(home.path());
+            let directory = policy(&home.path().join(DIRECTORY));
+            broaden_owned_test_file(&target);
+            let broad = policy(&target);
+            assert_ne!(broad, private);
+            assert!(!windows_file_policy::private(
+                &fs::File::open(&target).unwrap()
+            ));
+            let calls = Cell::new(0);
+            let result = run_with_token(home.path(), Instant::now(), &owner, || {
+                calls.set(calls.get() + 1);
+                Err::<(), _>("unchanged-check-error")
+            });
+            assert_eq!(result, Err("unchanged-check-error"));
+            assert_eq!(calls.get(), 1);
+            assert_eq!(fs::read(&target).unwrap(), bytes);
+            assert_eq!(policy(&target), broad);
+            assert_eq!(policy(home.path()), parent);
+            assert_eq!(policy(&home.path().join(DIRECTORY)), directory);
+            assert!(!owner.load(Ordering::Acquire));
+        }
+
+        #[test]
+        fn mid_capture_broad_snapshot_stays_unchanged_through_phase_and_finish() {
+            let home = home();
+            let owner = AtomicBool::new(false);
+            let parent = policy(home.path());
+            let mut retained = None;
+            let result = run_with_token(home.path(), Instant::now(), &owner, || {
+                let target = path(home.path());
+                let private = policy(&target);
+                broaden_owned_test_file(&target);
+                let broad = policy(&target);
+                assert_ne!(broad, private);
+                retained = Some((
+                    fs::read(&target).unwrap(),
+                    broad,
+                    policy(&home.path().join(DIRECTORY)),
+                ));
+                observe(Stage::Inputs, || Ok::<_, ()>(73))
+            });
+            assert_eq!(result, Ok(73));
+            let (bytes, broad, directory) = retained.unwrap();
+            assert_eq!(fs::read(path(home.path())).unwrap(), bytes);
+            assert_eq!(policy(&path(home.path())), broad);
+            assert_eq!(policy(home.path()), parent);
+            assert_eq!(policy(&home.path().join(DIRECTORY)), directory);
+            assert!(!owner.load(Ordering::Acquire));
+        }
     }
 
     #[test]

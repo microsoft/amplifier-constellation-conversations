@@ -555,9 +555,19 @@ def _check_observation_bytes(path, *, parents):
                 and not getattr(metadata, "st_file_attributes", 0) & 0x400,
                 "Invalid observation file")
 
-    def identity(metadata):
-        return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
-                metadata.st_mtime_ns, metadata.st_ctime_ns)
+    def identity(metadata, *, cross_family=False):
+        value = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+                 metadata.st_mtime_ns)
+        if os.name == "nt":
+            # CPython3.13.17 path stat reports birthtime in ctime, whereas
+            # descriptor stat retains ChangeTime. Cross-family comparisons use
+            # explicit birthtime; same-family comparisons still require ctime.
+            birth = getattr(metadata, "st_birthtime_ns", None)
+            require(type(birth) is int, "Observation birthtime is unavailable")
+            value += (birth,)
+            if cross_family:
+                return value
+        return value + (metadata.st_ctime_ns,)
 
     def parent_identity(parent):
         metadata = parent.lstat()
@@ -577,7 +587,8 @@ def _check_observation_bytes(path, *, parents):
         with path.open("rb") as stream:
             opened = os.fstat(stream.fileno())
             ordinary(opened)
-            require(identity(before) == identity(opened), "Observation changed before read")
+            require(identity(before, cross_family=True) == identity(opened, cross_family=True),
+                    "Observation changed before read")
             raw = stream.read(CHECK_OBSERVATION_MAX_BYTES + 1)
             finished = os.fstat(stream.fileno())
         after = path.lstat()
@@ -587,7 +598,9 @@ def _check_observation_bytes(path, *, parents):
     ordinary(after)
     require(len(raw) <= CHECK_OBSERVATION_MAX_BYTES
             and parent_before == parent_after
-            and identity(before) == identity(finished) == identity(after)
+            and identity(before) == identity(after)
+            and identity(opened) == identity(finished)
+            and identity(after, cross_family=True) == identity(finished, cross_family=True)
             and len(raw) == before.st_size, "Observation changed during read")
     return raw
 

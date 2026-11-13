@@ -365,6 +365,60 @@ class CheckObservationTests(unittest.TestCase):
             self.assertEqual(observed["id_relation"], "unknown_prior")
             self.assertEqual(observed["attribution"], "unknown")
 
+    def windows_stat_sample(self, home, *, drift=None):
+        path = self.trace(home, self.snapshot())
+        expected = path.read_bytes()
+        lstat, fstat = Path.lstat, controller.os.fstat
+        reads = {"path": 0, "handle": 0}
+
+        def metadata(value, family):
+            reads[family] += 1
+            fields = {key: getattr(value, key) for key in
+                      ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")}
+            # CPython3.13.17 Windows path stat preserves legacy birthtime in
+            # ctime; descriptor stat uses ChangeTime instead. Both are stable.
+            fields.update(st_birthtime_ns=101, st_ctime_ns=101 if family == "path" else 202,
+                          st_file_attributes=0)
+            if drift:
+                target, field, sample = drift
+                if family == target and reads[family] >= sample:
+                    if field == "missing_birthtime":
+                        del fields["st_birthtime_ns"]
+                    else:
+                        fields[field] += 0o100 if field == "st_mode" else 1
+            return SimpleNamespace(**fields)
+
+        def path_stat(value, *args, **kwargs):
+            result = lstat(value, *args, **kwargs)
+            return metadata(result, "path") if value == path else result
+
+        with patch.object(controller.os, "name", "nt"), patch.object(Path, "lstat", path_stat), \
+             patch.object(controller.os, "fstat", side_effect=lambda fd: metadata(fstat(fd), "handle")):
+            actual = controller._check_observation_bytes(path, parents=(home, path.parent))
+        return actual, expected, reads
+
+    def test_check_observation_windows_distinct_stable_clocks_keep_same_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            actual, expected, reads = self.windows_stat_sample(Path(directory))
+            self.assertEqual(actual, expected)
+            self.assertEqual(reads, {"path": 2, "handle": 2})
+
+    def test_check_observation_windows_same_family_drift_remains_unknown(self):
+        for family in ["path", "handle"]:
+            for field in ["st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
+                          "st_ctime_ns", "st_birthtime_ns"]:
+                with self.subTest(family=family, field=field), tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaises(AssertionError):
+                        self.windows_stat_sample(Path(directory), drift=(family, field, 2))
+
+    def test_check_observation_windows_cross_family_mismatch_or_missing_birth_is_unknown(self):
+        for family, field in [("handle", key) for key in
+                              ["st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_birthtime_ns"]] + \
+                             [(family, "missing_birthtime") for family in ["path", "handle"]]:
+            with self.subTest(family=family, field=field), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(AssertionError):
+                    self.windows_stat_sample(Path(directory), drift=(family, field, 1))
+
     def test_check_observation_all_fixed_phases_and_returned_or_unwound_states(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
