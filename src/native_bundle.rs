@@ -1,6 +1,7 @@
 //! Installation of an already acquired, immutable native bundle. This does not
 //! enroll updates, change an agent, replace configuration, or start a service.
 use crate::config;
+use crate::native_installation_diagnostics::{Phase, observe};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -350,7 +351,7 @@ pub fn verify(root: &Path) -> Result<Value> {
 pub fn install(root: &Path, home: &Path) -> Result<Value> {
     // Verify before creating installation state; extraction/download belongs to
     // the package acquisition surface, not to a remotely callable host API.
-    let (m, bytes, hash) = load(root)?;
+    let (m, bytes, hash) = observe(Phase::BundleVerify, || load(root))?;
     config::private_dir(home)?;
     let home = dunce::canonicalize(home)?;
     let packages = home.join("packages");
@@ -364,23 +365,28 @@ pub fn install(root: &Path, home: &Path) -> Result<Value> {
     let staged = packages.join(format!(".install-{}", uuid::Uuid::new_v4()));
     config::private_dir(&staged)?;
     let attempt = (|| -> Result<()> {
-        for file in &m.files {
-            let dest = staged.join(&file.path);
-            config::private_dir(dest.parent().context("Invalid package parent")?)?;
-            // Copy into a private directory, then preserve executable identity.
-            fs::copy(root.join(&file.path), &dest)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(
-                    &dest,
-                    fs::Permissions::from_mode(if file.executable { 0o700 } else { 0o600 }),
-                )?;
+        observe(Phase::BundleCopy, || {
+            for file in &m.files {
+                let dest = staged.join(&file.path);
+                config::private_dir(dest.parent().context("Invalid package parent")?)?;
+                // Copy into a private directory, then preserve executable identity.
+                fs::copy(root.join(&file.path), &dest)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        &dest,
+                        fs::Permissions::from_mode(if file.executable { 0o700 } else { 0o600 }),
+                    )?;
+                }
             }
-        }
-        config::private_write(&staged.join("manifest.json"), &bytes)?;
-        load(&staged)?;
-        amplifier_native_platform::publish_directory_if_absent(&staged, &destination)?;
+            config::private_write(&staged.join("manifest.json"), &bytes)?;
+            Ok(())
+        })?;
+        observe(Phase::BundleVerifyCopied, || load(&staged))?;
+        observe(Phase::BundlePublish, || {
+            amplifier_native_platform::publish_directory_if_absent(&staged, &destination)
+        })?;
         Ok(())
     })();
     if attempt.is_err() && staged.exists() {

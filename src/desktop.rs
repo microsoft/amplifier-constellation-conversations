@@ -3,7 +3,9 @@
 use crate::{
     auth,
     config::{AuthMode, Config, Transport},
-    native_bundle, native_update,
+    native_bundle,
+    native_installation_diagnostics::{Phase, observe},
+    native_update,
     state::AppState,
 };
 use amplifier_native_platform as platform;
@@ -40,6 +42,12 @@ fn file_digest(path: &Path) -> Result<String> {
 /// Both the ordinary archive and the Mac application carry the same verified
 /// immutable bundle. The Mac executable is a byte-identical native launcher.
 fn downloaded_bundle(executable: &Path) -> Result<PathBuf> {
+    observe(Phase::DownloadVerify, || {
+        downloaded_bundle_inner(executable)
+    })
+}
+
+fn downloaded_bundle_inner(executable: &Path) -> Result<PathBuf> {
     let parent = executable.parent().context("Missing application folder")?;
     let bundle = if cfg!(target_os = "macos") && parent.file_name().is_some_and(|v| v == "MacOS") {
         parent
@@ -114,7 +122,7 @@ pub async fn launch(home: PathBuf, open_browser: bool) -> Result<()> {
         downloaded_bundle(&std::env::current_exe()?)?;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
-        create(&home, port)?;
+        observe(Phase::IdentityCreate, || create(&home, port))?;
         drop(listener);
     }
     let home = dunce::canonicalize(home)?;

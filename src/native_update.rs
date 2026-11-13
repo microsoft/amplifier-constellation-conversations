@@ -4,7 +4,9 @@
 use crate::{
     auth,
     config::{self, Config},
-    native_bundle, native_startup_state,
+    native_bundle,
+    native_installation_diagnostics::{Phase, observe},
+    native_startup_state,
     native_update_process::{self, ServiceChild},
     state::AppState,
     update_admission,
@@ -243,7 +245,7 @@ fn installed(home: &Path) -> Result<Value> {
 /// Read-only validation for desktop reopen: verify the complete selected bundle,
 /// its receipt, and the installed executable before choosing a launch target.
 pub fn verify_installed(home: &Path) -> Result<Value> {
-    installed(home)
+    observe(Phase::InstalledVerify, || installed(home))
 }
 
 /// Explicit first-install adoption while stopped. Does not register startup or
@@ -252,10 +254,15 @@ pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
     let _owner = lock(home, "native-update.lock")?;
     let _service = lock(home, "service.lock")?;
     let c = Config::load(home)?;
-    let incoming = package_record(native_bundle::verify(package)?)?;
-    let selected = package_record(
-        native_bundle::install(package, home).context("Cannot stage immutable native bundle")?,
-    )?;
+    let incoming = observe(Phase::BootstrapVerify, || {
+        package_record(native_bundle::verify(package)?)
+    })?;
+    let selected = observe(Phase::BootstrapVerify, || {
+        package_record(
+            native_bundle::install(package, home)
+                .context("Cannot stage immutable native bundle")?,
+        )
+    })?;
     if home.join(INSTALLED).exists() {
         let old = installed(home)?;
         ensure!(
@@ -273,10 +280,12 @@ pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
             "Existing executable preserved"
         );
     } else {
-        write_binary(
-            &path(&selected["bundle"]["entrypoints"], "service")?,
-            &service,
-        )?;
+        observe(Phase::BinaryPublish, || {
+            write_binary(
+                &path(&selected["bundle"]["entrypoints"], "service")?,
+                &service,
+            )
+        })?;
     }
     // A previous bootstrap may have published the private binary before its
     // execute permission was applied. Only the verified selected bytes reach
@@ -295,7 +304,9 @@ pub fn bootstrap(home: &Path, package: &Path) -> Result<Value> {
             .context("Cannot commit Companion bundle bindings")?;
     }
     let record = json!({"schema":1,"id":c.id,"package":selected});
-    save(&home.join(INSTALLED), &record)?;
+    observe(Phase::ReceiptPublish, || {
+        save(&home.join(INSTALLED), &record)
+    })?;
     Ok(record)
 }
 
