@@ -426,7 +426,7 @@ pub fn install(root: &Path, home: &Path) -> Result<Value> {
     config::private_dir(&packages)?;
     let destination = packages.join(&hash);
     if destination.exists() {
-        let (_, existing, _) = load(&destination)?;
+        let (_, existing, _) = observe(Phase::BundleVerifyExisting, || load(&destination))?;
         ensure!(existing == bytes, "Existing immutable package differs");
         return Ok(result(&destination, &m, &hash));
     }

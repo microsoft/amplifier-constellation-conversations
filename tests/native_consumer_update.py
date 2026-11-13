@@ -41,6 +41,15 @@ MAX_FRAME_BYTES = 32768
 # Match the shipped update page's POST allowance. CHECK verifies and stages the
 # complete package before replying; ordinary controller requests retain 15s.
 CHECK_REPLY_SECONDS = 40
+CHECK_OBSERVATION_MAX_BYTES = 32768
+CHECK_OBSERVATION_MAX_EVENTS = 64
+CHECK_OBSERVATION_PHASES = frozenset({
+    "check_cleanup", "check_prepare", "check_lock", "check_previous_verify", "check_inputs",
+    "check_stage", "check_package_record", "check_rebind", "check_launcher",
+    "check_publication_guards", "check_binding_validation", "check_ledger_publish", "check_response",
+    "download_verify", "identity_create", "bootstrap_verify", "bundle_verify", "bundle_copy",
+    "bundle_verify_copied", "bundle_verify_existing", "bundle_publish", "binary_publish", "receipt_publish", "installed_verify",
+})
 
 
 class PrivateCapture:
@@ -539,13 +548,162 @@ def check_failure_ledger(home):
         return {"status": "unavailable", "code": "browser_ledger_observation_failed"}
 
 
+def _check_observation_bytes(path, *, parents):
+    """One bounded ordinary-file read; replacement is uncertainty, never a retry."""
+    def ordinary(metadata):
+        require(stat.S_ISREG(metadata.st_mode)
+                and not getattr(metadata, "st_file_attributes", 0) & 0x400,
+                "Invalid observation file")
+
+    def identity(metadata, *, cross_family=False):
+        value = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+                 metadata.st_mtime_ns)
+        if os.name == "nt":
+            # CPython3.13.17 path stat reports birthtime in ctime, whereas
+            # descriptor stat retains ChangeTime. Cross-family comparisons use
+            # explicit birthtime; same-family comparisons still require ctime.
+            birth = getattr(metadata, "st_birthtime_ns", None)
+            require(type(birth) is int, "Observation birthtime is unavailable")
+            value += (birth,)
+            if cross_family:
+                return value
+        return value + (metadata.st_ctime_ns,)
+
+    def parent_identity(parent):
+        metadata = parent.lstat()
+        require(stat.S_ISDIR(metadata.st_mode)
+                and not getattr(metadata, "st_file_attributes", 0) & 0x400,
+                "Invalid observation directory")
+        # Creating/replacing the trace changes directory timestamps. Only its
+        # native identity/type bind the read; ordinary temporary-path ancestors
+        # are not installation-owned and are deliberately not traversed here.
+        return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+    parent_before = [parent_identity(parent) for parent in parents]
+    before = path.lstat()
+    ordinary(before)
+    require(before.st_size <= CHECK_OBSERVATION_MAX_BYTES, "Observation exceeds bound")
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            ordinary(opened)
+            require(identity(before, cross_family=True) == identity(opened, cross_family=True),
+                    "Observation changed before read")
+            raw = stream.read(CHECK_OBSERVATION_MAX_BYTES + 1)
+            finished = os.fstat(stream.fileno())
+        after = path.lstat()
+        parent_after = [parent_identity(parent) for parent in parents]
+    except FileNotFoundError:
+        raise AssertionError("Observation disappeared during read") from None
+    ordinary(after)
+    require(len(raw) <= CHECK_OBSERVATION_MAX_BYTES
+            and parent_before == parent_after
+            and identity(before) == identity(after)
+            and identity(opened) == identity(finished)
+            and identity(after, cross_family=True) == identity(finished, cross_family=True)
+            and len(raw) == before.st_size, "Observation changed during read")
+    return raw
+
+
+def _check_observation_u64(value):
+    return type(value) is int and 0 <= value <= (1 << 64) - 1
+
+
+def _check_observation_digest(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _check_observation_generation(home):
+    try:
+        value = json.loads(_check_observation_bytes(home / "runtime.json", parents=(home,)))
+        pid, nonce = value["pid"], value["process_nonce"]
+        require(type(pid) is int and 0 < pid < 1 << 32 and isinstance(nonce, str)
+                and 0 < len(nonce.encode("utf-8")) <= 4096, "Invalid runtime generation")
+        return {"pid": pid, "process_nonce_sha256": hashlib.sha256(nonce.encode("utf-8")).hexdigest()}
+    except (OSError, ValueError, KeyError, TypeError, AssertionError):
+        return None
+
+
+def _check_observation_projection(value):
+    require(isinstance(value, dict) and type(value["schema"]) is int and value["schema"] == 1
+            and value["observation_only"] is True, "Invalid observation schema")
+    require(isinstance(value["id"], str) and str(uuid.UUID(value["id"])) == value["id"],
+            "Invalid observation identity")
+    require(type(value["pid"]) is int and 0 < value["pid"] < 1 << 32
+            and (value["process_nonce_sha256"] is None or _check_observation_digest(value["process_nonce_sha256"])),
+            "Invalid observation generation")
+    times = ("started_at_ms", "queued_ms", "elapsed_ms", "prior_observation_io_ms")
+    require(all(_check_observation_u64(value[key]) for key in times), "Invalid observation timing")
+    require(value["state"] in {"running", "returned", "unwound"}
+            and type(value["truncated"]) is bool, "Invalid observation state")
+    require(value["result"] in {"ok", "error"} if value["state"] == "returned"
+            else value["result"] is None, "Invalid observation result")
+    require(isinstance(value["events"], list) and len(value["events"]) <= CHECK_OBSERVATION_MAX_EVENTS,
+            "Invalid observation events")
+    events = []
+    for index, event in enumerate(value["events"], 1):
+        require(isinstance(event, dict) and type(event["sequence"]) is int and event["sequence"] == index
+                and event["phase"] in CHECK_OBSERVATION_PHASES
+                and event["state"] in {"started", "returned"}
+                and _check_observation_u64(event["at_ms"]), "Invalid observation event")
+        require((event["elapsed_ms"] is None and event["result"] is None) if event["state"] == "started"
+                else (_check_observation_u64(event["elapsed_ms"]) and event["result"] in {"ok", "error"}),
+                "Invalid observation event result")
+        events.append({key: event[key] for key in ("sequence", "phase", "state", "at_ms", "elapsed_ms", "result")})
+    # Copy only known, validated scalar fields. Unknown/private extensions never
+    # enter a receipt, even when supplied alongside an otherwise valid snapshot.
+    return {**{key: value[key] for key in ("schema", "observation_only", "id", "pid",
+            "process_nonce_sha256", *times, "state", "result", "truncated")}, "events": events}
+
+
+def check_observation(home, *, before=None):
+    """Observe a fixed diagnostic file, without binding it to an HTTP request."""
+    initial = _check_observation_generation(home)
+    result = {"status": "unavailable", "observation_only": True, "request_identity_bound": False,
+              "attribution": "unknown", "runtime_generation": None}
+    try:
+        directory = home / "native-browser-update"
+        raw = _check_observation_bytes(directory / "check-observation.json", parents=(home, directory))
+        result.update(status="observed", sha256=hashlib.sha256(raw).hexdigest(),
+                      snapshot=_check_observation_projection(json.loads(raw)))
+    except FileNotFoundError:
+        result["status"] = "absent"
+    except (OSError, ValueError, KeyError, TypeError, AssertionError):
+        result["code"] = "check_observation_unavailable"
+    final = _check_observation_generation(home)
+    result["runtime_bracket"] = "unavailable" if initial is None or final is None else "stable" if initial == final else "changed"
+    if result["runtime_bracket"] == "stable":
+        result["runtime_generation"] = final
+    snapshot = result.get("snapshot")
+    result["generation_matches"] = (snapshot["pid"] == final["pid"]
+            and snapshot["process_nonce_sha256"] == final["process_nonce_sha256"]) if snapshot and snapshot["process_nonce_sha256"] is not None and final and initial == final else None
+    result["id_relation"] = "baseline" if before is None else "unknown_prior"
+    if before is not None and snapshot and before.get("status") in {"observed", "absent"}:
+        result["id_relation"] = "same" if before.get("snapshot", {}).get("id") == snapshot["id"] else "new"
+        if result["generation_matches"] is True and before.get("runtime_generation") == final:
+            result["attribution"] = "stale_id" if result["id_relation"] == "same" else "new_id_same_generation"
+    # Even a fresh matching record could belong to a concurrent CHECK. Returned
+    # means the synchronous action returned, never HTTP delivery or APPLY authority.
+    return result
+
+
+def _safe_check_observation(home, *, before=None):
+    try:
+        return check_observation(home, before=before)
+    except Exception:
+        return {"status": "unavailable", "observation_only": True, "request_identity_bound": False,
+                "attribution": "unknown", "code": "check_observation_capture_failed"}
+
+
 def check_once(install, candidate):
     # A timeout does not establish whether staging/check publication finished.
     # Never retry CHECK or continue to APPLY after an unobserved reply.
     row = {"timeout_seconds": CHECK_REPLY_SECONDS, "response": "pending", "mutation_retries": 0}
+    row["observation_before"] = _safe_check_observation(install.home)
     install.result["check_request"] = row
     install.checkpoint()
     started = time.monotonic()
+    failed = False
     try:
         checked = install.browser_request("POST", API + "/check", {"package_path": str(candidate)},
                                           timeout=CHECK_REPLY_SECONDS)
@@ -553,17 +711,41 @@ def check_once(install, candidate):
         row["response"] = "received"
         return checked
     except (OSError, urllib.error.URLError, http.client.HTTPException):
+        failed = True
         row["elapsed_seconds"] = time.monotonic() - started
         row["response"] = "transport_unknown"
-        row["ledger_after_failure"] = check_failure_ledger(install.home)
+        try:
+            row["ledger_after_failure"] = check_failure_ledger(install.home)
+        except BaseException:
+            row["ledger_after_failure"] = {"status": "unavailable", "code": "browser_ledger_observation_failed"}
         raise
     except Exception:
+        failed = True
         row["elapsed_seconds"] = time.monotonic() - started
         row["response"] = "failed"
-        row["ledger_after_failure"] = check_failure_ledger(install.home)
+        try:
+            row["ledger_after_failure"] = check_failure_ledger(install.home)
+        except BaseException:
+            row["ledger_after_failure"] = {"status": "unavailable", "code": "browser_ledger_observation_failed"}
+        raise
+    except BaseException:
+        failed = True
         raise
     finally:
-        install.checkpoint()
+        if failed:
+            try:
+                row["observation_after"] = _safe_check_observation(install.home, before=row["observation_before"])
+            except BaseException:
+                row["observation_after"] = {"status": "unavailable", "observation_only": True,
+                    "request_identity_bound": False, "attribution": "unknown",
+                    "code": "check_observation_capture_interrupted"}
+            try:
+                install.checkpoint()
+            except BaseException:
+                pass  # A diagnostic/checkpoint failure must not replace CHECK's original exception.
+        else:
+            row["observation_after"] = _safe_check_observation(install.home, before=row["observation_before"])
+            install.checkpoint()
 
 
 def exercise_api(install, a, b, observer, *, verify_cross_version_workers=False):

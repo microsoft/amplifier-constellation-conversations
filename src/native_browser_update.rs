@@ -5,6 +5,7 @@ use crate::{
     auth,
     config::Config,
     error::{ApiError, ApiResult},
+    native_check_diagnostics::{self as check_diagnostics, Stage},
     native_update,
     state::AppState,
 };
@@ -702,10 +703,14 @@ pub(crate) fn check(
             "Choose the full path to an extracted complete native package",
         ));
     }
-    crate::native_browser_cleanup::before_check(home)?;
+    check_diagnostics::observe(Stage::Cleanup, || {
+        crate::native_browser_cleanup::before_check(home)
+    })?;
     let package = crate::desktop::selected_package_folder(&input.package_path)?;
-    let checked = native_update::prepare_plan(home, &package.bundle)?;
-    package.verify_launcher(&checked)?;
+    let checked = check_diagnostics::observe(Stage::Prepare, || {
+        native_update::prepare_plan(home, &package.bundle)
+    })?;
+    check_diagnostics::observe(Stage::Launcher, || package.verify_launcher(&checked))?;
     let plan = checked.value();
     if !plan["version"]
         .as_str()
@@ -720,13 +725,17 @@ pub(crate) fn check(
         // publication. Do not re-open full immutable bundles here; no saved or
         // caller-provided plan can enter this path. APPLY still revalidates all
         // package bytes before granting any worker or lifecycle authority.
-        standalone(home)?;
-        if worker_active(home)? {
-            return Err(conflict("A native update worker is still running"));
-        }
-        let mut ledger = load(home)?;
-        settle_current(home, &mut ledger)?;
-        checked.validate_current()?;
+        let mut ledger =
+            check_diagnostics::observe(Stage::PublicationGuards, || -> ApiResult<Ledger> {
+                standalone(home)?;
+                if worker_active(home)? {
+                    return Err(conflict("A native update worker is still running"));
+                }
+                let mut ledger = load(home)?;
+                settle_current(home, &mut ledger)?;
+                Ok(ledger)
+            })?;
+        check_diagnostics::observe(Stage::BindingValidation, || checked.validate_current())?;
         let id = uuid::Uuid::new_v4().to_string();
         ledger.checks.insert(
             id.clone(),
@@ -737,10 +746,10 @@ pub(crate) fn check(
             },
         );
         ledger.current_check = Some(id);
-        save(home, &ledger)?;
+        check_diagnostics::observe(Stage::LedgerPublish, || save(home, &ledger))?;
     }
     drop(checked);
-    status(home, "normal", None, launch)
+    check_diagnostics::observe(Stage::Response, || status(home, "normal", None, launch))
 }
 
 fn duplicate(home: &Path, ledger: &Ledger, id: &str, payload: &RequestPayload) -> ApiResult<bool> {
@@ -1078,7 +1087,11 @@ async fn http_check(
 ) -> ApiResult<Json<Value>> {
     auth::check(&state, &headers, "admin", true)?;
     let home = state.home.clone();
-    blocking_control(move || check(&home, input, launcher())).await
+    let queued = std::time::Instant::now();
+    blocking_control(move || {
+        check_diagnostics::run(&home, queued, || check(&home, input, launcher()))
+    })
+    .await
 }
 async fn http_apply(
     State(state): State<Arc<AppState>>,
@@ -1550,6 +1563,73 @@ mod tests {
                 .to_owned()
         }
     }
+    static DIAGNOSTIC_FIXTURE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_check_retains_content_free_phase_observations() {
+        let _diagnostic_fixture = DIAGNOSTIC_FIXTURE_SERIAL.lock().await;
+        let fixture = Fixture::new();
+        let state = AppState::open(fixture.home.clone()).unwrap();
+        let nonce = "a".repeat(64);
+        write_json(
+            &fixture.home.join("runtime.json"),
+            &json!({"pid":std::process::id(),"process_nonce":nonce}),
+        );
+        let token = fs::read_to_string(fixture.home.join("secrets/control-token")).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:54127".parse().unwrap());
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", token.trim()).parse().unwrap(),
+        );
+        let Json(result) = http_check(
+            State(state),
+            headers,
+            Json(CheckInput {
+                package_path: fixture.candidate.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result["check"]["available"].as_bool().unwrap());
+        let path = fixture.home.join(DIRECTORY).join("check-observation.json");
+        assert!(
+            path.is_file(),
+            "A successful authenticated CHECK must retain bounded phase evidence"
+        );
+        let raw = fs::read(&path).unwrap();
+        assert!(raw.len() <= 32768);
+        let observation: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(observation["observation_only"], true);
+        assert_eq!(observation["state"], "returned");
+        assert_eq!(observation["result"], "ok");
+        assert_eq!(observation["pid"], std::process::id());
+        assert_eq!(observation["process_nonce_sha256"], auth::digest(&nonce));
+        let events = observation["events"].as_array().unwrap();
+        for phase in [
+            "check_cleanup",
+            "check_previous_verify",
+            "bundle_verify",
+            "bundle_copy",
+            "bundle_verify_copied",
+            "check_binding_validation",
+            "check_ledger_publish",
+            "check_response",
+        ] {
+            assert!(
+                events.iter().any(|event| event["phase"] == phase
+                    && event["state"] == "returned"
+                    && event["result"] == "ok"),
+                "Missing phase {phase}"
+            );
+        }
+        let text = String::from_utf8(raw).unwrap();
+        assert!(!text.contains(token.trim()));
+        assert!(!text.contains(&nonce));
+        assert!(!text.contains(fixture.home.to_str().unwrap()));
+        assert!(!fixture.home.join("native-update.json").exists());
+    }
+
     #[test]
     fn fresh_check_verifies_each_required_bundle_once() {
         let fixture = Fixture::new();
@@ -1690,6 +1770,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn abandoning_check_observation_does_not_release_its_running_owner() {
+        let _diagnostic_fixture = DIAGNOSTIC_FIXTURE_SERIAL.lock().await;
         // Dropping the HTTP observer is not cancellation of spawn_blocking.
         // Work and lock ownership settle together, without a second request or
         // interpreting the missing reply as a failed/no-effect CHECK.
@@ -1701,14 +1782,17 @@ mod tests {
         let (settled, done) = tokio::sync::oneshot::channel();
         let observer = tokio::spawn(async move {
             blocking_control(move || {
-                let checked = native_update::prepare_plan(&home, &candidate)?;
-                prepared.send(()).unwrap();
-                wait.recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap();
-                checked.validate_current()?;
-                drop(checked);
+                let result = check_diagnostics::run(&home, std::time::Instant::now(), || {
+                    let checked = native_update::prepare_plan(&home, &candidate)?;
+                    prepared.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    checked.validate_current()?;
+                    drop(checked);
+                    Ok(json!({"observed":true}))
+                });
                 settled.send(()).unwrap();
-                Ok(json!({"observed":true}))
+                result
             })
             .await
         });
@@ -1719,12 +1803,19 @@ mod tests {
         observer.abort();
         assert!(observer.await.unwrap_err().is_cancelled());
         assert!(native_update::lock(&fixture.home, "native-update.lock").is_err());
+        let trace_path = fixture.home.join(DIRECTORY).join("check-observation.json");
+        let running = read_json(&trace_path);
+        assert_eq!(running["state"], "running");
         release.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), done)
             .await
             .unwrap()
             .unwrap();
         assert!(native_update::lock(&fixture.home, "native-update.lock").is_ok());
+        let completed = read_json(&trace_path);
+        assert_eq!(completed["id"], running["id"]);
+        assert_eq!(completed["state"], "returned");
+        assert_eq!(completed["result"], "ok");
         assert!(!fixture.home.join("native-update.json").exists());
     }
 

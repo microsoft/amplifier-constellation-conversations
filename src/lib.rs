@@ -29,6 +29,7 @@ pub mod imports;
 mod native_browser_cleanup;
 pub mod native_browser_update;
 pub mod native_bundle;
+mod native_check_diagnostics;
 mod native_installation_diagnostics;
 pub mod native_recovery;
 pub mod native_startup_state;

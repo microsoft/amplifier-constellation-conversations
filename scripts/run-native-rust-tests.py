@@ -22,6 +22,7 @@ SELECTIONS = [
     ("native_update::cleanup::", False),
     ("native_update_identity::", False),
     ("native_browser_update::", False),
+    ("native_check_diagnostics::", False),
     ("native_browser_cleanup::", False),
     ("native_recovery::", False),
     ("native_update_launch::", False),

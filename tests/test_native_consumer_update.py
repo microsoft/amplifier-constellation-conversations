@@ -1,10 +1,12 @@
 """Controller failure boundaries; these do not claim native lifetime proof."""
 import importlib.util
+import hashlib
 import http.server
 import io
 import json
 from pathlib import Path
 import queue
+import stat
 import tempfile
 import threading
 import time
@@ -17,6 +19,424 @@ import urllib.request
 spec = importlib.util.spec_from_file_location("native_consumer_update", Path(__file__).with_name("native_consumer_update.py"))
 controller = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(controller)
+
+
+class CheckObservationTests(unittest.TestCase):
+    OLD_ID = "1c97701c-955f-4d8e-ae6a-ccf563e6687a"
+    NEW_ID = "057c2e79-cc3d-4852-ae80-66b494de6a21"
+    NONCE = "private-test-runtime-nonce"
+
+    def runtime(self, home, *, nonce=None, pid=101):
+        (home / "runtime.json").write_text(json.dumps({"pid": pid, "process_nonce": nonce or self.NONCE,
+            "private_extra": "runtime-private-extension"}))
+
+    def snapshot(self, *, identity=None, nonce=None, pid=101):
+        return {"schema": 1, "observation_only": True, "id": identity or self.NEW_ID, "pid": pid,
+            "process_nonce_sha256": hashlib.sha256((nonce or self.NONCE).encode()).hexdigest(),
+            "started_at_ms": 1794570000000, "queued_ms": 2, "elapsed_ms": 39000,
+            "prior_observation_io_ms": 3, "state": "running", "result": None, "truncated": False,
+            "events": [{"sequence": 1, "phase": "bundle_copy", "state": "started",
+                        "at_ms": 25, "elapsed_ms": None, "result": None}]}
+
+    def trace(self, home, value):
+        path = home / "native-browser-update/check-observation.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(value))
+        return path
+
+    def installation(self, home, request):
+        return SimpleNamespace(home=home, result={}, checkpoint=Mock(), browser_request=Mock(side_effect=request))
+
+    def test_check_observation_timeout_retains_progress_without_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            error = TimeoutError("original CHECK timeout")
+            def request(*_args, **_kwargs):
+                self.trace(home, self.snapshot())
+                raise error
+            install = self.installation(home, request)
+            with patch.object(controller, "request_status", return_value={"owner": "standalone", "mode": "normal", "actions": {"check": True}}), \
+                 patch.object(controller, "submit_once") as submit, self.assertRaises(TimeoutError) as caught:
+                controller.exercise_api(install, Path("a"), Path("b"), Mock())
+            self.assertIs(caught.exception, error)
+            submit.assert_not_called()
+            install.browser_request.assert_called_once_with("POST", controller.API + "/check", {"package_path": "b"}, timeout=40)
+            row = install.result["check_request"]
+            self.assertEqual(row["response"], "transport_unknown")
+            self.assertEqual(row["mutation_retries"], 0)
+            self.assertEqual(row["observation_before"]["status"], "absent")
+            after = row["observation_after"]
+            self.assertEqual(after["attribution"], "new_id_same_generation")
+            self.assertEqual(after["snapshot"]["events"][0]["phase"], "bundle_copy")
+            self.assertFalse(after["request_identity_bound"])
+            self.assertEqual(install.checkpoint.call_count, 2)
+
+    def test_check_observation_returned_ok_never_turns_timeout_into_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            value = {**self.snapshot(), "state": "returned", "result": "ok"}
+            def request(*_args, **_kwargs):
+                self.trace(home, value)
+                raise TimeoutError("no HTTP reply")
+            install = self.installation(home, request)
+            with self.assertRaises(TimeoutError):
+                controller.check_once(install, Path("candidate"))
+            row = install.result["check_request"]
+            self.assertEqual(row["response"], "transport_unknown")
+            self.assertEqual(row["observation_after"]["snapshot"]["result"], "ok")
+            self.assertFalse(row["observation_after"]["request_identity_bound"])
+
+    def test_check_observation_failures_preserve_original_request_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = TimeoutError("original request error")
+            install = self.installation(Path(directory), original)
+            install.checkpoint.side_effect = [None, RuntimeError("private checkpoint error")]
+            with patch.object(controller, "check_observation", side_effect=RuntimeError("private diagnostic path")), \
+                 patch.object(controller, "check_failure_ledger", side_effect=RuntimeError("private ledger error")), \
+                 self.assertRaises(TimeoutError) as caught:
+                controller.check_once(install, Path("candidate"))
+            self.assertIs(caught.exception, original)
+            install.browser_request.assert_called_once_with("POST", controller.API + "/check", {"package_path": "candidate"}, timeout=40)
+            row = install.result["check_request"]
+            self.assertEqual(row["response"], "transport_unknown")
+            self.assertEqual(row["observation_after"]["status"], "unavailable")
+            self.assertNotIn("private", json.dumps(row))
+
+    def test_check_observation_cancellation_before_request_never_dispatches(self):
+        for interruption in [KeyboardInterrupt(), SystemExit(13)]:
+            with self.subTest(kind=type(interruption).__name__), tempfile.TemporaryDirectory() as directory:
+                install = self.installation(Path(directory), {"unexpected": "reply"})
+                with patch.object(controller, "check_observation", side_effect=interruption), \
+                     self.assertRaises(type(interruption)) as caught:
+                    controller.check_once(install, Path("candidate"))
+                self.assertIs(caught.exception, interruption)
+                install.browser_request.assert_not_called()
+                install.checkpoint.assert_not_called()
+
+    def test_check_observation_cancellation_after_reply_never_reaches_apply(self):
+        for interruption in [KeyboardInterrupt(), SystemExit(13)]:
+            with self.subTest(kind=type(interruption).__name__), tempfile.TemporaryDirectory() as directory:
+                install = self.installation(Path(directory), Mock(return_value={"check": {"id": self.NEW_ID, "available": True}, "actions": {"apply": True}}))
+                before = {"status": "absent", "runtime_generation": None}
+                status = {"owner": "standalone", "mode": "normal", "actions": {"check": True}}
+                with patch.object(controller, "check_observation", side_effect=[before, interruption]), \
+                     patch.object(controller, "request_status", return_value=status), \
+                     patch.object(controller, "submit_once", side_effect=AssertionError("APPLY reached after observation cancellation")) as submit, \
+                     self.assertRaises(type(interruption)) as caught:
+                    controller.exercise_api(install, Path("a"), Path("b"), Mock())
+                self.assertIs(caught.exception, interruption)
+                submit.assert_not_called()
+                install.browser_request.assert_called_once_with("POST", controller.API + "/check", {"package_path": "b"}, timeout=40)
+                self.assertEqual(install.result["check_request"]["response"], "received")
+                self.assertEqual(install.checkpoint.call_count, 1)
+
+    def test_check_observation_secondary_cancellation_preserves_request_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = TimeoutError("original request failure")
+            install = self.installation(Path(directory), original)
+            install.checkpoint.side_effect = [None, KeyboardInterrupt()]
+            with patch.object(controller, "check_observation", side_effect=[{"status": "absent"}, SystemExit(13)]), \
+                 patch.object(controller, "check_failure_ledger", side_effect=KeyboardInterrupt()), \
+                 self.assertRaises(TimeoutError) as caught:
+                controller.check_once(install, Path("candidate"))
+            self.assertIs(caught.exception, original)
+            self.assertEqual(install.browser_request.call_count, 1)
+            self.assertEqual(install.result["check_request"]["observation_after"]["code"], "check_observation_capture_interrupted")
+
+    def test_check_observation_success_preserves_reply_and_checkpoint_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            reply = {"check": {"id": self.NEW_ID}, "actual_reply": True}
+            def request(*_args, **_kwargs):
+                self.trace(home, self.snapshot())
+                return reply
+            install = self.installation(home, request)
+            self.assertIs(controller.check_once(install, Path("candidate")), reply)
+            self.assertEqual(install.result["check_request"]["response"], "received")
+            self.assertEqual(install.checkpoint.call_count, 2)
+            for calls in [[RuntimeError("before dispatch")], [None, RuntimeError("after success")]]:
+                with self.subTest(calls=len(calls)):
+                    install = self.installation(home, request)
+                    install.checkpoint.side_effect = calls
+                    with self.assertRaises(RuntimeError):
+                        controller.check_once(install, Path("candidate"))
+                    self.assertEqual(install.browser_request.call_count, len(calls) - 1)
+
+    def test_check_observation_absent_or_missing_generation_stays_unattributed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            absent = controller.check_observation(home)
+            self.assertEqual(absent["status"], "absent")
+            self.assertIsNone(absent["runtime_generation"])
+            self.trace(home, self.snapshot())
+            value = controller.check_observation(home, before=absent)
+            self.assertEqual(value["status"], "observed")
+            self.assertEqual(value["attribution"], "unknown")
+            self.assertIsNone(value["generation_matches"])
+            self.runtime(home)
+            before = controller.check_observation(home)
+            self.trace(home, {**self.snapshot(identity=self.OLD_ID), "process_nonce_sha256": None})
+            value = controller.check_observation(home, before=before)
+            self.assertIsNone(value["generation_matches"])
+            self.assertEqual(value["attribution"], "unknown")
+
+    def test_check_observation_same_id_is_stale_even_if_progress_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            self.trace(home, self.snapshot())
+            before = controller.check_observation(home)
+            self.trace(home, {**self.snapshot(), "elapsed_ms": 40001, "state": "returned", "result": "ok"})
+            value = controller.check_observation(home, before=before)
+            self.assertEqual(value["id_relation"], "same")
+            self.assertEqual(value["attribution"], "stale_id")
+            self.assertFalse(value["request_identity_bound"])
+
+    def test_check_observation_generation_drift_or_mismatch_stays_unknown(self):
+        for change in ["runtime_between", "trace_pid", "trace_nonce", "runtime_during"]:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                self.runtime(home)
+                before = controller.check_observation(home)
+                value = self.snapshot()
+                if change == "runtime_between":
+                    self.runtime(home, nonce="new-generation")
+                    value = self.snapshot(nonce="new-generation")
+                elif change == "trace_pid":
+                    value["pid"] = 202
+                elif change == "trace_nonce":
+                    value["process_nonce_sha256"] = "0" * 64
+                self.trace(home, value)
+                if change == "runtime_during":
+                    original = controller._check_observation_bytes
+                    def change_runtime(path, **kwargs):
+                        raw = original(path, **kwargs)
+                        if path.name == "check-observation.json":
+                            self.runtime(home, nonce="changed-during-read")
+                        return raw
+                    with patch.object(controller, "_check_observation_bytes", side_effect=change_runtime):
+                        observed = controller.check_observation(home, before=before)
+                    self.assertEqual(observed["runtime_bracket"], "changed")
+                else:
+                    observed = controller.check_observation(home, before=before)
+                self.assertEqual(observed["attribution"], "unknown")
+                self.assertFalse(observed["request_identity_bound"])
+
+    def test_check_observation_concurrent_file_replacement_is_unavailable(self):
+        for action in ["replace", "delete"]:
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                self.runtime(home)
+                trace = self.trace(home, self.snapshot())
+                replacement = home / "replacement.json"
+                replacement.write_text(json.dumps(self.snapshot(identity=self.OLD_ID)))
+                real_lstat, reads = Path.lstat, []
+                def lstat(path, *args, **kwargs):
+                    if path == trace:
+                        reads.append(path)
+                        if len(reads) == 2:
+                            replacement.replace(trace) if action == "replace" else trace.unlink()
+                    return real_lstat(path, *args, **kwargs)
+                with patch.object(Path, "lstat", lstat):
+                    value = controller.check_observation(home)
+                self.assertEqual(value["status"], "unavailable")
+                self.assertNotIn("snapshot", value)
+
+    def test_check_observation_reparse_and_nonordinary_files_are_refused(self):
+        for mode, attributes in [(stat.S_IFREG | 0o600, 0x400), (stat.S_IFLNK | 0o600, 0), (stat.S_IFDIR | 0o700, 0)]:
+            with self.subTest(mode=mode, attributes=attributes), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                self.runtime(home)
+                trace = self.trace(home, self.snapshot())
+                real_lstat = Path.lstat
+                def lstat(path, *args, **kwargs):
+                    if path == trace:
+                        return SimpleNamespace(st_mode=mode, st_file_attributes=attributes)
+                    return real_lstat(path, *args, **kwargs)
+                with patch.object(Path, "lstat", lstat):
+                    value = controller.check_observation(home)
+                self.assertEqual(value["status"], "unavailable")
+                self.assertNotIn("snapshot", value)
+
+    @unittest.skipIf(controller.os.name == "nt", "Actual Unix directory symlink; Windows reparse is covered by the portable metadata cases")
+    def test_check_observation_actual_symlink_parent_is_refused(self):
+        for target in ["home", "diagnostic"]:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                home = root / "home"
+                home.mkdir()
+                self.runtime(home)
+                self.trace(home, self.snapshot())
+                if target == "home":
+                    linked = root / "linked-home"
+                    linked.symlink_to(home, target_is_directory=True)
+                    home = linked
+                else:
+                    parent = home / "native-browser-update"
+                    destination = root / "external-directory"
+                    parent.rename(destination)
+                    parent.symlink_to(destination, target_is_directory=True)
+                value = controller.check_observation(home)
+                self.assertEqual(value["status"], "unavailable")
+                self.assertNotIn("snapshot", value)
+
+    def test_check_observation_parent_reparse_or_replacement_is_unavailable(self):
+        for target in ["home", "diagnostic"]:
+            for change in ["reparse", "replacement"]:
+                with self.subTest(target=target, change=change), tempfile.TemporaryDirectory() as directory:
+                    home = Path(directory)
+                    self.runtime(home)
+                    self.trace(home, self.snapshot())
+                    parent = home if target == "home" else home / "native-browser-update"
+                    real_lstat, reads = Path.lstat, []
+                    def lstat(path, *args, **kwargs):
+                        value = real_lstat(path, *args, **kwargs)
+                        if path == parent:
+                            reads.append(path)
+                            # Replace between the trace's parent reads, after
+                            # the separate runtime-generation bracket if home.
+                            return SimpleNamespace(st_mode=value.st_mode, st_dev=value.st_dev,
+                                st_ino=value.st_ino + (change == "replacement" and len(reads) >= (4 if target == "home" else 2)),
+                                st_file_attributes=0x400 if change == "reparse" else 0)
+                        return value
+                    with patch.object(Path, "lstat", lstat):
+                        value = controller.check_observation(home)
+                    self.assertEqual(value["status"], "unavailable")
+                    self.assertNotIn("snapshot", value)
+
+    def test_check_observation_malformed_oversized_and_invalid_contract_is_unavailable(self):
+        invalid = ["{malformed", " " * 32769]
+        updates = [{"schema": True}, {"schema": 2}, {"id": "private-invalid-id"}, {"pid": True},
+                   {"pid": 0}, {"pid": 1 << 32}, {"process_nonce_sha256": "A" * 64},
+                   {"queued_ms": -1}, {"elapsed_ms": 1.5}, {"prior_observation_io_ms": 1 << 64},
+                   {"state": "private-state"}, {"result": "ok"}, {"state": "returned", "result": None},
+                   {"truncated": 1}]
+        invalid.extend(json.dumps({**self.snapshot(), **update}) for update in updates)
+        for update in [{"phase": "private-path"}, {"state": "private-state"}, {"sequence": 2},
+                       {"at_ms": True}, {"elapsed_ms": 0}, {"result": "ok"}, {"state": "returned"}]:
+            value = self.snapshot()
+            value["events"][0].update(update)
+            invalid.append(json.dumps(value))
+        value = self.snapshot()
+        value["events"] *= 65
+        invalid.append(json.dumps(value))
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            path = self.trace(home, self.snapshot())
+            for index, raw in enumerate(invalid):
+                with self.subTest(index=index):
+                    path.write_text(raw)
+                    observed = controller.check_observation(home)
+                    self.assertEqual(observed["status"], "unavailable")
+                    self.assertNotIn("snapshot", observed)
+                    self.assertNotIn("private", json.dumps(observed))
+
+    def test_check_observation_truncation_and_private_extensions_are_preserved_safely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            before = controller.check_observation(home)
+            value = {**self.snapshot(), "truncated": True, "raw_nonce": self.NONCE,
+                     "private_path": "private-source-path"}
+            value["events"] = [{**value["events"][0], "sequence": i, "private_error": "private-error"} for i in range(1, 65)]
+            self.trace(home, value)
+            observed = controller.check_observation(home, before=before)
+            self.assertTrue(observed["snapshot"]["truncated"])
+            self.assertEqual(len(observed["snapshot"]["events"]), 64)
+            self.assertEqual(observed["attribution"], "new_id_same_generation")
+            self.assertFalse(observed["request_identity_bound"])
+            rendered = json.dumps(observed)
+            for private in [self.NONCE, "private-source-path", "private-error", "runtime-private-extension"]:
+                self.assertNotIn(private, rendered)
+
+    def test_check_observation_unknown_prior_cannot_attribute_new_trace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            path = self.trace(home, self.snapshot())
+            path.write_text("malformed")
+            before = controller.check_observation(home)
+            self.trace(home, self.snapshot())
+            observed = controller.check_observation(home, before=before)
+            self.assertEqual(observed["id_relation"], "unknown_prior")
+            self.assertEqual(observed["attribution"], "unknown")
+
+    def windows_stat_sample(self, home, *, drift=None):
+        path = self.trace(home, self.snapshot())
+        expected = path.read_bytes()
+        lstat, fstat = Path.lstat, controller.os.fstat
+        reads = {"path": 0, "handle": 0}
+
+        def metadata(value, family):
+            reads[family] += 1
+            fields = {key: getattr(value, key) for key in
+                      ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")}
+            # CPython3.13.17 Windows path stat preserves legacy birthtime in
+            # ctime; descriptor stat uses ChangeTime instead. Both are stable.
+            fields.update(st_birthtime_ns=101, st_ctime_ns=101 if family == "path" else 202,
+                          st_file_attributes=0)
+            if drift:
+                target, field, sample = drift
+                if family == target and reads[family] >= sample:
+                    if field == "missing_birthtime":
+                        del fields["st_birthtime_ns"]
+                    else:
+                        fields[field] += 0o100 if field == "st_mode" else 1
+            return SimpleNamespace(**fields)
+
+        def path_stat(value, *args, **kwargs):
+            result = lstat(value, *args, **kwargs)
+            return metadata(result, "path") if value == path else result
+
+        with patch.object(controller.os, "name", "nt"), patch.object(Path, "lstat", path_stat), \
+             patch.object(controller.os, "fstat", side_effect=lambda fd: metadata(fstat(fd), "handle")):
+            actual = controller._check_observation_bytes(path, parents=(home, path.parent))
+        return actual, expected, reads
+
+    def test_check_observation_windows_distinct_stable_clocks_keep_same_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            actual, expected, reads = self.windows_stat_sample(Path(directory))
+            self.assertEqual(actual, expected)
+            self.assertEqual(reads, {"path": 2, "handle": 2})
+
+    def test_check_observation_windows_same_family_drift_remains_unknown(self):
+        for family in ["path", "handle"]:
+            for field in ["st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
+                          "st_ctime_ns", "st_birthtime_ns"]:
+                with self.subTest(family=family, field=field), tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaises(AssertionError):
+                        self.windows_stat_sample(Path(directory), drift=(family, field, 2))
+
+    def test_check_observation_windows_cross_family_mismatch_or_missing_birth_is_unknown(self):
+        for family, field in [("handle", key) for key in
+                              ["st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_birthtime_ns"]] + \
+                             [(family, "missing_birthtime") for family in ["path", "handle"]]:
+            with self.subTest(family=family, field=field), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(AssertionError):
+                    self.windows_stat_sample(Path(directory), drift=(family, field, 1))
+
+    def test_check_observation_all_fixed_phases_and_returned_or_unwound_states(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            self.assertIn("bundle_verify_existing", controller.CHECK_OBSERVATION_PHASES)
+            for state, result in [("returned", "ok"), ("returned", "error"), ("unwound", None)]:
+                with self.subTest(state=state, result=result):
+                    value = {**self.snapshot(), "state": state, "result": result}
+                    value["events"] = [{"sequence": index, "phase": phase, "state": "returned",
+                                        "at_ms": 10, "elapsed_ms": 2, "result": "ok"}
+                                       for index, phase in enumerate(sorted(controller.CHECK_OBSERVATION_PHASES), 1)]
+                    self.trace(home, value)
+                    observed = controller.check_observation(home)
+                    self.assertEqual(observed["status"], "observed")
+                    self.assertEqual(observed["snapshot"]["state"], state)
+                    self.assertEqual(observed["snapshot"]["result"], result)
+                    self.assertEqual(observed["attribution"], "unknown")
+                    self.assertFalse(observed["request_identity_bound"])
 
 
 class ConsumerUpdateControllerTests(unittest.TestCase):
@@ -580,10 +1000,11 @@ class ConsumerUpdateControllerTests(unittest.TestCase):
                 install.browser.open.assert_called_once()
 
     def test_apply_uncertainty_enters_original_uuid_reconciliation_before_any_rollback(self):
-        install = SimpleNamespace(result={}, checkpoint=Mock(), browser_request=Mock(return_value={"check": {"available": True, "id": "checked"}, "actions": {"apply": True}}))
-        with patch.object(controller, "request_status", return_value={"owner": "standalone", "mode": "normal", "actions": {"check": True}}), patch.object(controller, "submit_once") as submit, patch.object(controller, "await_operation", side_effect=TimeoutError("outcome unknown")) as reconcile:
-            with self.assertRaises(TimeoutError):
-                controller.exercise_api(install, Path("a"), Path("b"), Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            install = SimpleNamespace(home=Path(directory), result={}, checkpoint=Mock(), browser_request=Mock(return_value={"check": {"available": True, "id": "checked"}, "actions": {"apply": True}}))
+            with patch.object(controller, "request_status", return_value={"owner": "standalone", "mode": "normal", "actions": {"check": True}}), patch.object(controller, "submit_once") as submit, patch.object(controller, "await_operation", side_effect=TimeoutError("outcome unknown")) as reconcile:
+                with self.assertRaises(TimeoutError):
+                    controller.exercise_api(install, Path("a"), Path("b"), Mock())
         submit.assert_called_once()
         reconcile.assert_called_once()
         self.assertEqual(submit.call_args.args[1], "apply")
