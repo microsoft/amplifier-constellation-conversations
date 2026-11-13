@@ -11,6 +11,13 @@ at a time. It is the same agent identity, with a new private conversation and
 backend session for each call. A call does not replace its Slack, Minecraft, or
 another person's session.
 
+That call-to-session mapping is this service's current implementation. The
+[Conversation](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/conversation.md)
+and the agent's execution session have distinct identities. Companion presents
+the exchange through an [Experience](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/experience.md);
+it uses the selected agent's declared interface without prescribing its internal
+reasoning architecture.
+
 OpenAI GPT-Live (`gpt-live-1`) handles the spoken conversation through client
 delegation. The selected agent handles work through Conversations' existing
 ordinary ACP connection. Its runtime and model remain selected by its own

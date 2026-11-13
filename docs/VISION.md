@@ -12,15 +12,19 @@ the result where you asked. A product can make that feel natural in its own
 setting, using these services without adopting their screens.
 
 The service owns its rooms, membership, messages and authorized source context.
-It connects to independently configured ACP agents; other platforms keep their
-own conversations. This makes Conversations useful on its own and as a supporting
-part of [Constellation](https://github.com/microsoft/amplifier-constellation/blob/main/docs/VISION.md).
+People can encounter the same exchange through different experiences while its
+source keeps its identity, audience and history. The service connects to
+independently configured agents through ACP; other platforms keep their own
+conversations. Agents can change how they carry out work without changing what
+the conversation means to its participants. This makes Conversations useful on
+its own and as a supporting part of
+[Constellation](https://github.com/microsoft/amplifier-constellation/blob/main/docs/VISION.md).
 
 The ambition is dependable conversation infrastructure that leaves experience
 design open. Current browser screens provide developer, administrator and reference
 access. They help test the services without defining future product UX.
-[Companion](companion-vision.md) is a distinct product that brings an agent into
-the person's physical world through live interaction.
+[Companion](companion-vision.md) is an Experience that brings an agent into the
+person's physical world through live interaction.
 
 Judge the service through complete journeys: can people and agents coordinate,
 correct work and recover an uncertain delivery while spending less effort on
