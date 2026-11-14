@@ -3,7 +3,7 @@ import {presentMessages,appendMessageDetails,voiceLabel} from './message-present
 import {createHuddles} from './huddles.mjs';
 import {createHuddleApi} from './huddles-api.mjs';
 const $=id=>document.getElementById(id);
-const ui={meta:null,session:null,items:[],conversation:null,view:null,eventSource:null,refreshing:false,refreshAgain:false,sending:false,draftTimer:null,searchTimer:null,saveChain:Promise.resolve(),viewIntents:new Set(),viewEdits:new Map(),viewIntentSequence:0,savingViews:0,refreshTimer:null,titleTimer:null,actionId:null,agents:[],people:[],files:[],historyCursor:null,historyTimer:null,roomTimer:null};
+const ui={meta:null,session:null,items:[],conversation:null,view:null,eventSource:null,refreshing:false,refreshAgain:false,sending:false,draftTimer:null,searchTimer:null,saveChain:Promise.resolve(),viewIntents:new Set(),viewEdits:new Map(),viewIntentSequence:0,savingViews:0,viewEpoch:0,refreshTimer:null,titleTimer:null,actionId:null,agents:[],people:[],files:[],historyCursor:null,historyTimer:null,roomTimer:null};
 const viewId=localStorage.getItem('acv-view')||crypto.randomUUID();localStorage.setItem('acv-view',viewId);
 const initials=name=>(name||'A').trim().split(/\s+/).map(p=>p[0]).slice(0,2).join('').toUpperCase();
 const shortTime=at=>new Date(at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
@@ -80,10 +80,12 @@ function queueRefresh(){if(ui.refreshTimer)return;ui.refreshTimer=setTimeout(()=
 async function refresh(){
   if($('app').hidden)return;if(ui.refreshing){ui.refreshAgain=true;return;}ui.refreshing=true;
   try{
+    const observed=ui.view,observedEpoch=ui.viewEpoch;
     const [list,remote,agents,people]=await Promise.all([api('/api/v1/conversations?search='+encodeURIComponent(ui.view.state.search||'')),api(`/api/v1/views/${viewId}`),api('/api/v1/agents'),api('/api/v1/people')]);ui.items=list.items;ui.agents=agents.items;ui.people=people.items;
-    if(remote.revision>ui.view.revision&&!ui.draftTimer&&!ui.searchTimer){ui.view=remote;applyView();}
+    const reset=remote.revision<observed.revision&&ui.view===observed;
+    if(reset||(remote.revision>ui.view.revision&&!ui.draftTimer&&!ui.searchTimer)){receiveView(remote,observed,observedEpoch);applyView();}
     const id=ui.view.state.selected_conversation_id;
-    if(id){try{ui.conversation=await api(`/api/v1/conversations/${encodeURIComponent(id)}`);}catch(e){if(e.status===404){ui.conversation=null;await saveView({selected_conversation_id:null});}else throw e;}}else ui.conversation=null;
+    if(id){try{ui.conversation=await api(`/api/v1/conversations/${encodeURIComponent(id)}`);}catch(e){if(e.status===404){if(clearUnavailableConversation(id)){try{await saveView({selected_conversation_id:null});}catch(saved){if(saved.status!==409)throw saved;}ui.refreshAgain=true;}}else throw e;}}else ui.conversation=null;
     if(ui.conversation){
       const v=ui.view.state;const params=new URLSearchParams({limit:'100',search:v.history_search||''});if(v.history_before)params.set('before',v.history_before);
       const history=await api(`/api/v1/conversations/${id}/messages?${params}`);ui.conversation.messages=history.items;ui.historyCursor=history.next_cursor;
@@ -92,11 +94,33 @@ async function refresh(){
     renderList();renderChat();renderParticipants();void refreshLinkedHuddles();if(ui.view.state.panel==='activity')await renderActivity();
   }finally{ui.refreshing=false;if(ui.refreshAgain){ui.refreshAgain=false;queueRefresh();}}
 }
-function viewOrigin(patch){return {...structuredClone(ui.view),writes:Object.keys(patch),sequence:++ui.viewIntentSequence};}
+function viewOrigin(patch){return {...structuredClone(ui.view),writes:Object.keys(patch),sequence:++ui.viewIntentSequence,epoch:ui.viewEpoch};}
+function invalidateViewIntents(){
+  ui.viewEpoch++;
+  for(const timer of [...ui.viewEdits.keys()])cancelViewEdit(timer);
+}
+function receiveView(remote,observed,epoch=ui.viewEpoch){
+  if(epoch!==ui.viewEpoch)return false;
+  const reset=remote.revision<observed.revision;
+  // A response to an older GET cannot replace a snapshot adopted in the meantime.
+  if((reset&&ui.view!==observed)||(!reset&&remote.revision<ui.view.revision))return false;
+  if(reset)invalidateViewIntents();
+  ui.view=remote;
+  if(reset)clearConversation();
+  return true;
+}
+function clearUnavailableConversation(id){
+  if(ui.view.state.selected_conversation_id!==id)return false;
+  invalidateViewIntents();
+  ui.items=ui.items.filter(c=>c.id!==id);
+  ui.view={...ui.view,state:{...ui.view.state,selected_conversation_id:null,panel:'conversation',draft:'',draft_request_id:'',draft_request_sha256:'',dialog:null,title_draft:'',action:null,attachment_ids:[],target_agent_ids:[],history_search:'',history_before:null,permission_details:null,elicitation_drafts:{},participants_open:false,invite_username:'',invite_agent_id:'',share_history:false}};
+  clearConversation();applyView();
+  return true;
+}
 function sameViewValue(a,b){return JSON.stringify(a)===JSON.stringify(b);}
 function viewConflict(){const e=new Error('This view changed elsewhere. The newer view was kept; review it before editing again.');e.status=409;return e;}
 function checkViewIntent(origin){
-  if(!ui.view||origin.id!==ui.view.id)throw viewConflict();
+  if(!ui.view||origin.id!==ui.view.id||origin.epoch!==ui.viewEpoch)throw viewConflict();
   // Drafts and selections retain their room. Focus and rename edits also retain
   // the panel/dialog in which the caller prepared them.
   const fields=new Set(['selected_conversation_id',...origin.writes]);
@@ -107,7 +131,7 @@ function checkViewIntent(origin){
 function advanceLocalViewIntents(before,after,settled){
   if(before.id!==after.id||after.revision!==before.revision+1)return;
   for(const origin of ui.viewIntents){
-    if(origin.id!==before.id||origin.revision>before.revision||origin.sequence<=settled.sequence)continue;
+    if(origin.id!==before.id||origin.epoch!==ui.viewEpoch||origin.revision>before.revision||origin.sequence<=settled.sequence)continue;
     // Acknowledged predecessors can advance queued edits of the same field.
     // Navigation must not silently retarget an edit made in the previous room.
     for(const field of origin.writes){
@@ -115,7 +139,7 @@ function advanceLocalViewIntents(before,after,settled){
     }
   }
 }
-function pendingViewField(field){return [...ui.viewIntents].some(origin=>origin.id===ui.view?.id&&origin.state.selected_conversation_id===ui.view.state.selected_conversation_id&&origin.writes.includes(field)&&sameViewValue(origin.state[field],ui.view.state[field]));}
+function pendingViewField(field){return [...ui.viewIntents].some(origin=>origin.id===ui.view?.id&&origin.epoch===ui.viewEpoch&&origin.state.selected_conversation_id===ui.view.state.selected_conversation_id&&origin.writes.includes(field)&&sameViewValue(origin.state[field],ui.view.state[field]));}
 function cancelViewEdit(timer){
   clearTimeout(ui[timer]);ui[timer]=null;
   const previous=ui.viewEdits.get(timer);if(previous)ui.viewIntents.delete(previous.origin);
@@ -135,13 +159,14 @@ function saveView(patch,origin=viewOrigin(patch)){
       const before=structuredClone(ui.view),body={expected_revision:before.revision,state:{...before.state,...patch}};
       try{
         const saved=await api(`/api/v1/views/${viewId}`,'PUT',body);
+        if(origin.epoch!==ui.viewEpoch)throw viewConflict();
         advanceLocalViewIntents(before,saved,origin);
         if(saved.revision>=ui.view.revision)ui.view=saved;
         return structuredClone(ui.view);
       }catch(e){
         if(e.status!==409)throw e;
-        const latest=await api(`/api/v1/views/${viewId}`);
-        if(latest.revision>=ui.view.revision)ui.view=latest;
+        const observed=ui.view,epoch=ui.viewEpoch,latest=await api(`/api/v1/views/${viewId}`);
+        receiveView(latest,observed,epoch);
         // One rebase is safe only when the original fields/context are unchanged.
         // A second conflict or unknown transport outcome never starts a loop.
         if(attempt===1)throw e;
@@ -170,6 +195,11 @@ function applyView(){
   if(!ui.searchTimer&&!pendingViewField('search')&&$('search').value!==v.search)$('search').value=v.search;
   const next=v.selected_conversation_id?`/?conversation=${encodeURIComponent(v.selected_conversation_id)}`:'/';if(location.pathname+location.search!==next)history.replaceState({},'',next);
   updateSend();renderList();
+}
+function clearConversation(){
+  // Clear protected room contents synchronously, before any recovery request.
+  ui.conversation=null;ui.files=[];ui.historyCursor=null;ui.actionId=null;
+  clearHuddles();$('activity-list').replaceChildren();renderChat();renderParticipants();
 }
 async function selectConversation(id){
   clearHuddles();

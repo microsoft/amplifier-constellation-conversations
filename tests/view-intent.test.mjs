@@ -12,8 +12,8 @@ const clone=value=>structuredClone(value);
 const initial=()=>({id:'view-a',revision:1,state:{selected_conversation_id:'room-a',panel:'conversation',dialog:null,draft:'original',search:'',action:null}});
 const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};};
 function fixture(){
-  const ui={view:initial(),saveChain:Promise.resolve(),viewIntents:new Set(),viewEdits:new Map(),viewIntentSequence:0,savingViews:0};
-  let stored=initial();const calls=[],rendered=[],timers=new Map();let timerId=0;
+  const ui={items:[],view:initial(),saveChain:Promise.resolve(),viewIntents:new Set(),viewEdits:new Map(),viewIntentSequence:0,savingViews:0,viewEpoch:0};
+  let stored=initial();const calls=[],rendered=[],cleared=[],timers=new Map();let timerId=0;
   const remote=patch=>{stored={...stored,revision:stored.revision+1,state:{...stored.state,...clone(patch)}};};
   let beforePut=async()=>{};
   const api=async(path,method='GET',body)=>{
@@ -30,8 +30,8 @@ function fixture(){
   const setTimer=callback=>{const id=++timerId;timers.set(id,callback);return id;};
   const clearTimer=id=>timers.delete(id);
   const errors=[];
-  const control=new Function('ui','api','viewId','applyView','structuredClone','setTimeout','clearTimeout','error',`${helpers}\nreturn {saveView,...(typeof queueViewEdit==='function'?{queueViewEdit,cancelViewEdit}:{}),...(typeof pendingViewField==='function'?{pendingViewField}:{})};`)(ui,api,'view-a',applyView,structuredClone,setTimer,clearTimer,e=>errors.push(e));
-  return {...control,ui,calls,rendered,errors,remote,timers,stored:()=>clone(stored),beforePut:fn=>{beforePut=fn;}};
+  const control=new Function('ui','api','viewId','applyView','structuredClone','setTimeout','clearTimeout','error','clearConversation',`${helpers}\nreturn {saveView,...(typeof queueViewEdit==='function'?{queueViewEdit,cancelViewEdit}:{}),...(typeof pendingViewField==='function'?{pendingViewField}:{}),...(typeof receiveView==='function'?{receiveView,clearUnavailableConversation}:{})};`)(ui,api,'view-a',applyView,structuredClone,setTimer,clearTimer,e=>errors.push(e),()=>cleared.push(clone(ui.view)));
+  return {...control,ui,calls,rendered,cleared,errors,remote,timers,replace:value=>{stored=clone(value);},stored:()=>clone(stored),beforePut:fn=>{beforePut=fn;}};
 }
 
 test('a conflict keeps the newer draft and never resends the stale patch',async()=>{
@@ -169,4 +169,60 @@ test('earlier debounced typing cannot follow a newer programmatic draft',async()
   assert.equal(f.stored().state.draft,'newer explicit draft');
   assert.equal(f.calls.filter(c=>c.method==='PUT').length,1);
   assert.equal(f.ui.savingViews,0);
+});
+
+test('a 409 reset adopts the empty view and rejects the old room draft',async()=>{
+  const f=fixture();let first=true;
+  f.beforePut(async()=>{if(first){first=false;f.replace({id:'view-a',revision:0,state:{selected_conversation_id:null,panel:'conversation',draft:'',search:''}});}});
+  await assert.rejects(f.saveView({draft:'removed-room private draft'}),e=>e.status===409);
+  assert.equal(f.ui.view.revision,0);assert.equal(f.ui.view.state.draft,'');
+  assert.equal(f.ui.view.state.selected_conversation_id,null);
+  assert.equal(f.calls.filter(c=>c.method==='PUT').length,1);
+  assert.equal(f.cleared.length,1);
+  await f.saveView({draft:'new user intent after reset'});
+  assert.equal(f.stored().state.draft,'new user intent after reset');
+});
+
+test('reset invalidates old queued intent even when its original fields match',async()=>{
+  const f=fixture(),release=deferred();
+  f.replace({...initial(),state:{...initial().state,selected_conversation_id:null,draft:''}});f.ui.view=f.stored();
+  f.ui.saveChain=release.promise;const old=f.saveView({draft:'prepared before reset'});
+  const oldOutcome=assert.rejects(old,e=>e.status===409);
+  f.replace({...f.stored(),revision:0});
+  f.receiveView(f.stored(),f.ui.view);release.resolve();await oldOutcome;
+  assert.equal(f.calls.length,0);assert.equal(f.ui.view.state.draft,'');
+});
+
+test('reset cancels old debounce and clears protected content before rendering',()=>{
+  const f=fixture();f.queueViewEdit('draftTimer',450,{draft:'removed-room typing'});
+  f.receiveView({id:'view-a',revision:0,state:{selected_conversation_id:null,panel:'conversation',draft:'',search:''}},f.ui.view);
+  assert.equal(f.timers.size,0);assert.equal(f.pendingViewField('draft'),false);
+  assert.equal(f.cleared.length,1);assert.equal(f.cleared[0].state.selected_conversation_id,null);
+});
+
+test('a delayed reset snapshot cannot replace a newer adopted view',()=>{
+  const f=fixture(),requestedFrom=f.ui.view;
+  f.remote({draft:'newer human intent'});f.ui.view=f.stored();
+  f.receiveView({id:'view-a',revision:0,state:{selected_conversation_id:null,panel:'conversation',draft:'',search:''}},requestedFrom);
+  assert.equal(f.ui.view.state.draft,'newer human intent');assert.equal(f.cleared.length,0);
+});
+
+test('an unavailable room clears private state synchronously before recovery writes',()=>{
+  const f=fixture();f.ui.view.state={...f.ui.view.state,title_draft:'private title',dialog:'rename',attachment_ids:['private-file'],elicitation_drafts:{form:{secret:'private answer'}}};
+  f.queueViewEdit('titleTimer',300,{title_draft:'older private title'});
+  assert.equal(f.clearUnavailableConversation('room-a'),true);
+  assert.equal(f.calls.length,0);assert.equal(f.cleared.length,1);
+  const current=f.cleared[0].state;assert.equal(current.selected_conversation_id,null);
+  assert.equal(current.draft,'');assert.equal(current.title_draft,'');assert.equal(current.dialog,null);
+  assert.deepEqual(current.attachment_ids,[]);assert.deepEqual(current.elicitation_drafts,{});
+  assert.equal(f.timers.size,0);
+});
+
+test('an older in-flight GET cannot revive a deleted view after reset',()=>{
+  const f=fixture(),requestedFrom=f.ui.view,epoch=f.ui.viewEpoch;
+  const staleReply={...initial(),revision:2,state:{...initial().state,draft:'revoked room draft'}};
+  f.receiveView({id:'view-a',revision:0,state:{selected_conversation_id:null,panel:'conversation',draft:'',search:''}},f.ui.view,epoch);
+  f.receiveView(staleReply,requestedFrom,epoch);
+  assert.equal(f.ui.view.revision,0);assert.equal(f.ui.view.state.selected_conversation_id,null);
+  assert.equal(f.ui.view.state.draft,'');assert.equal(f.cleared.length,1);
 });
