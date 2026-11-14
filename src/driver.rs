@@ -335,7 +335,7 @@ struct Client {
     process_tree: crate::platform::ProcessTree,
 }
 impl Client {
-    async fn start(c: &Agent) -> Result<Self> {
+    fn command(c: &Agent) -> Command {
         let mut cmd = Command::new(&c.command);
         crate::platform::ProcessTree::prepare(&mut cmd);
         cmd.args(&c.args)
@@ -350,6 +350,10 @@ impl Client {
             cmd.env("SSH_AUTH_SOCK", value);
         }
         cmd.envs(&c.env);
+        cmd
+    }
+    async fn start(c: &Agent) -> Result<Self> {
+        let mut cmd = Self::command(c);
         let mut child = cmd
             .spawn()
             .context("The ACP command could not be started")?;
@@ -370,6 +374,54 @@ impl Client {
                 auth_attempted: false,
             },
         })
+    }
+    /// Inspection setup is owned through disposal even if transport creation
+    /// fails. Its caller does not abandon this constructor on HTTP disconnect.
+    async fn start_inspection(c: &Agent) -> Result<Self> {
+        let mut child = Self::command(c)
+            .spawn()
+            .context("The ACP command could not be started")?;
+        let mut process_tree = match crate::platform::ProcessTree::attach(&mut child).await {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.start_kill();
+                child
+                    .wait()
+                    .await
+                    .context(TurnFailure::new("cleanup_unconfirmed", "source_inspection"))?;
+                return Err(error);
+            }
+        };
+        let setup = async {
+            let input = child.stdin.take().context("Missing agent input")?;
+            let output = child.stdout.take().context("Missing agent output")?;
+            Ok::<_, anyhow::Error>(Peer {
+                connection: amplifier_acp_connection::Connection::client(
+                    output,
+                    input,
+                    24 * 1024 * 1024,
+                )
+                .await?,
+                auth_methods: json!([]),
+                auth_attempted: false,
+            })
+        }
+        .await;
+        match setup {
+            Ok(peer) => Ok(Self {
+                child,
+                process_tree,
+                peer,
+            }),
+            Err(error) => {
+                process_tree.terminate(&mut child);
+                child
+                    .wait()
+                    .await
+                    .context(TurnFailure::new("cleanup_unconfirmed", "source_inspection"))?;
+                Err(error)
+            }
+        }
     }
     async fn initialize(&mut self, capabilities: Value) -> Result<Value> {
         let init=self.peer.request("initialize",json!({"protocolVersion":1,"clientInfo":{"name":"agent-conversations","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":capabilities})).await?;
@@ -416,6 +468,183 @@ pub async fn probe(agent: &Agent) -> Result<Value> {
         let init=c.initialize(json!({})).await?;
         Ok(json!({"ok":true,"agent_info":init["agentInfo"],"capabilities":init["agentCapabilities"],"authentication":crate::acp_auth::authentication(&init),"note":"ACP initialized. No conversation or model prompt was created."}))
     }).await.context("ACP connection check timed out")?
+}
+
+/// Receipt inspection owns the ordinary room slot, but never creates a turn,
+/// source contribution, replacement session, or recovery acknowledgment.
+struct InspectionRoom {
+    state: Arc<AppState>,
+    room: String,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    disposed: bool,
+}
+impl Drop for InspectionRoom {
+    fn drop(&mut self) {
+        if self.disposed {
+            crate::delivery::after_inspection(
+                self.state.clone(),
+                self.room.clone(),
+                self.cancel.clone(),
+            );
+        }
+        // A panic or unconfirmed child disposal must not admit another client.
+        // Retain the occupied slot instead of claiming the endpoint is idle.
+    }
+}
+
+fn inspection_authorized(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    room: &str,
+    actor: &str,
+) -> Result<()> {
+    ensure!(
+        crate::auth::check(state, headers, "observe", true).is_ok_and(|p| p.actor == actor)
+            && state.member(room, actor)?,
+        "Receipt inspection access changed"
+    );
+    Ok(())
+}
+
+pub(crate) async fn inspect_source(
+    state: Arc<AppState>,
+    input: crate::delivery::Input,
+    actor: String,
+    headers: axum::http::HeaderMap,
+) -> Result<()> {
+    let cancel = {
+        let mut running = state.running.lock().unwrap();
+        ensure!(
+            !running.contains_key(&input.room),
+            "Wait for the active conversation before inspecting a saved receipt"
+        );
+        ensure!(
+            !crate::update_admission::closed(&state.db.lock().unwrap())?,
+            "Installation update admission is closed"
+        );
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        running.insert(input.room.clone(), tx);
+        rx
+    };
+    let room = InspectionRoom {
+        state: state.clone(),
+        room: input.room.clone(),
+        cancel,
+        disposed: false,
+    };
+    // HTTP cancellation detaches observation of this owned cleanup task; it
+    // cannot drop the process/permit and release the room before actual exit.
+    tokio::spawn(async move {
+        let mut room = room; // Move the entire Drop guard, not individual fields.
+        let mut cancelled = Some(room.cancel.clone());
+        let mut client: Option<Client> = None;
+        let mut permit = None;
+        let result = async {
+            let agent = state.agent(&input.agent)?.context("The original endpoint is unavailable")?;
+            let endpoint = format!("{:x}", Sha256::digest(serde_json::to_vec(&agent)?));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(agent.timeout_seconds);
+            permit = Some(tokio::select! {
+                biased;
+                _ = cancel_signal(&mut cancelled) => bail!("Receipt inspection cancelled"),
+                _ = tokio::time::sleep_until(deadline) => bail!("Receipt inspection timed out"),
+                p = state.turn_gate.clone().acquire_owned() => p?,
+            });
+            inspection_authorized(&state,&headers,&input.room,&actor)?;
+            crate::delivery::check_owner(&state, &input)?;
+            let original = crate::source_delivery::input(&state, &input.room, &input.id)?;
+            ensure!(original.agent == input.agent, "Original recipient changed");
+            let saved = crate::source_delivery::saved(&state.db.lock().unwrap(), &input.id)?
+                .context("No negotiated original source receipt")?;
+            ensure!(saved.endpoint == endpoint, "Restore the original endpoint before inspecting this input");
+            // This constructor owns startup failure cleanup. Its small setup is
+            // never abandoned halfway through attaching process-tree ownership.
+            client = Some(Client::start_inspection(&agent).await?);
+            let c = client.as_mut().unwrap();
+            let observation = async {
+                let init = c.initialize(json!({})).await?;
+                crate::source_delivery::inspection(&state, &input.id, &saved.session, &endpoint, &init)?;
+                let method = if init["agentCapabilities"]["sessionCapabilities"]["resume"].is_object() {
+                    "session/resume"
+                } else if init["agentCapabilities"]["loadSession"] == true {
+                    "session/load"
+                } else { bail!("The original endpoint cannot restore its saved session for inspection") };
+                let mut params = json!({"sessionId":saved.session,"cwd":agent.session_cwd.as_ref().unwrap_or(&agent.cwd),"mcpServers":agent.mcp_servers});
+                if crate::companion::context_registered(&state, &input.room)? {
+                    params["_meta"] = json!({"io.github.bkrabach.conversation":{"provider_id":state.config.provider_id(),"grant":context::grant(&state,&input.room)?}});
+                }
+                let loaded = c.peer.request(method, params).await?;
+                ensure!(loaded.get("sessionId").is_none_or(|id| id == &saved.session), "Endpoint returned a different restored session");
+                inspection_authorized(&state,&headers,&input.room,&actor)?;
+                inspect_loaded_source(&state,c,&input.id,&saved.session,&endpoint,&init).await
+            };
+            tokio::select! {
+                biased;
+                _ = cancel_signal(&mut cancelled) => Err(anyhow::anyhow!("Source receipt inspection cancelled")),
+                _ = tokio::time::sleep_until(deadline) => Err(anyhow::anyhow!("Source receipt inspection timed out")),
+                result = observation => result,
+            }
+        }.await;
+        if let Some(mut c) = client {
+            c.terminate();
+            // Keep both room and capacity ownership until this exact child is
+            // reaped. A termination request alone is not an exit receipt.
+            c.child.wait().await.context(TurnFailure::new("cleanup_unconfirmed", "source_inspection"))?;
+        }
+        room.disposed = !result.as_ref().is_err_and(|error| {
+            error.downcast_ref::<TurnFailure>().is_some_and(|cause| cause.kind == "cleanup_unconfirmed")
+        });
+        if result.is_err() { let _ = crate::source_delivery::unavailable(&state,&input.id); }
+        drop(permit);
+        result
+    }).await.context("Source inspection cleanup could not be observed")?
+}
+
+async fn inspect_loaded_source(
+    state: &AppState,
+    client: &mut Client,
+    id: &str,
+    session: &str,
+    endpoint: &str,
+    init: &Value,
+) -> Result<()> {
+    let item = crate::source_delivery::inspection(state, id, session, endpoint, init)?;
+    let reply = client
+        .peer
+        .request(
+            crate::source_delivery::METHOD,
+            json!({"sessionId":session,"sources":item.metadata["sources"]}),
+        )
+        .await?;
+    crate::source_delivery::record(state, &item, &reply, init)
+}
+
+async fn observe_completed_sources(
+    state: &AppState,
+    client: &mut Client,
+    turn: &str,
+    session: &str,
+    endpoint: &str,
+    init: &Value,
+) {
+    let Ok(ids) = crate::source_delivery::for_turn(state, turn) else {
+        return;
+    };
+    // Receipt availability is optional and cannot undo an accepted terminal.
+    // One shared bound covers all inputs, rather than extending each turn per
+    // steering message. A later explicit inspection uses the original session.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    for id in ids {
+        if !matches!(
+            tokio::time::timeout_at(
+                deadline,
+                inspect_loaded_source(state, client, &id, session, endpoint, init)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            let _ = crate::source_delivery::unavailable(state, &id);
+        }
+    }
 }
 pub async fn deliver(state: Arc<AppState>, input: crate::delivery::Input) -> Result<()> {
     // Callers without the room worker retain immediate process disposal.
@@ -569,6 +798,7 @@ fn steering_params(
     state: &AppState,
     input: &crate::delivery::Input,
     sid: &str,
+    endpoint: &str,
     init: &Value,
 ) -> Result<Value> {
     let text = format!(
@@ -582,9 +812,11 @@ fn steering_params(
         &input.attachments,
         &init["agentCapabilities"],
     )?);
-    Ok(
-        json!({"sessionId":sid,"prompt":blocks,"_meta":{"steering":{"idleBehavior":"promptRequired","inputId":input.id},"com.microsoft.amplifier.conversations":{"messageId":input.message_id,"author":input.actor,"sequence":input.seq,"conversationId":input.room}}}),
-    )
+    let mut params = json!({"sessionId":sid,"prompt":blocks,"_meta":{"steering":{"idleBehavior":"promptRequired","inputId":input.id},"com.microsoft.amplifier.conversations":{"messageId":input.message_id,"author":input.actor,"sequence":input.seq,"conversationId":input.room}}});
+    if let Some(source) = crate::source_delivery::prepare(state, &input.id, sid, endpoint, init)? {
+        params["_meta"][crate::source_delivery::META] = source;
+    }
+    Ok(params)
 }
 async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<Option<CompletedTurn>> {
     let Turn {
@@ -929,6 +1161,11 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<Option<CompletedTur
         crate::delivery::set(&state, &input_id, "notAccepted")?;
         bail!("The source authorization expired or was revoked before delivery");
     }
+    if let Some(source) =
+        crate::source_delivery::prepare(&state, &input_id, &sid, &endpoint, &init)?
+    {
+        params["_meta"][crate::source_delivery::META] = source;
+    }
     crate::delivery::set(&state, &input_id, "submitted")?;
     let request_id = c.peer.send_request("session/prompt", params)?;
     let mut output = String::new();
@@ -962,7 +1199,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<Option<CompletedTur
                         if let Some(input)=next {
                             crate::delivery::check_owner(&state,&input)?;
                             if !crate::delivery::authorized(&state,&input.message_id,&input.actor)? {crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;steering_guard.close();continue;}
-                            let prepared=steering_params(&state,&input,&sid,&init);
+                            let prepared=steering_params(&state,&input,&sid,&endpoint,&init);
                             let mut params=match prepared {Ok(params)=>params,Err(_)=>{crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;steering_guard.close();continue;}};
                             if !crate::companion::room_identity_valid(&state,&input.room)? {crate::delivery::set(&state,&input.id,"notAccepted")?;steering_open=false;steering_guard.close();continue;}
                             let attention=input.participation=="ambient"&&crate::attention::supported(&init);
@@ -1147,6 +1384,7 @@ async fn turn_agent(state: Arc<AppState>, t: Turn) -> Result<Option<CompletedTur
                 )?;
             }
             state.db.lock().unwrap().execute("UPDATE room_agents SET last_seq=MAX(last_seq,?3,COALESCE((SELECT MAX(m.seq) FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.target_turn=?4 AND d.state IN ('submitted','received_remote','remoteQueued','incorporated','completed')),0)) WHERE conversation_id=?1 AND agent_id=?2",params![conversation,agent_id,source_seq,message_id])?;
+            observe_completed_sources(&state, &mut c, &message_id, &sid, &endpoint, &init).await;
             return Ok(Some(CompletedTurn(c)));
         }
         if v["method"] == "$/cancel_request" {

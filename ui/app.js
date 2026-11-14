@@ -3,7 +3,7 @@ import {presentMessages,appendMessageDetails,voiceLabel} from './message-present
 import {createHuddles} from './huddles.mjs';
 import {createHuddleApi} from './huddles-api.mjs';
 const $=id=>document.getElementById(id);
-const ui={meta:null,session:null,items:[],conversation:null,view:null,eventSource:null,refreshing:false,refreshAgain:false,sending:false,draftTimer:null,searchTimer:null,saveChain:Promise.resolve(),refreshTimer:null,titleTimer:null,actionId:null,agents:[],people:[],files:[],historyCursor:null,historyTimer:null,roomTimer:null};
+const ui={meta:null,session:null,items:[],conversation:null,view:null,eventSource:null,refreshing:false,refreshAgain:false,sending:false,draftTimer:null,searchTimer:null,saveChain:Promise.resolve(),viewIntents:new Set(),viewEdits:new Map(),viewIntentSequence:0,savingViews:0,refreshTimer:null,titleTimer:null,actionId:null,agents:[],people:[],files:[],historyCursor:null,historyTimer:null,roomTimer:null};
 const viewId=localStorage.getItem('acv-view')||crypto.randomUUID();localStorage.setItem('acv-view',viewId);
 const initials=name=>(name||'A').trim().split(/\s+/).map(p=>p[0]).slice(0,2).join('').toUpperCase();
 const shortTime=at=>new Date(at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
@@ -92,12 +92,63 @@ async function refresh(){
     renderList();renderChat();renderParticipants();void refreshLinkedHuddles();if(ui.view.state.panel==='activity')await renderActivity();
   }finally{ui.refreshing=false;if(ui.refreshAgain){ui.refreshAgain=false;queueRefresh();}}
 }
-function saveView(patch){
+function viewOrigin(patch){return {...structuredClone(ui.view),writes:Object.keys(patch),sequence:++ui.viewIntentSequence};}
+function sameViewValue(a,b){return JSON.stringify(a)===JSON.stringify(b);}
+function viewConflict(){const e=new Error('This view changed elsewhere. The newer view was kept; review it before editing again.');e.status=409;return e;}
+function checkViewIntent(origin){
+  if(!ui.view||origin.id!==ui.view.id)throw viewConflict();
+  // Drafts and selections retain their room. Focus and rename edits also retain
+  // the panel/dialog in which the caller prepared them.
+  const fields=new Set(['selected_conversation_id',...origin.writes]);
+  if(origin.writes.includes('action')){fields.add('panel');fields.add('dialog');}
+  if(origin.writes.includes('title_draft'))fields.add('dialog');
+  for(const field of fields)if(!sameViewValue(origin.state[field],ui.view.state[field]))throw viewConflict();
+}
+function advanceLocalViewIntents(before,after,settled){
+  if(before.id!==after.id||after.revision!==before.revision+1)return;
+  for(const origin of ui.viewIntents){
+    if(origin.id!==before.id||origin.revision>before.revision||origin.sequence<=settled.sequence)continue;
+    // Acknowledged predecessors can advance queued edits of the same field.
+    // Navigation must not silently retarget an edit made in the previous room.
+    for(const field of origin.writes){
+      if(sameViewValue(origin.state[field],before.state[field]))origin.state[field]=structuredClone(after.state[field]);
+    }
+  }
+}
+function pendingViewField(field){return [...ui.viewIntents].some(origin=>origin.id===ui.view?.id&&origin.state.selected_conversation_id===ui.view.state.selected_conversation_id&&origin.writes.includes(field)&&sameViewValue(origin.state[field],ui.view.state[field]));}
+function cancelViewEdit(timer){
+  clearTimeout(ui[timer]);ui[timer]=null;
+  const previous=ui.viewEdits.get(timer);if(previous)ui.viewIntents.delete(previous.origin);
+  ui.viewEdits.delete(timer);
+}
+function queueViewEdit(timer,delay,patch,after=()=>{}){
+  cancelViewEdit(timer);
+  patch=structuredClone(patch);const origin=viewOrigin(patch);
+  ui.viewIntents.add(origin);ui.viewEdits.set(timer,{patch,origin});
+  ui[timer]=setTimeout(()=>{ui[timer]=null;ui.viewEdits.delete(timer);saveView(patch,origin).then(after).catch(e=>error(e.message));},delay);
+}
+function saveView(patch,origin=viewOrigin(patch)){
+  patch=structuredClone(patch);ui.viewIntents.add(origin);ui.savingViews++;
   ui.saveChain=ui.saveChain.catch(()=>{}).then(async()=>{
-    let body={expected_revision:ui.view.revision,state:{...ui.view.state,...patch}};
-    try{ui.view=await api(`/api/v1/views/${viewId}`,'PUT',body);}catch(e){if(e.status!==409)throw e;ui.view=await api(`/api/v1/views/${viewId}`);body={expected_revision:ui.view.revision,state:{...ui.view.state,...patch}};ui.view=await api(`/api/v1/views/${viewId}`,'PUT',body);}
-    applyView();return ui.view;
-  });return ui.saveChain;
+    for(let attempt=0;attempt<2;attempt++){
+      checkViewIntent(origin);
+      const before=structuredClone(ui.view),body={expected_revision:before.revision,state:{...before.state,...patch}};
+      try{
+        const saved=await api(`/api/v1/views/${viewId}`,'PUT',body);
+        advanceLocalViewIntents(before,saved,origin);
+        if(saved.revision>=ui.view.revision)ui.view=saved;
+        return structuredClone(ui.view);
+      }catch(e){
+        if(e.status!==409)throw e;
+        const latest=await api(`/api/v1/views/${viewId}`);
+        if(latest.revision>=ui.view.revision)ui.view=latest;
+        // One rebase is safe only when the original fields/context are unchanged.
+        // A second conflict or unknown transport outcome never starts a loop.
+        if(attempt===1)throw e;
+      }
+    }
+  }).finally(()=>{ui.savingViews--;ui.viewIntents.delete(origin);applyView();});
+  return ui.saveChain;
 }
 function applyView(){
   const v=ui.view.state;
@@ -108,15 +159,15 @@ function applyView(){
   $('page-name').textContent={conversation:'Conversation',connection:'Agent connection',activity:'Activity'}[v.panel];
   $('connection-tab').classList.toggle('active',v.panel==='connection');$('activity-tab').classList.toggle('active',v.panel==='activity');
   $('app').classList.toggle('menu-open',Boolean(v.menu_open));$('connection-details-panel').open=Boolean(v.details_open);
-  if(!ui.titleTimer&&$('title-input').value!==(v.title_draft||''))$('title-input').value=v.title_draft||'';
+  if(!ui.titleTimer&&!pendingViewField('title_draft')&&$('title-input').value!==(v.title_draft||''))$('title-input').value=v.title_draft||'';
   if(v.dialog==='rename'&&!$('rename-dialog').open)$('rename-dialog').showModal();else if(v.dialog!=='rename'&&$('rename-dialog').open)$('rename-dialog').close();
   $('participants-panel').hidden=!v.participants_open||!ui.conversation||ui.conversation.read_only;
-  if(!ui.historyTimer)$('history-search').value=v.history_search||'';
-  if(!ui.roomTimer)$('connection-draft').value=v.connection_draft||'';
+  if(!ui.historyTimer&&!pendingViewField('history_search'))$('history-search').value=v.history_search||'';
+  if(!ui.roomTimer&&!pendingViewField('connection_draft'))$('connection-draft').value=v.connection_draft||'';
   $('share-history').checked=Boolean(v.share_history);$('agent-registry').open=Boolean(v.registry_open);
   applyAction();
-  if(!ui.draftTimer&&$('message').value!==v.draft)$('message').value=v.draft;
-  if(!ui.searchTimer&&$('search').value!==v.search)$('search').value=v.search;
+  if(!ui.draftTimer&&!pendingViewField('draft')&&$('message').value!==v.draft)$('message').value=v.draft;
+  if(!ui.searchTimer&&!pendingViewField('search')&&$('search').value!==v.search)$('search').value=v.search;
   const next=v.selected_conversation_id?`/?conversation=${encodeURIComponent(v.selected_conversation_id)}`:'/';if(location.pathname+location.search!==next)history.replaceState({},'',next);
   updateSend();renderList();
 }
@@ -202,7 +253,7 @@ function renderElicitations(force=false){
  applyAction(true);
 }
 function updateSend(){const stale=Boolean(ui.view?.state.selected_conversation_id&&ui.conversation?.id!==ui.view.state.selected_conversation_id);$('file-upload').disabled=stale||Boolean(ui.conversation?.huddle);$('send').disabled=ui.sending||stale||(!$('message').value.trim()&&!ui.view?.state.attachment_ids?.length)||ui.conversation?.read_only||Boolean(ui.conversation?.huddle&&ui.conversation.huddle.state!=='open');}
-async function flushDraft(){if(ui.draftTimer){clearTimeout(ui.draftTimer);ui.draftTimer=null;await saveView({draft:$('message').value});}}
+async function flushDraft(){if(ui.draftTimer){const edit=ui.viewEdits.get('draftTimer');cancelViewEdit('draftTimer');await saveView(edit?.patch||{draft:$('message').value},edit?.origin);}else if(ui.savingViews)await ui.saveChain;}
 async function newConversation(){await flushDraft();const c=await api('/api/v1/conversations','POST',{title:'New conversation'});await selectConversation(c.id);}
 async function sendMessage(e){
   e?.preventDefault();if($('send').disabled)return false;const text=$('message').value.trim();ui.sending=true;updateSend();error('');
@@ -254,12 +305,12 @@ $('share-history').onchange=()=>saveView({share_history:$('share-history').check
 $('invite-person').onclick=()=>addParticipant('members').catch(e=>error(e.message));
 $('invite-agent').onclick=()=>addParticipant('agents').catch(e=>error(e.message));
 $('reply-target').onchange=()=>{if($('reply-target').value==='__selected')return;saveView({target_agent_ids:$('reply-target').value?[$('reply-target').value]:[]}).catch(e=>error(e.message));};
-$('history-search').oninput=()=>{clearTimeout(ui.historyTimer);ui.historyTimer=setTimeout(()=>{ui.historyTimer=null;saveView({history_search:$('history-search').value,history_before:null}).then(refresh).catch(e=>error(e.message));},300);};
+$('history-search').oninput=()=>queueViewEdit('historyTimer',300,{history_search:$('history-search').value,history_before:null},refresh);
 $('older-messages').onclick=()=>saveView({history_before:ui.historyCursor}).then(refresh).catch(e=>error(e.message));
 $('latest-messages').onclick=()=>{ $('history-search').value='';saveView({history_before:null,history_search:''}).then(refresh).catch(e=>error(e.message));};
 $('file-upload').onchange=async()=>{try{if(!ui.conversation)await newConversation();const files=Array.from($('file-upload').files);if(files.length+(ui.view.state.attachment_ids||[]).length>4)throw new Error('Attach up to four files to one message.');for(const file of files){if(file.size>2*1024*1024)throw new Error('Each file must be at most 2 MB.');let mime=file.type;const ext=file.name.split('.').pop().toLowerCase();mime=({md:'text/markdown',txt:'text/plain',csv:'text/csv',json:'application/json',pdf:'application/pdf'})[ext]||mime;const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=()=>reject(new Error('This file could not be read.'));reader.readAsDataURL(file);});const upload=await api(`/api/v1/conversations/${ui.conversation.id}/attachments`,'POST',{name:file.name,mime_type:mime,data});await saveView({attachment_ids:[...(ui.view.state.attachment_ids||[]),upload.id]});}await refresh();}catch(e){error(e.message);}finally{$('file-upload').value='';}};
 $('agent-registry').addEventListener('toggle',()=>{if(ui.view&&$('agent-registry').open!==Boolean(ui.view.state.registry_open))saveView({registry_open:$('agent-registry').open}).catch(e=>error(e.message));});
-$('connection-draft').oninput=()=>{clearTimeout(ui.roomTimer);ui.roomTimer=setTimeout(()=>{ui.roomTimer=null;saveView({connection_draft:$('connection-draft').value}).catch(e=>error(e.message));},400);};
+$('connection-draft').oninput=()=>queueViewEdit('roomTimer',400,{connection_draft:$('connection-draft').value});
 $('save-connection').onclick=async()=>{try{const v=JSON.parse($('connection-draft').value);const {id,...config}=v;config.env={};config.mcp_servers=[];config.timeout_seconds??=900;config.args??=[];await api('/api/v1/agents','POST',{id,config});$('connection-save-result').textContent='Connection saved. Add this agent to a conversation when you are ready.';await saveView({connection_draft:''});await refresh();}catch(e){$('connection-save-result').textContent=e.message;}};
 const activityLabels={'input.received':'Message received','input.acknowledged':'Delivery reviewed','conversation.created':'Conversation started','conversation.removed':'Web conversation removed','turn.started':'Agent started working','turn.completed':'Reply completed','turn.interrupted':'Turn interrupted','tool.progress':'Tool progress','permission.declined':'Action needed approval','permission.requested':'Action awaiting approval','permission.decided':'Approval reviewed','context.read':'Context retrieved','session.rebuilt':'Working context rebuilt','turn.passed':'Agent chose to listen','room.member_added':'Person joined','room.member_removed':'Person removed','room.agent_added':'Agent joined','room.agent_removed':'Agent removed','agent.configured':'Agent connection saved','configuration.saved':'Connection settings saved','auth.signed_in':'Signed in','auth.signed_out':'Signed out','auth.failed':'Unsuccessful sign-in','conversation.imported':'External conversation updated'};
 async function renderActivity(){const {items}=await api('/api/v1/activity');$('activity-list').replaceChildren(...items.map(a=>{const row=el('article','activity-item');row.append(el('time',null,shortTime(a.at)));const body=el('div');body.append(el('strong',null,activityLabels[a.kind]||a.kind));const c=ui.items.find(c=>c.id===a.conversation_id);const detail=a.data.title||a.data.reason||a.data.note||(a.data.operation?`Requested ${a.data.operation} context`:'');if(c){const p=el('p');const link=el('button',null,c.title);link.onclick=()=>selectConversation(c.id).catch(e=>error(e.message));p.append(link);body.append(p);}if(detail)body.append(el('p',null,detail));row.append(body);return row;}));if(!items.length)$('activity-list').append(el('p','list-empty','Agent activity will appear when you start a conversation.'));}
@@ -268,8 +319,8 @@ $('sign-out').onclick=async()=>{try{await api('/auth/logout','POST',{});ui.sessi
 $('new-conversation').onclick=()=>newConversation().catch(e=>error(e.message));
 $('composer').addEventListener('submit',sendMessage);
 $('message').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendMessage();}});
-$('message').addEventListener('input',()=>{updateSend();clearTimeout(ui.draftTimer);ui.draftTimer=setTimeout(()=>{ui.draftTimer=null;saveView({draft:$('message').value}).catch(e=>error(e.message));},450);});
-$('search').addEventListener('input',()=>{renderList();clearTimeout(ui.searchTimer);ui.searchTimer=setTimeout(()=>{ui.searchTimer=null;saveView({search:$('search').value}).then(refresh).catch(e=>error(e.message));},350);});
+$('message').addEventListener('input',()=>{updateSend();queueViewEdit('draftTimer',450,{draft:$('message').value});});
+$('search').addEventListener('input',()=>{renderList();queueViewEdit('searchTimer',350,{search:$('search').value},refresh);});
 $('connection-tab').onclick=()=>saveView({panel:'connection'}).catch(e=>error(e.message));
 $('activity-tab').onclick=()=>saveView({panel:'activity'}).then(renderActivity).catch(e=>error(e.message));
 $('stop').onclick=async()=>{if(!ui.conversation)return;try{await api(`/api/v1/conversations/${ui.conversation.id}/cancel`,'POST',{});await refresh();}catch(e){error(e.message);}};
@@ -277,9 +328,9 @@ $('check').onclick=async()=>{$('check').disabled=true;$('check-result').textCont
 $('rename').onclick=()=>saveView({dialog:'rename',title_draft:ui.conversation?.title||'',action:{id:crypto.randomUUID(),kind:'focus',target:'rename_title'}}).catch(e=>error(e.message));
 $('rename-cancel').onclick=()=>saveView({dialog:null,title_draft:''}).catch(e=>error(e.message));
 $('rename-dialog').addEventListener('cancel',e=>{e.preventDefault();$('rename-cancel').click();});
-$('title-input').addEventListener('input',()=>{clearTimeout(ui.titleTimer);ui.titleTimer=setTimeout(()=>{ui.titleTimer=null;saveView({title_draft:$('title-input').value}).catch(e=>error(e.message));},300);});
+$('title-input').addEventListener('input',()=>queueViewEdit('titleTimer',300,{title_draft:$('title-input').value}));
 $('connection-details-panel').addEventListener('toggle',()=>{if(ui.view&&$('connection-details-panel').open!==Boolean(ui.view.state.details_open))saveView({details_open:$('connection-details-panel').open}).catch(e=>error(e.message));});
-$('rename-form').addEventListener('submit',async e=>{e.preventDefault();try{await api(`/api/v1/conversations/${ui.conversation.id}`,'PATCH',{title:$('title-input').value});clearTimeout(ui.titleTimer);ui.titleTimer=null;await saveView({dialog:null,title_draft:''});await refresh();}catch(e){error(e.message);}});
+$('rename-form').addEventListener('submit',async e=>{e.preventDefault();try{await api(`/api/v1/conversations/${ui.conversation.id}`,'PATCH',{title:$('title-input').value});cancelViewEdit('titleTimer');await saveView({dialog:null,title_draft:''});await refresh();}catch(e){error(e.message);}});
 $('dismiss-error').onclick=()=>error('');
 $('menu').onclick=()=>saveView({menu_open:!ui.view.state.menu_open}).catch(e=>error(e.message));
 window.addEventListener('online',()=>{if(!ui.eventSource&&!$('app').hidden)connectEvents();queueRefresh();});
@@ -295,7 +346,7 @@ async function voiceAction(command){
     case 'delivery_show':await showDelivery(command.id);break;
     case 'delivery_resolve':await resolveDelivery(command.id);break;
     case 'send':if(!await sendMessage())throw new Error('Message was not sent. Check the draft, connection, or current agent response.');break;
-    case 'clear':clearTimeout(ui.draftTimer);ui.draftTimer=null;await saveView({draft:''});break;
+    case 'clear':cancelViewEdit('draftTimer');await saveView({draft:''});break;
     case 'new':await newConversation();break;
     case 'cancel':if(c)await api(`/api/v1/conversations/${c.id}/cancel`,'POST',{});await refresh();break;
     case 'activity':case 'connection':case 'conversation':await saveView({panel:command.action});await refresh();break;
@@ -322,7 +373,7 @@ const voice=createVoice({perform:voiceAction,status:s=>{$('voice-status').textCo
 $('voice-toggle').onclick=()=>voice.enable(!voice.state().armed||!voice.state().enabled,true);
 $('voice-read-aloud').onchange=()=>voice.readAloud($('voice-read-aloud').checked);
 $('voice-help').addEventListener('toggle',()=>{if(ui.view&&Boolean(ui.view.state.voice_help_open)!==$('voice-help').open)saveView({voice_help_open:$('voice-help').open}).catch(e=>error(e.message));});
-window.agentConversationsControl={perform:voiceAction,voice,view:()=>structuredClone(ui.view),setView:saveView};
+window.agentConversationsControl={perform:voiceAction,voice,view:()=>structuredClone(ui.view),setView:patch=>saveView(patch)};
 window.addEventListener('pagehide',()=>voice.close());
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 start();
