@@ -19,7 +19,8 @@ All paths below start with `/api/v1`.
 | `/conversations/{id}` | GET, PATCH, DELETE | GET includes latest 100 messages, people, agents, owner and shared status. PATCH `{title}` renames native conversations. DELETE removes this stored transcript and source grants, but not the agent's private memory. |
 | `/conversations/{id}/messages` | GET, POST | GET accepts `limit` (max 100), `before` sequence cursor, `search`, returning `items,next_cursor`. POST `{text,request_id,target_agent_ids?,attachment_ids?}`; request_id is a UUID. Saves source and recipient delivery rows transactionally, including during active work; returns 202. Capacity rejection returns 429 without accepting the source. A repeated identical request returns 200 without another turn. |
 | `/conversations/{id}/cancel` | POST | Explicitly stops this client's active turn, attached subprocess and unsent queued messages. Work already performed is not undone. |
-| `/conversations/{id}/deliveries` | GET | Latest 256 per-agent delivery records plus every unresolved row; also included in conversation GET. Requires observe plus current membership. |
+| `/conversations/{id}/deliveries` | GET | Latest 256 per-agent delivery records plus every unresolved row; also included in conversation GET. Optional `request_id=<original UUID>` inspects that exact native submission and all its retained recipient rows, without the recent-window filter. Requires observe plus current membership. |
+| `/conversations/{id}/deliveries/{input}/inspect` | POST | Refresh the negotiated Instance source receipt for an existing delivery input through its original endpoint/session. Requires observe, current membership and browser CSRF. Does not prompt, resolve, dismiss or replay input. |
 | `/conversations/{id}/deliveries/{input}/resolve` | POST | Source author acknowledges unknown/notAccepted with `{disposition:"proceed_without_replay"}` while idle. Requires chat and current membership. Retains source/receipt, never resubmits it, and allows saved newer messages to proceed. |
 | `/activity` | GET | Latest 100 turn/tool/context/error records. No view-change acknowledgments. |
 | `/events` | GET | SSE `change` notifications, then fetch the needed state. Credentials are rechecked during the stream. |
@@ -33,6 +34,90 @@ At most one agent prompt per room and four per installation run concurrently. Fo
 Relevant ACP progress is exposed as status and activity; private one-to-one replies stream into a persisted message; group drafts are buffered until complete. Unknown-session notifications are ignored. Agents without session loading receive a bounded public transcript (100 messages / 60 KB). A failed attempt to load a saved session retains that binding and reports failure rather than silently replaying work in a new session. This is conversation data, not a new agent persona.
 
 Conversation records include `surface` and `read_only`. Imported records cannot be prompted or renamed through the native web actions. Their source updater can append additional transcript messages.
+
+### Inspect an original submission
+
+After a lost message-publication reply, read
+`GET /api/v1/conversations/{id}/deliveries?request_id=<original UUID>` instead of
+issuing a new message. The UUID is the original `POST /messages` request ID and
+saved source message ID. An exact lookup returns:
+
+```json
+{
+  "request_id": "original UUID",
+  "publication": {
+    "state": "saved",
+    "message_id": "original UUID",
+    "conversation_id": "room UUID",
+    "source_sequence": 42,
+    "actor": "source author",
+    "created_at": 1794657600000
+  },
+  "items": [],
+  "coverage": "retained_submission",
+  "observed_at": 1794657601000
+}
+```
+
+`items` uses the existing per-agent delivery shape, including source/input IDs,
+state, target turn/session, arrival/source sequences, update time and bounded
+receipt evidence. A saved publication can have no managed-agent recipients, so
+an empty array is not a failed publication. `saved` establishes source intake;
+it does not establish agent incorporation, accepted work, completed effects or
+human receipt. Lookup only reads the retained source and deliveries; it does not
+load an agent session, prompt, acknowledge uncertainty or replay the submission.
+
+This exact inspection uses existing native intake evidence. It does not turn an
+imported or legacy transcript UUID into a native request receipt. Malformed UUIDs
+return 400. Missing retained intake, a different room, or lost current access
+returns 404; that is unavailable evidence, not proof the original submission never
+occurred. Removing a conversation removes its local source/receipt records, and
+this API promises neither cross-installation nor unlimited retention. Plain GET
+without `request_id` keeps its existing recent-plus-unresolved projection.
+
+### Refresh negotiated source and work references
+
+When an ordinary Conversations endpoint advertises Instance's optional
+`inputContinuity.sourceDelivery` v1 profile with `ordinaryPrompts:true` and
+`promptRetry:"inspectOnly"`, delivery retains the original per-recipient input ID
+and source reference/revision/time in the existing delivery row. No responsibility
+is created automatically. When `workReferences:true` is also negotiated, the
+Instance's receipt can identify zero, one or several responsibilities explicitly
+linked to that input by its owner. A proposed record remains proposed; a completed
+prompt is not completed work.
+
+Both forms of delivery GET include an optional `source_delivery` projection:
+`{version,input_id,sources,status,receipt,observed_at}`. `status` is `unobserved`,
+`observed`, or `unavailable`. Its observation time belongs to the saved endpoint
+inspection, not to the current browser read. GET never starts an endpoint or
+refreshes its work state. The projection withholds retained work/receipt details
+when the original provider, session, endpoint or room audience no longer matches.
+
+To explicitly refresh this evidence, use
+`POST /api/v1/conversations/{id}/deliveries/{input}/inspect` with no body required.
+Here `{input}` is the per-recipient `items[].id`, not the original source-message
+UUID. The operation requires current observation authorization/membership and normal
+browser CSRF, takes the room's existing execution slot, initializes the original
+endpoint, loads its saved session, and queries only the negotiated source-receipt
+method. It creates no replacement session, sends no model prompt, and does not
+acknowledge, dismiss or resend uncertain source input. An authorized current room
+member may request inspection; the original source author and authority remain
+bound to the retained input rather than being replaced by the inspecting member.
+
+A confirmed inspection returns
+`{inspected:true,input_id,source_delivery}`. Busy, unsupported, changed binding,
+unavailable original session or unconfirmed inspection returns a conflict rather
+than a work-success or non-delivery claim. Caller access is rechecked before
+returning the saved projection. A lost inspection reply can be reconciled through
+the ordinary local delivery GET; it does not authorize another source submission.
+
+This is an application mapping of an optional Instance profile, not a universal
+ACP method. Missing support leaves the existing ordinary ACP behavior intact.
+Instance delivery-journal retention/coverage and work-reference coverage remain
+explicit in the receipt; absent evidence stays unknown. Work references retain
+their owner, revision, state and input identity. Use that owner's existing
+inspection/amendment/Stop controls, not a second Conversations work ledger.
+Companion call rooms do not adopt this ordinary-Conversations profile here.
 
 
 ## Room and endpoint operations

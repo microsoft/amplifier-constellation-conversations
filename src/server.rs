@@ -378,6 +378,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/conversations/{id}/deliveries/{input}/resolve",
             post(crate::delivery::resolve),
         )
+        .route(
+            "/api/v1/conversations/{id}/deliveries/{input}/inspect",
+            post(crate::delivery::inspect),
+        )
         .route("/api/v1/conversations/{id}/cancel", post(cancel))
         .route(
             "/api/v1/conversations/{id}/permissions/{permission}",

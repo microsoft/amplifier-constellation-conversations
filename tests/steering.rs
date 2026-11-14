@@ -1029,3 +1029,661 @@ async fn received_only_steering_is_unknown_after_terminal_and_is_never_replayed(
         1
     );
 }
+
+const SOURCE_META: &str = "com.microsoft.amplifier.source-delivery";
+const SOURCE_QUERY: &str = "_amplifier/source_receipts";
+
+fn source_delivery(f: &Fixture, message: &str) -> Value {
+    f.deliveries()
+        .into_iter()
+        .find(|row| row["message_id"] == message)
+        .unwrap()
+}
+
+fn source_frames(f: &Fixture, method: &str) -> Vec<Value> {
+    f.frames()
+        .into_iter()
+        .filter(|frame| frame["method"] == method)
+        .collect()
+}
+
+fn start_source_inspection(
+    f: &Fixture,
+    input_id: &str,
+    token: &str,
+) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let app = f.app.clone();
+    let path = format!(
+        "/api/v1/conversations/{}/deliveries/{input_id}/inspect",
+        f.room
+    );
+    let token = token.to_owned();
+    tokio::spawn(async move {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    })
+}
+
+#[tokio::test]
+async fn source_profile_binds_original_message_and_preserves_generic_acp() {
+    for mode in ["source-zero", "generic"] {
+        let f = Fixture::new(mode, false, false);
+        f.release();
+        let first = f.send("A distinct saved source.").await;
+        f.idle().await;
+        let second = f.send("A separate source, not the earlier history.").await;
+        f.idle().await;
+        let prompts = source_frames(&f, "session/prompt");
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(
+            prompts[0]["params"]["sessionId"],
+            prompts[1]["params"]["sessionId"]
+        );
+        for (index, message) in [&first, &second].into_iter().enumerate() {
+            let delivery = source_delivery(&f, message);
+            assert_eq!(delivery["state"], "completed");
+            let metadata = &prompts[index]["params"]["_meta"][SOURCE_META];
+            if mode == "generic" {
+                assert!(metadata.is_null());
+                assert!(delivery["source_delivery"].is_null());
+                continue;
+            }
+            let created_at: i64 = f
+                .state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT created_at FROM messages WHERE id=?1",
+                    [message],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(metadata["version"], 1);
+            assert_eq!(metadata["inputId"], delivery["id"]);
+            assert_eq!(metadata["sources"].as_array().unwrap().len(), 1);
+            assert_eq!(metadata["sources"][0]["id"], message.as_str());
+            assert_eq!(metadata["sources"][0]["occurredAt"], created_at);
+            let revision = metadata["sources"][0]["revision"].as_str().unwrap();
+            assert_eq!(revision.len(), 64);
+            assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let saved = &delivery["source_delivery"];
+            assert_eq!(saved["version"], 1);
+            assert_eq!(saved["input_id"], delivery["id"]);
+            assert_eq!(saved["sources"], metadata["sources"]);
+            assert_eq!(saved["status"], "observed");
+            assert!(saved["observed_at"].as_i64().unwrap() >= created_at);
+            let receipt = &saved["receipt"]["receipts"][0];
+            assert_eq!(receipt["sourceId"], message.as_str());
+            assert_eq!(receipt["revision"], metadata["sources"][0]["revision"]);
+            assert_eq!(receipt["occurredAt"], created_at);
+            assert_eq!(receipt["completion"], "not_established");
+            assert_eq!(receipt["work"], json!([]));
+        }
+        assert_eq!(
+            source_frames(&f, SOURCE_QUERY).len(),
+            if mode == "generic" { 0 } else { 2 }
+        );
+        assert_eq!(source_frames(&f, "session/new").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn source_profile_keeps_zero_one_many_and_retained_work_separate_from_completion() {
+    for (mode, count) in [
+        ("source-zero", 0),
+        ("source-one", 1),
+        ("source-many", 3),
+        ("source-work-only", 1),
+    ] {
+        let f = Fixture::new(mode, false, false);
+        f.release();
+        let message = f
+            .send("Record only the work that was actually created.")
+            .await;
+        f.idle().await;
+        let delivery = source_delivery(&f, &message);
+        assert_eq!(delivery["state"], "completed");
+        let profile = &delivery["source_delivery"];
+        assert_eq!(profile["status"], "observed", "{mode}: {profile}");
+        let receipt = &profile["receipt"]["receipts"][0];
+        assert_eq!(receipt["completion"], "not_established");
+        assert_eq!(receipt["incorporated"], false);
+        assert_eq!(receipt["workCoverage"], "retained_session_records");
+        assert_eq!(profile["receipt"]["coverage"]["missing"], "unknown");
+        let work = receipt["work"].as_array().unwrap();
+        assert_eq!(work.len(), count);
+        for (index, row) in work.iter().enumerate() {
+            assert_eq!(
+                row["id"],
+                format!("00000000-0000-4000-8000-{:012}", index + 1)
+            );
+            assert_eq!(row["ownerAgentId"], "11111111-1111-4111-8111-111111111111");
+            assert_eq!(row["revision"], index + 1);
+            assert_eq!(
+                row["state"],
+                if index == 0 { "proposed" } else { "accepted" }
+            );
+        }
+        if count == 3 {
+            assert_eq!(work[2]["inputId"], "22222222-2222-4222-8222-222222222222");
+        }
+        if mode == "source-work-only" {
+            assert!(receipt["inputId"].is_null());
+            assert_eq!(receipt["state"], "unknown");
+            assert!(receipt["response"].is_null());
+            assert_eq!(work[0]["inputId"], delivery["id"]);
+        }
+        assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn source_profile_rejects_wrong_revision_or_time_without_losing_completed_answer() {
+    for mode in [
+        "source-wrong-revision",
+        "source-wrong-time",
+        "source-query-error",
+    ] {
+        let f = Fixture::new(mode, false, false);
+        f.release();
+        let message = f
+            .send("A completed answer is not conditional on receipt availability.")
+            .await;
+        f.idle().await;
+        let delivery = source_delivery(&f, &message);
+        assert_eq!(delivery["state"], "completed", "{mode}: {delivery}");
+        let profile = &delivery["source_delivery"];
+        assert_eq!(profile["status"], "unavailable", "{mode}: {profile}");
+        assert!(
+            profile["receipt"].is_null(),
+            "Mismatched source facts leaked: {profile}"
+        );
+        let answer: (String, String) = f
+            .state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT text,status FROM messages WHERE id=?1",
+                [delivery["target_turn"].as_str().unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(answer.0, "Completed the work once.");
+        assert_eq!(answer.1, "complete");
+        assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+        assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn source_profile_inspects_lost_ordinary_reply_after_restart_without_replay() {
+    let mut f = Fixture::new("source-disconnect", false, false);
+    let message = f
+        .send("An uncertain original must never be submitted again.")
+        .await;
+    f.idle().await;
+    let before = source_delivery(&f, &message);
+    assert_eq!(before["state"], "unknown");
+    let prompt = source_frames(&f, "session/prompt").pop().unwrap();
+    let metadata = prompt["params"]["_meta"][SOURCE_META].clone();
+    let original_session = prompt["params"]["sessionId"].clone();
+    f.state = AppState::open(f.home.path().into()).unwrap();
+    f.app = server::router(f.state.clone());
+    let (status, result) = f
+        .request(
+            "POST",
+            &format!("deliveries/{}/inspect", before["id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["inspected"], true);
+    assert_eq!(result["input_id"], before["id"]);
+    let after = source_delivery(&f, &message);
+    assert_eq!(
+        after["state"], "unknown",
+        "Observation must not dismiss uncertainty"
+    );
+    assert_eq!(result["source_delivery"], after["source_delivery"]);
+    assert_eq!(after["source_delivery"]["sources"], metadata["sources"]);
+    assert_eq!(after["source_delivery"]["status"], "observed");
+    assert_eq!(
+        after["source_delivery"]["receipt"]["receipts"][0]["state"],
+        "unknown"
+    );
+    assert_eq!(
+        after["source_delivery"]["receipt"]["receipts"][0]["work"][0]["state"],
+        "proposed"
+    );
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+    assert!(source_frames(&f, "_session/acknowledge_inputs").is_empty());
+    let loads = source_frames(&f, "session/load");
+    assert_eq!(loads.len(), 1);
+    assert_eq!(loads[0]["params"]["sessionId"], original_session);
+    let queries = source_frames(&f, SOURCE_QUERY);
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0]["params"]["sessionId"], original_session);
+    assert_eq!(queries[0]["params"]["sources"], metadata["sources"]);
+}
+
+#[tokio::test]
+async fn source_profile_refuses_active_inspection_without_an_extra_connection() {
+    let f = Fixture::new("source-zero", false, false);
+    let message = f
+        .send("Stay active until explicitly released by the fixture.")
+        .await;
+    f.frames_at_least("session/prompt", 1).await;
+    let delivery = source_delivery(&f, &message);
+    let (status, _) = f
+        .request(
+            "POST",
+            &format!("deliveries/{}/inspect", delivery["id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(source_frames(&f, "initialize").len(), 1);
+    assert!(source_frames(&f, SOURCE_QUERY).is_empty());
+    f.release();
+    f.idle().await;
+    assert_eq!(source_delivery(&f, &message)["state"], "completed");
+}
+
+#[tokio::test]
+async fn source_profile_inspection_requires_auth_and_never_replaces_a_failed_original_load() {
+    let f = Fixture::new("source-one", false, false);
+    f.release();
+    let message = f.send("Keep the original completed session.").await;
+    f.idle().await;
+    let delivery = source_delivery(&f, &message);
+    let path = format!("deliveries/{}/inspect", delivery["id"].as_str().unwrap());
+    let denied = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/conversations/{}/{path}", f.room))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!denied.status().is_success());
+    let browser = "source-inspection-browser";
+    f.state.db.lock().unwrap().execute(
+        "INSERT INTO browser_sessions(hash,owner,csrf,expires_at) VALUES(?1,'owner','required-csrf',?2)",
+        rusqlite::params![agent_conversations::auth::digest(browser), agent_conversations::state::now_ms() + 60_000],
+    ).unwrap();
+    let missing_csrf = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/conversations/{}/{path}", f.room))
+                .header(
+                    "cookie",
+                    format!(
+                        "{}={browser}",
+                        agent_conversations::auth::cookie_name(&f.state)
+                    ),
+                )
+                .header("host", "example.test")
+                .header("origin", "https://example.test")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+    assert_eq!(source_frames(&f, "initialize").len(), 1);
+    assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 1);
+    let original_session = source_frames(&f, "session/prompt")[0]["params"]["sessionId"].clone();
+    std::fs::write(f.home.path().join("reject-load"), b"1").unwrap();
+    let (status, _) = f.request("POST", &path, json!({})).await;
+    assert!(!status.is_success());
+    assert_eq!(source_delivery(&f, &message)["state"], "completed");
+    let loads = source_frames(&f, "session/load");
+    assert_eq!(loads.len(), 1);
+    assert_eq!(loads[0]["params"]["sessionId"], original_session);
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+    assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 1);
+    let retained: String = f
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT session_id FROM room_agents WHERE conversation_id=?1 AND agent_id='default'",
+            [&f.room],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, original_session.as_str().unwrap());
+}
+
+#[tokio::test]
+async fn source_profile_hides_cached_work_and_refuses_changed_audience_endpoint_or_provider() {
+    for change in ["audience", "endpoint", "provider"] {
+        let mut f = Fixture::new("source-one", false, false);
+        f.release();
+        let message = f.send("Owner-private work reference.").await;
+        f.idle().await;
+        let before = source_delivery(&f, &message);
+        assert_eq!(
+            before["source_delivery"]["receipt"]["receipts"][0]["work"][0]["id"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        if change == "audience" {
+            let (status, body) = f
+                .request(
+                    "POST",
+                    "members",
+                    json!({"username":"other","share_history":true}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        } else if change == "endpoint" {
+            f.state.db.lock().unwrap().execute(
+                "UPDATE room_agents SET endpoint='a-different-endpoint' WHERE conversation_id=?1",
+                [&f.room],
+            ).unwrap();
+        } else {
+            let mut config = Config::load(f.home.path()).unwrap();
+            config.id = uuid::Uuid::new_v4().to_string();
+            config.save(f.home.path()).unwrap();
+            f.state = AppState::open(f.home.path().into()).unwrap();
+            f.app = server::router(f.state.clone());
+        }
+        let after = source_delivery(&f, &message);
+        assert!(
+            !after
+                .to_string()
+                .contains("00000000-0000-4000-8000-000000000001"),
+            "Cached work escaped its original {change}: {after}"
+        );
+        assert!(after["source_delivery"]["receipt"].is_null());
+        let (status, _) = f
+            .request(
+                "POST",
+                &format!("deliveries/{}/inspect", before["id"].as_str().unwrap()),
+                json!({}),
+            )
+            .await;
+        assert!(
+            !status.is_success(),
+            "Changed {change} must not load a replacement session"
+        );
+        assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 1);
+        assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+        assert_eq!(source_frames(&f, "session/new").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn source_profile_inspection_accepts_observe_only_room_member_without_chat_authority() {
+    let mut f = Fixture::new("source-one", false, false);
+    let observer = "source-observe-only-token";
+    {
+        let db = f.state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO tokens(hash,id,scopes,expires_at) VALUES(?1,'source-observer','[\"observe\"]',?2)",
+            rusqlite::params![agent_conversations::auth::digest(observer), agent_conversations::state::now_ms() + 60_000],
+        ).unwrap();
+        db.execute("UPDATE conversations SET shared=1 WHERE id=?1", [&f.room])
+            .unwrap();
+        db.execute(
+            "INSERT INTO room_members VALUES(?1,'token:source-observer','member',1)",
+            [&f.room],
+        )
+        .unwrap();
+    }
+    f.release();
+    let message = f
+        .send("Observe already recorded work without starting anything.")
+        .await;
+    f.idle().await;
+    let before = source_delivery(&f, &message);
+    f.token = observer.into();
+    let (status, result) = f
+        .request(
+            "POST",
+            &format!("deliveries/{}/inspect", before["id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["inspected"], true);
+    assert_eq!(result["source_delivery"]["status"], "observed");
+    assert_eq!(source_delivery(&f, &message)["state"], "completed");
+    let (chat_status, _) = f
+        .request(
+            "POST",
+            "messages",
+            json!({"text":"Must not be admitted","request_id":uuid::Uuid::new_v4().to_string()}),
+        )
+        .await;
+    assert_eq!(chat_status, StatusCode::FORBIDDEN);
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+    assert_eq!(source_frames(&f, "session/load").len(), 1);
+    assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 2);
+    assert!(source_frames(&f, "_session/acknowledge_inputs").is_empty());
+}
+
+#[tokio::test]
+async fn source_profile_loss_cannot_downgrade_a_negotiated_steering_fallback() {
+    let f = Fixture::new("source-idle-loss", false, false);
+    f.send("Original ongoing turn.").await;
+    f.frames_at_least("session/prompt", 1).await;
+    let message = f
+        .send("Keep this input's negotiated provenance through fallback.")
+        .await;
+    f.frames_at_least("_session/steering", 1).await;
+    f.release();
+    f.idle().await;
+    assert_eq!(source_frames(&f, "initialize").len(), 2);
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+    assert_eq!(source_frames(&f, "_session/steering").len(), 1);
+    let delivery = source_delivery(&f, &message);
+    assert_ne!(delivery["state"], "completed");
+    assert_eq!(delivery["source_delivery"]["input_id"], delivery["id"]);
+    let steering = source_frames(&f, "_session/steering");
+    assert_eq!(
+        delivery["source_delivery"]["sources"],
+        steering[0]["params"]["_meta"][SOURCE_META]["sources"]
+    );
+}
+
+#[tokio::test]
+async fn source_profile_preserves_metadata_through_explicit_steering_fallback() {
+    let f = Fixture::new("source-idle", false, false);
+    f.send("Original ongoing turn.").await;
+    f.frames_at_least("session/prompt", 1).await;
+    let message = f
+        .send("This steering input needs the next ordinary prompt.")
+        .await;
+    f.frames_at_least("session/prompt", 2).await;
+    f.release();
+    f.idle().await;
+    let steering = source_frames(&f, "_session/steering");
+    let prompts = source_frames(&f, "session/prompt");
+    assert_eq!(steering.len(), 1);
+    assert_eq!(prompts.len(), 2);
+    let metadata = &steering[0]["params"]["_meta"][SOURCE_META];
+    assert_eq!(metadata, &prompts[1]["params"]["_meta"][SOURCE_META]);
+    assert_eq!(
+        metadata["inputId"],
+        steering[0]["params"]["_meta"]["steering"]["inputId"]
+    );
+    assert_eq!(metadata["sources"][0]["id"], message);
+    assert_eq!(
+        steering[0]["params"]["sessionId"],
+        prompts[1]["params"]["sessionId"]
+    );
+    assert_eq!(source_delivery(&f, &message)["state"], "completed");
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert!(source_frames(&f, "session/cancel").is_empty());
+}
+
+#[tokio::test]
+async fn source_inspection_cancel_cancels_queued_input_and_reaps_before_idle() {
+    let f = Fixture::new("source-query-hold", false, false);
+    f.release();
+    let original = f.send("The completed original remains completed.").await;
+    f.idle().await;
+    let delivery = source_delivery(&f, &original);
+    assert_eq!(delivery["state"], "completed");
+    assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 1);
+    std::fs::write(f.home.path().join("hold-source-query"), b"1").unwrap();
+    let inspection = start_source_inspection(&f, delivery["id"].as_str().unwrap(), &f.token);
+    f.frames_at_least(SOURCE_QUERY, 2).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Some(frame) = f.frames().iter().find(|v| v["inspection"] == "query-held") {
+            break frame["pid"].as_u64().unwrap() as u32;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Inspection did not enter its deterministic query gate"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(pid > 0);
+    #[cfg(target_os = "linux")]
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+    let queued = f
+        .send("This newer input is queued, then cancelled with the inspection.")
+        .await;
+    assert_eq!(source_delivery(&f, &queued)["state"], "received");
+    assert_eq!(
+        f.request("POST", "cancel", json!({})).await.0,
+        StatusCode::OK
+    );
+    let (status, result) = tokio::time::timeout(Duration::from_secs(5), inspection)
+        .await
+        .expect("Cancelled inspection did not return")
+        .expect("Inspection request panicked");
+    assert!(
+        !status.is_success(),
+        "Cancelled inspection was reported successful: {result}"
+    );
+    f.idle().await;
+    // Inspect the OS at the first observed idle state, rather than polling for
+    // disposal afterward and concealing an early room-release boundary.
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "Inspection child {pid} remained after room idle"
+    );
+    assert_eq!(source_delivery(&f, &original)["state"], "completed");
+    assert_eq!(source_delivery(&f, &queued)["state"], "cancelled");
+    assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert_eq!(source_frames(&f, "session/load").len(), 1);
+    assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 2);
+    assert!(source_frames(&f, "_session/acknowledge_inputs").is_empty());
+}
+
+#[tokio::test]
+async fn source_inspection_rechecks_revoked_observe_token_after_capacity_wait() {
+    let f = Fixture::new("source-one", false, false);
+    let observer = "capacity-wait-observe-token";
+    {
+        let db = f.state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO tokens(hash,id,scopes,expires_at) VALUES(?1,'waiting-observer','[\"observe\"]',?2)",
+            rusqlite::params![agent_conversations::auth::digest(observer), agent_conversations::state::now_ms() + 60_000],
+        ).unwrap();
+        db.execute("UPDATE conversations SET shared=1 WHERE id=?1", [&f.room])
+            .unwrap();
+        db.execute(
+            "INSERT INTO room_members VALUES(?1,'token:waiting-observer','member',1)",
+            [&f.room],
+        )
+        .unwrap();
+    }
+    f.release();
+    let original = f
+        .send("A saved source whose inspection must remain authorized.")
+        .await;
+    f.idle().await;
+    let delivery = source_delivery(&f, &original);
+    assert_eq!(delivery["state"], "completed");
+    let baseline =
+        ["initialize", "session/load", SOURCE_QUERY].map(|method| source_frames(&f, method).len());
+    let permits = f
+        .state
+        .turn_gate
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap();
+    assert_eq!(f.state.turn_gate.available_permits(), 0);
+    let inspection = start_source_inspection(&f, delivery["id"].as_str().unwrap(), observer);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if f.state.running.lock().unwrap().contains_key(&f.room) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Inspection never claimed the room before waiting for capacity"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        ["initialize", "session/load", SOURCE_QUERY].map(|method| source_frames(&f, method).len()),
+        baseline
+    );
+    assert_eq!(
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM tokens WHERE id='waiting-observer'", [])
+            .unwrap(),
+        1
+    );
+    drop(permits);
+    let (status, result) = tokio::time::timeout(Duration::from_secs(5), inspection)
+        .await
+        .expect("Revoked inspection did not settle after capacity became available")
+        .expect("Inspection request panicked");
+    assert!(
+        !status.is_success(),
+        "Revoked credential retained inspection authority: {result}"
+    );
+    f.idle().await;
+    assert_eq!(
+        ["initialize", "session/load", SOURCE_QUERY].map(|method| source_frames(&f, method).len()),
+        baseline,
+        "Revoked inspection performed remote setup or query before refusing"
+    );
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+    assert_eq!(source_delivery(&f, &original)["state"], "completed");
+}

@@ -3367,3 +3367,312 @@ async fn delivery_metadata_and_recovery_keep_membership_scope_and_source_authori
         "dismissed"
     );
 }
+
+#[tokio::test]
+async fn original_submission_lookup_recovers_old_delivery_without_resubmission() {
+    let f = fixture();
+    let room = f.state.create("Original submission").unwrap();
+    let room = room["id"].as_str().unwrap();
+    let original = uuid::Uuid::new_v4().to_string();
+    // Treat the acknowledged response as lost to the caller. Recovery below
+    // uses only GET against the original request identity, never another POST.
+    let sent = request(
+        &f.app,
+        "POST",
+        &format!("/api/v1/conversations/{room}/messages"),
+        Some(&f.admin),
+        Some(json!({"request_id":original,"text":"Original submission PRIVATE-TEXT"})),
+    )
+    .await;
+    assert_eq!(sent.0, StatusCode::ACCEPTED);
+    wait_idle(&f, room).await;
+    let original_delivery: String = f
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM input_deliveries WHERE message_id=?1",
+            [&original],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // Deterministic retained history puts the real completed submission beyond
+    // the ordinary latest-256 projection without dispatching hundreds of turns.
+    {
+        let mut db = f.state.db.lock().unwrap();
+        let tx = db.transaction().unwrap();
+        for index in 0..300 {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,'user','Later retained source','complete',?3,?3,'owner')",rusqlite::params![id,room,index+1]).unwrap();
+            tx.execute("INSERT INTO input_authority(message_id) VALUES(?1)", [&id])
+                .unwrap();
+            tx.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,mode,updated_at) VALUES(?1,?2,?3,'default','direct','completed','prompt',?4)",rusqlite::params![format!("later-{index}"),id,room,index+1]).unwrap();
+        }
+        tx.execute("UPDATE input_deliveries SET attention='PRIVATE-TICKET',endpoint='PRIVATE-ENDPOINT' WHERE id=?1",[&original_delivery]).unwrap();
+        tx.commit().unwrap();
+    }
+    let frames_before = std::fs::read(f._home.path().join("frames.jsonl")).unwrap();
+    let counts_before: (i64, i64, i64) = f.state.db.lock().unwrap().query_row(
+        "SELECT (SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM input_deliveries),(SELECT COUNT(*) FROM audit)",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).unwrap();
+    let path = format!("/api/v1/conversations/{room}/deliveries");
+    let recent = request(&f.app, "GET", &path, Some(&f.admin), None).await;
+    assert_eq!(recent.0, StatusCode::OK);
+    assert_eq!(recent.1["items"].as_array().unwrap().len(), 256);
+    assert!(
+        !recent.1["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["message_id"] == original)
+    );
+
+    let lookup = format!("{path}?request_id={original}");
+    let recovered = request(&f.app, "GET", &lookup, Some(&f.admin), None).await;
+    assert_eq!(recovered.0, StatusCode::OK);
+    assert_eq!(recovered.1["request_id"], original);
+    assert_eq!(recovered.1["publication"]["state"], "saved");
+    assert_eq!(recovered.1["publication"]["message_id"], original);
+    assert_eq!(recovered.1["publication"]["conversation_id"], room);
+    assert_eq!(recovered.1["publication"]["actor"], "owner");
+    assert!(
+        recovered.1["publication"]["source_sequence"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        recovered.1["observed_at"].as_i64().unwrap()
+            >= recovered.1["publication"]["created_at"].as_i64().unwrap()
+    );
+    assert_eq!(recovered.1["coverage"], "retained_submission");
+    assert_eq!(recovered.1["items"].as_array().unwrap().len(), 1);
+    assert_eq!(recovered.1["items"][0]["id"], original_delivery);
+    assert_eq!(recovered.1["items"][0]["state"], "completed");
+    assert_eq!(recovered.1["items"][0]["message_id"], original);
+    assert!(!recovered.1.to_string().contains("PRIVATE-"));
+    let again = request(&f.app, "GET", &lookup, Some(&f.admin), None).await;
+    assert_eq!(again.1["publication"], recovered.1["publication"]);
+    assert_eq!(again.1["items"], recovered.1["items"]);
+    let counts_after: (i64, i64, i64) = f.state.db.lock().unwrap().query_row(
+        "SELECT (SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM input_deliveries),(SELECT COUNT(*) FROM audit)",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).unwrap();
+    assert_eq!(counts_after, counts_before);
+    assert_eq!(
+        std::fs::read(f._home.path().join("frames.jsonl")).unwrap(),
+        frames_before
+    );
+}
+
+#[tokio::test]
+async fn original_submission_lookup_preserves_zero_delivery_publication_and_current_access() {
+    let f = fixture();
+    let room = f
+        .state
+        .create_room("No agent recipients", "robin", &[])
+        .unwrap();
+    let room = room["id"].as_str().unwrap();
+    let original = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        user_request(
+            &f,
+            "robin",
+            "POST",
+            &format!("/api/v1/conversations/{room}/messages"),
+            Some(json!({"request_id":original,"text":"Saved for this conversation"}))
+        )
+        .await
+        .0,
+        StatusCode::ACCEPTED,
+    );
+    wait_idle(&f, room).await;
+    let path = format!("/api/v1/conversations/{room}/deliveries?request_id={original}");
+    assert_eq!(
+        request(&f.app, "GET", &path, None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&f.app, "GET", &path, Some(&f.context), None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&f.app, "GET", &path, Some(&f.admin), None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        user_request(&f, "casey", "GET", &path, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let saved = user_request(&f, "robin", "GET", &path, None).await;
+    assert_eq!(saved.0, StatusCode::OK);
+    assert_eq!(saved.1["publication"]["state"], "saved");
+    assert_eq!(saved.1["publication"]["actor"], "robin");
+    assert_eq!(saved.1["items"], json!([]));
+    assert!(!f._home.path().join("frames.jsonl").exists());
+
+    let members = format!("/api/v1/conversations/{room}/members");
+    assert_eq!(
+        user_request(
+            &f,
+            "robin",
+            "POST",
+            &members,
+            Some(json!({"username":"casey","share_history":true}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        user_request(&f, "casey", "GET", &path, None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        user_request(&f, "robin", "DELETE", &format!("{members}/casey"), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        user_request(&f, "casey", "GET", &path, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        user_request(&f, "robin", "GET", &path, None).await.1["publication"],
+        saved.1["publication"]
+    );
+
+    let other = f.state.create_room("Other room", "robin", &[]).unwrap();
+    assert_eq!(
+        user_request(
+            &f,
+            "robin",
+            "GET",
+            &format!(
+                "/api/v1/conversations/{}/deliveries?request_id={original}",
+                other["id"].as_str().unwrap()
+            ),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        user_request(
+            &f,
+            "robin",
+            "GET",
+            &format!(
+                "/api/v1/conversations/{room}/deliveries?request_id={}",
+                uuid::Uuid::new_v4()
+            ),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        user_request(
+            &f,
+            "robin",
+            "GET",
+            &format!("/api/v1/conversations/{room}/deliveries?request_id=not-a-uuid"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        user_request(
+            &f,
+            "robin",
+            "DELETE",
+            &format!("/api/v1/conversations/{room}"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        user_request(&f, "robin", "GET", &path, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn original_submission_lookup_does_not_invent_intake_or_settle_unknown() {
+    let f = fixture();
+    let room = f
+        .state
+        .create_room("Retained source", "owner", &[])
+        .unwrap();
+    let room = room["id"].as_str().unwrap();
+    let source = uuid::Uuid::new_v4().to_string();
+    let import_like = uuid::Uuid::new_v4().to_string();
+    let non_user = uuid::Uuid::new_v4().to_string();
+    {
+        let db = f.state.db.lock().unwrap();
+        for (id, role) in [
+            (&source, "user"),
+            (&import_like, "user"),
+            (&non_user, "assistant"),
+        ] {
+            db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES(?1,?2,?3,'Retained source','complete',1,1,'owner')",rusqlite::params![id,room,role]).unwrap();
+        }
+        // Source intake is distinguished from an imported/legacy user row.
+        for id in [&source, &non_user] {
+            db.execute("INSERT INTO input_authority(message_id) VALUES(?1)", [id])
+                .unwrap();
+        }
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,mode,updated_at) VALUES('uncertain-delivery',?1,?2,'default','direct','unknown','prompt',1)",rusqlite::params![source,room]).unwrap();
+    }
+    for id in [&import_like, &non_user] {
+        assert_eq!(
+            request(
+                &f.app,
+                "GET",
+                &format!("/api/v1/conversations/{room}/deliveries?request_id={id}"),
+                Some(&f.admin),
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let found = request(
+        &f.app,
+        "GET",
+        &format!("/api/v1/conversations/{room}/deliveries?request_id={source}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(found.0, StatusCode::OK);
+    assert_eq!(found.1["publication"]["state"], "saved");
+    assert_eq!(found.1["items"][0]["state"], "unknown");
+    assert_eq!(found.1["items"][0]["receipt"], Value::Null);
+    assert_eq!(
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM input_deliveries WHERE id='uncertain-delivery'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "unknown"
+    );
+    assert!(!f._home.path().join("frames.jsonl").exists());
+}

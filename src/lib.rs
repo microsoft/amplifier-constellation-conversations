@@ -43,5 +43,6 @@ pub mod permissions;
 pub mod platform;
 pub mod rooms;
 pub mod server;
+mod source_delivery;
 pub mod state;
 pub mod update_admission;

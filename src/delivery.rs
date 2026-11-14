@@ -7,8 +7,8 @@ use crate::{
 use anyhow::{Result, ensure};
 use axum::{
     Json,
-    extract::{Path, State},
-    http::HeaderMap,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -113,6 +113,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
     // No retry follows a crash after transmission. Keep the session binding and
     // source text so its owner can inspect the outcome before proceeding.
     db.execute("UPDATE input_deliveries SET state=CASE WHEN state='preparing' THEN 'notAccepted' ELSE 'unknown' END,updated_at=?1 WHERE state IN ('preparing','offering','submitted','received_remote','remoteQueued') OR (state='incorporated' AND target_turn IN (SELECT id FROM messages WHERE status='streaming'))",[now_ms()])?;
+    crate::source_delivery::migrate(db)?;
     Ok(())
 }
 
@@ -128,7 +129,7 @@ pub struct Input {
     pub participation: String,
     pub attachments: Vec<String>,
 }
-fn input(db: &Connection, id: &str) -> Result<Input> {
+pub(crate) fn input(db: &Connection, id: &str) -> Result<Input> {
     let mut i = db.query_row("SELECT d.id,d.message_id,m.seq,d.conversation_id,d.agent_id,m.actor,m.text,d.participation FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.id=?1",[id],|r|Ok(Input{id:r.get(0)?,message_id:r.get(1)?,seq:r.get(2)?,room:r.get(3)?,agent:r.get(4)?,actor:r.get(5)?,text:r.get(6)?,participation:r.get(7)?,attachments:vec![]}))?;
     i.attachments = db
         .prepare("SELECT id FROM attachments WHERE message_id=?1 ORDER BY created_at,id")?
@@ -270,20 +271,110 @@ pub fn finish(state: &AppState, turn: &str, success: bool) -> Result<()> {
     }
     Ok(())
 }
+const DELIVERY_COLUMNS: &str = "d.id,d.message_id,d.agent_id,d.state,d.mode,d.target_turn,d.session_id,d.sequence,d.updated_at,d.receipt,m.seq";
+
+fn delivery_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(
+        json!({"id":r.get::<_,String>(0)?,"message_id":r.get::<_,String>(1)?,"agent_id":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"mode":r.get::<_,Option<String>>(4)?,"target_turn":r.get::<_,Option<String>>(5)?,"session_id":r.get::<_,Option<String>>(6)?,"sequence":r.get::<_,i64>(7)?,"updated_at":r.get::<_,i64>(8)?,"source_sequence":r.get::<_,i64>(10)?,"receipt":r.get::<_,Option<String>>(9)?.and_then(|s|serde_json::from_str::<Value>(&s).ok())}),
+    )
+}
+
 pub fn list(state: &AppState, room: &str) -> Result<Vec<Value>> {
     let db = state.db.lock().unwrap();
-    let mut q=db.prepare("SELECT d.id,d.message_id,d.agent_id,d.state,d.mode,d.target_turn,d.session_id,d.sequence,d.updated_at,d.receipt,m.seq FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.conversation_id=?1 AND (d.state IN ('received','preparing','offering','submitted','received_remote','remoteQueued','promptRequired','unknown','notAccepted','ack_pending') OR d.sequence IN (SELECT sequence FROM input_deliveries WHERE conversation_id=?1 ORDER BY sequence DESC LIMIT 256)) ORDER BY d.sequence DESC")?;
-    Ok(q.query_map([room],|r|Ok(json!({"id":r.get::<_,String>(0)?,"message_id":r.get::<_,String>(1)?,"agent_id":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"mode":r.get::<_,Option<String>>(4)?,"target_turn":r.get::<_,Option<String>>(5)?,"session_id":r.get::<_,Option<String>>(6)?,"sequence":r.get::<_,i64>(7)?,"updated_at":r.get::<_,i64>(8)?,"source_sequence":r.get::<_,i64>(10)?,"receipt":r.get::<_,Option<String>>(9)?.and_then(|s|serde_json::from_str::<Value>(&s).ok())})))?.collect::<rusqlite::Result<_>>()?)
+    let mut q=db.prepare(&format!("SELECT {DELIVERY_COLUMNS} FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.conversation_id=?1 AND (d.state IN ('received','preparing','offering','submitted','received_remote','remoteQueued','promptRequired','unknown','notAccepted','ack_pending') OR d.sequence IN (SELECT sequence FROM input_deliveries WHERE conversation_id=?1 ORDER BY sequence DESC LIMIT 256)) ORDER BY d.sequence DESC"))?;
+    let mut items = q
+        .query_map([room], delivery_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(q);
+    crate::source_delivery::decorate(&db, &mut items, &state.config.provider_id())?;
+    Ok(items)
 }
+
+/// Inspect an original native submission without forwarding it again. Intake
+/// authority proves that this UUID was a saved request, not just an imported or
+/// legacy transcript message. A missing row establishes only unavailable
+/// retained evidence, never proof of non-delivery.
+fn submission(state: &AppState, room: &str, request: &str, actor: &str) -> Result<Option<Value>> {
+    let db = state.db.lock().unwrap();
+    let publication = db.query_row(
+        "SELECT m.seq,m.actor,m.created_at FROM messages m JOIN input_authority a ON a.message_id=m.id WHERE m.id=?1 AND m.conversation_id=?2 AND m.role='user' AND EXISTS(SELECT 1 FROM room_members WHERE conversation_id=?2 AND username=?3)",
+        params![request, room, actor],
+        |r| Ok(json!({"state":"saved","message_id":request,"conversation_id":room,"source_sequence":r.get::<_,i64>(0)?,"actor":r.get::<_,String>(1)?,"created_at":r.get::<_,i64>(2)?})),
+    ).optional()?;
+    let Some(publication) = publication else {
+        return Ok(None);
+    };
+    let mut q = db.prepare(&format!("SELECT {DELIVERY_COLUMNS} FROM input_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.conversation_id=?1 AND d.message_id=?2 ORDER BY d.sequence DESC"))?;
+    let mut items = q
+        .query_map(params![room, request], delivery_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(q);
+    crate::source_delivery::decorate(&db, &mut items, &state.config.provider_id())?;
+    Ok(Some(
+        json!({"request_id":request,"publication":publication,"items":items,"coverage":"retained_submission","observed_at":now_ms()}),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct DeliveryQuery {
+    request_id: Option<String>,
+}
+
 pub async fn read(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
     Path(room): Path<String>,
+    Query(query): Query<DeliveryQuery>,
 ) -> ApiResult<Json<Value>> {
     let p = auth::check(&s, &h, "observe", false)?;
     s.require_member(&room, &p)?;
+    if let Some(request) = query.request_id {
+        if uuid::Uuid::parse_str(&request).is_err() {
+            return Err(ApiError::bad("Use the original UUID request_id"));
+        }
+        return Ok(Json(
+            submission(&s, &room, &request, &p.actor)?.ok_or_else(ApiError::missing)?,
+        ));
+    }
     Ok(Json(json!({"items":list(&s,&room)?})))
 }
+
+/// Explicitly refresh an already negotiated source receipt in its original
+/// session. This is distinct from a local GET and never resolves or resends the
+/// source input. The driver owns endpoint admission, timeout and disposal.
+pub async fn inspect(
+    State(s): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path((room, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let p = auth::check(&s, &h, "observe", true)?;
+    s.require_member(&room, &p)?;
+    let input = crate::source_delivery::input(&s, &room, &id).map_err(|_| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "The original source session or receipt binding is unavailable".into(),
+        )
+    })?;
+    driver::inspect_source(s.clone(), input, p.actor.clone(), h.clone())
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::CONFLICT,
+                "Source inspection could not be confirmed. Read retained evidence before continuing."
+                    .into(),
+            )
+        })?;
+    // A long-running inspection cannot retain read authority after revocation.
+    let p = auth::check(&s, &h, "observe", true)?;
+    s.require_member(&room, &p)?;
+    let source =
+        crate::source_delivery::projection(&s.db.lock().unwrap(), &id, &s.config.provider_id())?
+            .ok_or_else(ApiError::missing)?;
+    Ok(Json(
+        json!({"inspected":true,"input_id":id,"source_delivery":source}),
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resolution {
@@ -481,6 +572,12 @@ async fn worker(state: Arc<AppState>, room: String, mut cancel: watch::Receiver<
             completed.close(&mut cancel).await;
         }
     }
+}
+
+/// Transfer the existing room slot and Stop signal after receipt inspection.
+/// Do not create a fresh channel that could restart work the user cancelled.
+pub(crate) fn after_inspection(state: Arc<AppState>, room: String, cancel: watch::Receiver<bool>) {
+    tokio::spawn(worker(state, room, cancel));
 }
 
 pub fn safe_history(state: &AppState, room: &str, agent: &str, trigger: i64) -> Result<Vec<Value>> {

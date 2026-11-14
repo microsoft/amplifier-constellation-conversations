@@ -8,6 +8,27 @@ const page=await context.newPage();const errors=[];page.on('pageerror',e=>errors
 const check=(name)=>checks.push(name);
 async function waitFor(test,message){for(let i=0;i<100;i++){if(await test())return;await page.waitForTimeout(100);}throw new Error(message);}
 async function api(path,method='GET',body,token=cfg.control){const r=await context.request.fetch(cfg.url+path,{method,headers:{Authorization:`Bearer ${token}`},data:body});const value=await r.json();assert(r.ok(),`API ${path}: ${r.status()} ${JSON.stringify(value)}`);return value;}
+// Hold one real browser PUT while another browser saves a newer user edit.
+// Direct test API reads are observations; neither path submits a message.
+async function raceDraftWrite(viewId,draft,newerEdit){
+  const path=cfg.url+`/api/v1/views/${viewId}`;
+  let release;const gate=new Promise(resolve=>{release=resolve;});let entered=false,puts=0;
+  const intercept=async route=>{
+    if(route.request().method()==='PUT'&&route.request().postDataJSON().state.draft===draft){
+      puts++;if(puts===1){entered=true;await gate;}
+    }
+    await route.continue();
+  };
+  await page.route(path,intercept);
+  const write=page.evaluate(async draft=>{
+    try{await window.agentConversationsControl.setView({draft});return {ok:true};}
+    catch(e){return {ok:false,status:e.status};}
+  },draft);
+  try{
+    await waitFor(()=>entered,'view write was not intercepted');
+    await newerEdit();release();return {result:await write,puts};
+  }finally{release();await write.catch(()=>{});await page.unroute(path,intercept);}
+}
 try{
   await page.goto(cfg.url);await page.locator('#login:not([hidden])').waitFor();assert.match(await page.locator('#login').innerText(),/Sign in to your conversations/);check('login screen');
   await page.locator('#username').fill('not-the-owner');await page.locator('#password').fill('fixture-invalid-password');await page.locator('#sign-in').click();await page.locator('#login-error:not([hidden])').waitFor();check('failed login is visible');
@@ -44,6 +65,30 @@ try{
   await api(`/api/v1/views/${view.id}`,'PUT',{expected_revision:view.revision,state:{...view.state,panel:'conversation',draft:'A remotely prepared draft'}});
   await waitFor(async()=>await page.locator('#message').inputValue()==='A remotely prepared draft','remote view draft missing');await page.locator('#chat-panel:not([hidden])').waitFor();check('remote panel and draft puppeteering');const current=await api(`/api/v1/views/${view.id}`);await api(`/api/v1/views/${view.id}`,'PUT',{expected_revision:current.revision,state:{...current.state,dialog:'rename',title_draft:'Prepared by an assistant',action:{id:crypto.randomUUID(),kind:'focus',target:'rename_title'}}});await page.locator('#rename-dialog[open]').waitFor();assert.equal(await page.locator('#title-input').inputValue(),'Prepared by an assistant');assert(await page.locator('#title-input').evaluate(n=>document.activeElement===n));await page.locator('#rename-cancel').click();await page.locator('#rename-dialog:not([open])').waitFor({state:'attached'});check('remote dialog and focus control');
   await page.locator('#message').fill('A local edit');await waitFor(async()=>(await api(`/api/v1/views/${view.id}`)).state.draft==='A local edit','local draft not exposed');check('local edits exposed through API');
+  const peer=await context.newPage();peer.on('pageerror',e=>errors.push(e.message));
+  try{
+    await peer.goto(page.url());await peer.locator('#app:not([hidden])').waitFor();
+    assert.equal(await peer.evaluate(()=>window.agentConversationsControl.view().id),view.id);
+    const beforeRace=(await api(`/api/v1/conversations/${selected}/messages?limit=100`)).items;
+    const stale=await raceDraftWrite(view.id,'Older prepared control draft',async()=>{
+      await peer.locator('#message').fill('Newer human draft');
+      await waitFor(async()=>(await api(`/api/v1/views/${view.id}`)).state.draft==='Newer human draft','newer human draft did not save');
+    });
+    assert.deepEqual(stale.result,{ok:false,status:409});assert.equal(stale.puts,1);
+    assert.equal((await api(`/api/v1/views/${view.id}`)).state.draft,'Newer human draft');
+    await waitFor(async()=>await page.locator('#message').inputValue()==='Newer human draft','newer human draft was not retained');
+    check('stale programmatic draft cannot overwrite a newer human edit');
+    const disjoint=await raceDraftWrite(view.id,'Prepared draft with independent filter',async()=>{
+      await peer.locator('#search').fill('Working together');
+      await waitFor(async()=>(await api(`/api/v1/views/${view.id}`)).state.search==='Working together','independent human filter did not save');
+    });
+    assert.deepEqual(disjoint.result,{ok:true});assert.equal(disjoint.puts,2);
+    const afterDisjoint=await api(`/api/v1/views/${view.id}`);
+    assert.equal(afterDisjoint.state.search,'Working together');assert.equal(afterDisjoint.state.draft,'Prepared draft with independent filter');
+    assert.deepEqual((await api(`/api/v1/conversations/${selected}/messages?limit=100`)).items,beforeRace);
+    check('disjoint view changes rebase once without implicit message delivery');
+    await page.evaluate(()=>window.agentConversationsControl.setView({search:''}));
+  }finally{await peer.close();}
   await page.screenshot({path:cfg.screenshot,fullPage:true});
   const imported=await api('/api/v1/imports/toad/native-one','PUT',{label:'A native Toad conversation',surface:'toad',messages:[{id:'one',role:'user',text:'From an independent ACP experience',created_at:Date.now()},{id:'two',role:'assistant',text:'The same individual, another surface. [Source](https://example.org/source) <img src=x onerror=alert(1)>',created_at:Date.now()+1}]},cfg.import_token);
   await waitFor(async()=>(await page.locator('#conversation-list').innerText()).includes('A native Toad conversation'),'import did not appear');await page.getByRole('button',{name:/A native Toad conversation/}).click();await waitFor(async()=>(await page.locator('#messages').innerText()).includes('The same individual'),'import not readable');assert(await page.locator('#composer').isHidden());assert.match(await page.locator('#conversation-eyebrow').innerText(),/TOAD.*READ ONLY/);check('read-only native-client transcript with provenance');assert.equal(await page.locator('#messages a').getAttribute('href'),'https://example.org/source');assert.equal(await page.locator('#messages img').count(),0);check('safe clickable sources without raw HTML');
