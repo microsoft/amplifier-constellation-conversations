@@ -81,20 +81,43 @@ async function refresh(){
   if($('app').hidden)return;if(ui.refreshing){ui.refreshAgain=true;return;}ui.refreshing=true;
   try{
     const observed=ui.view,observedEpoch=ui.viewEpoch;
-    const [list,remote,agents,people]=await Promise.all([api('/api/v1/conversations?search='+encodeURIComponent(ui.view.state.search||'')),api(`/api/v1/views/${viewId}`),api('/api/v1/agents'),api('/api/v1/people')]);ui.items=list.items;ui.agents=agents.items;ui.people=people.items;
+    const [list,remote,agents,people]=await Promise.all([api('/api/v1/conversations?search='+encodeURIComponent(ui.view.state.search||'')),api(`/api/v1/views/${viewId}`),api('/api/v1/agents'),api('/api/v1/people')]);
+    if(!refreshCurrent(observedEpoch))return;
+    ui.items=list.items;ui.agents=agents.items;ui.people=people.items;
     const reset=remote.revision<observed.revision&&ui.view===observed;
     if(reset||(remote.revision>ui.view.revision&&!ui.draftTimer&&!ui.searchTimer)){receiveView(remote,observed,observedEpoch);applyView();}
-    const id=ui.view.state.selected_conversation_id;
-    if(id){try{ui.conversation=await api(`/api/v1/conversations/${encodeURIComponent(id)}`);}catch(e){if(e.status===404){if(clearUnavailableConversation(id)){try{await saveView({selected_conversation_id:null});}catch(saved){if(saved.status!==409)throw saved;}ui.refreshAgain=true;}}else throw e;}}else ui.conversation=null;
+    const id=ui.view.state.selected_conversation_id,epoch=ui.viewEpoch;
+    if(id){
+      try{
+        const conversation=await api(`/api/v1/conversations/${encodeURIComponent(id)}`);
+        if(!refreshCurrent(epoch,id))return;
+        ui.conversation=conversation;
+      }catch(e){
+        if(e.status!==404)throw e;
+        if(!refreshCurrent(epoch,id))return;
+        if(clearUnavailableConversation(id)){
+          try{await saveView({selected_conversation_id:null});}catch(saved){if(saved.status!==409)throw saved;}
+          ui.refreshAgain=true;
+        }
+        return;
+      }
+    }else ui.conversation=null;
     if(ui.conversation){
       const v=ui.view.state;const params=new URLSearchParams({limit:'100',search:v.history_search||''});if(v.history_before)params.set('before',v.history_before);
-      const history=await api(`/api/v1/conversations/${id}/messages?${params}`);ui.conversation.messages=history.items;ui.historyCursor=history.next_cursor;
-      ui.files=(await api(`/api/v1/conversations/${id}/attachments`)).items;
+      const history=await api(`/api/v1/conversations/${id}/messages?${params}`);
+      if(!refreshCurrent(epoch,id))return;
+      const files=await api(`/api/v1/conversations/${id}/attachments`);
+      if(!refreshCurrent(epoch,id))return;
+      ui.conversation.messages=history.items;ui.historyCursor=history.next_cursor;ui.files=files.items;
     }else{ui.files=[];ui.historyCursor=null;}
     renderList();renderChat();renderParticipants();void refreshLinkedHuddles();if(ui.view.state.panel==='activity')await renderActivity();
   }finally{ui.refreshing=false;if(ui.refreshAgain){ui.refreshAgain=false;queueRefresh();}}
 }
 function viewOrigin(patch){return {...structuredClone(ui.view),writes:Object.keys(patch),sequence:++ui.viewIntentSequence,epoch:ui.viewEpoch};}
+function refreshCurrent(epoch,id){
+  if(epoch===ui.viewEpoch&&(id===undefined||id===ui.view.state.selected_conversation_id))return true;
+  ui.refreshAgain=true;return false;
+}
 function invalidateViewIntents(){
   ui.viewEpoch++;
   for(const timer of [...ui.viewEdits.keys()])cancelViewEdit(timer);
@@ -104,7 +127,7 @@ function receiveView(remote,observed,epoch=ui.viewEpoch){
   const reset=remote.revision<observed.revision;
   // A response to an older GET cannot replace a snapshot adopted in the meantime.
   if((reset&&ui.view!==observed)||(!reset&&remote.revision<ui.view.revision))return false;
-  if(reset)invalidateViewIntents();
+  if(reset){invalidateViewIntents();ui.items=ui.items.filter(c=>c.id!==observed.state.selected_conversation_id);}
   ui.view=remote;
   if(reset)clearConversation();
   return true;
@@ -343,7 +366,7 @@ $('agent-registry').addEventListener('toggle',()=>{if(ui.view&&$('agent-registry
 $('connection-draft').oninput=()=>queueViewEdit('roomTimer',400,{connection_draft:$('connection-draft').value});
 $('save-connection').onclick=async()=>{try{const v=JSON.parse($('connection-draft').value);const {id,...config}=v;config.env={};config.mcp_servers=[];config.timeout_seconds??=900;config.args??=[];await api('/api/v1/agents','POST',{id,config});$('connection-save-result').textContent='Connection saved. Add this agent to a conversation when you are ready.';await saveView({connection_draft:''});await refresh();}catch(e){$('connection-save-result').textContent=e.message;}};
 const activityLabels={'input.received':'Message received','input.acknowledged':'Delivery reviewed','conversation.created':'Conversation started','conversation.removed':'Web conversation removed','turn.started':'Agent started working','turn.completed':'Reply completed','turn.interrupted':'Turn interrupted','tool.progress':'Tool progress','permission.declined':'Action needed approval','permission.requested':'Action awaiting approval','permission.decided':'Approval reviewed','context.read':'Context retrieved','session.rebuilt':'Working context rebuilt','turn.passed':'Agent chose to listen','room.member_added':'Person joined','room.member_removed':'Person removed','room.agent_added':'Agent joined','room.agent_removed':'Agent removed','agent.configured':'Agent connection saved','configuration.saved':'Connection settings saved','auth.signed_in':'Signed in','auth.signed_out':'Signed out','auth.failed':'Unsuccessful sign-in','conversation.imported':'External conversation updated'};
-async function renderActivity(){const {items}=await api('/api/v1/activity');$('activity-list').replaceChildren(...items.map(a=>{const row=el('article','activity-item');row.append(el('time',null,shortTime(a.at)));const body=el('div');body.append(el('strong',null,activityLabels[a.kind]||a.kind));const c=ui.items.find(c=>c.id===a.conversation_id);const detail=a.data.title||a.data.reason||a.data.note||(a.data.operation?`Requested ${a.data.operation} context`:'');if(c){const p=el('p');const link=el('button',null,c.title);link.onclick=()=>selectConversation(c.id).catch(e=>error(e.message));p.append(link);body.append(p);}if(detail)body.append(el('p',null,detail));row.append(body);return row;}));if(!items.length)$('activity-list').append(el('p','list-empty','Agent activity will appear when you start a conversation.'));}
+async function renderActivity(){const epoch=ui.viewEpoch;const {items}=await api('/api/v1/activity');if(epoch!==ui.viewEpoch)return;$('activity-list').replaceChildren(...items.map(a=>{const row=el('article','activity-item');row.append(el('time',null,shortTime(a.at)));const body=el('div');body.append(el('strong',null,activityLabels[a.kind]||a.kind));const c=ui.items.find(c=>c.id===a.conversation_id);const detail=a.data.title||a.data.reason||a.data.note||(a.data.operation?`Requested ${a.data.operation} context`:'');if(c){const p=el('p');const link=el('button',null,c.title);link.onclick=()=>selectConversation(c.id).catch(e=>error(e.message));p.append(link);body.append(p);}if(detail)body.append(el('p',null,detail));row.append(body);return row;}));if(!items.length)$('activity-list').append(el('p','list-empty','Agent activity will appear when you start a conversation.'));}
 $('login-form').addEventListener('submit',async e=>{e.preventDefault();$('sign-in').disabled=true;$('login-error').hidden=true;try{ui.session=await api('/auth/login','POST',{username:$('username').value,password:$('password').value});$('password').value='';await openApp();}catch(e){$('login-error').textContent=e.message;$('login-error').hidden=false;}finally{$('sign-in').disabled=false;}});
 $('sign-out').onclick=async()=>{try{await api('/auth/logout','POST',{});ui.session=null;showLogin();}catch(e){error(e.message);}};
 $('new-conversation').onclick=()=>newConversation().catch(e=>error(e.message));

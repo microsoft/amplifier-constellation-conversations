@@ -226,3 +226,45 @@ test('an older in-flight GET cannot revive a deleted view after reset',()=>{
   assert.equal(f.ui.view.revision,0);assert.equal(f.ui.view.state.selected_conversation_id,null);
   assert.equal(f.ui.view.state.draft,'');assert.equal(f.cleared.length,1);
 });
+
+// Exercise the real refresh coroutine, holding actual read boundaries rather
+// than testing only the generation predicate in isolation.
+const refreshSource=source.slice(source.indexOf('async function refresh(){'),source.indexOf('\nfunction viewOrigin('));
+for(const phase of ['list','conversation','history','attachments']){
+  test(`reset discards an already started ${phase} response before assigning or rendering`,async()=>{
+    const ui={items:[{id:'room-a',title:'Original room'}],agents:[],people:[],conversation:{id:'room-a',messages:[{text:'old room text'}]},files:[{id:'old-file'}],view:initial(),viewEpoch:0,viewIntents:new Set(),viewEdits:new Map(),refreshing:false,refreshAgain:false,viewIntentSequence:0,savingViews:0,saveChain:Promise.resolve()};
+    const entered=deferred(),release=deferred(),events=[],calls=[];
+    const paths={list:'/api/v1/conversations?search=',conversation:'/api/v1/conversations/room-a',history:'/api/v1/conversations/room-a/messages?limit=100&search=',attachments:'/api/v1/conversations/room-a/attachments'};
+    const responses={
+      [paths.list]:{items:[{id:'delayed-list',title:'Delayed private title'}]},
+      '/api/v1/views/view-a':initial(),'/api/v1/agents':{items:[]},'/api/v1/people':{items:[]},
+      [paths.conversation]:{id:'room-a',messages:[{text:'delayed room body'}]},
+      [paths.history]:{items:[{text:'delayed history'}],next_cursor:null},[paths.attachments]:{items:[{id:'delayed-file'}]}
+    };
+    const api=async(path,method='GET')=>{
+      assert.equal(method,'GET','refresh must not deliver input');calls.push(path);
+      assert(Object.hasOwn(responses,path),path);
+      if(path===paths[phase]){entered.resolve();await release.promise;}
+      return clone(responses[path]);
+    };
+    const clearConversation=()=>{ui.conversation=null;ui.files=[];ui.historyCursor=null;events.push('clear');};
+    const render=()=>events.push('render'),queue=()=>events.push('queue');
+    const control=new Function('ui','api','viewId','$','applyView','structuredClone','clearTimeout','clearConversation','renderList','renderChat','renderParticipants','refreshLinkedHuddles','renderActivity','queueRefresh',`${helpers}\n${refreshSource}\nreturn {refresh,receiveView};`)(ui,api,'view-a',()=>({hidden:false}),render,structuredClone,()=>{},clearConversation,render,render,render,render,render,queue);
+    const running=control.refresh();await entered.promise;
+    control.receiveView({id:'view-a',revision:0,state:{selected_conversation_id:null,panel:'conversation',draft:'',search:''}},ui.view);
+    const keptItems=clone(ui.items),startedCalls=[...calls];release.resolve();await running;
+    assert.equal(ui.conversation,null);assert.deepEqual(ui.files,[]);
+    assert.deepEqual(ui.items,keptItems,'an older list cannot replace the reset cache');
+    assert.deepEqual(events,['clear','queue'],'no stale render or linked-room lookup follows the reset');
+    assert.deepEqual(calls,startedCalls,'no later room read follows stale completion');
+  });
+}
+
+test('an in-flight activity read cannot refill cleared details after reset',async()=>{
+  const start=source.indexOf('async function renderActivity(){');
+  const activitySource=source.slice(start,source.indexOf('\n',start));
+  const response=deferred(),ui={viewEpoch:0},rendered=[];
+  const activity=new Function('ui','api','$','el',`${activitySource}\nreturn renderActivity;`)(ui,async path=>{assert.equal(path,'/api/v1/activity');return response.promise;},()=>({replaceChildren:()=>rendered.push('replace'),append:()=>rendered.push('append')}),()=>({}));
+  const running=activity();ui.viewEpoch++;response.resolve({items:[]});await running;
+  assert.deepEqual(rendered,[]);
+});
