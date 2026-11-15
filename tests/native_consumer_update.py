@@ -220,6 +220,41 @@ def public_observation(value):
     return result
 
 
+WORKER_OBSERVATION_STAGES = frozenset({
+    "saved_launch", "manager_observation", "worker_identity", "worker_liveness", "worker_binding",
+    "previous_liveness", "previous_binding", "runtime_identity", "runtime_binding",
+})
+WORKER_OBSERVATION_HISTORY = 8
+
+
+def _worker_observation_summary(value):
+    """Fixed diagnostic fields only; never retain raw identities, paths or errors."""
+    if not isinstance(value, dict):
+        return {"status": "unavailable"}
+    result = {}
+    choices = {
+        "status": {"observed", "unavailable", "not_dispatched", "absent"},
+        "code": {"controller_observation_timeout", "native_controller_observation_or_dispatch_failed"},
+        "diagnostic_stage": WORKER_OBSERVATION_STAGES,
+        "actual_worker_manager_binding": {"same_process", "descendant_of_task_engine"},
+        "application_manager_binding": {"same_process", "descendant_of_task_engine"},
+    }
+    for key, allowed in choices.items():
+        if key in value:
+            item = value[key]
+            result[key] = item if isinstance(item, str) and item in allowed else "unrecognized"
+    for key in ["profile_matches", "active", "transitioning", "actual_worker_alive", "previous_process_alive"]:
+        if key in value:
+            result[key] = value[key] if type(value[key]) is bool else None
+    processes = value.get("processes")
+    if isinstance(processes, list):
+        result["process_count"] = len(processes)
+        result["processes_sha256"] = fingerprint(processes)
+    if isinstance(value.get("actual_worker_identity"), dict):
+        result["actual_worker_identity_sha256"] = fingerprint(value["actual_worker_identity"])
+    return result
+
+
 class NativeObserver:
     def __init__(self, install, controller: Path, *, managed: bool, retain_application_identity=False):
         require(controller.is_absolute() and controller.is_file() and os.access(controller, os.X_OK),
@@ -289,21 +324,82 @@ class NativeObserver:
         self.old_exit = False
         self.worker_observation = None
         self.observations = []
+        self.worker_diagnostics = None
+
+    def _record_worker_sample(self, started_ns, trace, *, preserve_error=False):
+        try:
+            now = time.monotonic_ns()
+            row = {"outcome": trace["outcome"], "sample_stage": trace["stage"],
+                   "elapsed_seconds": max(0, now-started_ns)/1_000_000_000,
+                   "worker": _worker_observation_summary(trace["worker"])}
+            state = getattr(self, "worker_diagnostics", None)
+            if state is None:
+                state = {"started_ns": started_ns, "samples": 0, "counts": {}, "history": [], "omitted_samples": 0}
+                self.worker_diagnostics = state
+            state["samples"] += 1
+            state["counts"][trace["outcome"]] = state["counts"].get(trace["outcome"], 0)+1
+            state["elapsed_seconds"] = max(0, now-state["started_ns"])/1_000_000_000
+            state["history"].append(row)
+            if len(state["history"]) > WORKER_OBSERVATION_HISTORY:
+                state["history"].pop(0)
+                state["omitted_samples"] += 1
+        except Exception:
+            pass  # Diagnostic failure neither supplies proof nor changes a sample.
+        except BaseException:
+            if not preserve_error:
+                raise
+
+    def _save_worker_failure(self, started_ns):
+        # Called only while an original settlement exception is pending. Even a
+        # secondary interruption here must not replace that original exception.
+        try:
+            state = getattr(self, "worker_diagnostics", None)
+            row = {"schema": 1, "status": "failed_or_interrupted", "proof_complete": False,
+                   "settlement_timeout_seconds": 40, "controller_timeout_seconds": 45,
+                   "settlement_elapsed_seconds": max(0, time.monotonic_ns()-started_ns)/1_000_000_000,
+                   "samples": 0, "counts": {}, "history": [], "omitted_samples": 0}
+            if state is not None:
+                row.update({key: state[key] for key in ["samples", "counts", "history", "omitted_samples", "elapsed_seconds"]})
+            for key in ["operation", "attempt", "transaction"]:
+                value = getattr(self, key, None)
+                if value is not None:
+                    row[key+"_sha256"] = fingerprint(value)
+            # The histories contain only fixed fields/digests and at most eight
+            # samples. Freeze the in-memory view before its failure checkpoint.
+            self.install.result["worker_observation_failure"] = json.loads(json.dumps(row))
+            self.install.checkpoint()
+        except BaseException:
+            pass
 
     def sample(self):
+        started_ns = time.monotonic_ns()
+        trace = {"outcome": "sample_error", "stage": "ledger", "worker": None}
+        try:
+            result = self._sample(trace)
+        except BaseException:
+            self._record_worker_sample(started_ns, trace, preserve_error=True)
+            raise
+        self._record_worker_sample(started_ns, trace)
+        return result
+
+    def _sample(self, trace):
         ledger = self.install.home / "native-browser-update/control.json"
         try:
             if not ledger.is_file():
+                trace["outcome"] = "ledger_absent"
                 return False
             value = read_json(ledger)
         except (PermissionError, FileNotFoundError):
             # Publication can overlap this read-only observation. Unavailable
             # evidence advances no proof; the caller retains its existing clock.
             # A persistent refusal remains incomplete, never a mutation retry.
+            trace["outcome"] = "ledger_unavailable"
             return False
         operation_id = value.get("current_operation")
         if not operation_id or operation_id == self.previous_operation:
+            trace["outcome"] = "no_new_operation"
             return False
+        trace["stage"] = "operation_binding"
         operation = value["operations"][operation_id]
         attempt = operation["attempt"]["id"]
         transaction = operation["transaction_id"]
@@ -311,12 +407,18 @@ class NativeObserver:
             self.operation, self.attempt, self.transaction = operation_id, attempt, transaction
         require((operation_id, attempt, transaction) == (self.operation, self.attempt, self.transaction),
                 "Operation or launch attempt changed without a new controller mutation")
+        trace["stage"] = "controller"
         worker = self.call({"kind": "worker", "operation": operation_id, "attempt": attempt}, previous=self.old_identity)
+        trace["worker"] = worker
         if worker.get("status") != "observed":
+            trace["outcome"] = "controller_unavailable"
             return False
+        trace["stage"] = "profile"
         if worker.get("profile_matches") is not True:
+            trace["outcome"] = "profile_mismatch"
             require(worker.get("active") is not True, "Active worker registration does not match its saved fixed profile")
             return False  # Marker publication legitimately precedes registration.
+        trace["stage"] = "generation"
         self.worker_observation = worker
         identity = worker.get("actual_worker_identity")
         if isinstance(identity, dict):
@@ -324,6 +426,7 @@ class NativeObserver:
             if self.actual_worker_generation is None:
                 self.actual_worker_generation = generation
             require(generation == self.actual_worker_generation, "Actual worker generation changed for one fixed attempt")
+        trace["stage"] = "survival"
         old_gone = worker.get("previous_process_alive") is False
         self.old_exit = self.old_exit or old_gone
         if (worker.get("active") is True and worker.get("transitioning") is False
@@ -335,13 +438,23 @@ class NativeObserver:
                 self.worker_generation = generation
             require(generation == self.worker_generation, "A second worker process generation appeared for the same attempt")
             self.survived_old_exit = self.survived_old_exit or old_gone
+        trace["stage"] = "projection"
         public = public_observation(worker)
         if not self.observations or public != self.observations[-1]:
             self.observations.append(public)
             require(len(self.observations) <= 64, "Too many worker state changes for one fixed attempt")
+        trace["outcome"] = "observed"
         return True
 
     def settled(self, operation, running):
+        started_ns = time.monotonic_ns()
+        try:
+            return self._settled(operation, running)
+        except BaseException:
+            self._save_worker_failure(started_ns)
+            raise
+
+    def _settled(self, operation, running):
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             sampled = self.sample()
