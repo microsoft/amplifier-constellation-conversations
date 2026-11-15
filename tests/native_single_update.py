@@ -15,7 +15,7 @@ import http.cookiejar
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import queue
 import re
 import select
@@ -518,15 +518,28 @@ def verify_exact_children(install):
     require([row["phase"] for row in phases] == ["applied", "rolled_back"], "Missing final native checkpoints")
     expected = {row["operation_id"] for row in phases}
     require(len(expected) == 2, "Apply and rollback reused a native operation")
+    observed = {"status": "observing", "expected_operation_ids": sorted(expected)}
+    install.result["exact_children"] = observed
+    install.checkpoint()
     saved = shared.retained_operations(install.home)
     operation_ids = set(saved["ledger"]["operations"])
-    operation_ids.update(Path(name).stem for name in saved["immutable_history"] if name.startswith("operations/"))
+    # Evidence keys retain the producing host's separators; parsing does not
+    # rewrite those keys or their bound fingerprint.
+    archived = (PureWindowsPath(name) for name in saved["immutable_history"])
+    operation_ids.update(path.stem for path in archived if path.parts[:-1] == ("operations",))
+    observed.update(observed_operation_ids=sorted(operation_ids)[:64],
+                    observed_operation_count=len(operation_ids), operation_ids_truncated=len(operation_ids) > 64,
+                    retained_operation_evidence_sha256=fingerprint(saved))
+    install.checkpoint()
     require(operation_ids == expected, "An extra or missing native child was retained")
     workers = [key for key in shared.launch_keys(install.home) if key[0] == "worker"]
+    observed.update(observed_worker_count=len(workers), worker_attempts_truncated=len(workers) > 64,
+                    observed_worker_attempts=[{"operation_id": key[1], "attempt_id": key[2]}
+                                              for key in sorted(workers)[:64]])
+    install.checkpoint()
     require(len(workers) == 2 and {key[1] for key in workers} == expected
             and all(key[1] == key[2] for key in workers), "A native child has extra or changed worker attempts")
-    install.result["exact_children"] = {"operation_ids": sorted(expected), "worker_attempts": 2,
-        "retained_operation_evidence_sha256": fingerprint(saved), "mutation_retries": 0}
+    observed.update(status="passed", operation_ids=sorted(expected), worker_attempts=2, mutation_retries=0)
     install.checkpoint()
 
 

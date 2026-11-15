@@ -224,6 +224,103 @@ class AssistantClosureTests(unittest.TestCase):
             connection.close.assert_called_once()
 
 
+class ExactChildrenTests(unittest.TestCase):
+    APPLY = "11111111-1111-4111-8111-111111111111"
+    ROLLBACK = "22222222-2222-4222-8222-222222222222"
+    OTHER = "33333333-3333-4333-8333-333333333333"
+
+    def fixture(self, separator="\\"):
+        install = SimpleNamespace(home=Path("unused-disposable-home"), checkpoint=Mock(), result={
+            "phase_snapshots": [{"phase": "applied", "operation_id": self.APPLY},
+                                {"phase": "rolled_back", "operation_id": self.ROLLBACK}]})
+        saved = {"ledger": {"operations": {self.ROLLBACK: {"outcome": "rolled_back"}}},
+                 "immutable_history": {f"operations{separator}{self.APPLY}.json": "a" * 64,
+                                       f"requests{separator}{self.OTHER}.json": "b" * 64}}
+        workers = {("worker", self.APPLY, self.APPLY), ("worker", self.ROLLBACK, self.ROLLBACK),
+                   ("replacement", "unchanged-replacement-transaction")}
+        return install, saved, workers
+
+    def verify(self, install, saved, workers):
+        with patch.object(controller.shared, "retained_operations", return_value=saved), \
+             patch.object(controller.shared, "launch_keys", return_value=workers):
+            controller.verify_exact_children(install)
+
+    def test_windows_archived_apply_and_current_rollback_keep_exactly_two_workers(self):
+        install, saved, workers = self.fixture()
+        self.verify(install, saved, workers)
+        self.assertEqual(install.result["exact_children"]["operation_ids"], [self.APPLY, self.ROLLBACK])
+        self.assertEqual(install.result["exact_children"]["worker_attempts"], 2)
+
+    def test_both_history_separators_preserve_original_keys_and_evidence_hash(self):
+        for separator in ["/", "\\"]:
+            with self.subTest(separator=separator):
+                install, saved, workers = self.fixture(separator)
+                original = json.dumps(saved, sort_keys=True)
+                expected_hash = controller.fingerprint(saved)
+                self.verify(install, saved, workers)
+                observed = install.result["exact_children"]
+                self.assertEqual(observed["status"], "passed")
+                self.assertEqual(observed["observed_operation_ids"], [self.APPLY, self.ROLLBACK])
+                self.assertEqual(observed["retained_operation_evidence_sha256"], expected_hash)
+                self.assertEqual(json.dumps(saved, sort_keys=True), original)
+                self.assertIn(f"operations{separator}{self.APPLY}.json", saved["immutable_history"])
+
+    def test_missing_or_extra_child_refuses_with_compared_ids_retained(self):
+        for extra in [False, True]:
+            with self.subTest(extra=extra):
+                install, saved, workers = self.fixture()
+                if extra:
+                    saved["immutable_history"][f"operations\\{self.OTHER}.json"] = "c" * 64
+                else:
+                    del saved["immutable_history"][f"operations\\{self.APPLY}.json"]
+                with self.assertRaisesRegex(AssertionError, "extra or missing native child"):
+                    self.verify(install, saved, workers)
+                observed = install.result["exact_children"]
+                self.assertEqual(observed["status"], "observing")
+                self.assertEqual(observed["expected_operation_ids"], [self.APPLY, self.ROLLBACK])
+                self.assertEqual(observed["observed_operation_ids"],
+                                 [self.APPLY, self.ROLLBACK, self.OTHER] if extra else [self.ROLLBACK])
+                self.assertNotIn("worker_attempts", observed)
+                install.checkpoint.assert_called()
+
+    def test_missing_extra_or_changed_worker_attempt_still_refuses(self):
+        for case in ["missing", "extra", "changed"]:
+            with self.subTest(case=case):
+                install, saved, workers = self.fixture()
+                if case in {"missing", "changed"}:
+                    workers.remove(("worker", self.APPLY, self.APPLY))
+                if case in {"extra", "changed"}:
+                    workers.add(("worker", self.APPLY, self.OTHER))
+                with self.assertRaisesRegex(AssertionError, "extra or changed worker attempts"):
+                    self.verify(install, saved, workers)
+                observed = install.result["exact_children"]
+                self.assertEqual(observed["status"], "observing")
+                self.assertEqual(observed["observed_worker_count"],
+                                 {"missing": 1, "extra": 3, "changed": 2}[case])
+                self.assertNotIn("worker_attempts", observed)
+
+    def test_diagnostic_projection_is_bounded_without_truncating_the_actual_assertion(self):
+        for category in ["operations", "workers"]:
+            with self.subTest(category=category):
+                install, saved, workers = self.fixture()
+                for index in range(70):
+                    identity = f"44444444-4444-4444-8444-{index:012d}"
+                    if category == "operations":
+                        saved["ledger"]["operations"][identity] = {}
+                    else:
+                        workers.add(("worker", self.APPLY, identity))
+                with self.assertRaises(AssertionError):
+                    self.verify(install, saved, workers)
+                observed = install.result["exact_children"]
+                self.assertEqual(observed["status"], "observing")
+                prefix = "operation" if category == "operations" else "worker"
+                projection = "observed_operation_ids" if category == "operations" else "observed_worker_attempts"
+                truncated = "operation_ids_truncated" if category == "operations" else "worker_attempts_truncated"
+                self.assertEqual(observed[f"observed_{prefix}_count"], 72)
+                self.assertEqual(len(observed[projection]), 64)
+                self.assertTrue(observed[truncated])
+
+
 class ArtifactPreflightTests(unittest.TestCase):
     def test_fresh_exclusive_directory_is_bound_existing_captures_are_never_reused(self):
         with tempfile.TemporaryDirectory() as directory:
