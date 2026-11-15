@@ -202,7 +202,7 @@ async fn presence(
     camera: bool,
     consent: bool,
 ) -> (StatusCode, Value) {
-    browser_request(f,"POST",&format!("/api/v1/companion/calls/{}/surface/presence",c.id),Some(json!({"browser_id":browser,"camera_enabled":camera,"capture_consent":consent,"user_speaking":false,"agent_speaking":null})),"browser",true).await
+    browser_request(f,"POST",&format!("/api/v1/companion/calls/{}/surface/presence",c.id),Some(json!({"browser_id":browser,"view_revision":0,"camera_enabled":camera,"capture_consent":consent,"user_speaking":false,"agent_speaking":null})),"browser",true).await
 }
 async fn ack(
     f: &Fixture,
@@ -789,7 +789,7 @@ async fn owner_browser_session_csrf_heartbeat_and_hangup_bound_all_controls() {
     let browser = uuid::Uuid::new_v4().to_string();
     let operation = uuid::Uuid::new_v4().to_string();
     let path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
-    let body = json!({"browser_id":browser,"camera_enabled":true,"capture_consent":true});
+    let body = json!({"browser_id":browser,"view_revision":0,"camera_enabled":true,"capture_consent":true});
     assert_eq!(
         browser_request(&f, "POST", &path, Some(body.clone()), "browser", false)
             .await
@@ -900,7 +900,7 @@ async fn view_commands_are_finite_owned_and_recoverable_without_reexecution() {
     )
     .await;
     let operation = uuid::Uuid::new_v4().to_string();
-    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","action":"focus_card","card_id":shown["card_id"]});
+    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"focus_card","card_id":shown["card_id"]});
     let (status, receipt) =
         request(&f, &c, "POST", "view", Some(body.clone()), &c.token, false).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
@@ -943,9 +943,9 @@ async fn view_commands_are_finite_owned_and_recoverable_without_reexecution() {
     );
     for extra in [
         json!({"action":"open_url","url":"https://example.test"}),
-        json!({"action":"scroll_down","script":"alert(1)"}),
-        json!({"action":"focus_card","card_id":"999999"}),
-        json!({"action":"scroll_down","card_id":shown["card_id"]}),
+        json!({"expected_browser_id":browser,"expected_revision":0,"action":"scroll_down","script":"alert(1)"}),
+        json!({"expected_browser_id":browser,"expected_revision":0,"action":"focus_card","card_id":"999999"}),
+        json!({"expected_browser_id":browser,"expected_revision":0,"action":"scroll_down","card_id":shown["card_id"]}),
     ] {
         let mut body = json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation"});
         body.as_object_mut()
@@ -1003,7 +1003,7 @@ async fn exact_native_capture_permission_explains_browser_consent_without_author
         agent_conversations::permissions::cancelled()
     );
     assert!(check("companion_feedback",json!({"operation_id":operation,"delegation_id":"fixture-delegation","text":"Feedback","external_channel":"Slack"})).is_none());
-    assert_eq!(check("companion_view",json!({"operation_id":operation,"delegation_id":"fixture-delegation","action":"scroll_down"})).unwrap()["outcome"]["optionId"],"once");
+    assert_eq!(check("companion_view",json!({"operation_id":operation,"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"scroll_down"})).unwrap()["outcome"]["optionId"],"once");
     presence(&f, &c, &browser, true, true).await;
     assert!(check("companion_capture", capture.clone()).is_some());
     assert_eq!(
@@ -1119,12 +1119,12 @@ async fn surface_queue_is_bounded_and_focus_cannot_cross_calls() {
         false,
     )
     .await;
-    let (_, missing) = request(&f, &c, "POST", "view", Some(json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation","action":"focus_card","card_id":shown["card_id"]})), &c.token, false).await;
+    let (_, missing) = request(&f, &c, "POST", "view", Some(json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"focus_card","card_id":shown["card_id"]})), &c.token, false).await;
     assert!(missing.get("error").is_some());
     for _ in 0..8 {
-        assert_eq!(request(&f, &c, "POST", "view", Some(json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation","action":"scroll_down"})), &c.token, false).await.0, StatusCode::OK);
+        assert_eq!(request(&f, &c, "POST", "view", Some(json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"scroll_down"})), &c.token, false).await.0, StatusCode::OK);
     }
-    assert_eq!(request(&f, &c, "POST", "view", Some(json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation","action":"scroll_down"})), &c.token, false).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(request(&f, &c, "POST", "view", Some(json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"scroll_down"})), &c.token, false).await.0, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1158,7 +1158,7 @@ async fn a_new_login_cannot_claim_an_old_browsers_command_by_reusing_its_identif
             &f,
             "POST",
             &format!("{path}/presence"),
-            Some(json!({"browser_id":browser,"camera_enabled":true,"capture_consent":true})),
+            Some(json!({"browser_id":browser,"view_revision":0,"camera_enabled":true,"capture_consent":true})),
             "new-login",
             true
         )
@@ -1225,7 +1225,7 @@ async fn whiteboard_commands_retain_history_and_record_protected_item_refusal() 
     )
     .await;
     let presence_path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
-    let state = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"board_card_ids":[cards[0]],"pinned_card_ids":[cards[0]],"focused_card_id":cards[0]});
+    let state = json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false,"board_card_ids":[cards[0]],"pinned_card_ids":[cards[0]],"focused_card_id":cards[0]});
     assert_eq!(
         browser_request(
             &f,
@@ -1244,7 +1244,7 @@ async fn whiteboard_commands_retain_history_and_record_protected_item_refusal() 
     assert_eq!(current["pinned_card_ids"], json!([cards[0]]));
     assert_eq!(current["focused_card_id"], cards[0]);
     let operation = uuid::Uuid::new_v4().to_string();
-    let change = json!({"operation_id":operation,"delegation_id":"fixture-delegation","action":"replace_board","card_ids":[cards[2]]});
+    let change = json!({"operation_id":operation,"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"replace_board","card_ids":[cards[2]]});
     let (_, queued) = request(
         &f,
         &c,
@@ -1290,11 +1290,11 @@ async fn whiteboard_commands_retain_history_and_record_protected_item_refusal() 
         false
     );
     for extra in [
-        json!({"action":"replace_board","card_ids":[cards[0],cards[0]]}),
-        json!({"action":"replace_board","card_ids":[]}),
-        json!({"action":"replace_board","card_ids":[cards[0],cards[1],cards[2],foreign["card_id"]]}),
-        json!({"action":"replace_board","card_ids":[foreign["card_id"]]}),
-        json!({"action":"clear_board","card_ids":[cards[0]]}),
+        json!({"expected_browser_id":browser,"expected_revision":0,"action":"replace_board","card_ids":[cards[0],cards[0]]}),
+        json!({"expected_browser_id":browser,"expected_revision":0,"action":"replace_board","card_ids":[]}),
+        json!({"expected_browser_id":browser,"expected_revision":0,"action":"replace_board","card_ids":[cards[0],cards[1],cards[2],foreign["card_id"]]}),
+        json!({"expected_browser_id":browser,"expected_revision":0,"action":"replace_board","card_ids":[foreign["card_id"]]}),
+        json!({"expected_browser_id":browser,"expected_revision":0,"action":"clear_board","card_ids":[cards[0]]}),
     ] {
         let mut body = json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation"});
         body.as_object_mut()
@@ -1382,7 +1382,7 @@ async fn existing_shared_image_is_readable_without_recapture_and_stays_call_scop
         StatusCode::NOT_FOUND
     );
     let upload_card = format!("upload:{upload}");
-    let (status,result)=browser_request(&f,"POST",&format!("/api/v1/companion/calls/{}/surface/presence",c.id),Some(json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"board_card_ids":[upload_card],"pinned_card_ids":[upload_card]})),"browser",true).await;
+    let (status,result)=browser_request(&f,"POST",&format!("/api/v1/companion/calls/{}/surface/presence",c.id),Some(json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false,"board_card_ids":[upload_card],"pinned_card_ids":[upload_card]})),"browser",true).await;
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(
         surface_status(&f, &c, "current").await["board_card_ids"],
@@ -1801,7 +1801,7 @@ async fn context_view_is_an_exact_existing_call_surface_action() {
     let browser = uuid::Uuid::new_v4().to_string();
     presence(&f, &c, &browser, false, false).await;
     let operation = uuid::Uuid::new_v4().to_string();
-    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","action":"show_context"});
+    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"show_context"});
     assert_eq!(
         request(&f, &c, "POST", "view", Some(body.clone()), &c.token, false)
             .await
@@ -2102,7 +2102,7 @@ async fn own_mcp_proxy_allows_bounded_image_reads_without_expanding_other_respon
 
 fn playback_presence(browser: &str, interruption: &str, phase: &str) -> Value {
     let suppressed = phase == "suppressed";
-    json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,
+    json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false,
         "user_speaking":suppressed,"agent_speaking":false,
         "playback":{"state":if suppressed {"suppressed"} else {"ready"},
             "floor":if suppressed {"user"} else {"open"},"output_active":suppressed,
@@ -2200,7 +2200,7 @@ async fn browser_playback_interruptions_are_deduplicated_speech_controls_not_wor
         // provider acknowledgment, playback proof, or reason to replay work.
         assert_eq!(receipt["state"], "not_queued");
     }
-    let unknown = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,
+    let unknown = json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false,
         "user_speaking":null,"agent_speaking":null,
         "playback":{"state":"unknown","floor":"unknown","output_active":null,"interruption_id":interruption}});
     assert_eq!(
@@ -2455,11 +2455,11 @@ async fn browser_board_membership_is_scoped_deduplicated_and_tracks_return_to_im
         vec![],
         vec![card.clone()],
     ] {
-        let body = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"user_speaking":true,"agent_speaking":false,"board_card_ids":ids});
+        let body = json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false,"user_speaking":true,"agent_speaking":false,"board_card_ids":ids});
         let response = browser_request(&f, "POST", &path, Some(body), "browser", true).await;
         assert_eq!(response.0, StatusCode::OK, "{response:?}");
     }
-    let bad = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"board_card_ids":[foreign]});
+    let bad = json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false,"board_card_ids":[foreign]});
     assert_eq!(
         browser_request(&f, "POST", &path, Some(bad), "browser", true)
             .await
@@ -2546,7 +2546,7 @@ async fn maximum_three_owned_board_items_fit_complete_voice_context() {
         }
     }
     for ids in [results, uploads] {
-        let body = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"board_card_ids":ids});
+        let body = json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false,"board_card_ids":ids});
         let response = browser_request(&f, "POST", &path, Some(body), "browser", true).await;
         assert_eq!(response.0, StatusCode::OK, "{response:?}");
     }
@@ -2557,4 +2557,215 @@ async fn maximum_three_owned_board_items_fit_complete_voice_context() {
         let j: Value = serde_json::from_str(&batch).unwrap();
         assert!(j[0]["content"].as_str().unwrap().len() <= 480);
     }
+}
+
+#[tokio::test]
+async fn view_revisions_reject_stale_preparation_and_acceptance_without_rewriting_history() {
+    let f = fixture();
+    let c = call(&f);
+    delegation(&f, &c, "user");
+    let browser = uuid::Uuid::new_v4().to_string();
+    let path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
+    let state = |revision| json!({"browser_id":browser,"view_revision":revision,"camera_enabled":false,"capture_consent":false,"user_speaking":false,"agent_speaking":null});
+    assert_eq!(
+        browser_request(&f, "POST", &path, Some(state(4)), "browser", true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(surface_status(&f, &c, "current").await["view_revision"], 4);
+    assert_eq!(
+        surface_status(&f, &c, "current").await["browser_id"],
+        browser
+    );
+    let operation = uuid::Uuid::new_v4().to_string();
+    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":4,"action":"show_context"});
+    let mut stale = body.clone();
+    stale["expected_revision"] = json!(3);
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(stale), &c.token, false)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let mut other_browser = body.clone();
+    other_browser["expected_browser_id"] = json!(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(other_browser), &c.token, false)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(body.clone()), &c.token, false)
+            .await
+            .1["state"],
+        "queued"
+    );
+    assert_eq!(
+        browser_request(&f, "POST", &path, Some(state(5)), "browser", true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // Delayed presence cannot roll the same browser's human intent back.
+    assert_eq!(
+        browser_request(&f, "POST", &path, Some(state(4)), "browser", true)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let (_, receipt) = ack(&f, &c, &browser, &operation, "accepted", vec![]).await;
+    assert_eq!(receipt["execute"], false);
+    assert_eq!(receipt["state"], "failed");
+    assert_eq!(receipt["reason"], "stale_view");
+    let (_, repeated) = request(&f, &c, "POST", "view", Some(body.clone()), &c.token, false).await;
+    assert_eq!(repeated["state"], "failed");
+    assert_eq!(repeated["command"]["expected_revision"], 4);
+    let mut changed = body;
+    changed["expected_revision"] = json!(5);
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(changed), &c.token, false)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let accepted:Option<i64>=f.s.db.lock().unwrap().query_row("SELECT accepted_at FROM companion_surface_commands WHERE call_id=?1 AND operation_id=?2",params![c.id,operation],|r|r.get(0)).unwrap();
+    assert_eq!(accepted, None);
+}
+
+#[tokio::test]
+async fn newer_browser_intent_can_refuse_before_or_after_acceptance_without_replay() {
+    for accepted in [false, true] {
+        let f = fixture();
+        let c = call(&f);
+        delegation(&f, &c, "user");
+        let browser = uuid::Uuid::new_v4().to_string();
+        presence(&f, &c, &browser, false, false).await;
+        let operation = uuid::Uuid::new_v4().to_string();
+        let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"show_transcript"});
+        assert_eq!(
+            request(&f, &c, "POST", "view", Some(body.clone()), &c.token, false)
+                .await
+                .1["state"],
+            "queued"
+        );
+        if accepted {
+            assert_eq!(
+                ack(&f, &c, &browser, &operation, "accepted", vec![])
+                    .await
+                    .1["execute"],
+                true
+            );
+            let newer = json!({"browser_id":browser,"view_revision":1,"camera_enabled":false,"capture_consent":false});
+            assert_eq!(
+                browser_request(
+                    &f,
+                    "POST",
+                    &format!("/api/v1/companion/calls/{}/surface/presence", c.id),
+                    Some(newer),
+                    "browser",
+                    true
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+            // Presence cannot relabel an accepted command whose effect is unknown.
+            assert_eq!(
+                surface_status(&f, &c, &operation).await["state"],
+                "accepted"
+            );
+        }
+        // Local intent happened while presence/acceptance response was in flight.
+        let ack_path = format!(
+            "/api/v1/companion/calls/{}/surface/commands/{operation}/ack",
+            c.id
+        );
+        let failure =
+            json!({"browser_id":browser,"state":"failed","reason":"stale_view","view_revision":1});
+        let (status, result) = browser_request(
+            &f,
+            "POST",
+            &ack_path,
+            Some(failure.clone()),
+            "browser",
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["state"], "failed");
+        assert_eq!(result["execute"], false);
+        assert_eq!(
+            browser_request(&f, "POST", &ack_path, Some(failure), "browser", true)
+                .await
+                .1["state"],
+            "failed"
+        );
+        assert_eq!(
+            ack(&f, &c, &browser, &operation, "accepted", vec![])
+                .await
+                .1["execute"],
+            false
+        );
+        assert_eq!(
+            request(&f, &c, "POST", "view", Some(body), &c.token, false)
+                .await
+                .1["reason"],
+            "stale_view"
+        );
+    }
+}
+
+#[tokio::test]
+async fn view_revision_does_not_restore_revoked_source_or_revisionless_browser_authority() {
+    let f = fixture();
+    let c = call(&f);
+    delegation(&f, &c, "user");
+    let browser = uuid::Uuid::new_v4().to_string();
+    let path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
+    let legacy = json!({"browser_id":browser,"camera_enabled":false,"capture_consent":false,"user_speaking":false,"agent_speaking":null});
+    assert_eq!(
+        browser_request(&f, "POST", &path, Some(legacy), "browser", true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let operation = uuid::Uuid::new_v4().to_string();
+    let body = json!({"operation_id":operation,"delegation_id":"fixture-delegation","expected_browser_id":browser,"expected_revision":0,"action":"show_context"});
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(body.clone()), &c.token, false)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    presence(&f, &c, &browser, false, false).await;
+    assert_eq!(
+        request(&f, &c, "POST", "view", Some(body), &c.token, false)
+            .await
+            .1["state"],
+        "queued"
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM input_authority", [])
+        .unwrap();
+    assert_eq!(
+        ack(&f, &c, &browser, &operation, "accepted", vec![])
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let state: String =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM companion_surface_commands WHERE call_id=?1 AND operation_id=?2",
+                params![c.id, operation],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(state, "queued");
 }

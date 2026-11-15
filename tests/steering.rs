@@ -1047,6 +1047,262 @@ fn source_frames(f: &Fixture, method: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Seed only the durable source records normally written by the voice bridge;
+/// delivery below still uses the actual HTTP intake and deterministic ACP peer.
+/// No realtime provider, media session or model is involved.
+fn companion_spoken_source(f: &Fixture, call: &str, text: &str, at: i64) -> (String, String) {
+    let message = uuid::Uuid::new_v4().to_string();
+    let delegation = uuid::Uuid::new_v4().to_string();
+    let endpoint = agent_conversations::auth::digest(
+        &serde_json::to_string(&f.state.agent("default").unwrap().unwrap()).unwrap(),
+    );
+    let db = f.state.db.lock().unwrap();
+    db.execute("INSERT OR IGNORE INTO companion_calls(id,owner,request_id,request_hash,agent_id,conversation_id,state,created_at,heartbeat_at,endpoint_hash) VALUES(?1,'owner',?2,'fixture','default',?3,'closed',?4,?4,?5)",
+        rusqlite::params![call,uuid::Uuid::new_v4().to_string(),f.room,at,endpoint]).unwrap();
+    let mut fragments = Vec::new();
+    for (index, role, body) in [
+        (
+            0,
+            "assistant",
+            "Earlier generated speech, not a new instruction.",
+        ),
+        (1, "user", text),
+    ] {
+        let event = json!({"event_id":format!("{delegation}-{index}"),"role":role,"text":body,"start_ms":index*100,"end_ms":index*100+50});
+        db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'transcript',?3,?4)",
+            rusqlite::params![call,format!("{delegation}-{index}"),event.to_string(),at-100+index*100]).unwrap();
+        let mut fragment = event;
+        fragment["seq"] = json!(db.last_insert_rowid());
+        fragments.push(fragment);
+    }
+    let source = json!({"version":1,"previous_anchor_ms":-1,"offset_ms":150,"fragments":fragments});
+    db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at,source,request_text) VALUES(?1,?2,150,'dispatched',?3,?4,?5,?6)",
+        rusqlite::params![call,delegation,message,at+1000,source.to_string(),text]).unwrap();
+    (message, delegation)
+}
+
+async fn send_companion_wrapper(f: &Fixture, message: &str) {
+    let (status, result) = f.request("POST", "messages", json!({
+        "request_id":message,
+        "text":"Generated delegation wrapper, connection catalog and earlier context; not the human request.",
+        "target_agent_ids":["default"]
+    })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{result}");
+}
+
+#[tokio::test]
+async fn companion_source_profile_links_original_speech_and_distinct_correction_to_work() {
+    let f = Fixture::new("source-many", false, false);
+    f.release();
+    let call = uuid::Uuid::new_v4().to_string();
+    let (first, first_delegation) =
+        companion_spoken_source(&f, &call, "Inspect the blue wall.", 100_000);
+    send_companion_wrapper(&f, &first).await;
+    f.idle().await;
+    let first_before = source_delivery(&f, &first);
+    let (second, second_delegation) =
+        companion_spoken_source(&f, &call, "Correction: inspect the red wall.", 105_000);
+    send_companion_wrapper(&f, &second).await;
+    f.idle().await;
+    let prompts = source_frames(&f, "session/prompt");
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(
+        prompts[0]["params"]["sessionId"],
+        prompts[1]["params"]["sessionId"]
+    );
+    for (index, message, delegation, human, at) in [
+        (
+            0,
+            &first,
+            &first_delegation,
+            "Inspect the blue wall.",
+            100_000,
+        ),
+        (
+            1,
+            &second,
+            &second_delegation,
+            "Correction: inspect the red wall.",
+            105_000,
+        ),
+    ] {
+        let delivery = source_delivery(&f, message);
+        let profile = &delivery["source_delivery"];
+        let metadata = &prompts[index]["params"]["_meta"][SOURCE_META];
+        assert_eq!(metadata["inputId"], delivery["id"]);
+        assert_eq!(
+            metadata["sources"],
+            json!([{"id":message,"revision":agent_conversations::auth::digest(human),"occurredAt":at}])
+        );
+        assert_eq!(profile["sources"], metadata["sources"]);
+        assert_eq!(profile["origin"]["call_id"], call);
+        assert_eq!(profile["origin"]["delegation_id"], delegation.as_str());
+        assert_eq!(profile["origin"]["conversation_id"], f.room);
+        assert_eq!(profile["origin"]["message_id"], message.as_str());
+        assert_eq!(profile["origin"]["actor"], "owner");
+        assert_eq!(profile["origin"]["agent_id"], "default");
+        assert_ne!(
+            profile["origin"]["source_revision"],
+            profile["origin"]["evidence_revision"]
+        );
+        let receipt = &profile["receipt"]["receipts"][0];
+        assert_eq!(receipt["sourceId"], message.as_str());
+        assert_eq!(receipt["completion"], "not_established");
+        assert_eq!(receipt["work"][0]["state"], "proposed");
+        assert_eq!(receipt["work"][1]["state"], "accepted");
+        assert_eq!(receipt["work"][1]["inputId"], delivery["id"]);
+        let (status, submission) = f
+            .request(
+                "GET",
+                &format!("deliveries?request_id={message}"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(submission["publication"]["state"], "saved");
+        assert_eq!(submission["items"][0]["source_delivery"], *profile);
+    }
+    assert_eq!(
+        source_delivery(&f, &first),
+        first_before,
+        "A later correction rewrote the original receipt"
+    );
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 2);
+}
+
+#[tokio::test]
+async fn companion_source_profile_inspects_original_session_after_lost_reply_without_replay() {
+    let mut f = Fixture::new("source-disconnect", false, false);
+    let call = uuid::Uuid::new_v4().to_string();
+    let (message, delegation) =
+        companion_spoken_source(&f, &call, "Inspect without changing anything.", 100_000);
+    send_companion_wrapper(&f, &message).await;
+    f.idle().await;
+    let before = source_delivery(&f, &message);
+    assert_eq!(before["state"], "unknown");
+    let prompt = source_frames(&f, "session/prompt").pop().unwrap();
+    f.state = AppState::open(f.home.path().into()).unwrap();
+    f.app = server::router(f.state.clone());
+    let (status, result) = f
+        .request(
+            "POST",
+            &format!("deliveries/{}/inspect", before["id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let after = source_delivery(&f, &message);
+    assert_eq!(after["state"], "unknown");
+    assert_eq!(after["source_delivery"]["origin"]["call_id"], call);
+    assert_eq!(
+        after["source_delivery"]["origin"]["delegation_id"],
+        delegation
+    );
+    assert_eq!(
+        after["source_delivery"]["sources"],
+        prompt["params"]["_meta"][SOURCE_META]["sources"]
+    );
+    assert_eq!(
+        after["source_delivery"]["receipt"]["receipts"][0]["state"],
+        "unknown"
+    );
+    assert_eq!(
+        after["source_delivery"]["receipt"]["coverage"]["missing"],
+        "unknown"
+    );
+    assert_eq!(source_frames(&f, "session/new").len(), 1);
+    assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+    let loads = source_frames(&f, "session/load");
+    assert_eq!(loads.len(), 1);
+    assert_eq!(
+        loads[0]["params"]["sessionId"],
+        prompt["params"]["sessionId"]
+    );
+    assert!(source_frames(&f, "_session/acknowledge_inputs").is_empty());
+}
+
+#[tokio::test]
+async fn companion_source_profile_withholds_work_after_original_binding_drift() {
+    for change in [
+        "speech",
+        "transcript",
+        "delegation",
+        "actor",
+        "recipient",
+        "wrapper",
+        "audience",
+    ] {
+        let f = Fixture::new("source-many", false, false);
+        f.release();
+        let call = uuid::Uuid::new_v4().to_string();
+        let (message, delegation) =
+            companion_spoken_source(&f, &call, "A private original request.", 100_000);
+        send_companion_wrapper(&f, &message).await;
+        f.idle().await;
+        let before = source_delivery(&f, &message);
+        assert_eq!(before["source_delivery"]["status"], "observed");
+        {
+            let db = f.state.db.lock().unwrap();
+            match change {
+                "speech" => db.execute("UPDATE companion_delegations SET request_text='Changed instruction' WHERE call_id=?1 AND id=?2", rusqlite::params![call,delegation]),
+                "transcript" => db.execute("UPDATE companion_events SET data=json_set(data,'$.text','Changed speech') WHERE call_id=?1 AND kind='transcript' AND json_extract(data,'$.role')='user'", [&call]),
+                "delegation" => db.execute("UPDATE companion_delegations SET id=?2 WHERE call_id=?1", rusqlite::params![call,uuid::Uuid::new_v4().to_string()]),
+                "actor" => db.execute("UPDATE messages SET actor='other' WHERE id=?1", [&message]),
+                "recipient" => db.execute("UPDATE companion_calls SET agent_id='substituted-agent' WHERE id=?1", [&call]),
+                "wrapper" => db.execute("UPDATE messages SET text='Changed generated transport evidence' WHERE id=?1", [&message]),
+                "audience" => db.execute("UPDATE conversations SET shared=1 WHERE id=?1", [&f.room]),
+                _ => unreachable!(),
+            }.unwrap();
+        }
+        let after = source_delivery(&f, &message);
+        assert_eq!(
+            after["source_delivery"]["status"], "unavailable",
+            "{change}: {after}"
+        );
+        assert!(after["source_delivery"]["receipt"].is_null());
+        assert!(
+            !after
+                .to_string()
+                .contains("00000000-0000-4000-8000-000000000002")
+        );
+        let (status, _) = f
+            .request(
+                "POST",
+                &format!("deliveries/{}/inspect", before["id"].as_str().unwrap()),
+                json!({}),
+            )
+            .await;
+        assert!(
+            !status.is_success(),
+            "{change} unexpectedly inspected a different origin"
+        );
+        assert_eq!(source_frames(&f, "session/prompt").len(), 1);
+        assert_eq!(source_frames(&f, SOURCE_QUERY).len(), 1);
+        assert!(source_frames(&f, "session/load").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn companion_source_profile_keeps_legacy_and_unadvertised_paths_unnegotiated() {
+    for mode in ["generic", "source-optional"] {
+        let f = Fixture::new(mode, false, false);
+        f.release();
+        let call = uuid::Uuid::new_v4().to_string();
+        let (message, _) = companion_spoken_source(&f, &call, "Original speech.", 100_000);
+        if mode == "source-optional" {
+            f.state.db.lock().unwrap().execute("UPDATE companion_delegations SET source=NULL,request_text=NULL WHERE call_id=?1", [&call]).unwrap();
+        }
+        send_companion_wrapper(&f, &message).await;
+        f.idle().await;
+        let prompts = source_frames(&f, "session/prompt");
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0]["params"]["_meta"][SOURCE_META].is_null());
+        assert!(source_delivery(&f, &message)["source_delivery"].is_null());
+        assert!(source_frames(&f, SOURCE_QUERY).is_empty());
+    }
+}
+
 fn start_source_inspection(
     f: &Fixture,
     input_id: &str,

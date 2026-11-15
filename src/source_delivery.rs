@@ -69,15 +69,6 @@ fn audience(db: &Connection, room: &str) -> Result<String> {
     ))
 }
 
-fn ordinary_room(db: &Connection, room: &str) -> Result<bool> {
-    // Companion remains on its existing behavior while that component is paused.
-    Ok(!db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM companion_calls WHERE conversation_id=?1)",
-        [room],
-        |r| r.get::<_, bool>(0),
-    )?)
-}
-
 fn original(db: &Connection, message: &str) -> Result<Value> {
     let (room, actor, text, at): (String, String, String, i64) = db.query_row(
         "SELECT conversation_id,actor,text,created_at FROM messages WHERE id=?1 AND role='user'",
@@ -101,6 +92,62 @@ fn original(db: &Connection, message: &str) -> Result<Value> {
     Ok(json!({"id":message,"revision":revision,"occurredAt":at}))
 }
 
+/// A call's generated delegation prompt is evidence of transport, not the
+/// original human speech. Keep those revisions separate while reusing the
+/// original message/input identities and the negotiated source receipt profile.
+fn source(
+    db: &Connection,
+    room: &str,
+    message: &str,
+    agent: &str,
+) -> Result<Option<(Value, Option<Value>)>> {
+    let call: Option<String> = db
+        .query_row(
+            "SELECT id FROM companion_calls WHERE conversation_id=?1",
+            [room],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(call) = call else {
+        return Ok(Some((original(db, message)?, None)));
+    };
+    let row: Option<(String, Option<String>, Option<String>)> = db.query_row(
+        "SELECT id,source,request_text FROM companion_delegations WHERE call_id=?1 AND message_id=?2 AND state IN ('dispatched','completed','failed','unknown')",
+        params![call,message], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional()?;
+    let Some((delegation, Some(raw), Some(text))) = row else {
+        // Legacy/no-speech and other call inputs retain their existing behavior;
+        // do not invent source provenance from a generated prompt or label.
+        return Ok(None);
+    };
+    ensure!(!text.trim().is_empty(), "No retained human request text");
+    let identity = crate::companion_history::private_identity(db, &call)?
+        .context("The original private call identity is unavailable")?;
+    let actor: String = db.query_row(
+        "SELECT actor FROM messages WHERE id=?1 AND conversation_id=?2 AND role='user'",
+        params![message, room],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        identity.room == room && identity.owner == actor && identity.agent == agent,
+        "The original call source or recipient changed"
+    );
+    let at = crate::companion_awareness::original_human_source_time(db, &call, &delegation)?
+        .context("The original human transcript is unavailable")?;
+    let fragments: Value = serde_json::from_str(&raw)?;
+    let revision = crate::auth::digest(&text);
+    let evidence = original(db, message)?;
+    let binding = json!({"kind":"companion","call_id":call,"delegation_id":delegation,
+        "conversation_id":room,"message_id":message,"actor":actor,"agent_id":agent,
+        "source_revision":revision,"occurred_at":at,
+        "fragment_revision":crate::auth::digest(&serde_json::to_string(&fragments)?),
+        "evidence_revision":evidence["revision"]});
+    Ok(Some((
+        json!({"id":message,"revision":revision,"occurredAt":at}),
+        Some(binding),
+    )))
+}
+
 pub(crate) fn prepare(
     state: &AppState,
     id: &str,
@@ -109,12 +156,9 @@ pub(crate) fn prepare(
     init: &Value,
 ) -> Result<Option<Value>> {
     let db = state.db.lock().unwrap();
-    let (room,message,old_meta,old_binding): (String,String,Option<String>,Option<String>) = db.query_row(
-        "SELECT conversation_id,message_id,source_metadata,source_binding FROM input_deliveries WHERE id=?1", [id],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-    if !ordinary_room(&db, &room)? {
-        return Ok(None);
-    }
+    let (room,message,agent,old_meta,old_binding): (String,String,String,Option<String>,Option<String>) = db.query_row(
+        "SELECT conversation_id,message_id,agent_id,source_metadata,source_binding FROM input_deliveries WHERE id=?1", [id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     let Some(cap) = capability(init) else {
         ensure!(
             old_meta.is_none(),
@@ -122,8 +166,18 @@ pub(crate) fn prepare(
         );
         return Ok(None);
     };
-    let metadata = json!({"version":1,"inputId":id,"sources":[original(&db,&message)?]});
-    let binding = json!({"provider_id":state.config.provider_id(),"audience":audience(&db,&room)?,"session_id":sid,"endpoint":endpoint,"work_references":cap["workReferences"]==true});
+    let Some((original, companion)) = source(&db, &room, &message, &agent)? else {
+        ensure!(
+            old_meta.is_none(),
+            "The original call source is unavailable"
+        );
+        return Ok(None);
+    };
+    let metadata = json!({"version":1,"inputId":id,"sources":[original]});
+    let mut binding = json!({"provider_id":state.config.provider_id(),"audience":audience(&db,&room)?,"session_id":sid,"endpoint":endpoint,"work_references":cap["workReferences"]==true});
+    if let Some(companion) = companion {
+        binding["companion"] = companion;
+    }
     if let Some(old) = old_meta {
         ensure!(
             serde_json::from_str::<Value>(&old)? == metadata,
@@ -138,7 +192,8 @@ pub(crate) fn prepare(
             old["provider_id"] == binding["provider_id"]
                 && old["audience"] == binding["audience"]
                 && old["session_id"] == binding["session_id"]
-                && old["endpoint"] == binding["endpoint"],
+                && old["endpoint"] == binding["endpoint"]
+                && old["companion"] == binding["companion"],
             "The original source session or audience changed"
         );
     } else {
@@ -188,14 +243,22 @@ pub(crate) fn saved(db: &Connection, id: &str) -> Result<Option<Saved>> {
 }
 
 fn current(db: &Connection, item: &Saved, provider: &str) -> Result<bool> {
-    let row: Option<(String,Option<String>,Option<String>)> = db.query_row(
-        "SELECT d.conversation_id,r.session_id,r.endpoint FROM input_deliveries d JOIN room_agents r ON r.conversation_id=d.conversation_id AND r.agent_id=d.agent_id WHERE d.id=?1", [&item.id],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let Some((room, session, endpoint)) = row else {
+    type CurrentSource = (String, String, String, Option<String>, Option<String>);
+    let row: Option<CurrentSource> = db.query_row(
+        "SELECT d.conversation_id,d.message_id,d.agent_id,r.session_id,r.endpoint FROM input_deliveries d JOIN room_agents r ON r.conversation_id=d.conversation_id AND r.agent_id=d.agent_id WHERE d.id=?1", [&item.id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+    let Some((room, message, agent, session, endpoint)) = row else {
         return Ok(false);
     };
+    if item.binding.get("companion").is_some() {
+        let Ok(Some((original, Some(binding)))) = source(db, &room, &message, &agent) else {
+            return Ok(false);
+        };
+        if item.binding["companion"] != binding || item.metadata["sources"] != json!([original]) {
+            return Ok(false);
+        }
+    }
     Ok(item.binding["provider_id"] == provider
-        && ordinary_room(db, &room)?
         && session.as_deref() == Some(item.session.as_str())
         && endpoint.as_deref() == Some(item.endpoint.as_str())
         && item.binding["audience"] == audience(db, &room)?)
@@ -393,10 +456,12 @@ pub(crate) fn projection(db: &Connection, id: &str, provider: &str) -> Result<Op
             json!({"version":1,"input_id":id,"sources":item.metadata["sources"],"status":"unavailable","receipt":null,"observed_at":null}),
         ));
     }
-    Ok(Some(
-        json!({"version":1,"input_id":id,"sources":item.metadata["sources"],"status":if observed.is_some(){"observed"}else{"unobserved"},
-        "receipt":observed.as_ref().map(|v|&v["receipt"]),"observed_at":observed.as_ref().map(|v|&v["observed_at"])}),
-    ))
+    let mut value = json!({"version":1,"input_id":id,"sources":item.metadata["sources"],"status":if observed.is_some(){"observed"}else{"unobserved"},
+        "receipt":observed.as_ref().map(|v|&v["receipt"]),"observed_at":observed.as_ref().map(|v|&v["observed_at"])});
+    if let Some(origin) = item.binding.get("companion") {
+        value["origin"] = origin.clone();
+    }
+    Ok(Some(value))
 }
 
 pub(crate) fn decorate(db: &Connection, items: &mut [Value], provider: &str) -> Result<()> {

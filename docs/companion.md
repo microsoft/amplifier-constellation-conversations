@@ -449,6 +449,18 @@ does not replay work or turn an uncertain delivery into success. Already submitt
 work retains its original authority and must be inspected through its owning
 connector's controls when no retained receipt establishes the outcome.
 
+`companion_action_status` also supports saved inspection after hang-up, using the
+original request ID and call grant. It returns the retained submission alongside
+any later observation already saved for that same request. It does not refresh an
+observer, expire a submission receipt, or promote an unknown outcome. Missing
+saved results return not found. Existing historical lookup from a later private
+call still requires the same owner, agent and endpoint, unchanged observer
+configuration and validated original source; its result identifies the original
+source call. The later call's token cannot authorize the original call's route.
+Disabled tools, a removed grant, or a changed private-room/endpoint identity still
+deny access. A native permission after hang-up can allow only an exact saved
+action-status lookup while the original tool transport remains available.
+
 ## API reference
 
 Browser routes use the host session and authenticated ownership checks. Mutations
