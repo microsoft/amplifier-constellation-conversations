@@ -1701,7 +1701,7 @@ pub(crate) fn permission_notice(s: &AppState, id: &str, room: &str) -> Result<()
                 id,
                 "commentary",
                 None,
-                PERMISSION_WAITING,
+                PERMISSION_REQUESTED,
                 &format!("permission_{permission_id}"),
             )?;
         }
@@ -1758,8 +1758,11 @@ pub(crate) fn permission_notice(s: &AppState, id: &str, room: &str) -> Result<()
     }
     Ok(())
 }
-const PERMISSION_WAITING: &str =
-    "A permission choice is waiting on your screen before that request can continue.";
+// A choice may resolve after dispatch but before the model speaks. Announce
+// the request event, not a continuing blockage; current cards and the exact
+// decision revision still carry the current state. Appended context cannot
+// selectively recall audio that the provider has already generated.
+const PERMISSION_REQUESTED: &str = "An action requested your approval.";
 
 fn permission_pending(s: &AppState, db: &Connection, call: &str, permission: &str) -> Result<bool> {
     let (room, owner): (String, String) = db.query_row(
@@ -1856,7 +1859,7 @@ pub(crate) fn permission_update_matches(
         && permission_pending(s, db, call, permission)?
         && *command
             == json!({"op":"append","channel":"commentary","delegation_id":null,
-            "event_id":format!("permission_{permission}"),"content":PERMISSION_WAITING}))
+            "event_id":format!("permission_{permission}"),"content":PERMISSION_REQUESTED}))
 }
 pub(crate) fn is_permission_revision_batch(
     s: &AppState,
