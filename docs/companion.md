@@ -449,6 +449,18 @@ does not replay work or turn an uncertain delivery into success. Already submitt
 work retains its original authority and must be inspected through its owning
 connector's controls when no retained receipt establishes the outcome.
 
+`companion_action_status` also supports saved inspection after hang-up, using the
+original request ID and call grant. It returns the retained submission alongside
+any later observation already saved for that same request. It does not refresh an
+observer, expire a submission receipt, or promote an unknown outcome. Missing
+saved results return not found. Existing historical lookup from a later private
+call still requires the same owner, agent and endpoint, unchanged observer
+configuration and validated original source; its result identifies the original
+source call. The later call's token cannot authorize the original call's route.
+Disabled tools, a removed grant, or a changed private-room/endpoint identity still
+deny access. A native permission after hang-up can allow only an exact saved
+action-status lookup while the original tool transport remains available.
+
 ## API reference
 
 Browser routes use the host session and authenticated ownership checks. Mutations
@@ -508,6 +520,12 @@ Official provider references: [Live](https://developers.openai.com/api/docs/guid
 [server controls](https://developers.openai.com/api/docs/guides/voice-server-controls).
 
 ## Hands-free controls and connection awareness
+
+Before `companion_view`, read `companion_surface_status` and pass its observed
+`browser_id` as `expected_browser_id` and `view_revision` as `expected_revision`.
+Newer human navigation refuses the old command with `stale_view`, including
+navigation while acceptance is awaiting a reply; the original operation is not
+replayed. A missing revision leaves view control unavailable.
 
 An enabled call MCP server now also exposes `companion_view`,
 `companion_capture`, and `companion_surface_status`. A view operation can scroll

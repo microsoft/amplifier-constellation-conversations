@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 const FRESH_MS: i64 = 30_000;
 const TTL_MS: i64 = 30_000;
+const MAX_VIEW_REVISION: i64 = 9_007_199_254_740_991;
 const IMAGE_LIMIT: i64 = 512 * 1024;
 // Stored agent output uses the ordinary image-upload budget; camera capture
 // remains smaller to keep a single phone photo responsive.
@@ -58,6 +59,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
         ("pinned_card_ids", "TEXT NOT NULL DEFAULT '[]'"),
         ("focused_card_id", "TEXT"),
         ("playback", "TEXT"),
+        ("view_revision", "INTEGER"),
     ] {
         if !surface_columns.iter().any(|c| c == name) {
             db.execute(
@@ -241,6 +243,10 @@ pub(crate) fn capability_presentation_allowed(
 #[serde(deny_unknown_fields)]
 pub struct Presence {
     browser_id: String,
+    // This browser-owned generation advances on human navigation only.
+    // Older browsers may still report capture consent, but cannot authorize
+    // view changes without an observed interaction revision.
+    view_revision: Option<i64>,
     camera_enabled: bool,
     capture_consent: bool,
     user_speaking: Option<bool>,
@@ -301,6 +307,8 @@ fn valid_playback(p: &Presence) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct View {
     operation_id: String,
+    expected_browser_id: String,
+    expected_revision: i64,
     delegation_id: String,
     action: String,
     card_id: Option<String>,
@@ -334,6 +342,7 @@ pub struct BrowserQuery {
 #[serde(deny_unknown_fields)]
 pub struct Ack {
     browser_id: String,
+    view_revision: Option<i64>,
     state: String,
     #[serde(default)]
     attachment_ids: Vec<String>,
@@ -360,6 +369,8 @@ fn valid_card_id(id: &str) -> bool {
 }
 fn valid_view(v: &View) -> bool {
     valid_identity(&v.operation_id, &v.delegation_id)
+        && uuid::Uuid::parse_str(&v.expected_browser_id).is_ok()
+        && (0..=MAX_VIEW_REVISION).contains(&v.expected_revision)
         && VIEW_ACTIONS.contains(&v.action.as_str())
         && match v.action.as_str() {
             "focus_card" | "add_card" | "remove_card" => {
@@ -505,6 +516,16 @@ fn accept_operation_in(
         )?
     {
         return Err(ApiError::forbidden());
+    }
+    // A command remains tied to the interaction state it was prepared for.
+    // Resolve duplicates/unknowns without rewriting their historical outcome.
+    let stale: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM companion_surface_commands o JOIN companion_surfaces p ON p.call_id=o.call_id WHERE o.call_id=?1 AND o.operation_id=?2 AND o.kind='view' AND o.state='queued' AND (p.view_revision IS NULL OR json_extract(o.command,'$.expected_revision') IS NULL OR p.view_revision!=json_extract(o.command,'$.expected_revision')))",
+        params![id, operation], |r| r.get(0),
+    )?;
+    if stale {
+        db.execute("UPDATE companion_surface_commands SET state='failed',reason='stale_view' WHERE call_id=?1 AND operation_id=?2 AND state='queued'", params![id, operation])?;
+        return Ok(false);
     }
     Ok(db.execute("UPDATE companion_surface_commands SET state='accepted',accepted_at=?3 WHERE call_id=?1 AND operation_id=?2 AND state='queued' AND expires_at>=?3",params![id,operation,at])?==1)
 }
@@ -674,6 +695,9 @@ pub async fn presence(
 ) -> ApiResult<Json<Value>> {
     let (p, _) = browser(&s, &id, &h, true)?;
     if uuid::Uuid::parse_str(&presence.browser_id).is_err()
+        || presence
+            .view_revision
+            .is_some_and(|r| !(0..=MAX_VIEW_REVISION).contains(&r))
         || !valid_playback(&presence)
         || (presence.capture_consent && !presence.camera_enabled)
         || presence.board_card_ids.len() > 3
@@ -717,22 +741,38 @@ pub async fn presence(
     let mut db = s.db.lock().unwrap();
     let tx = db.transaction()?;
     // A fresh different browser cannot silently take over this call surface.
-    let current: Option<(String, String, i64, String)> = tx
+    let current: Option<(String, String, i64, String, Option<i64>)> = tx
         .query_row(
-            "SELECT browser_id,session_hash,updated_at,board_card_ids FROM companion_surfaces WHERE call_id=?1",
+            "SELECT browser_id,session_hash,updated_at,board_card_ids,view_revision FROM companion_surfaces WHERE call_id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    if current.as_ref().is_some_and(|(browser, session, at, _)| {
-        *at >= now_ms() - FRESH_MS
-            && (browser != &presence.browser_id || Some(session) != p.session_hash.as_ref())
-    }) {
+    if current
+        .as_ref()
+        .is_some_and(|(browser, session, at, _, _)| {
+            *at >= now_ms() - FRESH_MS
+                && (browser != &presence.browser_id || Some(session) != p.session_hash.as_ref())
+        })
+    {
         return Err(ApiError::busy());
+    }
+    if current
+        .as_ref()
+        .is_some_and(|(browser, session, _, _, revision)| {
+            browser == &presence.browser_id
+                && Some(session) == p.session_hash.as_ref()
+                && revision.is_some_and(|old| presence.view_revision.is_none_or(|new| new < old))
+        })
+    {
+        return Err(ApiError(
+            axum::http::StatusCode::CONFLICT,
+            "The browser view revision is stale".into(),
+        ));
     }
     let mut old_board: Vec<String> = current
         .as_ref()
-        .map(|(_, _, _, raw)| serde_json::from_str(raw))
+        .map(|(_, _, _, raw, _)| serde_json::from_str(raw))
         .transpose()
         .map_err(anyhow::Error::from)?
         .unwrap_or_default();
@@ -742,8 +782,12 @@ pub async fn presence(
     let board_changed = old_board != board;
     tx.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,user_speaking,agent_speaking,updated_at,board_card_ids,pinned_card_ids,focused_card_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(call_id) DO UPDATE SET browser_id=excluded.browser_id,session_hash=excluded.session_hash,camera_enabled=excluded.camera_enabled,capture_consent=excluded.capture_consent,user_speaking=excluded.user_speaking,agent_speaking=excluded.agent_speaking,updated_at=excluded.updated_at,board_card_ids=excluded.board_card_ids,pinned_card_ids=excluded.pinned_card_ids,focused_card_id=excluded.focused_card_id",params![id,presence.browser_id,p.session_hash,presence.camera_enabled,presence.capture_consent,presence.user_speaking,presence.agent_speaking,now_ms(),serde_json::to_string(&presence.board_card_ids).unwrap(),serde_json::to_string(&presence.pinned_card_ids).unwrap(),presence.focused_card_id])?;
     tx.execute(
-        "UPDATE companion_surfaces SET playback=?2 WHERE call_id=?1",
-        params![id, presence.playback.as_ref().map(|p| json!(p).to_string())],
+        "UPDATE companion_surfaces SET playback=?2,view_revision=?3 WHERE call_id=?1",
+        params![
+            id,
+            presence.playback.as_ref().map(|p| json!(p).to_string()),
+            presence.view_revision
+        ],
     )?;
     let board_control = if board_changed {
         let mut identities = Vec::new();
@@ -807,7 +851,7 @@ pub async fn presence(
         s.changed();
     }
     Ok(Json(
-        json!({"browser_id":presence.browser_id,"camera_enabled":presence.camera_enabled,"capture_consent":presence.capture_consent,"expires_at":now_ms()+FRESH_MS}),
+        json!({"browser_id":presence.browser_id,"view_revision":presence.view_revision,"camera_enabled":presence.camera_enabled,"capture_consent":presence.capture_consent,"expires_at":now_ms()+FRESH_MS}),
     ))
 }
 fn enqueue(
@@ -876,6 +920,19 @@ fn enqueue(
     }
     let (browser, session, _, _) =
         presence.ok_or_else(|| ApiError::bad("No fresh active browser surface"))?;
+    if kind == "view" {
+        let revision: Option<i64> = tx.query_row(
+            "SELECT view_revision FROM companion_surfaces WHERE call_id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if command["expected_browser_id"] != browser
+            || revision.is_none()
+            || revision != command["expected_revision"].as_i64()
+        {
+            return Err(ApiError(axum::http::StatusCode::CONFLICT, "The surface changed. Read its current view revision before preparing a new action.".into()));
+        }
+    }
     let (total,recent,pending):(i64,i64,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(created_at>=?2),0),COALESCE(SUM(state IN ('queued','accepted')),0) FROM companion_surface_commands WHERE call_id=?1",params![id,now_ms()-60_000],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     if total >= 256 || recent >= 16 || pending >= 8 {
         return Err(ApiError::bad("Surface command limit reached"));
@@ -911,7 +968,7 @@ pub async fn view(
         &v.operation_id,
         &v.delegation_id,
         "view",
-        json!({"action":v.action,"card_id":v.card_id,"card_ids":v.card_ids}),
+        json!({"action":v.action,"card_id":v.card_id,"card_ids":v.card_ids,"expected_browser_id":v.expected_browser_id,"expected_revision":v.expected_revision}),
     )?))
 }
 pub async fn capture(
@@ -1060,7 +1117,7 @@ pub async fn ack(
         || (a.state == "uploaded") != (a.attachment_ids.len() == 1)
         || (a.state != "uploaded" && !a.attachment_ids.is_empty())
         || a.reason.as_deref().is_some_and(|reason| {
-            a.state != "failed" || !["board_full", "item_protected"].contains(&reason)
+            a.state != "failed" || !["board_full", "item_protected", "stale_view"].contains(&reason)
         })
     {
         return Err(ApiError::bad("Use one supported browser acknowledgment"));
@@ -1073,7 +1130,23 @@ pub async fn ack(
         return Err(ApiError::forbidden());
     }
     let mut execute = false;
-    if a.state == "accepted" {
+    // The browser can observe newer human intent before its serialized presence
+    // reaches the host. This refusal records nonexecution; it grants no effect.
+    let stale_refusal = a.state == "failed" && a.reason.as_deref() == Some("stale_view");
+    if stale_refusal
+        && (previous["kind"] != "view"
+            || !a.view_revision.is_some_and(|revision| {
+                (0..=MAX_VIEW_REVISION).contains(&revision)
+                    && previous["command"]["expected_revision"]
+                        .as_i64()
+                        .is_some_and(|expected| revision > expected)
+            }))
+    {
+        return Err(ApiError::bad("A newer browser view revision is required"));
+    }
+    if stale_refusal && previous["state"] == "queued" {
+        tx.execute("UPDATE companion_surface_commands SET state='failed',reason='stale_view' WHERE call_id=?1 AND operation_id=?2 AND state='queued'", params![id, operation])?;
+    } else if a.state == "accepted" {
         execute = accept_operation_in(
             &s,
             &tx,
@@ -1085,7 +1158,11 @@ pub async fn ack(
         )?;
     } else {
         let accepted:bool=tx.query_row("SELECT accepted_at IS NOT NULL FROM companion_surface_commands WHERE call_id=?1 AND operation_id=?2",params![id,operation],|r|r.get(0))?;
-        if !accepted {
+        if !(accepted
+            || (stale_refusal
+                && previous["state"] == "failed"
+                && previous["reason"] == "stale_view"))
+        {
             return Err(ApiError::bad(
                 "An operation must be accepted before reporting its effect",
             ));
@@ -1181,9 +1258,19 @@ fn shared_artifacts(
 
 fn current_status(s: &AppState, id: &str, owner: &str, room: &str) -> Result<Value> {
     let db = s.db.lock().unwrap();
-    let presence: Option<(bool, bool, i64, String, String, Option<String>)> = db.query_row(
-        "SELECT camera_enabled,capture_consent,updated_at,board_card_ids,pinned_card_ids,focused_card_id FROM companion_surfaces WHERE call_id=?1",
-        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+    type CurrentSurface = (
+        bool,
+        bool,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        String,
+    );
+    let presence: Option<CurrentSurface> = db.query_row(
+        "SELECT camera_enabled,capture_consent,updated_at,board_card_ids,pinned_card_ids,focused_card_id,view_revision,browser_id FROM companion_surfaces WHERE call_id=?1",
+        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
     ).optional()?;
     let fresh = presence
         .as_ref()
@@ -1204,6 +1291,9 @@ fn current_status(s: &AppState, id: &str, owner: &str, room: &str) -> Result<Val
         "board_card_ids":presence.as_ref().filter(|_|fresh).and_then(|p|serde_json::from_str::<Value>(&p.3).ok()),
         "pinned_card_ids":presence.as_ref().filter(|_|fresh).and_then(|p|serde_json::from_str::<Value>(&p.4).ok()),
         "focused_card_id":presence.as_ref().filter(|_|fresh).and_then(|p|p.5.as_ref()),
+        "view_revision":presence.as_ref().filter(|_|fresh).and_then(|p|p.6),
+        "browser_id":presence.as_ref().filter(|_|fresh).map(|p|&p.7),
+        "view_revision_scope":"human_interaction",
         "board_capacity":3,"artifacts":artifacts,
         "guidance":"Read an already shared image by its artifact_id instead of asking for another photo. Existing explicit browser capture consent does not need to be requested again. Saved availability is not inspection; stale browser state is unknown. Keep the board useful and sparse, and preserve pinned or currently read material."}),
     )

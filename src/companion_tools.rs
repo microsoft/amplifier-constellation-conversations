@@ -259,7 +259,11 @@ pub fn permission_once(
     let inactive = !matches!(state.as_str(), "connecting" | "connected");
     let saved_receipt = (raw.tool == "companion_surface_status"
         && crate::companion_surface::terminal_status_shape_valid(&raw.arguments))
-        || raw.tool == "companion_huddle_status";
+        || raw.tool == "companion_huddle_status"
+        || (inactive
+            && raw.tool == "companion_action_status"
+            && saved_action_status(s, &call, raw.arguments["request_id"].as_str().unwrap())?
+                .is_some());
     if (inactive && !saved_receipt) || cfg.as_ref().is_none_or(|cfg| !cfg.enabled) {
         return deny(if inactive {
             "call_inactive"
@@ -469,6 +473,19 @@ pub async fn mcp(
                             "companion_huddle_status",
                             &value["params"]["arguments"],
                         ))
+                    || (value["params"]["name"] == "companion_action_status"
+                        && own_tool_shape_valid(
+                            "companion_action_status",
+                            &value["params"]["arguments"],
+                        )
+                        && saved_action_status(
+                            &s,
+                            &id,
+                            value["params"]["arguments"]["request_id"]
+                                .as_str()
+                                .unwrap_or(""),
+                        )?
+                        .is_some())
             }
             _ => false,
         };
@@ -675,19 +692,55 @@ fn action_row(s: &AppState, id: &str, rid: &str) -> Result<Option<Value>> {
     // before recording that outcome; expiry establishes uncertainty, not failure.
     // A later matching receipt may still replace this provisional unknown state.
     db.execute("UPDATE companion_actions SET state='unknown',result=?3 WHERE call_id=?1 AND request_id=?2 AND state='submitting' AND created_at<?4",params![id,rid,json!({"request_id":rid,"state":"unknown","diagnostic":"submission_receipt_expired","message":"No terminal receipt was observed within the helper deadline. The effect may have occurred; do not retry automatically."}).to_string(),now_ms()-45_000])?;
+    read_action_row(&db, id, rid)
+}
+
+/// Retained submission and observation bytes only. Unlike active reconciliation,
+/// inspecting a saved result after hang-up cannot expire or promote its receipt.
+fn read_action_row(db: &rusqlite::Connection, id: &str, rid: &str) -> Result<Option<Value>> {
     let mut value = db.query_row("SELECT request_id,connection_id,state,result,created_at FROM companion_actions WHERE call_id=?1 AND request_id=?2",params![id,rid],|r|{let result:String=r.get(3)?;Ok(json!({"request_id":r.get::<_,String>(0)?,"connection_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"result":serde_json::from_str::<Value>(&result).unwrap_or(Value::Null),"created_at":r.get::<_,i64>(4)?}))}).optional()?;
-    drop(db);
     if let Some(row) = value.as_mut() {
-        row["observation"] =
-            crate::companion_awareness::action_observation(s, id, rid)?.unwrap_or(Value::Null);
+        let observation: Option<String> = db
+            .query_row(
+                "SELECT data FROM companion_observations WHERE call_id=?1 AND request_id=?2",
+                params![id, rid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        row["observation"] = observation
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?
+            .unwrap_or(Value::Null);
     }
     Ok(value)
+}
+
+fn saved_action_status(s: &AppState, id: &str, rid: &str) -> Result<Option<Value>> {
+    let saved = read_action_row(&s.db.lock().unwrap(), id, rid)?;
+    if saved.is_some() {
+        return Ok(saved);
+    }
+    // This existing fallback reads retained results only. It revalidates both
+    // private identities, original source and observer binding; it never invokes
+    // a live observer or uses the new call as authority for another action.
+    crate::companion_awareness::action_observation_for_call(s, id, rid)
 }
 pub async fn status(
     State(s): State<Arc<AppState>>,
     Path((id, rid)): Path<(String, String)>,
     h: HeaderMap,
 ) -> ApiResult<Json<Value>> {
+    authorize_receipt(&s, &id, &h)?;
+    let active: bool = s.db.lock().unwrap().query_row(
+        "SELECT state IN ('connecting','connected') FROM companion_calls WHERE id=?1",
+        [&id],
+        |r| r.get(0),
+    )?;
+    if !active {
+        return Ok(Json(
+            saved_action_status(&s, &id, &rid)?.ok_or_else(ApiError::missing)?,
+        ));
+    }
     authorize(&s, &id, &h)?;
     Ok(Json(match action_row(&s, &id, &rid)? {
         Some(value) => value,

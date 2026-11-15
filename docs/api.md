@@ -117,7 +117,14 @@ Instance delivery-journal retention/coverage and work-reference coverage remain
 explicit in the receipt; absent evidence stays unknown. Work references retain
 their owner, revision, state and input identity. Use that owner's existing
 inspection/amendment/Stop controls, not a second Conversations work ledger.
-Companion call rooms do not adopt this ordinary-Conversations profile here.
+Companion call rooms use this negotiated profile when an exact retained human
+source is available. The original submission ID stays fixed; its source revision
+and occurrence time identify the retained human request and transcript separately
+from the generated delegation prompt. Later corrections have distinct source
+identities. Legacy calls without retained human sources and agents without the
+capability keep their existing behavior. See [Companion](companion.md) for the
+private call and saved-result boundaries; accepted work still uses its owner's
+existing inspection and control APIs.
 
 
 ## Room and endpoint operations

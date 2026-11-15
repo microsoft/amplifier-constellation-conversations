@@ -37,7 +37,7 @@ test('official MCP client discovers only bounded tools and callbacks stay in thi
     ['companion_action_status',{request_id:id}],
     ['companion_show',{url:'https://example.com/video',title:'The demonstration',kind:'video'}],
     ['companion_shared',{}],
-    ['companion_view',{operation_id:id,delegation_id:'delegate-1',action:'focus_card',card_id:'123'}],
+    ['companion_view',{operation_id:id,delegation_id:'delegate-1',expected_browser_id:randomUUID(),expected_revision:0,action:'focus_card',card_id:'123'}],
     ['companion_capture',{operation_id:id,delegation_id:'delegate-1'}],
     ['companion_surface_status',{operation_id:id}],
   ])assert.notEqual((await client.callTool({name,arguments:args})).isError,true);
@@ -62,10 +62,10 @@ test('tool schemas cannot redirect callbacks, switch calls or expose credentials
     ['companion_request_action',{connection_id:'game',delegation_id:'delegate-1',instruction:'漢'.repeat(2667),request_id:randomUUID()}],
     ['companion_show',{url:'javascript:alert(1)',title:'Unsafe'}],
     ['companion_show',{url:'https://user:secret@example.com/',title:'Credential URL'}],
-    ['companion_view',{operation_id:randomUUID(),delegation_id:'delegate-1',action:'open_url',url:'https://example.com'}],
-    ['companion_view',{operation_id:randomUUID(),delegation_id:'delegate-1',action:'focus_card',card_id:'#arbitrary-selector'}],
-    ['companion_view',{operation_id:randomUUID(),delegation_id:'delegate-1',action:'focus_card'}],
-    ['companion_view',{operation_id:randomUUID(),delegation_id:'delegate-1',action:'scroll_up',card_id:'1'}],
+    ['companion_view',{operation_id:randomUUID(),delegation_id:'delegate-1',expected_browser_id:randomUUID(),expected_revision:0,action:'open_url',url:'https://example.com'}],
+    ['companion_view',{operation_id:randomUUID(),delegation_id:'delegate-1',expected_browser_id:randomUUID(),expected_revision:0,action:'focus_card',card_id:'#arbitrary-selector'}],
+    ['companion_view',{operation_id:randomUUID(),delegation_id:'delegate-1',expected_browser_id:randomUUID(),expected_revision:0,action:'focus_card'}],
+    ['companion_view',{operation_id:randomUUID(),delegation_id:'delegate-1',expected_browser_id:randomUUID(),expected_revision:0,action:'scroll_up',card_id:'1'}],
     ['companion_capture',{operation_id:randomUUID(),delegation_id:'delegate-1',enable_camera:true}],
     ['companion_capture',{operation_id:randomUUID(),delegation_id:'delegate-1',count:2}],
     ['companion_capture',{operation_id:randomUUID()}],
@@ -237,10 +237,10 @@ test('surface state and existing shared-image lookup reuse one scoped read tool'
 test('whiteboard operations are limited to three exact saved IDs and cannot change other surfaces',async t=>{
  const {client,requests}=await fixture(t);const upload=`upload:${randomUUID()}`;
  for(const extra of [{action:'replace_board',card_ids:['1',upload]},{action:'add_card',card_id:'2'},{action:'remove_card',card_id:upload},{action:'clear_board'}]) {
-  assert.notEqual((await client.callTool({name:'companion_view',arguments:{operation_id:randomUUID(),delegation_id:'delegate-1',...extra}})).isError,true);
+  assert.notEqual((await client.callTool({name:'companion_view',arguments:{operation_id:randomUUID(),delegation_id:'delegate-1',expected_browser_id:randomUUID(),expected_revision:0,...extra}})).isError,true);
  }
  for(const extra of [{action:'replace_board',card_ids:[]},{action:'replace_board',card_ids:['1','1']},{action:'replace_board',card_ids:['1','2','3','4']},{action:'replace_board',card_ids:['#selector']},{action:'add_card',card_ids:['1']},{action:'clear_board',card_id:'1'},{action:'remove_card',card_id:'upload:../../secret'}]) {
-  assert.equal((await client.callTool({name:'companion_view',arguments:{operation_id:randomUUID(),delegation_id:'delegate-1',...extra}})).isError,true);
+  assert.equal((await client.callTool({name:'companion_view',arguments:{operation_id:randomUUID(),delegation_id:'delegate-1',expected_browser_id:randomUUID(),expected_revision:0,...extra}})).isError,true);
  }
  assert.equal(requests.length,4);assert.ok(requests.every(r=>r.path===`/api/v1/companion/calls/${callId}/tools/view`));
 });
@@ -423,4 +423,22 @@ test('post rejection and uncertain response carry original operation identities 
   }
   assert.equal(requests.length,4,'One callback per independent test intent; no retry/redirect');
   assert(requests.every(r=>r.path===`/api/v1/companion/calls/${callId}/tools/huddles/${huddle_id}/posts`));
+});
+
+
+test('view controls require an observed bounded human-interaction revision',async t=>{
+ const {client,requests}=await fixture(t);
+ for(const expected_revision of [undefined,-1,0.5,Number.MAX_SAFE_INTEGER+1,null]) {
+  const args={operation_id:randomUUID(),delegation_id:'delegate-1',action:'show_context',expected_browser_id:randomUUID(),...(expected_revision===undefined?{}:{expected_revision})};
+  assert.equal((await client.callTool({name:'companion_view',arguments:args})).isError,true);
+ }
+ assert.equal(requests.length,0);
+ for(const expected_browser_id of [undefined,'not-a-browser']) {
+  const args={operation_id:randomUUID(),delegation_id:'delegate-1',action:'show_context',expected_revision:7,...(expected_browser_id===undefined?{}:{expected_browser_id})};
+  assert.equal((await client.callTool({name:'companion_view',arguments:args})).isError,true);
+ }
+ const args={operation_id:randomUUID(),delegation_id:'delegate-1',action:'show_context',expected_browser_id:randomUUID(),expected_revision:7};
+ assert.notEqual((await client.callTool({name:'companion_view',arguments:args})).isError,true);
+ assert.equal(requests[0].body.expected_revision,7);
+ assert.equal(requests[0].body.expected_browser_id,args.expected_browser_id);
 });

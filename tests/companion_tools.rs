@@ -656,6 +656,563 @@ fn native_permission(tool: &str, arguments: Value) -> Value {
 }
 
 #[tokio::test]
+async fn ended_call_reads_saved_actions_and_late_results_without_refresh_or_promotion() {
+    let f = fixture();
+    let c = call(&f);
+    delegation(&f, &c, "user");
+    companion_tools::record_mcp_port(&f.s, &c.id, 34567).unwrap();
+    let rid = uuid::Uuid::new_v4().to_string();
+    let (code, original) = request(
+        &f,
+        &c,
+        "POST",
+        "actions",
+        Some(action(&rid)),
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{original}");
+    assert_eq!(effects(&f).len(), 1);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    let path = format!("actions/{rid}");
+    assert_eq!(
+        request(&f, &c, "GET", &path, None, &c.token, false).await,
+        (StatusCode::OK, original)
+    );
+
+    let unknown = json!({"request_id":rid,"state":"unknown","transport_submitted":null});
+    f.s.db.lock().unwrap().execute("UPDATE companion_actions SET state='unknown',result=?3 WHERE call_id=?1 AND request_id=?2", params![c.id,rid,unknown.to_string()]).unwrap();
+    let observed = json!({"request_id":rid,"revision":"late-original","scope":"conversation","state":"reported","verified":false,"text":"The original source has now supplied a reply."});
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_observations(call_id,request_id,revision,data,updated_at) VALUES(?1,?2,'late-original',?3,?4)", params![c.id,rid,observed.to_string(),now_ms()]).unwrap();
+    let (code, saved) = request(&f, &c, "GET", &path, None, &c.token, false).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(saved["state"], "unknown");
+    assert_eq!(saved["result"], unknown);
+    assert_eq!(saved["observation"], observed);
+    // A saved read is not a timer-based reconciliation or a new observation.
+    f.s.db.lock().unwrap().execute("UPDATE companion_actions SET state='submitting',result='{}',created_at=?3 WHERE call_id=?1 AND request_id=?2", params![c.id,rid,now_ms()-46_000]).unwrap();
+    let stored = || {
+        f.s.db.lock().unwrap().query_row("SELECT state,result,source,created_at FROM companion_actions WHERE call_id=?1 AND request_id=?2", params![c.id,rid], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?))).unwrap()
+    };
+    let before = stored();
+    let (_, saved) = request(&f, &c, "GET", &path, None, &c.token, false).await;
+    assert_eq!(saved["state"], "submitting");
+    assert_eq!(saved["result"], json!({}));
+    assert_eq!(stored(), before);
+    assert_eq!(saved["observation"], observed);
+
+    let permission = companion_tools::permission_once(
+        &f.s,
+        &c.room,
+        "owner",
+        "default",
+        true,
+        &native_permission("companion_action_status", json!({"request_id":rid})),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(permission["outcome"]["optionId"], "single");
+    let missing = companion_tools::permission_once(
+        &f.s,
+        &c.room,
+        "owner",
+        "default",
+        true,
+        &native_permission(
+            "companion_action_status",
+            json!({"request_id":uuid::Uuid::new_v4().to_string()}),
+        ),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(missing, agent_conversations::permissions::cancelled());
+    for (method, path, body) in [
+        (
+            "POST",
+            "actions",
+            Some(action(&uuid::Uuid::new_v4().to_string())),
+        ),
+        ("GET", "connection-status?connection_id=minecraft", None),
+        ("GET", "observations", None),
+        (
+            "POST",
+            "view",
+            Some(
+                json!({"operation_id":uuid::Uuid::new_v4().to_string(),"expected_browser_id":uuid::Uuid::new_v4().to_string(),"expected_revision":0,"delegation_id":"fixture-delegation","action":"show_shared"}),
+            ),
+        ),
+        (
+            "POST",
+            "capture",
+            Some(
+                json!({"operation_id":uuid::Uuid::new_v4().to_string(),"delegation_id":"fixture-delegation"}),
+            ),
+        ),
+    ] {
+        // Valid routes and bodies must reach the closed-call authority check,
+        // not pass this negative through routing or JSON extraction failure.
+        assert_eq!(
+            request(&f, &c, method, path, body, &c.token, false).await.0,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+    assert_eq!(stored(), before);
+    assert_eq!(
+        effects(&f).len(),
+        1,
+        "No helper was invoked by saved inspection or a denied new effect"
+    );
+}
+
+#[tokio::test]
+async fn ended_action_status_keeps_original_grant_room_and_endpoint_revocation() {
+    for case in [
+        "wrong_call_token",
+        "origin",
+        "grant_removed",
+        "tools_disabled",
+        "extra_member",
+        "endpoint_changed",
+    ] {
+        let f = fixture();
+        let c = call(&f);
+        let other = call(&f);
+        let rid = uuid::Uuid::new_v4().to_string();
+        f.s.db.lock().unwrap().execute("INSERT INTO companion_actions VALUES(?1,?2,'retained','minecraft','Original request','{}','unknown',?3,?4)", params![c.id,rid,json!({"state":"unknown","request_id":rid}).to_string(),now_ms()]).unwrap();
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE companion_calls SET state='closed' WHERE id=?1",
+                [&c.id],
+            )
+            .unwrap();
+        match case {
+            "grant_removed" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "DELETE FROM companion_tool_grants WHERE call_id=?1",
+                        [&c.id],
+                    )
+                    .unwrap();
+            }
+            "tools_disabled" => {
+                std::fs::write(
+                    f.home.path().join("companion-actions.json"),
+                    r#"{"enabled":false,"agents":{}}"#,
+                )
+                .unwrap();
+            }
+            "extra_member" => {
+                f.s.db.lock().unwrap().execute("INSERT INTO room_members(conversation_id,username,role,joined_at) VALUES(?1,'other','member',?2)", params![c.room,now_ms()]).unwrap();
+            }
+            "endpoint_changed" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE companion_calls SET endpoint_hash='changed' WHERE id=?1",
+                        [&c.id],
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        // A later valid call's bearer cannot stand in for the original call's grant.
+        let token = if case == "wrong_call_token" {
+            &other.token
+        } else {
+            &c.token
+        };
+        let (code, _) = request(
+            &f,
+            &c,
+            "GET",
+            &format!("actions/{rid}"),
+            None,
+            token,
+            case == "origin",
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+            "{case}: {code}"
+        );
+        assert!(effects(&f).is_empty());
+    }
+}
+
+struct ActionProxyTasks(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for ActionProxyTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+async fn exercise_closed_action_mcp(official_bridge: bool) {
+    use axum::{Json, http::HeaderMap, response::IntoResponse, routing::post};
+    use std::{process::Stdio, sync::Mutex, time::Duration};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let f = fixture();
+    let c = call(&f);
+    let later_call = call(&f);
+    delegation(&f, &c, "user");
+    let rid = uuid::Uuid::new_v4().to_string();
+    let (code, _) = request(
+        &f,
+        &c,
+        "POST",
+        "actions",
+        Some(action(&rid)),
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(effects(&f).len(), 1);
+    // The action was actually admitted once; simulate its retained uncertain
+    // transport outcome and a later saved original-source observation.
+    let unknown = json!({"request_id":rid,"state":"unknown","transport_submitted":null});
+    let observation = json!({"request_id":rid,"state":"reported","verified":false,"text":"A late original-source report."});
+    f.s.db.lock().unwrap().execute("UPDATE companion_actions SET state='unknown',result=?3 WHERE call_id=?1 AND request_id=?2", params![c.id,rid,unknown.to_string()]).unwrap();
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_observations(call_id,request_id,revision,data,updated_at) VALUES(?1,?2,'late',?3,?4)", params![c.id,rid,observation.to_string(),now_ms()]).unwrap();
+    let expected = request(
+        &f,
+        &c,
+        "GET",
+        &format!("actions/{rid}"),
+        None,
+        &c.token,
+        false,
+    )
+    .await
+    .1;
+    let original_rows = f.s.db.lock().unwrap().query_row("SELECT state,result,source,created_at FROM companion_actions WHERE call_id=?1 AND request_id=?2", params![c.id,rid], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?))).unwrap();
+
+    let mut tasks = ActionProxyTasks(vec![]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed_requests = requests.clone();
+    let host = f.app.clone().layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: axum::middleware::Next| {
+            observed_requests
+                .lock()
+                .unwrap()
+                .push((request.method().clone(), request.uri().path().to_owned()));
+            async move { next.run(request).await }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tasks.0.push(tokio::spawn(async move {
+        axum::serve(listener, host).await.unwrap();
+    }));
+    let mut node_child = None;
+    let port = if official_bridge {
+        // Plain cargo runs before npm ci in CI. The explicitly ignored test is
+        // required again after locked bridge dependencies are installed; absence
+        // of Node/dependencies fails that invocation rather than silently skipping.
+        let node = std::env::var_os("COMPANION_TEST_NODE").unwrap_or_else(|| "node".into());
+        if std::env::var_os("COMPANION_TEST_NODE").is_some() {
+            assert!(std::path::Path::new(&node).is_absolute());
+        }
+        let mut child = tokio::process::Command::new(node)
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/companion-action-bridge.mjs"),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Actual Node bridge dependencies are required");
+        let input = json!({"apiBase":api_base,"callId":c.id,"token":c.token});
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("{input}\n").as_bytes())
+            .await
+            .unwrap();
+        child.stdin.as_mut().unwrap().flush().await.unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        let line = tokio::time::timeout(Duration::from_secs(10), output.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("Bridge exited before readiness");
+        let port = serde_json::from_str::<Value>(&line).unwrap()["port"]
+            .as_u64()
+            .unwrap();
+        node_child = Some(child);
+        u16::try_from(port).unwrap()
+    } else {
+        // Mandatory Rust composition forwards through the actual HTTP proxy and
+        // actual saved GET. This bridge fixture is not the official SDK proof.
+        let base = api_base.clone();
+        let call_id = c.id.clone();
+        let bridge = Router::new().route("/mcp", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let base = base.clone();
+            let call_id = call_id.clone();
+            async move {
+                if body["method"] == "initialize" {
+                    return Json(json!({"jsonrpc":"2.0","id":body["id"],"result":{}})).into_response();
+                }
+                assert_eq!(body["params"]["name"], "companion_action_status");
+                let request_id = body["params"]["arguments"]["request_id"].as_str().unwrap();
+                let response = reqwest::Client::new()
+                    .get(format!("{base}/api/v1/companion/calls/{call_id}/tools/actions/{request_id}"))
+                    .header("authorization", headers.get("authorization").unwrap())
+                    .send().await.unwrap();
+                let status = response.status();
+                let receipt: Value = response.json().await.unwrap();
+                Json(json!({"jsonrpc":"2.0","id":body["id"],"result":{"isError":!status.is_success(),"structuredContent":receipt,"content":[{"type":"text","text":receipt.to_string()}]}})).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tasks.0.push(tokio::spawn(async move {
+            axum::serve(listener, bridge).await.unwrap();
+        }));
+        port
+    };
+    companion_tools::record_mcp_port(&f.s, &c.id, port).unwrap();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mcp_url = format!("{api_base}/api/v1/companion/calls/{}/mcp", c.id);
+    let mcp = |body: Value, token: String| {
+        let client = client.clone();
+        let url = mcp_url.clone();
+        async move {
+            let response = client
+                .post(url)
+                .bearer_auth(token)
+                .header("accept", "application/json, text/event-stream")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            (status, body)
+        }
+    };
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"closed-action-test","version":"1"}}});
+    assert_eq!(mcp(init, c.token.clone()).await.0, StatusCode::OK);
+    let read = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"companion_action_status","arguments":{"request_id":rid}}});
+    let (code, reply) = mcp(read.clone(), c.token.clone()).await;
+    assert_eq!(code, StatusCode::OK, "{reply}");
+    assert_ne!(reply["result"]["isError"], true, "{reply}");
+    assert_eq!(reply["result"]["structuredContent"], expected);
+    assert_eq!(reply["result"]["structuredContent"]["result"], unknown);
+    assert_eq!(
+        reply["result"]["structuredContent"]["observation"],
+        observation
+    );
+    let read_path = format!("/api/v1/companion/calls/{}/tools/actions/{rid}", c.id);
+    let get_count = || {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, path)| *method == axum::http::Method::GET && *path == read_path)
+            .count()
+    };
+    assert_eq!(
+        get_count(),
+        1,
+        "The bridge must actually call the saved GET once"
+    );
+    // A valid new-call bearer never authorizes the original ended-call proxy.
+    assert_eq!(
+        mcp(read.clone(), later_call.token.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    for (name, args) in [
+        (
+            "companion_action_status",
+            json!({"request_id":uuid::Uuid::new_v4().to_string()}),
+        ),
+        (
+            "companion_action_status",
+            json!({"request_id":rid,"call_id":later_call.id}),
+        ),
+        ("companion_action_status", json!({"request_id":"../other"})),
+        ("companion_action_status", json!({})),
+        (
+            "companion_request_action",
+            action(&uuid::Uuid::new_v4().to_string()),
+        ),
+        (
+            "companion_connection_status",
+            json!({"connection_id":"minecraft"}),
+        ),
+        ("companion_observations", json!({})),
+    ] {
+        let body = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":args}});
+        assert_eq!(
+            mcp(body, c.token.clone()).await.0,
+            StatusCode::FORBIDDEN,
+            "{name}"
+        );
+    }
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM companion_tool_grants WHERE call_id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    assert_eq!(mcp(read, c.token.clone()).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        get_count(),
+        1,
+        "Denied requests must never reach the bridge callback"
+    );
+    let after = f.s.db.lock().unwrap().query_row("SELECT state,result,source,created_at FROM companion_actions WHERE call_id=?1 AND request_id=?2", params![c.id,rid], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?))).unwrap();
+    assert_eq!(after, original_rows);
+    assert_eq!(
+        effects(&f).len(),
+        1,
+        "Saved MCP inspection and refusals produce no new action"
+    );
+    if let Some(mut child) = node_child {
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"{\"op\":\"close\"}\n")
+            .await
+            .unwrap();
+        child.stdin.take();
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+#[tokio::test]
+async fn closed_call_action_status_roundtrips_http_proxy_and_saved_get() {
+    exercise_closed_action_mcp(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Node and locked npm bridge dependencies; CI runs this exact test after npm ci"]
+async fn closed_call_action_status_roundtrips_official_mcp_bridge() {
+    exercise_closed_action_mcp(true).await;
+}
+
+#[tokio::test]
+async fn ended_call_preserves_exact_authorized_historical_action_lookup_without_new_authority() {
+    let f = fixture();
+    let old = call(&f);
+    delegation(&f, &old, "user");
+    let source = json!({"id":"minecraft","label":"Workshop","command":["/usr/bin/python3",f.home.path().join("helper.py")],"owners":["owner"],"audiences":[]});
+    let config = json!({"enabled":true,"decision_command":["/usr/bin/python3",f.home.path().join("helper.py")],"agents":{"default":[source]}});
+    std::fs::write(
+        f.home.path().join("companion-awareness.json"),
+        config.to_string(),
+    )
+    .unwrap();
+    let rid = uuid::Uuid::new_v4().to_string();
+    let (code, original) = request(
+        &f,
+        &old,
+        "POST",
+        "actions",
+        Some(action(&rid)),
+        &old.token,
+        false,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{original}");
+    let later = call(&f);
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_calls SET state='closed' WHERE id IN (?1,?2)",
+            params![old.id, later.id],
+        )
+        .unwrap();
+    let observation = json!({"request_id":rid,"revision":"later-reply","scope":"conversation","state":"reported","verified":false,"text":"A retained reply to the original request."});
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_observations(call_id,request_id,revision,data,updated_at) VALUES(?1,?2,'later-reply',?3,?4)", params![old.id,rid,observation.to_string(),now_ms()]).unwrap();
+    let path = format!("actions/{rid}");
+    assert_eq!(
+        request(&f, &old, "GET", &path, None, &later.token, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    // This is the existing historical same-private-identity path. It returns
+    // the old source call explicitly; it does not grant access to its API token.
+    let (code, saved) = request(&f, &later, "GET", &path, None, &later.token, false).await;
+    assert_eq!(code, StatusCode::OK, "{saved}");
+    assert_eq!(saved["source_call_id"], old.id);
+    assert_eq!(saved["request_id"], rid);
+    assert_eq!(saved["observation"], observation);
+    assert_eq!(saved["automatic_replay_allowed"], false);
+    assert_eq!(saved["fulfillment"], "not_established");
+    let (code, _) = request(
+        &f,
+        &later,
+        "POST",
+        "actions",
+        Some(action(&rid)),
+        &later.token,
+        false,
+    )
+    .await;
+    assert!(!code.is_success());
+    let mut revoked = config;
+    revoked["agents"]["default"][0]["command"] = json!(["/unavailable/changed-observer"]);
+    std::fs::write(
+        f.home.path().join("companion-awareness.json"),
+        revoked.to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        request(&f, &later, "GET", &path, None, &later.token, false)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        effects(&f).len(),
+        1,
+        "Status never executes the configured observer or action helper"
+    );
+}
+
+#[tokio::test]
 async fn exact_awareness_lookup_finds_older_card_and_cannot_cross_calls_or_redirect() {
     let f = fixture();
     let a = call(&f);

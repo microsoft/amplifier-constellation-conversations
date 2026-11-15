@@ -221,7 +221,7 @@ function updateDuration(call) {
 async function startCall(contact) {
   if (state.call || state.recovery || !state.available) return;
   const call = {generation:++state.generation, authGeneration:state.authGeneration, contact, id:null, request:null, ended:false, connected:false,
-    browserId:crypto.randomUUID(), keepScreenAwake:true, surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), cards:new Map(), contextItems:new Map(), board:[], muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
+    browserId:crypto.randomUUID(), viewRevision:0, keepScreenAwake:true, surfaceSeen:new Set(), userSpeaking:null, agentSpeaking:null, cursor:0, working:new Map(), progress:new Map(), seen:new Set(), shares:new Map(), cards:new Map(), contextItems:new Map(), board:[], muted:false, startedAt:Date.now(), timers:new Set(), transcriptRow:null};
   state.call = call;
   audio.muted = false;
   call.floor = new ConversationFloor({changed:({playback,interruption})=>{
@@ -1405,7 +1405,7 @@ async function surfacePresence(call) {
   const board = call.board.filter(id=>/^\d+$/.test(id) || (id.startsWith('upload:') && call.shares.get(id.slice(7))?.availableRecorded));
   try {
     await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/presence`, 'POST', {
-      browser_id:call.browserId,camera_enabled:Boolean(call.cameraStream?.getVideoTracks().some(t=>t.readyState === 'live')),
+      browser_id:call.browserId,view_revision:call.viewRevision,camera_enabled:Boolean(call.cameraStream?.getVideoTracks().some(t=>t.readyState === 'live')),
       capture_consent:Boolean(call.cameraStream && $('voice-photos').checked),
       board_card_ids:board,pinned_card_ids:board.filter(id=>call.cards.get(id)?.pinned),focused_card_id:board.find(id=>readingProtected(call,call.cards.get(id))) || null,
       user_speaking:document.hidden ? null : call.userSpeaking,
@@ -1417,6 +1417,21 @@ async function surfacePresence(call) {
   } catch { if (current(call)) call.surfaceReady = false; }
   finally { call.surfaceUpdating = false; if (current(call) && call.surfaceDirty) { clearTimeout(call.surfaceRetryTimer); call.surfaceRetryTimer = setTimeout(()=>surfacePresence(call),100); } }
 }
+// Advance synchronously on human navigation, before handlers or network work.
+// Heartbeats, media telemetry, automatic cards and remote view execution do not
+// create human intent. The local comparison also protects a delayed accept ACK.
+function humanSurfaceIntent(event) {
+  const call = state.call;
+  if (!current(call) || !event.isTrusted) return;
+  if (call.viewRevision >= Number.MAX_SAFE_INTEGER) { call.viewIntentUnavailable = true; call.surfaceReady = false; return; }
+  call.viewRevision++;
+  surfacePresence(call);
+}
+const sharedPanel = document.querySelector('.shared-panel');
+for (const event of ['pointerdown','click','keydown','wheel','touchstart','input']) {
+  sharedPanel.addEventListener(event,humanSurfaceIntent,{capture:true,passive:true});
+}
+$('camera-toggle').addEventListener('click',humanSurfaceIntent,{capture:true});
 $('voice-photos').onchange = () => {
   $('voice-photo-hint').textContent = $('voice-photos').checked
     ? 'You can say “Take a photo and help me with this.” Each request shares one photo, not a live feed.'
@@ -1442,11 +1457,18 @@ async function executeSurface(call, receipt) {
   try {
     const cameraReady = () => call.cameraStream?.getVideoTracks().some(track=>track.readyState === 'live') && $('voice-photos').checked;
     if (receipt.kind === 'capture' && (!cameraReady() || call.capturing)) { await ack('failed'); return; }
+    const viewCurrent = () => receipt.kind !== 'view' || (!call.viewIntentUnavailable
+      && receipt.command?.expected_browser_id === call.browserId && Number.isSafeInteger(receipt.command?.expected_revision)
+      && receipt.command.expected_revision >= 0 && receipt.command.expected_revision === call.viewRevision);
+    const staleView = () => api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/commands/${encodeURIComponent(op)}/ack`,
+      'POST',{browser_id:call.browserId,state:'failed',reason:'stale_view',view_revision:call.viewRevision});
+    if (!viewCurrent()) { await staleView(); return; }
     const accepted = await ack('accepted');
     if (!current(call) || accepted.execute !== true || accepted.operation_id !== op || accepted.browser_id !== call.browserId
         || accepted.kind !== receipt.kind || accepted.state !== 'accepted' || !Number.isSafeInteger(accepted.expires_at)
         || accepted.expires_at !== receipt.expires_at || accepted.expires_at <= Date.now()) return;
     if (receipt.kind === 'view') {
+      if (!viewCurrent()) { await staleView(); return; }
       try { applyView(call,receipt.command); }
       catch (error) { await api(`/api/v1/companion/calls/${encodeURIComponent(call.id)}/surface/commands/${encodeURIComponent(op)}/ack`,'POST',{browser_id:call.browserId,state:'failed',...(['board_full','item_protected'].includes(error.reason) ? {reason:error.reason} : {})}); return; }
       await ack('executed');

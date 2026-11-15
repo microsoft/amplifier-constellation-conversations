@@ -24,6 +24,7 @@ jobs:
           node-version: 22
       - run: npm ci --ignore-scripts --prefix bridge
       - run: npm test --prefix bridge
+      - run: cargo test --locked --test companion_tools closed_call_action_status_roundtrips_official_mcp_bridge -- --ignored --exact
       - run: python3 -m unittest discover -s bridge/test -p 'test_*.py'
       - run: node tests/voice.mjs
       - run: node --test tests/companion-floor.test.mjs tests/message-presentation.test.mjs tests/huddles-api.test.mjs tests/view-intent.test.mjs

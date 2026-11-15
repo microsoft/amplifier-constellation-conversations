@@ -29,6 +29,7 @@ def save_sources():
     source_file.write_text(json.dumps(source_receipts))
 def register_source(params,kind):
     metadata=params.get('_meta',{}).get(source_meta)
+    if metadata is None and mode=='source-optional':return None
     assert metadata is not None,'Negotiated input omitted source metadata'
     assert metadata['version']==1 and metadata['inputId']
     assert params['sessionId']==sid,'Source input changed loaded session'
