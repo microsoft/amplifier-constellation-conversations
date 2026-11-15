@@ -162,6 +162,91 @@ pub(crate) struct ExpectedGate {
     pub phase: GatePhase,
 }
 
+/// Exact retained barrier evidence. `Restored` releases admission; it does not
+/// assert candidate health, completion of conversation work, or adoption.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GateRow {
+    pub transaction: String,
+    pub phase: GatePhase,
+    pub acquired_at: i64,
+    pub restored_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SchemaProfile {
+    Pristine,
+    GateOnly,
+    Complete,
+}
+
+/// Returned under the same reservation as the preservation proof. The caller
+/// must bind this to the exact controlled initializer and archive it before
+/// candidate Start. A digest by itself is not source or operation authority.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreservationWitness {
+    pub format: String,
+    pub snapshot_sha256: String,
+    pub schema_sha256: String,
+    pub profile: SchemaProfile,
+    pub gates: Vec<GateRow>,
+    pub witness_sha256: String,
+}
+
+/// All fields must come from the caller's validated immutable predecessor
+/// archive. The caller proves the old image/restoration and fresh explicit
+/// authorization; this state layer does not authorize an attempt from hashes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReentryProof {
+    pub archive_sha256: String,
+    pub predecessor_transaction: String,
+    pub expected_gates: Vec<GateRow>,
+    // Historical incomplete records can be decoded and refused explicitly;
+    // every supported reentry requires a preserved witness, including early recovery.
+    pub witness: Option<PreservationWitness>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReentryBaseline {
+    proof: ReentryProof,
+    predecessor_snapshot_sha256: String,
+    profile: SchemaProfile,
+}
+
+/// Publish this exact plan with the new immutable origin before transferring
+/// admission. The before and after ledgers make a lost commit reply observable
+/// without repeating the mutation. Earlier restored rows are never removed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GateTransfer {
+    pub format: String,
+    pub snapshot_sha256: String,
+    pub transaction: String,
+    pub at_ms: i64,
+    pub before: Vec<GateRow>,
+    pub after_prepared: Vec<GateRow>,
+    pub transfer_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GateStage {
+    Before,
+    Prepared,
+    Restored,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GateObservation {
+    pub stage: GateStage,
+    pub rows: Vec<GateRow>,
+}
+
 /// Original delivery identity and a hash of every original typed row field.
 /// This is retained uncertainty, never a completion or replay permission.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +298,10 @@ pub(crate) struct Snapshot {
     pub historical_inputs: Vec<HistoricalInput>,
     pub secrets: Vec<SecretEntry>,
     startup_refresh: StartupRefresh,
+    // Absence must remain absent on serialization: original v1 snapshot
+    // hashes and frozen origin records remain byte-for-byte compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reentry: Option<ReentryBaseline>,
 }
 
 pub(crate) struct AuditGuard {
@@ -240,6 +329,57 @@ impl AuditGuard {
         })
     }
 
+    /// Audit a freshly stopped, restored legacy installation without rewinding
+    /// its database or reusing the first attempt's data snapshot. Existing old
+    /// rows and safe secrets may have legitimately changed since restoration.
+    /// Full successor schema requires a prior source-bound witness; arbitrary
+    /// named empty tables and partial migrations do not establish that proof.
+    pub(crate) fn begin_reentry(
+        home: &Path,
+        previous: &Snapshot,
+        proof: &ReentryProof,
+    ) -> Result<Self> {
+        validate_snapshot(previous)?;
+        validate_reentry_proof(proof)?;
+        validate_predecessor_history(previous, proof.witness.as_ref(), &proof.expected_gates)?;
+        let (db, config_bytes) = begin_existing(home)?;
+        validate_schema_with_ledger(&db, &proof.expected_gates)?;
+        let profile = schema_profile(&db)?;
+        let schema = schema_digest(&db)?;
+        let witness = proof
+            .witness
+            .as_ref()
+            .context("Reentry requires its prior preservation witness")?;
+        ensure!(
+            witness.schema_sha256 == schema && witness.profile == profile,
+            "Restored schema differs from the qualified witness"
+        );
+        let mut snapshot = capture(&db, &config_bytes, home)?;
+        ensure!(
+            snapshot
+                .tables
+                .iter()
+                .zip(&previous.tables)
+                .all(|(actual, old)| actual.original_schema_sha256 == old.original_schema_sha256),
+            "Original schema changed after legacy restoration"
+        );
+        snapshot.reentry = Some(ReentryBaseline {
+            proof: proof.clone(),
+            predecessor_snapshot_sha256: previous.saved_state_sha256.clone(),
+            profile,
+        });
+        snapshot.saved_state_sha256 = snapshot_digest(&snapshot)?;
+        ensure!(
+            config_bytes == config_bytes_at(home)?,
+            "Legacy configuration changed during reentry audit"
+        );
+        Ok(Self {
+            db,
+            home: home.to_owned(),
+            snapshot,
+        })
+    }
+
     pub(crate) fn report(&self) -> &Readiness {
         &self.snapshot.readiness
     }
@@ -252,8 +392,18 @@ impl AuditGuard {
     /// excluded throughout. This also rereads the configuration bytes; it is
     /// not a hostile-filesystem CAS or proof of absent external processes.
     pub(crate) fn verify_current(&self) -> Result<()> {
-        validate_schema(&self.db, false)?;
-        let current = capture(&self.db, &config_bytes_at(&self.home)?, &self.home)?;
+        if let Some(baseline) = &self.snapshot.reentry {
+            validate_schema_with_ledger(&self.db, &baseline.proof.expected_gates)?;
+            ensure!(
+                schema_profile(&self.db)? == baseline.profile,
+                "Reentry schema profile changed"
+            );
+        } else {
+            validate_schema(&self.db, false)?;
+        }
+        let mut current = capture(&self.db, &config_bytes_at(&self.home)?, &self.home)?;
+        current.reentry = self.snapshot.reentry.clone();
+        current.saved_state_sha256 = snapshot_digest(&current)?;
         ensure!(
             current == self.snapshot,
             "Legacy saved state changed during adoption"
@@ -279,6 +429,10 @@ impl AuditGuard {
     /// table or row is changed. The caller retains service/operation ownership.
     /// A commit error is uncertain; do not redispatch or clear a possible gate.
     pub(crate) fn prepare_gate(self, transaction: &str) -> Result<Snapshot> {
+        ensure!(
+            self.snapshot.reentry.is_none(),
+            "Reentry requires its immutable gate-transfer plan"
+        );
         uuid::Uuid::parse_str(transaction).context("Use an adoption transaction UUID")?;
         self.verify_current()?;
         ensure!(
@@ -290,6 +444,75 @@ impl AuditGuard {
         self.db.execute("INSERT INTO native_update_admission(transaction_id,phase,acquired_at,restored_at) VALUES(?1,'prepared',?2,NULL)", rusqlite::params![transaction,crate::state::now_ms()])?;
         // COMMIT is the first point where the database reservation may end;
         // the new durable barrier is visible atomically with that release.
+        self.db.execute_batch("COMMIT")?;
+        Ok(self.snapshot.clone())
+    }
+
+    pub(crate) fn plan_reentry_gate(&self, transaction: &str, at_ms: i64) -> Result<GateTransfer> {
+        self.verify_current()?;
+        ensure!(
+            self.report().ready,
+            "Legacy state contains active or unsupported work"
+        );
+        let baseline = self
+            .snapshot
+            .reentry
+            .as_ref()
+            .context("A reentry audit is required")?;
+        let before = baseline.proof.expected_gates.clone();
+        let after_prepared = transferred_rows(&before, transaction, at_ms)?;
+        let mut plan = GateTransfer {
+            format: "conversations-legacy-gate-transfer-v1".to_owned(),
+            snapshot_sha256: self.snapshot.saved_state_sha256.clone(),
+            transaction: transaction.to_owned(),
+            at_ms,
+            before,
+            after_prepared,
+            transfer_sha256: String::new(),
+        };
+        plan.transfer_sha256 = transfer_digest(&plan)?;
+        validate_transfer(&self.snapshot, &plan)?;
+        Ok(plan)
+    }
+
+    pub(crate) fn prepare_reentry_gate(self, plan: &GateTransfer) -> Result<Snapshot> {
+        self.prepare_reentry_gate_inner(plan, || Ok(()))
+    }
+
+    fn prepare_reentry_gate_inner(
+        self,
+        plan: &GateTransfer,
+        between: impl FnOnce() -> Result<()>,
+    ) -> Result<Snapshot> {
+        validate_transfer(&self.snapshot, plan)?;
+        self.verify_current()?;
+        ensure!(
+            self.report().ready,
+            "Legacy state contains active or unsupported work"
+        );
+        self.db.execute_batch("PRAGMA query_only=OFF;")?;
+        crate::update_admission::migrate(&self.db)?;
+        if let Some(previous) = plan
+            .before
+            .iter()
+            .find(|row| row.phase == GatePhase::Prepared)
+        {
+            let changed = self.db.execute(
+                "UPDATE native_update_admission SET phase='restored',restored_at=?3 WHERE transaction_id=?1 AND phase='prepared' AND acquired_at=?2 AND restored_at IS NULL",
+                rusqlite::params![previous.transaction, previous.acquired_at, plan.at_ms])?;
+            ensure!(
+                changed == 1,
+                "Predecessor admission changed before transfer"
+            );
+        }
+        // Used by the fault regression to prove a failure or unwind between
+        // the two statements retains the original barrier on rollback.
+        between()?;
+        self.db.execute("INSERT INTO native_update_admission(transaction_id,phase,acquired_at,restored_at) VALUES(?1,'prepared',?2,NULL)",rusqlite::params![plan.transaction,plan.at_ms])?;
+        ensure!(
+            gate_rows(&self.db)? == plan.after_prepared,
+            "Gate transfer did not preserve exact history"
+        );
         self.db.execute_batch("COMMIT")?;
         Ok(self.snapshot.clone())
     }
@@ -311,6 +534,10 @@ pub(crate) fn verify_before_startup(
     expected_gate: Option<&ExpectedGate>,
 ) -> Result<()> {
     validate_snapshot(before)?;
+    ensure!(
+        before.reentry.is_none(),
+        "Reentry requires its exact transfer observation"
+    );
     ensure!(
         before.readiness.ready,
         "Original state was not ready for adoption"
@@ -366,13 +593,40 @@ pub(crate) fn verify_before_startup(
 /// permitted changes to old rows are the two known token expiry refreshes and
 /// default endpoint updated_at within the observed initialization interval.
 /// Historical uncertain outcomes remain exactly as recorded.
+#[cfg(test)]
 pub(crate) fn verify_preserved(
     home: &Path,
     before: &Snapshot,
     window: InitializationWindow,
     expected_gate: Option<&ExpectedGate>,
 ) -> Result<()> {
+    verify_preserved_inner(home, before, window, expected_gate, false).map(|_| ())
+}
+
+/// The witness is captured atomically with the proof, before releasing this
+/// reservation. Persist it with the exact initializer binding before Start.
+pub(crate) fn verify_preserved_with_witness(
+    home: &Path,
+    before: &Snapshot,
+    window: InitializationWindow,
+    expected_gate: Option<&ExpectedGate>,
+) -> Result<PreservationWitness> {
+    verify_preserved_inner(home, before, window, expected_gate, true)?
+        .context("Missing preservation witness")
+}
+
+fn verify_preserved_inner(
+    home: &Path,
+    before: &Snapshot,
+    window: InitializationWindow,
+    expected_gate: Option<&ExpectedGate>,
+    witness: bool,
+) -> Result<Option<PreservationWitness>> {
     validate_snapshot(before)?;
+    ensure!(
+        before.reentry.is_none(),
+        "Reentry requires its exact transfer observation"
+    );
     ensure!(
         before.readiness.ready,
         "Original state was not ready for adoption"
@@ -403,12 +657,175 @@ pub(crate) fn verify_preserved(
             config_bytes == config_bytes_at(home)?,
             "Configuration changed during preservation check"
         );
-        Ok(())
+        if witness {
+            Ok(Some(preservation_witness(&db, before)?))
+        } else {
+            Ok(None)
+        }
     })();
     let rollback = db.execute_batch("ROLLBACK");
-    result?;
+    let result = result?;
     rollback?;
-    Ok(())
+    Ok(result)
+}
+
+/// A read-only archive-time observation, not proof of process absence or
+/// permission to transfer a barrier. The stopped audit must compare it again.
+pub(crate) fn admission_ledger(home: &Path) -> Result<Vec<GateRow>> {
+    let db = readonly_ledger_connection(home)?;
+    let rows = gate_rows(&db)?;
+    validate_admission_schema(&db)?;
+    db.execute_batch("ROLLBACK")?;
+    Ok(rows)
+}
+
+fn readonly_ledger_connection(home: &Path) -> Result<Connection> {
+    ordinary_file(&home.join("state.sqlite3"))?;
+    let db =
+        Connection::open_with_flags(home.join("state.sqlite3"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::ZERO)?;
+    db.execute_batch("BEGIN; PRAGMA query_only=ON;")?;
+    Ok(db)
+}
+
+/// Archive-time validation of retained history against the prior successful
+/// preservation proof. This is one read-only SQLite snapshot; it requires no
+/// process absence or service lock and supplies no mutation authority. The
+/// stopped audit repeats the comparison under its writer reservation.
+pub(crate) fn predecessor_ledger(
+    home: &Path,
+    previous: &Snapshot,
+    witness: Option<&PreservationWitness>,
+) -> Result<Vec<GateRow>> {
+    let db = readonly_ledger_connection(home)?;
+    let rows = gate_rows(&db)?;
+    validate_admission_schema(&db)?;
+    validate_predecessor_history(previous, witness, &rows)?;
+    let profile = schema_profile(&db)?;
+    let witness = witness.context("Reentry requires its prior preservation witness")?;
+    ensure!(
+        witness.schema_sha256 == schema_digest(&db)? && witness.profile == profile,
+        "Restored schema differs from its retained preservation proof"
+    );
+    db.execute_batch("ROLLBACK")?;
+    Ok(rows)
+}
+
+/// Classify only an exact immutable plan's ledger. This never proves health,
+/// reissues a transfer, or treats a restored barrier as a successful adoption.
+pub(crate) fn classify_reentry_gate(
+    home: &Path,
+    before: &Snapshot,
+    plan: &GateTransfer,
+) -> Result<GateObservation> {
+    validate_transfer(before, plan)?;
+    let rows = admission_ledger(home)?;
+    let stage = if rows == plan.before {
+        GateStage::Before
+    } else if rows == plan.after_prepared {
+        GateStage::Prepared
+    } else {
+        GateStage::Restored
+    };
+    let observation = GateObservation { stage, rows };
+    validate_observation(plan, &observation)?;
+    Ok(observation)
+}
+
+pub(crate) fn verify_reentry_before_startup(
+    home: &Path,
+    before: &Snapshot,
+    plan: &GateTransfer,
+    observation: &GateObservation,
+) -> Result<()> {
+    verify_reentry_state(home, before, plan, observation, None).map(|_| ())
+}
+
+pub(crate) fn verify_reentry_preserved(
+    home: &Path,
+    before: &Snapshot,
+    plan: &GateTransfer,
+    observation: &GateObservation,
+    window: InitializationWindow,
+) -> Result<PreservationWitness> {
+    verify_reentry_state(home, before, plan, observation, Some(window))
+}
+
+fn verify_reentry_state(
+    home: &Path,
+    before: &Snapshot,
+    plan: &GateTransfer,
+    observation: &GateObservation,
+    window: Option<InitializationWindow>,
+) -> Result<PreservationWitness> {
+    validate_transfer(before, plan)?;
+    validate_observation(plan, observation)?;
+    ensure!(
+        before.readiness.ready,
+        "Reentry baseline contained active or unsupported work"
+    );
+    let baseline = before
+        .reentry
+        .as_ref()
+        .context("Missing reentry baseline")?;
+    let (db, config) = begin_existing(home)?;
+    let result = (|| {
+        validate_schema_with_ledger(&db, &observation.rows)?;
+        let profile = schema_profile(&db)?;
+        ensure!(
+            baseline.profile != SchemaProfile::GateOnly || profile != SchemaProfile::Pristine,
+            "Previously retained admission schema disappeared"
+        );
+        if baseline.profile == SchemaProfile::Complete || window.is_none() {
+            if baseline.profile == SchemaProfile::Pristine {
+                ensure!(
+                    profile == SchemaProfile::Pristine || profile == SchemaProfile::GateOnly,
+                    "Unexpected successor initialization before startup"
+                );
+                ensure!(
+                    schema_without_admission(&db)? == before.schema_sha256,
+                    "Original schema changed before startup"
+                );
+            } else {
+                ensure!(
+                    profile == baseline.profile && schema_digest(&db)? == before.schema_sha256,
+                    "Reentry schema changed from its exact baseline"
+                );
+            }
+        }
+        ensure!(
+            hash(&config) == before.config_sha256,
+            "Reentry configuration changed"
+        );
+        validate_default_endpoint(&db, &config)?;
+        ensure!(
+            secret_snapshot(home, &db)? == before.secrets,
+            "Reentry secret files or policy changed"
+        );
+        ensure!(
+            readiness(&db)? == before.readiness,
+            "Reentry work or uncertainty changed"
+        );
+        let refresh = if let Some(window) = window {
+            validate_initialization_window(&db, window)?;
+            Some(&before.startup_refresh)
+        } else {
+            None
+        };
+        ensure!(
+            table_snapshots(&db, refresh)? == before.tables,
+            "Reentry protected rows changed"
+        );
+        ensure!(
+            config == config_bytes_at(home)?,
+            "Configuration changed during reentry proof"
+        );
+        preservation_witness(&db, before)
+    })();
+    let rollback = db.execute_batch("ROLLBACK");
+    let result = result?;
+    rollback?;
+    Ok(result)
 }
 
 fn begin_existing(home: &Path) -> Result<(Connection, Vec<u8>)> {
@@ -770,6 +1187,21 @@ fn validate_schema_with_gate(
     after_migration: bool,
     expected_gate: Option<&ExpectedGate>,
 ) -> Result<()> {
+    validate_schema_common(db, after_migration, expected_gate, None)
+}
+
+fn validate_schema_with_ledger(db: &Connection, ledger: &[GateRow]) -> Result<()> {
+    validate_gate_rows(ledger)?;
+    validate_admission_schema(db)?;
+    validate_schema_common(db, true, None, Some(ledger))
+}
+
+fn validate_schema_common(
+    db: &Connection,
+    after_migration: bool,
+    expected_gate: Option<&ExpectedGate>,
+    expected_ledger: Option<&[GateRow]>,
+) -> Result<()> {
     let mut statement =
         db.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?;
     let actual = statement
@@ -781,6 +1213,15 @@ fn validate_schema_with_gate(
         "Unsupported legacy schema: missing original table"
     );
     for extra in actual.difference(&expected) {
+        if extra == "native_update_admission"
+            && let Some(ledger) = expected_ledger
+        {
+            ensure!(
+                gate_rows(db)? == ledger,
+                "Retained admission ledger changed"
+            );
+            continue;
+        }
         if extra == "native_update_admission"
             && let Some(gate) = expected_gate
         {
@@ -799,6 +1240,11 @@ fn validate_schema_with_gate(
     ensure!(
         expected_gate.is_none() || actual.contains("native_update_admission"),
         "Expected adoption admission gate is missing"
+    );
+    ensure!(
+        expected_ledger
+            .is_none_or(|ledger| ledger.is_empty() || actual.contains("native_update_admission")),
+        "Retained admission ledger is missing"
     );
     ensure!(
         count(
@@ -887,6 +1333,294 @@ fn validate_gate(db: &Connection, expected: &ExpectedGate) -> Result<()> {
     ensure!(
         transaction == expected.transaction && acquired >= 0 && phase_matches,
         "Adoption admission gate differs from expected transition"
+    );
+    Ok(())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn schema_digest(db: &Connection) -> Result<String> {
+    Ok(query_digest(
+        db,
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name",
+        None,
+    )?
+    .1)
+}
+
+fn schema_without_admission(db: &Connection) -> Result<String> {
+    Ok(query_digest(db, "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('native_update_admission','native_update_activity') ORDER BY type,name", None)?.1)
+}
+
+fn validate_admission_schema(db: &Connection) -> Result<()> {
+    let query = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name IN ('native_update_admission','native_update_activity') ORDER BY type,name";
+    let actual = query_digest(db, query, None)?;
+    if actual.0 == 0 {
+        return Ok(());
+    }
+    // Build a synthetic schema from the existing fixed definition. No second
+    // DDL implementation and no migration of the inspected database occurs.
+    let expected = Connection::open_in_memory()?;
+    crate::update_admission::migrate(&expected)?;
+    ensure!(
+        actual == query_digest(&expected, query, None)?,
+        "Unsupported admission schema"
+    );
+    Ok(())
+}
+
+fn schema_profile(db: &Connection) -> Result<SchemaProfile> {
+    validate_admission_schema(db)?;
+    let actual = db
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let original: BTreeSet<_> = TABLES.iter().map(|(name, _)| (*name).to_owned()).collect();
+    let mut gate_only = original.clone();
+    gate_only.extend([
+        "native_update_activity".to_owned(),
+        "native_update_admission".to_owned(),
+    ]);
+    let mut complete = original.clone();
+    complete.extend(EMPTY_ADDITIONS.iter().map(|name| (*name).to_owned()));
+    let delivery_columns: i64 = db.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('input_deliveries')",
+        [],
+        |r| r.get(0),
+    )?;
+    let old_count = columns(
+        TABLES
+            .iter()
+            .find(|(name, _)| *name == "input_deliveries")
+            .expect("fixed table")
+            .1,
+    )
+    .len() as i64;
+    if actual == original && delivery_columns == old_count {
+        return Ok(SchemaProfile::Pristine);
+    }
+    if actual == gate_only && delivery_columns == old_count {
+        return Ok(SchemaProfile::GateOnly);
+    }
+    ensure!(
+        actual == complete && delivery_columns == old_count + 6,
+        "Partial or unsupported schema cannot qualify legacy reentry"
+    );
+    Ok(SchemaProfile::Complete)
+}
+
+fn gate_rows(db: &Connection) -> Result<Vec<GateRow>> {
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='native_update_admission')",[],|r|r.get(0))?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut query = db.prepare("SELECT transaction_id,phase,acquired_at,restored_at FROM native_update_admission ORDER BY transaction_id")?;
+    let tuples = query
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut rows = Vec::with_capacity(tuples.len());
+    for (transaction, phase, acquired_at, restored_at) in tuples {
+        let phase = match phase.as_str() {
+            "prepared" => GatePhase::Prepared,
+            "restored" => GatePhase::Restored,
+            _ => anyhow::bail!("Unsupported admission phase"),
+        };
+        rows.push(GateRow {
+            transaction,
+            phase,
+            acquired_at,
+            restored_at,
+        });
+    }
+    validate_gate_rows(&rows)?;
+    Ok(rows)
+}
+
+fn validate_gate_rows(rows: &[GateRow]) -> Result<()> {
+    ensure!(
+        rows.windows(2)
+            .all(|pair| pair[0].transaction < pair[1].transaction),
+        "Admission ledger is duplicate or not canonical"
+    );
+    ensure!(
+        rows.iter()
+            .filter(|row| row.phase == GatePhase::Prepared)
+            .count()
+            <= 1,
+        "More than one prepared admission barrier"
+    );
+    for row in rows {
+        uuid::Uuid::parse_str(&row.transaction).context("Invalid admission transaction UUID")?;
+        ensure!(
+            row.acquired_at >= 0
+                && match row.phase {
+                    GatePhase::Prepared => row.restored_at.is_none(),
+                    GatePhase::Restored => row.restored_at.is_some_and(|at| at >= row.acquired_at),
+                },
+            "Invalid admission transition timestamps"
+        );
+    }
+    Ok(())
+}
+
+fn witness_digest(witness: &PreservationWitness) -> Result<String> {
+    let mut value = witness.clone();
+    value.witness_sha256.clear();
+    Ok(hash(&serde_json::to_vec(&value)?))
+}
+
+fn preservation_witness(db: &Connection, before: &Snapshot) -> Result<PreservationWitness> {
+    let mut witness = PreservationWitness {
+        format: "conversations-legacy-schema-witness-v1".to_owned(),
+        snapshot_sha256: before.saved_state_sha256.clone(),
+        schema_sha256: schema_digest(db)?,
+        profile: schema_profile(db)?,
+        gates: gate_rows(db)?,
+        witness_sha256: String::new(),
+    };
+    witness.witness_sha256 = witness_digest(&witness)?;
+    Ok(witness)
+}
+
+fn validate_witness(witness: &PreservationWitness) -> Result<()> {
+    ensure!(
+        witness.format == "conversations-legacy-schema-witness-v1"
+            && valid_digest(&witness.snapshot_sha256)
+            && valid_digest(&witness.schema_sha256)
+            && witness.witness_sha256 == witness_digest(witness)?,
+        "Invalid schema witness"
+    );
+    validate_gate_rows(&witness.gates)
+}
+
+fn validate_reentry_proof(proof: &ReentryProof) -> Result<()> {
+    ensure!(
+        valid_digest(&proof.archive_sha256),
+        "Invalid predecessor archive digest"
+    );
+    uuid::Uuid::parse_str(&proof.predecessor_transaction)
+        .context("Invalid predecessor transaction UUID")?;
+    validate_gate_rows(&proof.expected_gates)?;
+    if let Some(witness) = &proof.witness {
+        validate_witness(witness)?;
+    }
+    Ok(())
+}
+
+fn validate_predecessor_history(
+    previous: &Snapshot,
+    witness: Option<&PreservationWitness>,
+    rows: &[GateRow],
+) -> Result<()> {
+    validate_snapshot(previous)?;
+    validate_gate_rows(rows)?;
+    let witness = witness.context("Reentry requires its prior preservation witness")?;
+    validate_witness(witness)?;
+    let inherited = previous
+        .reentry
+        .as_ref()
+        .and_then(|baseline| baseline.proof.witness.as_ref());
+    ensure!(
+        witness.snapshot_sha256 == previous.saved_state_sha256 || inherited == Some(witness),
+        "Schema witness is not bound to the predecessor lineage"
+    );
+    ensure!(
+        witness.gates == rows,
+        "Retained admission history differs from the prior preservation proof"
+    );
+    Ok(())
+}
+
+fn transferred_rows(before: &[GateRow], transaction: &str, at_ms: i64) -> Result<Vec<GateRow>> {
+    validate_gate_rows(before)?;
+    uuid::Uuid::parse_str(transaction).context("Use a fresh adoption transaction UUID")?;
+    ensure!(
+        at_ms >= 0 && before.iter().all(|row| row.transaction != transaction),
+        "Gate transfer cannot reuse a retained transaction or invalid time"
+    );
+    let mut after = before.to_vec();
+    for row in &mut after {
+        if row.phase == GatePhase::Prepared {
+            ensure!(
+                at_ms >= row.acquired_at,
+                "Gate transfer predates predecessor admission"
+            );
+            row.phase = GatePhase::Restored;
+            row.restored_at = Some(at_ms);
+        }
+    }
+    after.push(GateRow {
+        transaction: transaction.to_owned(),
+        phase: GatePhase::Prepared,
+        acquired_at: at_ms,
+        restored_at: None,
+    });
+    after.sort_by(|a, b| a.transaction.cmp(&b.transaction));
+    validate_gate_rows(&after)?;
+    Ok(after)
+}
+
+fn transfer_digest(plan: &GateTransfer) -> Result<String> {
+    let mut value = plan.clone();
+    value.transfer_sha256.clear();
+    Ok(hash(&serde_json::to_vec(&value)?))
+}
+
+fn validate_transfer(before: &Snapshot, plan: &GateTransfer) -> Result<()> {
+    validate_snapshot(before)?;
+    let baseline = before
+        .reentry
+        .as_ref()
+        .context("Gate transfer requires a reentry snapshot")?;
+    ensure!(
+        plan.format == "conversations-legacy-gate-transfer-v1"
+            && plan.snapshot_sha256 == before.saved_state_sha256
+            && plan.before == baseline.proof.expected_gates
+            && plan.transaction != baseline.proof.predecessor_transaction
+            && plan.after_prepared
+                == transferred_rows(&plan.before, &plan.transaction, plan.at_ms)?
+            && plan.transfer_sha256 == transfer_digest(plan)?,
+        "Gate transfer differs from its bound plan"
+    );
+    Ok(())
+}
+
+fn validate_observation(plan: &GateTransfer, observation: &GateObservation) -> Result<()> {
+    validate_gate_rows(&observation.rows)?;
+    let matches = match observation.stage {
+        GateStage::Before => observation.rows == plan.before,
+        GateStage::Prepared => observation.rows == plan.after_prepared,
+        GateStage::Restored => {
+            let mut expected = plan.after_prepared.clone();
+            let restored = observation
+                .rows
+                .iter()
+                .find(|row| row.transaction == plan.transaction)
+                .context("Transferred admission is missing")?;
+            ensure!(
+                restored.phase == GatePhase::Restored && restored.acquired_at == plan.at_ms,
+                "Transferred admission is not a recognized release"
+            );
+            let index = expected
+                .iter()
+                .position(|row| row.transaction == plan.transaction)
+                .context("Transfer plan has no current row")?;
+            expected[index] = restored.clone();
+            observation.rows == expected
+        }
+    };
+    ensure!(
+        matches,
+        "Admission is not the exact before or after transfer ledger"
     );
     Ok(())
 }
@@ -1026,6 +1760,7 @@ fn capture(db: &Connection, config: &[u8], home: &Path) -> Result<Snapshot> {
         historical_inputs: historical_inputs(db)?,
         secrets: secret_snapshot(home, db)?,
         startup_refresh: startup_refresh(db)?,
+        reentry: None,
     };
     snapshot.saved_state_sha256 = snapshot_digest(&snapshot)?;
     Ok(snapshot)
@@ -1046,6 +1781,34 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
         snapshot.tables.len() == TABLES.len(),
         "Invalid saved-state table inventory"
     );
+    if let Some(baseline) = &snapshot.reentry {
+        validate_reentry_proof(&baseline.proof)?;
+        ensure!(
+            valid_digest(&baseline.predecessor_snapshot_sha256),
+            "Invalid predecessor snapshot binding"
+        );
+        let witness = baseline
+            .proof
+            .witness
+            .as_ref()
+            .context("Reentry baseline lost its prior preservation witness")?;
+        ensure!(
+            witness.gates == baseline.proof.expected_gates,
+            "Reentry baseline changed retained admission history"
+        );
+        if baseline.profile == SchemaProfile::Complete {
+            let witness = baseline
+                .proof
+                .witness
+                .as_ref()
+                .context("Missing migrated schema witness")?;
+            ensure!(
+                witness.profile == SchemaProfile::Complete
+                    && witness.schema_sha256 == snapshot.schema_sha256,
+                "Reentry baseline differs from its qualified schema witness"
+            );
+        }
+    }
     for (actual, (name, spec)) in snapshot.tables.iter().zip(TABLES) {
         ensure!(
             &actual.name == name
@@ -2228,5 +2991,532 @@ mod tests {
             count(&db, "SELECT COUNT(*) FROM sqlite_schema WHERE type='table'").unwrap(),
             1
         );
+    }
+
+    // A synthetic complete additive inventory, not an actual AppState or
+    // platform migration qualification. Exact DDL is witnessed and then must
+    // remain unchanged; the composed owner fixture proves real migration DDL.
+    fn add_complete_synthetic_schema(home: &Path) {
+        let db = Connection::open(home.join("state.sqlite3")).unwrap();
+        db.execute_batch("ALTER TABLE input_deliveries ADD COLUMN ordinary_not_before INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE input_deliveries ADD COLUMN steering_target_turn TEXT;
+            ALTER TABLE input_deliveries ADD COLUMN steering_session_id TEXT;
+            ALTER TABLE input_deliveries ADD COLUMN source_metadata TEXT;
+            ALTER TABLE input_deliveries ADD COLUMN source_binding TEXT;
+            ALTER TABLE input_deliveries ADD COLUMN source_receipt TEXT;").unwrap();
+        crate::update_admission::migrate(&db).unwrap();
+        for table in EMPTY_ADDITIONS {
+            if matches!(*table, "native_update_activity" | "native_update_admission") {
+                continue;
+            }
+            let column = if *table == "huddle_peer_deliveries" {
+                "input_id"
+            } else {
+                "value"
+            };
+            db.execute(&format!("CREATE TABLE {table}({column} TEXT)"), [])
+                .unwrap();
+        }
+    }
+
+    fn reentry_fixture() -> (tempfile::TempDir, Snapshot, ReentryProof) {
+        let home = fixture();
+        add_delivery(home.path(), "original-unknown", "unknown");
+        let guard = AuditGuard::begin(home.path()).unwrap();
+        let before = guard.snapshot().clone();
+        let transaction = uuid::Uuid::new_v4().to_string();
+        guard.prepare_gate(&transaction).unwrap();
+        add_complete_synthetic_schema(home.path());
+        let witness = verify_preserved_with_witness(
+            home.path(),
+            &before,
+            test_window(),
+            Some(&ExpectedGate {
+                transaction: transaction.clone(),
+                phase: GatePhase::Prepared,
+            }),
+        )
+        .unwrap();
+        let proof = ReentryProof {
+            archive_sha256: hash(b"immutable predecessor archive fixture"),
+            predecessor_transaction: transaction,
+            expected_gates: admission_ledger(home.path()).unwrap(),
+            witness: Some(witness),
+        };
+        (home, before, proof)
+    }
+
+    fn plan_for(guard: &AuditGuard) -> GateTransfer {
+        let at = guard
+            .snapshot
+            .reentry
+            .as_ref()
+            .unwrap()
+            .proof
+            .expected_gates
+            .iter()
+            .map(|row| row.acquired_at.max(row.restored_at.unwrap_or(0)))
+            .max()
+            .unwrap_or(2)
+            + 1;
+        guard
+            .plan_reentry_gate(&uuid::Uuid::new_v4().to_string(), at)
+            .unwrap()
+    }
+
+    #[test]
+    fn initial_snapshot_encoding_remains_unchanged_without_reentry_metadata() {
+        let home = fixture();
+        let snapshot = AuditGuard::begin(home.path()).unwrap().snapshot().clone();
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded.get("reentry").is_none());
+        let decoded: Snapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+        validate_snapshot(&decoded).unwrap();
+    }
+
+    #[test]
+    fn reentry_preserves_fresh_current_rows_secrets_and_historical_uncertainty() {
+        let (home, previous, proof) = reentry_fixture();
+        change(
+            home.path(),
+            "UPDATE conversations SET title='Legitimate work after restoration'; UPDATE views SET revision=revision+1,value='current retained canary'; UPDATE grants SET expires_at=2000;",
+        );
+        add_delivery(home.path(), "newly-retained-unknown", "unknown");
+        crate::config::private_write(
+            &home.path().join("secrets/extra-safe-file"),
+            b"new retained private material",
+        )
+        .unwrap();
+        let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+        assert!(guard.report().ready);
+        let current = guard.snapshot().clone();
+        assert_ne!(current.tables, previous.tables);
+        assert_eq!(current.historical_inputs.len(), 2);
+        assert_ne!(current.secrets, previous.secrets);
+        let plan = plan_for(&guard);
+        let before_observation = classify_reentry_gate(home.path(), &current, &plan).unwrap();
+        assert_eq!(before_observation.stage, GateStage::Before);
+        // The separate inspector needs its own reservation, so release the
+        // initial read-only guard and reacquire the exact current baseline.
+        drop(guard);
+        verify_reentry_before_startup(home.path(), &current, &plan, &before_observation).unwrap();
+        let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+        assert_eq!(guard.snapshot(), &current);
+        guard.prepare_reentry_gate(&plan).unwrap();
+        let prepared = classify_reentry_gate(home.path(), &current, &plan).unwrap();
+        assert_eq!(prepared.stage, GateStage::Prepared);
+        verify_reentry_before_startup(home.path(), &current, &plan, &prepared).unwrap();
+        let witness =
+            verify_reentry_preserved(home.path(), &current, &plan, &prepared, test_window())
+                .unwrap();
+        assert_eq!(witness.profile, SchemaProfile::Complete);
+        assert_eq!(witness.gates, plan.after_prepared);
+        assert_eq!(admission_ledger(home.path()).unwrap(), plan.after_prepared);
+        let db = Connection::open(home.path().join("state.sqlite3")).unwrap();
+        assert_eq!(table_snapshots(&db, None).unwrap(), current.tables);
+        assert_eq!(historical_inputs(&db).unwrap(), current.historical_inputs);
+        assert_eq!(secret_snapshot(home.path(), &db).unwrap(), current.secrets);
+    }
+
+    #[test]
+    fn reentry_transfer_has_no_unowned_writer_gap_and_retains_exact_prior_rows() {
+        let (home, previous, proof) = reentry_fixture();
+        let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+        let plan = plan_for(&guard);
+        let reader = Connection::open(home.path().join("state.sqlite3")).unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        assert!(reader.execute_batch("BEGIN IMMEDIATE").is_err());
+        assert_eq!(gate_rows(&reader).unwrap(), plan.before);
+        guard
+            .prepare_reentry_gate_inner(&plan, || {
+                assert_eq!(gate_rows(&reader).unwrap(), plan.before);
+                assert!(reader.execute_batch("BEGIN IMMEDIATE").is_err());
+                Ok(())
+            })
+            .unwrap();
+        reader.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(gate_rows(&reader).unwrap(), plan.after_prepared);
+        let old = plan
+            .after_prepared
+            .iter()
+            .find(|row| row.transaction == proof.predecessor_transaction)
+            .unwrap();
+        assert_eq!(old.acquired_at, plan.before[0].acquired_at);
+        assert_eq!(old.phase, GatePhase::Restored);
+        assert_eq!(old.restored_at, Some(plan.at_ms));
+        reader.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn reentry_error_or_unwind_between_release_and_insert_preserves_old_barrier() {
+        for panic in [false, true] {
+            let (home, previous, proof) = reentry_fixture();
+            let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+            let plan = plan_for(&guard);
+            let before = guard.snapshot().clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                guard.prepare_reentry_gate_inner(&plan, || {
+                    assert!(!panic, "synthetic unwind between gate statements");
+                    anyhow::bail!("synthetic stop before new admission insert")
+                })
+            }));
+            if panic {
+                assert!(outcome.is_err());
+            } else {
+                assert!(outcome.unwrap().is_err());
+            }
+            assert_eq!(admission_ledger(home.path()).unwrap(), plan.before);
+            let observation = classify_reentry_gate(home.path(), &before, &plan).unwrap();
+            assert_eq!(observation.stage, GateStage::Before);
+            verify_reentry_before_startup(home.path(), &before, &plan, &observation).unwrap();
+        }
+    }
+
+    #[test]
+    fn reentry_rejects_missing_witness_partial_schema_changed_ddl_and_new_work() {
+        for change_kind in [
+            "missing-witness",
+            "partial",
+            "new-index",
+            "new-work",
+            "new-delivery-field",
+            "working",
+            "queued",
+        ] {
+            let (home, previous, mut proof) = reentry_fixture();
+            match change_kind {
+                "missing-witness" => proof.witness = None,
+                "partial" => change(home.path(), "DROP TABLE companion_calls"),
+                "new-index" => change(
+                    home.path(),
+                    "CREATE INDEX unexpected_feature_index ON companion_calls(value)",
+                ),
+                "new-work" => change(
+                    home.path(),
+                    "INSERT INTO companion_calls VALUES('retained new work')",
+                ),
+                "new-delivery-field" => change(
+                    home.path(),
+                    "UPDATE input_deliveries SET source_metadata='{}'",
+                ),
+                "working" => change(home.path(), "UPDATE conversations SET status='working'"),
+                "queued" => add_delivery(home.path(), "queued-input", "queued"),
+                _ => unreachable!(),
+            }
+            match AuditGuard::begin_reentry(home.path(), &previous, &proof) {
+                Ok(guard) => {
+                    assert!(matches!(change_kind, "working" | "queued"));
+                    assert!(!guard.report().ready);
+                    assert!(
+                        guard
+                            .plan_reentry_gate(
+                                &uuid::Uuid::new_v4().to_string(),
+                                crate::state::now_ms()
+                            )
+                            .is_err()
+                    );
+                }
+                Err(_) => assert!(
+                    !matches!(change_kind, "working" | "queued"),
+                    "{change_kind}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn reentry_refuses_reused_transaction_changed_plan_and_post_audit_drift() {
+        let (home, previous, proof) = reentry_fixture();
+        let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+        assert!(
+            guard
+                .plan_reentry_gate(&proof.predecessor_transaction, crate::state::now_ms())
+                .is_err()
+        );
+        let mut plan = plan_for(&guard);
+        plan.at_ms += 1;
+        assert!(guard.prepare_reentry_gate(&plan).is_err());
+        assert_eq!(admission_ledger(home.path()).unwrap(), proof.expected_gates);
+        let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+        let plan = plan_for(&guard);
+        let config = fs::read(home.path().join("config.json")).unwrap();
+        let mut changed = config.clone();
+        changed.push(b' ');
+        fs::write(home.path().join("config.json"), changed).unwrap();
+        assert!(guard.prepare_reentry_gate(&plan).is_err());
+        assert_eq!(admission_ledger(home.path()).unwrap(), proof.expected_gates);
+        fs::write(home.path().join("config.json"), config).unwrap();
+        let mut wrong = proof.clone();
+        wrong.expected_gates[0].acquired_at += 1;
+        assert!(AuditGuard::begin_reentry(home.path(), &previous, &wrong).is_err());
+    }
+
+    #[test]
+    fn reentry_early_pristine_and_gate_only_profiles_need_no_migration_replay() {
+        for gate_present in [false, true] {
+            let home = fixture();
+            let guard = AuditGuard::begin(home.path()).unwrap();
+            let previous = guard.snapshot().clone();
+            let predecessor = uuid::Uuid::new_v4().to_string();
+            if gate_present {
+                guard.prepare_gate(&predecessor).unwrap();
+            } else {
+                drop(guard);
+            }
+            let expected = gate_present.then(|| ExpectedGate {
+                transaction: predecessor.clone(),
+                phase: GatePhase::Prepared,
+            });
+            let witness = verify_preserved_with_witness(
+                home.path(),
+                &previous,
+                test_window(),
+                expected.as_ref(),
+            )
+            .unwrap();
+            let proof = ReentryProof {
+                archive_sha256: hash(b"early predecessor archive"),
+                predecessor_transaction: predecessor,
+                expected_gates: admission_ledger(home.path()).unwrap(),
+                witness: Some(witness),
+            };
+            assert_eq!(
+                predecessor_ledger(home.path(), &previous, proof.witness.as_ref()).unwrap(),
+                proof.expected_gates
+            );
+            let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+            let current = guard.snapshot().clone();
+            let plan = plan_for(&guard);
+            drop(guard);
+            let before = classify_reentry_gate(home.path(), &current, &plan).unwrap();
+            assert_eq!(before.stage, GateStage::Before);
+            verify_reentry_before_startup(home.path(), &current, &plan, &before).unwrap();
+            AuditGuard::begin_reentry(home.path(), &previous, &proof)
+                .unwrap()
+                .prepare_reentry_gate(&plan)
+                .unwrap();
+            let prepared = classify_reentry_gate(home.path(), &current, &plan).unwrap();
+            verify_reentry_before_startup(home.path(), &current, &plan, &prepared).unwrap();
+            let witness =
+                verify_reentry_preserved(home.path(), &current, &plan, &prepared, test_window())
+                    .unwrap();
+            assert_eq!(witness.profile, SchemaProfile::GateOnly);
+            let db = Connection::open(home.path().join("state.sqlite3")).unwrap();
+            assert_eq!(table_snapshots(&db, None).unwrap(), previous.tables);
+        }
+    }
+
+    #[test]
+    fn reentry_before_transfer_recovery_preserves_prior_active_id_and_inherited_witness() {
+        let (home, previous, proof) = reentry_fixture();
+        let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+        let current = guard.snapshot().clone();
+        let plan = plan_for(&guard);
+        drop(guard); // origin publication followed by interruption before SQL transfer
+        let observation = classify_reentry_gate(home.path(), &current, &plan).unwrap();
+        assert_eq!(observation.stage, GateStage::Before);
+        assert_ne!(observation.rows[0].transaction, plan.transaction);
+        verify_reentry_before_startup(home.path(), &current, &plan, &observation).unwrap();
+        let next_proof = ReentryProof {
+            archive_sha256: hash(b"second archive after early restoration"),
+            predecessor_transaction: plan.transaction.clone(),
+            expected_gates: observation.rows,
+            witness: proof.witness,
+        };
+        assert_eq!(
+            predecessor_ledger(home.path(), &current, next_proof.witness.as_ref()).unwrap(),
+            next_proof.expected_gates
+        );
+        let next = AuditGuard::begin_reentry(home.path(), &current, &next_proof).unwrap();
+        assert!(next.report().ready);
+        drop(next);
+        change(
+            home.path(),
+            "UPDATE conversations SET note='changed after new origin'",
+        );
+        assert!(
+            verify_reentry_before_startup(
+                home.path(),
+                &current,
+                &plan,
+                &classify_reentry_gate(home.path(), &current, &plan).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reentry_restored_observation_retains_history_and_normal_updates_match_only_saved_unknowns() {
+        let (home, previous, proof) = reentry_fixture();
+        let guard = AuditGuard::begin_reentry(home.path(), &previous, &proof).unwrap();
+        let current = guard.snapshot().clone();
+        let plan = plan_for(&guard);
+        guard.prepare_reentry_gate(&plan).unwrap();
+        let db = Connection::open(home.path().join("state.sqlite3")).unwrap();
+        db.execute("UPDATE native_update_admission SET phase='restored',restored_at=?2 WHERE transaction_id=?1", params![plan.transaction,plan.at_ms+1]).unwrap();
+        let restored = classify_reentry_gate(home.path(), &current, &plan).unwrap();
+        assert_eq!(restored.stage, GateStage::Restored);
+        verify_reentry_preserved(home.path(), &current, &plan, &restored, test_window()).unwrap();
+        db.execute("INSERT INTO native_update_admission(transaction_id,phase,acquired_at) VALUES(?1,'prepared',?2)",params![uuid::Uuid::new_v4().to_string(),plan.at_ms+2]).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            matching_historical_inputs(&db, &current, &current.saved_state_sha256).unwrap(),
+            BTreeSet::from(["original-unknown".to_owned()])
+        );
+        db.execute_batch("ROLLBACK").unwrap();
+        assert!(classify_reentry_gate(home.path(), &current, &plan).is_err());
+    }
+
+    #[test]
+    fn repeated_reentry_keeps_older_restored_rows_exact_and_refuses_history_drift() {
+        let (home, original, proof) = reentry_fixture();
+        let guard = AuditGuard::begin_reentry(home.path(), &original, &proof).unwrap();
+        let first = guard.snapshot().clone();
+        let first_plan = plan_for(&guard);
+        guard.prepare_reentry_gate(&first_plan).unwrap();
+        let first_observation = classify_reentry_gate(home.path(), &first, &first_plan).unwrap();
+        let witness = verify_reentry_preserved(
+            home.path(),
+            &first,
+            &first_plan,
+            &first_observation,
+            test_window(),
+        )
+        .unwrap();
+        let second_proof = ReentryProof {
+            archive_sha256: hash(b"archive after second legacy restoration"),
+            predecessor_transaction: first_plan.transaction.clone(),
+            expected_gates: first_observation.rows,
+            witness: Some(witness),
+        };
+        let guard = AuditGuard::begin_reentry(home.path(), &first, &second_proof).unwrap();
+        let second = guard.snapshot().clone();
+        let second_plan = plan_for(&guard);
+        guard.prepare_reentry_gate(&second_plan).unwrap();
+        let second_observation = classify_reentry_gate(home.path(), &second, &second_plan).unwrap();
+        verify_reentry_preserved(
+            home.path(),
+            &second,
+            &second_plan,
+            &second_observation,
+            test_window(),
+        )
+        .unwrap();
+        assert_eq!(second_observation.rows.len(), 3);
+        assert_eq!(
+            second_observation
+                .rows
+                .iter()
+                .find(|row| row.transaction == proof.predecessor_transaction),
+            first_plan
+                .after_prepared
+                .iter()
+                .find(|row| row.transaction == proof.predecessor_transaction)
+        );
+        let db = Connection::open(home.path().join("state.sqlite3")).unwrap();
+        db.execute(
+            "UPDATE native_update_admission SET restored_at=restored_at+1 WHERE transaction_id=?1",
+            [&proof.predecessor_transaction],
+        )
+        .unwrap();
+        assert!(classify_reentry_gate(home.path(), &second, &second_plan).is_err());
+        assert!(
+            verify_reentry_preserved(
+                home.path(),
+                &second,
+                &second_plan,
+                &second_observation,
+                test_window()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prior_gate_history_cannot_be_rebaselined_from_corrupted_current_sqlite() {
+        let mut accepted = Vec::new();
+        for corruption in [
+            "prepared_deleted",
+            "prepared_retimed",
+            "prepared_released",
+            "older_restored_changed",
+            "older_restored_deleted",
+        ] {
+            let (home, original, first_proof) = reentry_fixture();
+            let guard = AuditGuard::begin_reentry(home.path(), &original, &first_proof).unwrap();
+            let previous = guard.snapshot().clone();
+            let plan = plan_for(&guard);
+            guard.prepare_reentry_gate(&plan).unwrap();
+            let observed = classify_reentry_gate(home.path(), &previous, &plan).unwrap();
+            let witness =
+                verify_reentry_preserved(home.path(), &previous, &plan, &observed, test_window())
+                    .unwrap();
+            let sql = match corruption {
+                "prepared_deleted" => "DELETE FROM native_update_admission WHERE phase='prepared'",
+                "prepared_retimed" => {
+                    "UPDATE native_update_admission SET acquired_at=acquired_at+1 WHERE phase='prepared'"
+                }
+                "prepared_released" => {
+                    "UPDATE native_update_admission SET phase='restored',restored_at=acquired_at WHERE phase='prepared'"
+                }
+                "older_restored_changed" => {
+                    "UPDATE native_update_admission SET restored_at=restored_at+1 WHERE phase='restored'"
+                }
+                "older_restored_deleted" => {
+                    "DELETE FROM native_update_admission WHERE phase='restored'"
+                }
+                _ => unreachable!(),
+            };
+            change(home.path(), sql);
+            // Recreate precisely the buggy capture path: observe the changed
+            // current ledger and attempt to turn it into the new expectation.
+            let corrupted = admission_ledger(home.path()).unwrap();
+            let proof = ReentryProof {
+                archive_sha256: hash(b"archive rebuilt from corrupted ledger"),
+                predecessor_transaction: plan.transaction,
+                expected_gates: corrupted.clone(),
+                witness: Some(witness),
+            };
+            assert!(
+                predecessor_ledger(home.path(), &previous, proof.witness.as_ref()).is_err(),
+                "Archive observation accepted changed history: {corruption}"
+            );
+            if AuditGuard::begin_reentry(home.path(), &previous, &proof).is_ok() {
+                accepted.push(corruption);
+            }
+            assert_eq!(
+                admission_ledger(home.path()).unwrap(),
+                corrupted,
+                "Audit changed retained evidence"
+            );
+        }
+        assert!(
+            accepted.is_empty(),
+            "Corrupted prior history was rebaselined: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn prior_gate_history_cannot_be_discarded_by_omitting_early_witness() {
+        for gate_present in [false, true] {
+            let home = fixture();
+            let guard = AuditGuard::begin(home.path()).unwrap();
+            let previous = guard.snapshot().clone();
+            let transaction = uuid::Uuid::new_v4().to_string();
+            if gate_present {
+                guard.prepare_gate(&transaction).unwrap();
+            } else {
+                drop(guard);
+            }
+            let proof = ReentryProof {
+                archive_sha256: hash(b"missing early witness archive"),
+                predecessor_transaction: transaction,
+                expected_gates: admission_ledger(home.path()).unwrap(),
+                witness: None,
+            };
+            assert!(predecessor_ledger(home.path(), &previous, None).is_err());
+            assert!(AuditGuard::begin_reentry(home.path(), &previous, &proof).is_err());
+        }
     }
 }

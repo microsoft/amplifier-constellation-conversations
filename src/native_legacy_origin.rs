@@ -855,19 +855,37 @@ mod linux {
         listener_owned(pid, listener)?;
         descendants_within_group(main, &members)?;
         ensure!(
-            installation::snapshot(&service)? == native
-                && control_group(&service)? == group
-                && cgroup_members(&group_path, false)? == member_pids
-                && members
-                    .iter()
-                    .map(process::matches)
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .all(|matched| matched)
-                && read_owned(path, false)? == definition_bytes
-                && read_owned(&home.join("config.json"), true)? == config_bytes
-                && read_owned(&home.join("runtime.json"), true)? == runtime_bytes,
-            "Original service changed during capture"
+            installation::snapshot(&service)? == native,
+            "Original native service snapshot changed during capture"
+        );
+        ensure!(
+            control_group(&service)? == group,
+            "Original service cgroup changed during capture"
+        );
+        ensure!(
+            cgroup_members(&group_path, false)? == member_pids,
+            "Original service cgroup members changed during capture"
+        );
+        ensure!(
+            members
+                .iter()
+                .map(process::matches)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .all(|matched| matched),
+            "Original service process generation changed during capture"
+        );
+        ensure!(
+            read_owned(path, false)? == definition_bytes,
+            "Original service definition changed during capture"
+        );
+        ensure!(
+            read_owned(&home.join("config.json"), true)? == config_bytes,
+            "Original configuration changed during capture"
+        );
+        ensure!(
+            read_owned(&home.join("runtime.json"), true)? == runtime_bytes,
+            "Original runtime record changed during capture"
         );
         let origin = Origin {
             schema: 1,

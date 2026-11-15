@@ -224,7 +224,10 @@ fn load(home: &Path) -> Result<Ledger> {
 fn history_path(home: &Path, kind: &str, id: &str) -> Result<PathBuf> {
     uuid(id)?;
     ensure!(
-        matches!(kind, "operations" | "requests" | "checks" | "transactions"),
+        matches!(
+            kind,
+            "operations" | "requests" | "checks" | "transactions" | "legacy-adoptions"
+        ),
         "Invalid retained record kind"
     );
     Ok(home
@@ -310,6 +313,44 @@ fn history_write<T: Serialize>(
         return Ok(());
     }
     amplifier_native_platform::private_create(&path, &bytes)
+}
+
+// Legacy adoption uses the existing immutable history storage, without
+// allocating a browser request, control ledger, worker, or another scheduler.
+// The adoption caller owns its installation lock and validates the terminal
+// rollback and original process before publishing this exact evidence.
+pub(crate) fn retain_legacy_adoption(
+    home: &Path,
+    installation: &str,
+    transaction: &str,
+    value: &Value,
+) -> Result<String> {
+    use sha2::Digest;
+    history_write(home, installation, "legacy-adoptions", transaction, value)?;
+    let bytes = serde_json::to_vec(
+        &json!({"schema":1,"installation_id":installation,"id":transaction,"value":value}),
+    )?;
+    Ok(format!("{:x}", sha2::Sha256::digest(&bytes)))
+}
+
+pub(crate) fn retained_legacy_adoption(
+    home: &Path,
+    installation: &str,
+    transaction: &str,
+    expected_sha256: &str,
+) -> Result<Value> {
+    use sha2::Digest;
+    let value: Value = history_read(home, installation, "legacy-adoptions", transaction)?
+        .context("Retained legacy adoption is missing")?;
+    let bytes = serde_json::to_vec(
+        &json!({"schema":1,"installation_id":installation,"id":transaction,"value":value}),
+    )?;
+    ensure!(
+        format!("{:x}", sha2::Sha256::digest(&bytes)) == expected_sha256
+            && fs::read(history_path(home, "legacy-adoptions", transaction)?)? == bytes,
+        "Retained legacy adoption bytes changed"
+    );
+    Ok(value)
 }
 fn verified_terminal(operation: &Operation) -> bool {
     terminal(operation)

@@ -31,7 +31,9 @@ are not maintenance controls.
    The digest comes from independently qualified old bytes. Capture checks the
    running image, original process generations, service definition and policy,
    recursive control-group membership and the process-owned listener. It does
-   not stop anything. The capture is create-only and belongs to that UUID.
+   not stop anything. The initial capture creates a record bound to that UUID;
+   it does not replace a pending attempt. A fresh capture after verified legacy
+   restoration follows the separate boundary below.
 
 2. The maintenance owner stops that exact original service. The adoption
    command does not issue this Stop or infer it from elapsed time. Recheck late
@@ -79,6 +81,32 @@ finish acknowledgement remain explicit recovery states. No automatic Start,
 Stop, message, input or task replay follows uncertainty. A committed gate that
 was released despite a lost reply can be reconciled by reading its exact
 transaction row.
+
+## Fresh adoption after verified legacy restoration
+
+After recovery has recorded completed restoration and authenticated the old
+service, the owner may explicitly request another adoption from a qualified
+successor package. Use a new transaction UUID for its capture, then follow the
+same owner Stop and `adopt-existing` steps. A still-running command, lost reply,
+uncertain service acknowledgement or unverified old service does not meet this
+boundary and must not be bypassed with another UUID.
+
+Before selecting the new attempt, the previous capture, origin, journal and
+admission evidence are retained in immutable history. The new capture and
+transaction bind that predecessor by identity and hash. Existing evidence is
+not deleted to make the installation appear fresh.
+
+The new attempt audits and establishes its baseline from the **current**
+database, including changes made after restoration. Original admission row
+identities and acquisition times remain in history while the closed gate is
+transferred to the new transaction. Neither this transfer nor a fresh capture
+settles historical unknown inputs or authorizes replay. No old database or
+configuration snapshot is copied back.
+
+This remains the supported Linux Conversations 0.9 transition, including its
+qualified pre-admission migrated state. Exact old service, successor package
+and recovery qualification are required separately; source support or a native
+package build is not proof of a live migration or another platform's behavior.
 
 The implementation does not claim atomicity against a hostile writer running
 under the same OS account, infer external effect completion from local process
