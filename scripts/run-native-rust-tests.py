@@ -20,6 +20,7 @@ SELECTIONS = [
     ("native_update_process::", False),
     ("native_update::startup_tests::", False),
     ("native_update::cleanup::", False),
+    ("native_update::adoption::", False),
     ("native_update_identity::", False),
     ("native_browser_update::", False),
     ("native_check_diagnostics::", False),
@@ -30,6 +31,12 @@ SELECTIONS = [
     ("update_admission::", False),
     ("companion_awareness::process_tests::stalled_observer_and_descendant_are_stopped_without_facts", True),
 ]
+
+def selections_for(target: str):
+    selections = list(SELECTIONS)
+    if "linux" in target.split("-"):
+        selections += [("native_adoption_state::", False), ("native_legacy_origin::", False)]
+    return selections
 
 
 def passed_counts(text: str) -> dict:
@@ -50,7 +57,7 @@ def main() -> None:
     receipt = {"schema_version": 1, "rust_target": args.target, "selections": [], "status": "running"}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
-        for selection, exact in SELECTIONS:
+        for selection, exact in selections_for(args.target):
             command = ["cargo", "test", "--locked", "--target", args.target, "--lib", selection]
             if exact:
                 command += ["--", "--exact"]

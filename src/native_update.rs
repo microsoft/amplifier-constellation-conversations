@@ -36,6 +36,11 @@ const INSTALLED: &str = "native-installation.json";
 #[path = "native_update_cleanup.rs"]
 mod cleanup;
 
+#[path = "native_update_adoption.rs"]
+mod adoption;
+pub(crate) use adoption::retained_inputs as retained_legacy_inputs;
+pub use adoption::{adopt_existing, capture_legacy_origin, recover_adoption};
+
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -402,6 +407,13 @@ pub(crate) fn prepare_plan(home: &Path, package: &Path) -> Result<CheckedPlan> {
 fn terminal(j: &Value) -> bool {
     j["phase"] == "restored"
 }
+fn native_transaction(j: &Value) -> Result<()> {
+    ensure!(
+        j["kind"] != "legacy_adoption",
+        "Use the explicit adoption controls for this legacy transition"
+    );
+    Ok(())
+}
 fn journal(home: &Path, transaction: &str) -> Result<Value> {
     id(transaction)?;
     let j = read(&home.join(JOURNAL))?;
@@ -428,12 +440,21 @@ fn current_record(j: &Value) -> &Value {
 }
 pub fn status(home: &Path) -> Result<Value> {
     let c = Config::load(home)?;
-    let i = read(&home.join(INSTALLED))?;
     let j = if home.join(JOURNAL).exists() {
         read(&home.join(JOURNAL))?
     } else {
         Value::Null
     };
+    if j["kind"] == "legacy_adoption" && !home.join(INSTALLED).exists() {
+        ensure!(
+            j["installation_id"] == c.id,
+            "Adoption installation changed"
+        );
+        return Ok(json!({"schema":1,"id":c.id,"native_baseline":false,
+            "phase":j["phase"],"transaction_id":j["transaction_id"],
+            "legacy_adoption":true,"recovery":"recover-adoption"}));
+    }
+    let i = read(&home.join(INSTALLED))?;
     Ok(
         json!({"schema":1,"id":c.id,"version":i["package"]["bundle"]["version"],"phase":j["phase"],"transaction_id":j["transaction_id"],"context_id":j["context"]["id"],"context_hash":j["context_hash"],"original_running":j["original_running"],"selected_manifest":i["package"]["bundle"]["manifest_sha256"]}),
     )
@@ -753,6 +774,11 @@ pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<
     } else {
         None
     };
+    if let Some(j) = &existing
+        && (!terminal(j) || j["transaction_id"] == transaction)
+    {
+        native_transaction(j)?;
+    }
     let previous_startup = existing
         .as_ref()
         .map(|j| {
@@ -916,14 +942,19 @@ fn switch(home: &Path, j: &Value, rollback: bool) -> Result<()> {
         config::private_write(&home.join("companion.json"), &bytes)
             .context("Cannot commit Companion bundle bindings")?;
     }
-    save(
-        &home.join(INSTALLED),
-        &json!({"schema":1,"id":j["installation_id"],"package":selected}),
-    )
+    let mut receipt = json!({"schema":1,"id":j["installation_id"],"package":selected});
+    if home.join(INSTALLED).exists() {
+        let before = read(&home.join(INSTALLED))?;
+        if !before["legacy_origin_sha256"].is_null() {
+            receipt["legacy_origin_sha256"] = before["legacy_origin_sha256"].clone();
+        }
+    }
+    save(&home.join(INSTALLED), &receipt)
 }
 pub async fn apply(home: &Path, transaction: &str, plan: &Value, rollback: bool) -> Result<Value> {
     let _owner = lock(home, "native-update.lock")?;
     let mut j = journal(home, transaction)?;
+    native_transaction(&j)?;
     ensure!(
         j["restore_started"] != true && j["rollback_aborted"] != true && !terminal(&j),
         "Restoration or rollback abort began; only that recovery may be retried"
@@ -1010,10 +1041,14 @@ pub fn managed_startup_ticket(home: &Path) -> Result<Option<(String, String)>> {
     if j["managed_start_requested"] == true
         && matches!(j["phase"].as_str(), Some("verifying" | "restoring"))
     {
-        ensure!(
-            j["startup"]["managed"] == true,
-            "No managed startup was captured"
-        );
+        if j["kind"] == "legacy_adoption" {
+            adoption::launch_target(home, &j)?;
+        } else {
+            ensure!(
+                j["startup"]["managed"] == true,
+                "No managed startup was captured"
+            );
+        }
         return Ok(Some((
             j["transaction_id"]
                 .as_str()
@@ -1098,12 +1133,18 @@ fn start(home: &Path, j: &mut Value) -> Result<Option<ServiceChild>> {
     j["launch_nonce"] = json!(nonce);
     j["child_pid"] = Value::Null;
     j["restore_boundary_verified"] = json!(false);
-    j["managed_start_requested"] =
-        json!(j["original_running"] == true && j["startup"]["managed"] == true);
+    j["managed_start_requested"] = json!(
+        (j["original_running"] == true && j["startup"]["managed"] == true)
+            || (j["kind"] == "legacy_adoption" && j["adoption_start_requested"] == true)
+    );
     save(&home.join(JOURNAL), j)?;
     if j["managed_start_requested"] == true {
-        let target = cleanup::Target::Startup {
-            snapshot: j["startup"].clone(),
+        let target = if j["kind"] == "legacy_adoption" {
+            adoption::launch_target(home, j)?
+        } else {
+            cleanup::Target::Startup {
+                snapshot: j["startup"].clone(),
+            }
         };
         cleanup::start(home, j, target)
             .map_err(|error| anyhow::Error::new(UncertainReplacement).context(error.to_string()))?;
@@ -1194,6 +1235,7 @@ async fn healthy(
 }
 pub async fn verify(home: &Path, transaction: &str) -> Result<Value> {
     let pending = journal(home, transaction)?;
+    native_transaction(&pending)?;
     if matches!(pending["phase"].as_str(), Some("intent" | "preparing")) {
         prepare(home, transaction, &pending["context"]).await?;
     }
@@ -1260,6 +1302,7 @@ pub async fn verify(home: &Path, transaction: &str) -> Result<Value> {
 pub async fn restore(home: &Path, transaction: &str, outcome: &str) -> Result<Value> {
     let _owner = lock(home, "native-update.lock")?;
     let mut j = journal(home, transaction)?;
+    native_transaction(&j)?;
     ensure!(
         j["rollback_aborted"] != true || outcome == "unchanged",
         "An aborted rollback can only restore unchanged"
@@ -1433,6 +1476,7 @@ pub async fn abort_rollback(home: &Path, transaction: &str, reason: &str) -> Res
     standalone_worker(home)?;
     let _owner = lock(home, "native-update.lock")?;
     let mut j = journal(home, transaction)?;
+    native_transaction(&j)?;
     ensure!(
         j["context"]["owner"] == "standalone" && j["context"]["plan"]["operation"] == "rollback",
         "This is not a standalone explicit rollback transaction"
@@ -1580,6 +1624,10 @@ pub async fn rollback_with_transaction(
 pub async fn recover(home: &Path, transaction: &str, rollback: bool) -> Result<Value> {
     standalone_worker(home)?;
     let mut j = journal(home, transaction)?;
+    ensure!(
+        j["kind"] != "legacy_adoption",
+        "Use recover-adoption for this retained legacy transition"
+    );
     if terminal(&j) {
         return Ok(json!({"restored":true,"transaction_id":transaction,
             "outcome":j["restore_outcome"],"rollback_aborted":j["rollback_aborted"] == true}));

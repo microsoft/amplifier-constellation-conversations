@@ -179,10 +179,21 @@ fn busy(db: &Connection) -> Result<Vec<Busy>> {
             },
         )
         .collect::<Result<_>>()?;
-    let pending: i64 = db.query_row(
-        &format!("SELECT count(*) FROM input_deliveries d LEFT JOIN messages m ON m.id=d.target_turn AND m.conversation_id=d.conversation_id AND m.agent_id=d.agent_id AND m.role='assistant' WHERE d.state IN ('received','promptRequired','preparing','offering','submitted','received_remote','remoteQueued','ack_pending','unknown') OR (d.state='notAccepted' AND NOT ({})) OR (d.state='incorporated' AND COALESCE(m.status,'')!='complete')", crate::delivery::PROVEN_NOT_STARTED),
-        [], |r| r.get(0),
-    )?;
+    let retained = crate::native_update::retained_legacy_inputs(db)?;
+    let sql = format!(
+        "SELECT d.id,d.state FROM input_deliveries d LEFT JOIN messages m ON m.id=d.target_turn AND m.conversation_id=d.conversation_id AND m.agent_id=d.agent_id AND m.role='assistant' WHERE d.state IN ('received','promptRequired','preparing','offering','submitted','received_remote','remoteQueued','ack_pending','unknown') OR (d.state='notAccepted' AND NOT ({})) OR (d.state='incorporated' AND COALESCE(m.status,'')!='complete')",
+        crate::delivery::PROVEN_NOT_STARTED
+    );
+    let mut inputs = db.prepare(&sql)?;
+    let mut rows = inputs.query([])?;
+    let mut pending = 0i64;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let state: String = row.get(1)?;
+        if !(matches!(state.as_str(), "unknown" | "notAccepted") && retained.contains(&id)) {
+            pending += 1;
+        }
+    }
     if pending != 0 {
         busy.push(Busy {
             kind: "pending_or_uncertain_inputs",

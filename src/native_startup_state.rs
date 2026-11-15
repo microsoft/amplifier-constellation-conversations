@@ -346,7 +346,10 @@ fn inspect_platform(s: &mut Snapshot) -> Result<()> {
     let path = amplifier_native_platform::user_home()?
         .join(".config/systemd/user")
         .join(&unit);
-    let expected = amplifier_native_platform::systemd_unit(&APPLICATION, &s.executable, &s.home)?;
+    let expected =
+        crate::native_legacy_origin::committed_definition(&s.home, &s.id, &path)?.unwrap_or(
+            amplifier_native_platform::systemd_unit(&APPLICATION, &s.executable, &s.home)?,
+        );
     let Some(definition) = definition(&path, &expected, true)? else {
         return inspect_missing_definition(s, &unit);
     };

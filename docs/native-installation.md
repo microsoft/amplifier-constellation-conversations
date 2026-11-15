@@ -51,6 +51,28 @@ Python, WSL, compiler, or build step is needed on the destination computer.
 Developer tools used by CI or the package builder are not shipped prerequisites.
 Paths containing spaces and Unicode must be passed as one command argument.
 
+## Existing pre-native Linux installations
+
+Conversations 0.9 installations with the supported Linux schema can use the
+explicit [legacy adoption workflow](legacy-adoption.md). Use the qualified
+successor bundle; do not initialize the existing home again or invent a native
+manifest for its old executable. Adoption preserves the existing custom service,
+configuration, credentials and current database. Companion homes and homes
+already controlled by an enrolled updater are excluded from this path.
+
+If adoption fails before new work is admitted, recover its exact transaction
+first. After recovery verifies the old service's health and records completed
+restoration, the owner can request a fresh capture with a new transaction UUID.
+The previous capture, origin, journal and admission history are retained
+immutably. The new attempt audits the installation's current data again,
+including changes made after restoration; it does not restore an older database.
+
+A lost reply or uncertain service outcome does not authorize a new attempt,
+automatic retry or replay of historical inputs. Preserve the original evidence
+and reconcile that transaction before proceeding. This Linux legacy path needs
+qualification for the exact old service and successor package; package builds
+alone do not establish migration support for another schema or platform.
+
 ## Sign in and open the interface
 
 Use the actual operating-system account name. With no `--owner` argument,
