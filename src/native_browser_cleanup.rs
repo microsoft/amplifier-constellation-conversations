@@ -172,7 +172,20 @@ fn execute(
     )
 }
 fn cleanup_with(home: &Path, before_check: bool, retirer: &dyn Retirer) -> ApiResult<Value> {
+    cleanup_for(home, before_check, retirer, None)
+}
+fn cleanup_for(
+    home: &Path,
+    before_check: bool,
+    retirer: &dyn Retirer,
+    update_id: Option<&str>,
+) -> ApiResult<Value> {
     let _owner = native_update::lock(home, "native-update.lock")?;
+    if let Some(id) = update_id {
+        native_browser_update::require_update_owner(home, id)?;
+    } else {
+        native_browser_update::require_no_update(home)?;
+    }
     if home.join("native-update-owner.json").exists() {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -200,6 +213,9 @@ pub(crate) fn cleanup(home: &Path) -> ApiResult<Value> {
 }
 pub(crate) fn before_check(home: &Path) -> ApiResult<()> {
     cleanup_with(home, true, &NativeRetirer).map(|_| ())
+}
+pub(crate) fn before_update(home: &Path, update_id: &str) -> ApiResult<()> {
+    cleanup_for(home, true, &NativeRetirer, Some(update_id)).map(|_| ())
 }
 pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/companion/update/cleanup", post(http_cleanup))

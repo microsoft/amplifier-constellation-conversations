@@ -19,9 +19,28 @@ const MAX_EVENTS: usize = 64;
 const DIRECTORY: &str = "native-browser-update";
 const FILE: &str = "check-observation.json";
 static OWNER: AtomicBool = AtomicBool::new(false);
+type ProgressObserver = Rc<dyn Fn(Stage)>;
 thread_local! {
     static CURRENT: RefCell<Option<Rc<Context>>> = const { RefCell::new(None) };
     static SUPPRESSED: Cell<bool> = const { Cell::new(false) };
+    static PROGRESS: RefCell<Option<ProgressObserver>> = const { RefCell::new(None) };
+}
+
+/// Coarse request-bound UI progress. This does not grant readiness or read the
+/// optional diagnostic snapshot. Restore nesting on return and unwind.
+pub(crate) fn with_progress<T>(
+    observer: impl Fn(Stage) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<ProgressObserver>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PROGRESS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = PROGRESS.with(|slot| slot.replace(Some(Rc::new(observer))));
+    let _reset = Reset(previous);
+    operation()
 }
 
 #[derive(Clone, Copy)]
@@ -42,7 +61,7 @@ pub(crate) enum Stage {
 }
 
 impl Stage {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Cleanup => "check_cleanup",
             Self::Prepare => "check_prepare",
@@ -237,6 +256,12 @@ pub(crate) fn observe<T, E>(
     stage: Stage,
     operation: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
+    let progress = PROGRESS.with(|slot| slot.borrow().clone());
+    if let Some(observer) = progress {
+        // Progress is observational. A callback failure cannot replace the
+        // verifier's result; no TLS borrow is held while invoking user code.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(stage)));
+    }
     let Some(context) = current() else {
         return operation();
     };
@@ -508,6 +533,22 @@ fn ordinary(metadata: &Metadata) -> bool {
         }
     }
     true
+}
+
+/// Read-only check for an already-open installation-owned private receipt.
+/// This neither repairs its policy nor proves a future pathname replacement.
+pub(crate) fn private_file_policy(file: &fs::File) -> bool {
+    if !file.metadata().is_ok_and(|metadata| ordinary(&metadata)) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        windows_file_policy::private(file)
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 #[cfg(windows)]
@@ -796,6 +837,43 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::{panic::AssertUnwindSafe, sync::Arc, sync::mpsc};
+
+    #[test]
+    fn progress_callback_failure_preserves_verifier_error_and_scope() {
+        let result = with_progress(
+            |_| panic!("unavailable optional progress"),
+            || {
+                observe(Stage::Prepare, || {
+                    Err::<(), _>("original verification refusal")
+                })
+            },
+        );
+        assert_eq!(result.unwrap_err(), "original verification refusal");
+        assert!(PROGRESS.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn progress_nested_scope_restores_outer_without_borrowing_during_callback() {
+        let outer = Rc::new(Cell::new(0));
+        let inner = Rc::new(Cell::new(0));
+        let observed = outer.clone();
+        with_progress(
+            move |_| observed.set(observed.get() + 1),
+            || {
+                observe(Stage::Prepare, || Ok::<_, ()>(())).unwrap();
+                let observed = inner.clone();
+                with_progress(
+                    move |_| observed.set(observed.get() + 1),
+                    || {
+                        observe(Stage::Launcher, || Ok::<_, ()>(())).unwrap();
+                    },
+                );
+                observe(Stage::Response, || Ok::<_, ()>(())).unwrap();
+            },
+        );
+        assert_eq!((outer.get(), inner.get()), (2, 1));
+        assert!(PROGRESS.with(|slot| slot.borrow().is_none()));
+    }
 
     fn home() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();

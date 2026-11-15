@@ -742,7 +742,50 @@ async fn stop_running(home: &Path, j: &mut Value) -> Result<InstallationLock> {
     }
     Ok(service)
 }
+/// The unified standalone flow owns this callback. It runs synchronously under
+/// native-update.lock; it must not reacquire that lock or start asynchronous work.
+pub(crate) enum WaitingUpdateEvent<'a> {
+    Waiting(&'a Value),
+    BeforeStop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitingUpdateDecision {
+    Continue,
+    Cancel,
+    NeedsAttention,
+}
+
+type WaitingUpdateControl<'a> =
+    dyn for<'event> FnMut(WaitingUpdateEvent<'event>) -> Result<WaitingUpdateDecision> + Send + 'a;
+
 pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<Value> {
+    prepare_controlled(home, transaction, context, None).await
+}
+
+async fn prepare_controlled(
+    home: &Path,
+    transaction: &str,
+    context: &Value,
+    control: Option<(&Value, &mut WaitingUpdateControl<'_>)>,
+) -> Result<Value> {
+    prepare_controlled_with_snapshot(
+        home,
+        transaction,
+        context,
+        control,
+        native_startup_state::capture,
+    )
+    .await
+}
+
+async fn prepare_controlled_with_snapshot(
+    home: &Path,
+    transaction: &str,
+    context: &Value,
+    mut control: Option<(&Value, &mut WaitingUpdateControl<'_>)>,
+    capture_startup: fn(&Path, &str) -> Result<Value>,
+) -> Result<Value> {
     fn defer(home: &Path, j: &mut Value, readiness: Value, release_gate: bool) -> Result<Value> {
         // No stop has been requested in intent/deferred. A retry uses the same
         // transaction; do not terminalize it or clear a different owner's gate.
@@ -794,6 +837,9 @@ pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<
             j["context_hash"] == context_hash && j["installation_id"] == Config::load(home)?.id,
             "Immutable update context or installation changed"
         );
+        if control.is_some() {
+            waiting_journal(&j, transaction, context)?;
+        }
         if terminal(&j) {
             return Ok(json!({"ready":false,"reason":"transaction_finished"}));
         }
@@ -824,17 +870,49 @@ pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<
     };
     // The recoverable intent must exist BEFORE a durable gate can be acquired.
     // A busy attempt has changed no application work or service availability.
+    if let Some((plan, _)) = control.as_ref()
+        && let Err(error) = validate_waiting_binding(home, plan)
+    {
+        defer(
+            home,
+            &mut j,
+            json!({"ready":false,"reason":"checked_installation_changed","needs_attention":true}),
+            true,
+        )?;
+        return Err(error);
+    }
     phase(home, &mut j, "intent")?;
     let readiness = update_admission::prepare(home, transaction)?;
     if readiness["ready"] != true {
-        return defer(home, &mut j, readiness, false);
+        let readiness = defer(home, &mut j, readiness, false)?;
+        if let Some((_, callback)) = control.as_mut() {
+            let decision = callback(WaitingUpdateEvent::Waiting(&readiness));
+            // This controlled path has not requested Stop. Release only its
+            // own gate even if a fresh uncertain fact appeared after admission.
+            if !matches!(decision, Ok(WaitingUpdateDecision::Continue)) {
+                update_admission::defer(home, transaction)?;
+            }
+            return Ok(waiting_decision(readiness, decision?));
+        }
+        return Ok(readiness);
+    }
+    if let Some((plan, _)) = control.as_ref()
+        && let Err(error) = validate_frozen_plan(home, plan)
+    {
+        defer(
+            home,
+            &mut j,
+            json!({"ready":false,"reason":"checked_installation_changed","needs_attention":true}),
+            true,
+        )?;
+        return Err(error);
     }
     let captured = (|| -> Result<(Value, Option<Vec<u8>>, String, Value)> {
         Ok((
             installed(home)?,
             companion(home)?,
             digest(&home.join("config.json"))?,
-            native_startup_state::capture(home, &Config::load(home)?.id)?,
+            capture_startup(home, &Config::load(home)?.id)?,
         ))
     })();
     let (old, before, config_hash, startup) = match captured {
@@ -882,6 +960,30 @@ pub async fn prepare(home: &Path, transaction: &str, context: &Value) -> Result<
             json!({"ready":false,"reason":"startup_manager_and_application_disagree"}),
             true,
         );
+    }
+    if let Some((plan, callback)) = control.as_mut() {
+        // Capture/health observation may have taken time. Recheck the frozen
+        // settings, selected package and original image before publishing any
+        // Stop intent. The callback and intent publication share this lock.
+        if let Err(error) = validate_waiting_binding(home, plan) {
+            defer(
+                home,
+                &mut j,
+                json!({"ready":false,"reason":"checked_installation_changed","needs_attention":true}),
+                true,
+            )?;
+            return Err(error);
+        }
+        let decision = callback(WaitingUpdateEvent::BeforeStop);
+        if !matches!(decision, Ok(WaitingUpdateDecision::Continue)) {
+            let readiness = defer(
+                home,
+                &mut j,
+                json!({"ready":false,"reason":"controlled_before_stop"}),
+                true,
+            )?;
+            return Ok(waiting_decision(readiness, decision?));
+        }
     }
     j["startup"] = startup;
     j["original_process"] = original_process;
@@ -1418,6 +1520,143 @@ pub async fn run_frozen(home: &Path, transaction: &str, p: &Value) -> Result<Val
         return Ok(ready);
     }
     continue_checked_update(home, transaction, p).await
+}
+
+fn waiting_decision(mut readiness: Value, decision: WaitingUpdateDecision) -> Value {
+    match decision {
+        WaitingUpdateDecision::Continue => readiness["waiting"] = json!(true),
+        WaitingUpdateDecision::Cancel => readiness["cancelled"] = json!(true),
+        WaitingUpdateDecision::NeedsAttention => readiness["needs_attention"] = json!(true),
+    }
+    readiness
+}
+
+fn waiting_journal(j: &Value, transaction: &str, context: &Value) -> Result<()> {
+    native_transaction(j)?;
+    ensure!(
+        j["transaction_id"] == transaction
+            && j["context"] == *context
+            && j["context_hash"] == hash(&serde_json::to_vec(context)?)
+            && context["owner"] == "standalone"
+            && matches!(j["phase"].as_str(), Some("intent" | "deferred"))
+            && j["stop_requested"] == false
+            && j["original_running"].is_null()
+            && j["original_process"].is_null()
+            && j["startup"].is_null()
+            && j["candidate"].is_null()
+            && j["selected"] == "previous"
+            && j["direction"] == "unchanged"
+            && j["launch_nonce"].is_null()
+            && j["restore_started"] == false
+            && j["restore_outcome"].is_null(),
+        "This transaction crossed the waiting boundary; use explicit native recovery"
+    );
+    Ok(())
+}
+
+// Cheap current bindings during a wait and after the final startup capture.
+// Full previous/candidate package checks remain mandatory at worker admission,
+// at idle admission, and again in the unchanged apply/verification lifecycle.
+fn validate_waiting_binding(home: &Path, plan: &Value) -> Result<()> {
+    let current = read(&home.join(INSTALLED))?;
+    ensure!(
+        current["schema"] == 1
+            && current["id"] == Config::load(home)?.id
+            && plan["schema"] == 1
+            && plan["installation_id"] == current["id"]
+            && plan["previous"] == current["package"]
+            && digest(&binary(home))? == current["package"]["binary_sha256"]
+            && plan["config_sha256"] == digest(&home.join("config.json"))?
+            && plan["companion_sha256"]
+                == companion(home)?
+                    .as_ref()
+                    .map(|bytes| hash(bytes))
+                    .map_or(Value::Null, Value::String),
+        "The checked installation changed while waiting; no stop was requested"
+    );
+    Ok(())
+}
+
+fn settle_waiting(
+    home: &Path,
+    transaction: &str,
+    context: &Value,
+    mut readiness: Value,
+) -> Result<Value> {
+    let _owner = lock(home, "native-update.lock")?;
+    let mut j = journal(home, transaction)?;
+    waiting_journal(&j, transaction, context)?;
+    // This path cannot call verify/prepare/restore: those entrypoints also serve
+    // later lifecycle phases. The exact intent/deferred record proves that no
+    // service Stop or package switch was requested by this transaction.
+    update_admission::defer(home, transaction)?;
+    ensure!(
+        update_admission::status(home)?["closed"] == false,
+        "Another admission owner remains; waiting settlement is unconfirmed"
+    );
+    j["restore_outcome"] = json!("unchanged");
+    phase(home, &mut j, "restored")?;
+    readiness["transaction_id"] = json!(transaction);
+    readiness["ready"] = json!(false);
+    readiness["changed"] = json!(false);
+    readiness["outcome"] = json!("unchanged");
+    Ok(readiness)
+}
+
+/// One already-claimed standalone worker may wait without consuming its
+/// transaction or closing admission. Browser loss is not cancellation. The
+/// caller retains native-browser-worker.lock throughout this future; this
+/// function releases native-update.lock before every wait. It never starts or
+/// redispatches a worker, and refuses automatic entry past the Stop boundary.
+pub(crate) async fn run_frozen_waiting<F>(
+    home: &Path,
+    transaction: &str,
+    plan: &Value,
+    mut control: F,
+) -> Result<Value>
+where
+    F: FnMut(WaitingUpdateEvent<'_>) -> Result<WaitingUpdateDecision> + Send,
+{
+    standalone_worker(home)?;
+    id(transaction)?;
+    let context = json!({"id":transaction,"owner":"standalone","checked_plan":plan});
+    {
+        let _owner = lock(home, "native-update.lock")?;
+        if home.join(JOURNAL).exists() {
+            let j = read(&home.join(JOURNAL))?;
+            if j["transaction_id"] == transaction {
+                waiting_journal(&j, transaction, &context)?;
+            } else {
+                ensure!(terminal(&j), "Another transaction remains unresolved");
+            }
+        }
+        validate_frozen_plan(home, plan)?;
+    }
+    if plan["available"] == false {
+        return Ok(json!({"changed":false,"version":plan["version"]}));
+    }
+    loop {
+        let readiness =
+            prepare_controlled(home, transaction, &context, Some((plan, &mut control))).await?;
+        if readiness["ready"] == true {
+            return continue_checked_update(home, transaction, plan).await;
+        }
+        if readiness["cancelled"] == true || readiness["needs_attention"] == true {
+            return settle_waiting(home, transaction, &context, readiness);
+        }
+        if readiness["waiting"] != true || readiness["reason"] != "busy" {
+            return settle_waiting(
+                home,
+                transaction,
+                &context,
+                waiting_decision(readiness, WaitingUpdateDecision::NeedsAttention),
+            );
+        }
+        // This is standalone waiting, outside prepare/verify/restore calls and
+        // their existing participant budgets. Every content/copy worker remains
+        // synchronously joined before the preparation owner can be released.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn continue_checked_update(home: &Path, transaction: &str, p: &Value) -> Result<Value> {
@@ -2230,5 +2469,541 @@ mod lock_tests {
         assert!(lock(home.path(), "native-update.lock").is_err());
         drop(next_owner);
         assert!(lock(home.path(), "native-update.lock").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod waiting_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn write_json(path: &Path, value: &Value) {
+        config::private_write(path, &serde_json::to_vec(value).unwrap()).unwrap();
+    }
+    fn native_header() -> Vec<u8> {
+        // Same bounded architecture/header fixture as native_bundle's own tests.
+        // It exercises integrity/selection, never executable startup qualification.
+        let mut bytes = vec![0u8; 128];
+        let arm = cfg!(target_arch = "aarch64");
+        if cfg!(target_os = "linux") {
+            bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            bytes[16] = 2;
+            bytes[18..20].copy_from_slice(&(if arm { 183u16 } else { 62u16 }).to_le_bytes());
+            bytes[24..32].copy_from_slice(&0x400078u64.to_le_bytes());
+            bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+            bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+            bytes[56] = 1;
+            bytes[64] = 1;
+            bytes[68] = 5;
+            bytes[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+            bytes[96..104].copy_from_slice(&128u64.to_le_bytes());
+            bytes[104..112].copy_from_slice(&128u64.to_le_bytes());
+        } else if cfg!(target_os = "macos") {
+            bytes[..4].copy_from_slice(b"\xcf\xfa\xed\xfe");
+            bytes[4..8]
+                .copy_from_slice(&(if arm { 0x0100000cu32 } else { 0x01000007u32 }).to_le_bytes());
+            bytes[12] = 2;
+        } else if cfg!(windows) {
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[60] = 64;
+            bytes[64..68].copy_from_slice(b"PE\0\0");
+            bytes[68..70].copy_from_slice(&(if arm { 0xaa64u16 } else { 0x8664u16 }).to_le_bytes());
+            bytes[86] = 2;
+            bytes[88..90].copy_from_slice(&0x20bu16.to_le_bytes());
+        }
+        bytes
+    }
+    fn package(root: &Path, version: &str) {
+        let service = if cfg!(windows) {
+            "agent-conversations.exe"
+        } else {
+            "agent-conversations"
+        };
+        let node = if cfg!(windows) {
+            "runtime/node.exe"
+        } else {
+            "runtime/node"
+        };
+        let paths = [service, node, "bridge/live.mjs", "bridge/companion-mcp.mjs"];
+        let mut files = Vec::new();
+        for relative in paths {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let executable = relative == service || relative == node;
+            if executable {
+                let mut bytes = native_header();
+                bytes.extend_from_slice(format!("\nfixture-{version}-{relative}\n").as_bytes());
+                fs::write(&path, bytes).unwrap();
+            } else {
+                fs::write(&path, format!("// fixture {version} {relative}\n")).unwrap();
+            }
+            files.push(json!({
+                "path":relative,"sha256":super::digest(&path).unwrap(),
+                "bytes":fs::metadata(&path).unwrap().len(),"executable":executable
+            }));
+        }
+        write_json(
+            &root.join("manifest.json"),
+            &json!({"schema_version":1,"component":"conversations","version":version,
+            "source_revision":"a".repeat(40),"target":native_bundle::target().unwrap(),
+            "entrypoints":{"service":service,"node":node,"bridge":paths[2],"mcp":paths[3]},
+            "files":files}),
+        );
+    }
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        plan: Value,
+        transaction: String,
+        context: Value,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            config::private_dir(&home).unwrap();
+            Config::local(&home, "Waiting fixture", 54127)
+                .unwrap()
+                .save(&home)
+                .unwrap();
+            let db = Connection::open(home.join("state.sqlite3")).unwrap();
+            // Same admission-only schema used by update_admission's tests. No
+            // AppState, endpoint, manager, listener or agent is started here.
+            db.execute_batch("CREATE TABLE companion_calls(id TEXT PRIMARY KEY,state TEXT);
+                CREATE TABLE companion_tool_grants(call_id TEXT,port INTEGER);
+                CREATE TABLE conversations(id TEXT PRIMARY KEY,status TEXT);
+                CREATE TABLE messages(id TEXT PRIMARY KEY,status TEXT,conversation_id TEXT,agent_id TEXT,role TEXT,text TEXT);
+                CREATE TABLE input_deliveries(id TEXT PRIMARY KEY,state TEXT,target_turn TEXT,conversation_id TEXT,agent_id TEXT,mode TEXT,session_id TEXT,endpoint TEXT,receipt TEXT);
+                CREATE TABLE companion_delegations(id TEXT PRIMARY KEY,state TEXT);
+                CREATE TABLE companion_actions(id TEXT PRIMARY KEY,state TEXT,call_id TEXT,request_id TEXT);
+                CREATE TABLE companion_events(call_id TEXT,kind TEXT,data TEXT);").unwrap();
+            update_admission::migrate(&db).unwrap();
+            let previous = root.path().join("previous");
+            let next = root.path().join("next");
+            package(&previous, "waiting-a");
+            package(&next, "waiting-b");
+            bootstrap(&home, &previous).unwrap();
+            let plan = super::plan(&home, &next).unwrap();
+            let transaction = uuid::Uuid::new_v4().to_string();
+            let context = json!({"id":transaction,"owner":"standalone","checked_plan":plan});
+            Self {
+                _root: root,
+                home,
+                plan,
+                transaction,
+                context,
+            }
+        }
+        fn db(&self) -> Connection {
+            Connection::open(self.home.join("state.sqlite3")).unwrap()
+        }
+        fn busy(&self) {
+            self.db()
+                .execute(
+                    "INSERT INTO conversations VALUES('retained-work','working')",
+                    [],
+                )
+                .unwrap();
+        }
+        fn original(&self) -> Vec<Vec<u8>> {
+            [
+                binary(&self.home),
+                self.home.join(INSTALLED),
+                self.home.join("config.json"),
+            ]
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect()
+        }
+    }
+    fn stopped_snapshot(_: &Path, _: &str) -> Result<Value> {
+        Ok(json!({"managed":false,"settings":{"fixture":"no-manager-query"}}))
+    }
+    fn never_snapshot(_: &Path, _: &str) -> Result<Value> {
+        panic!("Busy/cancelled/changed input must not inspect the manager")
+    }
+
+    #[tokio::test]
+    async fn busy_then_ready_keeps_one_transaction_and_checks_handoff_under_owner() {
+        let f = Fixture::new();
+        f.busy();
+        let original = f.original();
+        let mut waiting = 0;
+        let mut handoff = 0;
+        let mut control = |event: WaitingUpdateEvent<'_>| {
+            assert!(lock(&f.home, "native-update.lock").is_err());
+            match event {
+                WaitingUpdateEvent::Waiting(value) => {
+                    waiting += 1;
+                    assert_eq!(value["ready"], false);
+                    assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+                }
+                WaitingUpdateEvent::BeforeStop => {
+                    handoff += 1;
+                    assert_eq!(
+                        update_admission::status(&f.home).unwrap()["transaction_id"],
+                        f.transaction
+                    );
+                    assert_eq!(
+                        read(&f.home.join(JOURNAL)).unwrap()["stop_requested"],
+                        false
+                    );
+                }
+            }
+            Ok(WaitingUpdateDecision::Continue)
+        };
+        let busy = prepare_controlled_with_snapshot(
+            &f.home,
+            &f.transaction,
+            &f.context,
+            Some((&f.plan, &mut control)),
+            never_snapshot,
+        )
+        .await
+        .unwrap();
+        assert_eq!(busy["waiting"], true);
+        let retained = journal(&f.home, &f.transaction).unwrap();
+        assert_eq!(retained["phase"], "deferred");
+        assert!(retained["original_running"].is_null());
+        assert_eq!(f.original(), original);
+        f.db()
+            .execute("UPDATE conversations SET status='idle'", [])
+            .unwrap();
+        let ready = prepare_controlled_with_snapshot(
+            &f.home,
+            &f.transaction,
+            &f.context,
+            Some((&f.plan, &mut control)),
+            stopped_snapshot,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready["ready"], true);
+        assert_eq!((waiting, handoff), (1, 1));
+        let retained = journal(&f.home, &f.transaction).unwrap();
+        assert_eq!(retained["phase"], "prepared");
+        assert_eq!(retained["stop_requested"], false);
+        assert_eq!(retained["original_running"], false);
+        assert_eq!(retained["context"], f.context);
+        assert_eq!(f.original(), original);
+        assert_eq!(
+            f.db()
+                .query_row("SELECT count(*) FROM native_update_admission", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_busy_settles_without_stop_start_or_work_rewrite() {
+        let f = Fixture::new();
+        f.busy();
+        let original = f.original();
+        let result = run_frozen_waiting(&f.home, &f.transaction, &f.plan, |event| {
+            assert!(matches!(event, WaitingUpdateEvent::Waiting(_)));
+            Ok(WaitingUpdateDecision::Cancel)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result["cancelled"], true);
+        assert_eq!(result["outcome"], "unchanged");
+        assert_eq!(f.original(), original);
+        assert_eq!(
+            f.db()
+                .query_row("SELECT status FROM conversations", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "working"
+        );
+        assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+        let j = journal(&f.home, &f.transaction).unwrap();
+        assert_eq!(j["phase"], "restored");
+        assert_eq!(j["stop_requested"], false);
+        assert!(j["original_running"].is_null());
+        assert!(j["candidate"].is_null());
+    }
+
+    #[tokio::test]
+    async fn legacy_run_frozen_still_settles_busy_instead_of_waiting() {
+        let f = Fixture::new();
+        f.busy();
+        let original = f.original();
+        let result = run_frozen(&f.home, &f.transaction, &f.plan).await.unwrap();
+        assert_eq!(result["ready"], false);
+        assert_eq!(result["reason"], "busy");
+        assert_eq!(
+            journal(&f.home, &f.transaction).unwrap()["phase"],
+            "restored"
+        );
+        f.db()
+            .execute("UPDATE conversations SET status='idle'", [])
+            .unwrap();
+        let later = prepare(&f.home, &f.transaction, &f.context).await.unwrap();
+        assert_eq!(later["reason"], "transaction_finished");
+        assert_eq!(f.original(), original);
+    }
+
+    #[tokio::test]
+    async fn cancel_at_final_fence_releases_gate_before_any_stop_intent() {
+        let f = Fixture::new();
+        let original = f.original();
+        let mut control = |event: WaitingUpdateEvent<'_>| {
+            assert!(matches!(event, WaitingUpdateEvent::BeforeStop));
+            assert!(lock(&f.home, "native-update.lock").is_err());
+            Ok(WaitingUpdateDecision::Cancel)
+        };
+        let result = prepare_controlled_with_snapshot(
+            &f.home,
+            &f.transaction,
+            &f.context,
+            Some((&f.plan, &mut control)),
+            stopped_snapshot,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["cancelled"], true);
+        let settled = settle_waiting(&f.home, &f.transaction, &f.context, result).unwrap();
+        assert_eq!(settled["outcome"], "unchanged");
+        assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+        assert_eq!(
+            journal(&f.home, &f.transaction).unwrap()["stop_requested"],
+            false
+        );
+        assert_eq!(f.original(), original);
+    }
+
+    #[tokio::test]
+    async fn unknown_attention_retains_original_fact_without_retry_or_gate() {
+        let f = Fixture::new();
+        let original = f.original();
+        f.db().execute("INSERT INTO input_deliveries VALUES('unsettled','unknown',NULL,NULL,NULL,NULL,NULL,NULL,NULL)", []).unwrap();
+        let mut callbacks = 0;
+        let result = run_frozen_waiting(&f.home, &f.transaction, &f.plan, |event| {
+            callbacks += 1;
+            let WaitingUpdateEvent::Waiting(value) = event else {
+                panic!("Unknown must never reach Stop")
+            };
+            assert!(
+                value["busy"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["kind"] == "pending_or_uncertain_inputs")
+            );
+            Ok(WaitingUpdateDecision::NeedsAttention)
+        })
+        .await
+        .unwrap();
+        assert_eq!(callbacks, 1);
+        assert_eq!(result["needs_attention"], true);
+        assert_eq!(
+            f.db()
+                .query_row("SELECT state FROM input_deliveries", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "unknown"
+        );
+        assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+        assert_eq!(f.original(), original);
+    }
+
+    #[tokio::test]
+    async fn waiting_releases_native_lock_but_keeps_worker_owner_until_cancellation() {
+        let f = Arc::new(Fixture::new());
+        f.busy();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let child = f.clone();
+        let child_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let _worker = lock(&child.home, "native-browser-worker.lock").unwrap();
+            let mut signal = Some(tx);
+            run_frozen_waiting(&child.home, &child.transaction, &child.plan, |event| {
+                assert!(matches!(event, WaitingUpdateEvent::Waiting(_)));
+                if let Some(tx) = signal.take() {
+                    tx.send(()).unwrap();
+                }
+                Ok(if child_cancel.load(Ordering::Acquire) {
+                    WaitingUpdateDecision::Cancel
+                } else {
+                    WaitingUpdateDecision::Continue
+                })
+            })
+            .await
+        });
+        rx.await.unwrap();
+        assert!(lock(&f.home, "native-update.lock").is_ok());
+        assert!(lock(&f.home, "native-browser-worker.lock").is_err());
+        assert_eq!(
+            journal(&f.home, &f.transaction).unwrap()["phase"],
+            "deferred"
+        );
+        cancel.store(true, Ordering::Release);
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["cancelled"], true);
+        assert!(lock(&f.home, "native-browser-worker.lock").is_ok());
+    }
+
+    #[tokio::test]
+    async fn settings_drift_while_waiting_refuses_before_snapshot_and_handoff() {
+        let f = Fixture::new();
+        f.busy();
+        let mut control = |_: WaitingUpdateEvent<'_>| Ok(WaitingUpdateDecision::Continue);
+        prepare_controlled_with_snapshot(
+            &f.home,
+            &f.transaction,
+            &f.context,
+            Some((&f.plan, &mut control)),
+            never_snapshot,
+        )
+        .await
+        .unwrap();
+        let mut config = Config::load(&f.home).unwrap();
+        config.label = "Changed while waiting".into();
+        config.save(&f.home).unwrap();
+        f.db()
+            .execute("UPDATE conversations SET status='idle'", [])
+            .unwrap();
+        let mut no_callback = |_: WaitingUpdateEvent<'_>| -> Result<WaitingUpdateDecision> {
+            panic!("Changed settings cannot reach handoff")
+        };
+        let error = prepare_controlled_with_snapshot(
+            &f.home,
+            &f.transaction,
+            &f.context,
+            Some((&f.plan, &mut no_callback)),
+            never_snapshot,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("changed while waiting"));
+        assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+        assert_eq!(
+            journal(&f.home, &f.transaction).unwrap()["stop_requested"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_never_enters_past_stop_or_reuses_changed_context() {
+        let f = Fixture::new();
+        f.busy();
+        let mut control = |_: WaitingUpdateEvent<'_>| Ok(WaitingUpdateDecision::Continue);
+        prepare_controlled_with_snapshot(
+            &f.home,
+            &f.transaction,
+            &f.context,
+            Some((&f.plan, &mut control)),
+            never_snapshot,
+        )
+        .await
+        .unwrap();
+        let original = journal(&f.home, &f.transaction).unwrap();
+        for field in ["phase", "stop_requested", "context"] {
+            let mut changed = original.clone();
+            match field {
+                "phase" => changed[field] = json!("preparing"),
+                "stop_requested" => changed[field] = json!(true),
+                _ => changed[field]["id"] = json!(uuid::Uuid::new_v4().to_string()),
+            }
+            save(&f.home.join(JOURNAL), &changed).unwrap();
+            assert!(
+                run_frozen_waiting(&f.home, &f.transaction, &f.plan, |_| panic!(
+                    "No redispatch callback"
+                ))
+                .await
+                .is_err()
+            );
+            assert_eq!(journal(&f.home, &f.transaction).unwrap(), changed);
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupted_frozen_package_refuses_without_wait_or_journal() {
+        let f = Fixture::new();
+        let service = path(&f.plan["candidate"]["bundle"]["entrypoints"], "service").unwrap();
+        fs::write(service, b"corrupt candidate").unwrap();
+        assert!(
+            run_frozen_waiting(&f.home, &f.transaction, &f.plan, |_| panic!(
+                "No callback for corrupt package"
+            ))
+            .await
+            .is_err()
+        );
+        assert!(!f.home.join(JOURNAL).exists());
+        assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+    }
+
+    #[tokio::test]
+    async fn candidate_drift_during_wait_refuses_before_capture_or_stop() {
+        let f = Fixture::new();
+        f.busy();
+        let mut control = |_: WaitingUpdateEvent<'_>| Ok(WaitingUpdateDecision::Continue);
+        prepare_controlled_with_snapshot(
+            &f.home,
+            &f.transaction,
+            &f.context,
+            Some((&f.plan, &mut control)),
+            never_snapshot,
+        )
+        .await
+        .unwrap();
+        let service = path(&f.plan["candidate"]["bundle"]["entrypoints"], "service").unwrap();
+        fs::write(service, b"changed while waiting").unwrap();
+        f.db()
+            .execute("UPDATE conversations SET status='idle'", [])
+            .unwrap();
+        assert!(
+            prepare_controlled_with_snapshot(
+                &f.home,
+                &f.transaction,
+                &f.context,
+                Some((&f.plan, &mut control)),
+                never_snapshot
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+        assert_eq!(
+            journal(&f.home, &f.transaction).unwrap()["stop_requested"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_handoff_callback_releases_only_pre_stop_gate_and_retains_error() {
+        let f = Fixture::new();
+        let original = f.original();
+        let mut control = |_: WaitingUpdateEvent<'_>| -> Result<WaitingUpdateDecision> {
+            anyhow::bail!("control record publication failed")
+        };
+        let error = prepare_controlled_with_snapshot(
+            &f.home,
+            &f.transaction,
+            &f.context,
+            Some((&f.plan, &mut control)),
+            stopped_snapshot,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("control record publication failed")
+        );
+        assert_eq!(update_admission::status(&f.home).unwrap()["closed"], false);
+        let j = journal(&f.home, &f.transaction).unwrap();
+        assert_eq!(j["phase"], "deferred");
+        assert_eq!(j["stop_requested"], false);
+        assert!(j["original_running"].is_null());
+        assert_eq!(f.original(), original);
     }
 }

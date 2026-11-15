@@ -23,6 +23,44 @@ Startup registration uses that stable entrypoint. Bootstrap does not register
 startup, enable voice, enroll an updater or change an update policy. A different
 existing executable is preserved and requires an explicit migration.
 
+## Single browser Update
+
+For ordinary desktop use, open the extracted newer app and choose **Update**.
+See [consumer setup](native-consumer-setup.md#updates-and-recovery). The app can
+supply a restricted loopback update screen for an older installation using its
+existing account. That screen does not open `AppState`, migrate storage, hold the
+original service lock or register a recurring service. Reopening it requires its
+exact retained process generation and authenticated listener identity.
+
+`POST /api/v1/companion/update/request` accepts a caller-generated UUID and the
+opaque installation-owned offer ID. The installed UI also retains advanced
+absolute package selection. The accepted request is saved before expensive
+preparation and returns HTTP 202. One background preparation owns a separate
+kernel lock, retains the native installation lock through checked-plan
+publication, and uses the existing complete-package and final binding checks.
+Completed registration maintenance stays inside this background work.
+
+The saved parent request records its preparation attempt and exact native child.
+GET returns its current phase without dispatching work. Repeated immutable
+requests observe the same record. Cancel and Continue each carry a distinct
+control UUID; lost responses are reconciled through their saved receipts.
+Cancellation is an intent until all started preparation has joined or the exact
+pre-Stop native transaction settles unchanged. A process interruption never
+silently starts another preparation or native worker.
+
+The existing immutable OS-launched worker can wait for active calls and work
+without closing ordinary admission or creating a new transaction on every wait.
+Uncertain work is retained for attention. A final control fence under the native
+lock precedes Stop. Explicit recovery of the same intent/deferred transaction
+keeps this fence; later recovery uses the existing restore/rollback boundary.
+A lost final parent-state write can be reconciled only from its exact verified
+native child. Native request, attempt, transaction and unknown-outcome records
+retain their previous formats and meaning.
+
+The advanced CHECK/APPLY controls below remain compatible; the ordinary Update
+screen does not require a separate CHECK step. Neither this flow nor its temporary
+update screen takes ownership from an enrolled updater.
+
 ## Standalone update and rollback
 
 Run the updater from the newly extracted package, not the installed executable it

@@ -236,14 +236,13 @@ jobs:
           result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(), Path('dist/native-startup.json').resolve())
           assert result['status'] == 'passed', 'Unavailable startup manager is not a passing qualification'
           PY
-      - name: Verify actual browser update, manager lifetimes and checked retirement
+      - name: Verify existing managed and manual lifecycle compatibility and checked retirement
         env:
           CONSTELLATION_NATIVE_STARTUP_TEST: '1'
-          CONSUMER_BROWSER_TEST: ${{ matrix.target == 'linux-x64' && '1' || '0' }}
           NATIVE_UPDATE_CONTROLLER: target/${{ matrix.rust_target }}/release/examples/native-update-controller${{ matrix.suffix }}
         run: |
           python - <<'PY'
-          import importlib.util, json, os, shutil
+          import importlib.util, json, os
           from pathlib import Path
           spec = importlib.util.spec_from_file_location('consumer_update', 'tests/native_consumer_update.py')
           module = importlib.util.module_from_spec(spec)
@@ -251,16 +250,49 @@ jobs:
           receipts = list(Path('dist').glob('conversations-*.json'))
           assert len(receipts) == 1, 'Expected one immutable package receipt'
           receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
-          browser = {}
+          # Retain native API lifecycle coverage. The historical Check/Apply
+          # browser fixture targets the old UI and is not a current UI pass.
+          result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(),
+              Path('dist/native-consumer-update.json').resolve(), Path(os.environ['NATIVE_UPDATE_CONTROLLER']).resolve())
+          assert result['status'] == 'passed', 'Actual update lifetime/retirement qualification did not pass'
+          PY
+      - name: Acquire the digest-pinned published predecessor for Single Update
+        run: python scripts/native-update-baseline.py --target '${{ matrix.target }}' --output '${{ runner.temp }}/single-update-baseline'
+      - name: Verify one Update from the published predecessor and deliberate rollback
+        env:
+          CONSTELLATION_NATIVE_STARTUP_TEST: '1'
+          CONSUMER_BROWSER_TEST: ${{ matrix.target == 'linux-x64' && '1' || '0' }}
+          NATIVE_UPDATE_CONTROLLER: target/${{ matrix.rust_target }}/release/examples/native-update-controller${{ matrix.suffix }}
+          NATIVE_UPDATE_BASELINE: ${{ runner.temp }}/single-update-baseline/baseline.json
+        run: |
+          python - <<'PY'
+          import importlib.util, json, os, shutil
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('single_update', 'tests/native_single_update.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          previous = json.loads(Path(os.environ['NATIVE_UPDATE_BASELINE']).read_text(encoding='utf-8'))
+          receipts = list(Path('dist').glob('conversations-*.json'))
+          assert len(receipts) == 1, 'Expected one immutable candidate package receipt'
+          receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
+          arguments = {
+              'previous_archive': Path(previous['archive']).resolve(),
+              'previous_receipt': Path(previous['receipt']).resolve(),
+              'candidate_archive': (Path('dist') / receipt['archive']).resolve(),
+              'candidate_receipt': receipts[0].resolve(),
+              'controller': Path(os.environ['NATIVE_UPDATE_CONTROLLER']).resolve(),
+          }
+          result = module.qualify(**arguments, output=Path('dist/native-single-update-api.json').resolve(), mode='api')
+          assert result['status'] == 'passed', 'Native Single Update API qualification did not pass'
           if os.environ['CONSUMER_BROWSER_TEST'] == '1':
               controller_node = shutil.which('node')
-              assert controller_node, 'Missing browser controller runtime'
-              browser = {'browser_test': Path('tests/native_updates_actual_browser.mjs').resolve(),
-                         'browser_node': Path(controller_node).resolve(),
-                         'browser_artifacts': Path('dist/consumer-update-browser-artifacts').resolve()}
-          result = module.qualify((Path('dist') / receipt['archive']).resolve(), receipts[0].resolve(),
-              Path('dist/native-consumer-update.json').resolve(), Path(os.environ['NATIVE_UPDATE_CONTROLLER']).resolve(), **browser)
-          assert result['status'] == 'passed', 'Actual update lifetime/retirement qualification did not pass'
+              assert controller_node, 'Missing browser test runtime'
+              # Playwright and this controller Node are test-only tools. The
+              # application continues to use its self-contained bundle.
+              result = module.qualify(**arguments, output=Path('dist/native-single-update-browser.json').resolve(),
+                  mode='browser', browser_node=Path(controller_node).resolve(),
+                  browser_artifacts=Path('dist/single-update-browser-artifacts').resolve())
+              assert result['status'] == 'passed', 'Actual Single Update Chromium qualification did not pass'
           PY
       - name: Verify pre-status stop-only recovery under both actual manager topologies
         env:
@@ -311,6 +343,7 @@ jobs:
             ${{ runner.temp }}/native-inputs/native-build-provenance.json
             ${{ runner.temp }}/native-inputs/pe-imports.json
             ${{ runner.temp }}/native-rust-tests.json
+            ${{ runner.temp }}/single-update-baseline/baseline.json
           if-no-files-found: warn
           retention-days: 7
 

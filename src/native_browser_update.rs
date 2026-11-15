@@ -29,6 +29,99 @@ const DIRECTORY: &str = "native-browser-update";
 const LEDGER: &str = "control.json";
 const MAX_LEDGER_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = MAX_LEDGER_BYTES + 1024;
+mod flow;
+pub(crate) use flow::{ControlInput as UpdateControlInput, Input as UpdateInput};
+
+/// Shared by the normal server and the downloaded app's restricted update UI.
+/// Authentication remains with each exact-origin listener. The scheduling step
+/// happens inside the accepted control operation, not after awaiting its reply.
+pub(crate) fn request_update(home: &Path, input: UpdateInput) -> ApiResult<Value> {
+    let id = input.request_id.clone();
+    let offer_id = input.offer_id.clone();
+    if let Some(attempt) = flow::accept(home, input)? {
+        flow::spawn(home.to_owned(), id.clone(), attempt);
+    }
+    update_status(
+        home,
+        "normal",
+        &StatusQuery {
+            request_id: Some(id),
+            offer_id,
+            control_id: None,
+        },
+    )
+}
+
+pub(crate) fn control_update(
+    home: &Path,
+    input: &UpdateControlInput,
+    action: &str,
+) -> ApiResult<Value> {
+    if let Some(attempt) = flow::control(home, input, action)? {
+        flow::spawn(home.to_owned(), input.request_id.clone(), attempt);
+    }
+    update_status(
+        home,
+        "normal",
+        &StatusQuery {
+            request_id: Some(input.request_id.clone()),
+            offer_id: None,
+            control_id: Some(input.control_id.clone()),
+        },
+    )
+}
+
+pub(crate) fn update_status(home: &Path, mode: &str, query: &StatusQuery) -> ApiResult<Value> {
+    let mut result = status(home, mode, query.request_id.as_deref(), launcher())?;
+    flow::augment(
+        home,
+        &mut result,
+        query.request_id.as_deref(),
+        query.offer_id.as_deref(),
+        query.control_id.as_deref(),
+    )?;
+    Ok(result)
+}
+
+pub(crate) fn require_no_update(home: &Path) -> Result<()> {
+    flow::reconcile_current(home)?;
+    flow::require_available(home, None)
+}
+
+pub(crate) fn require_update_owner(home: &Path, update_id: &str) -> Result<()> {
+    uuid(update_id)?;
+    flow::require_available(home, Some(update_id))
+}
+
+/// Close only the downloaded application's own listener. The caller serializes
+/// its local admissions with this check; no original app or worker is stopped.
+/// Unknown/active work stays observable, and this predicate never writes state.
+pub(crate) fn assistant_can_close(home: &Path) -> Result<bool> {
+    let _owner = match native_update::lock(home, "native-update.lock") {
+        Ok(owner) => owner,
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                e.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+            }) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if !flow::settled_for_assistant_close(home)? {
+        return Ok(false);
+    }
+    let journal = native_update::recovery_snapshot(home)?;
+    if journal.as_ref().is_some_and(|j| j.phase != "restored") {
+        return Ok(false);
+    }
+    let ledger = load(home)?;
+    if let Some(mut operation) = current_operation(&ledger)?.cloned() {
+        settle(&mut operation, journal.as_ref());
+        return Ok(verified_terminal(&operation));
+    }
+    Ok(true)
+}
 pub(crate) const WORKER_LOCK: &str = "native-browser-worker.lock";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +152,8 @@ pub(crate) struct RecoverInput {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StatusQuery {
     pub request_id: Option<String>,
+    pub offer_id: Option<String>,
+    pub control_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -226,7 +321,7 @@ fn history_path(home: &Path, kind: &str, id: &str) -> Result<PathBuf> {
     ensure!(
         matches!(
             kind,
-            "operations" | "requests" | "checks" | "transactions" | "legacy-adoptions"
+            "operations" | "requests" | "checks" | "transactions" | "legacy-adoptions" | "updates"
         ),
         "Invalid retained record kind"
     );
@@ -544,6 +639,13 @@ pub(crate) fn worker_active(home: &Path) -> Result<bool> {
         Err(error) => Err(error),
     }
 }
+
+/// A deferred single Update may coexist with the original healthy app. Journal
+/// phase alone is insufficient: bind the saved parent, exact claimed child and
+/// live process generation while its execution lock is still held.
+pub(crate) fn active_waiting_update(home: &Path, transaction: &str) -> Result<bool> {
+    flow::active_waiting(home, transaction)
+}
 fn terminal(operation: &Operation) -> bool {
     matches!(
         operation.state,
@@ -739,6 +841,7 @@ pub(crate) fn check(
     launch: &dyn WorkerLauncher,
 ) -> ApiResult<Value> {
     standalone(home)?;
+    flow::require_available(home, None)?;
     if !input.package_path.is_absolute() || input.package_path.as_os_str().len() > 4096 {
         return Err(ApiError::bad(
             "Choose the full path to an extracted complete native package",
@@ -769,6 +872,8 @@ pub(crate) fn check(
         let mut ledger =
             check_diagnostics::observe(Stage::PublicationGuards, || -> ApiResult<Ledger> {
                 standalone(home)?;
+                flow::reconcile_current(home)?;
+                flow::require_available(home, None)?;
                 if worker_active(home)? {
                     return Err(conflict("A native update worker is still running"));
                 }
@@ -846,6 +951,15 @@ pub(crate) fn apply(
     input: ApplyInput,
     launch: &dyn WorkerLauncher,
 ) -> ApiResult<Value> {
+    apply_for_update(home, input, launch, None)
+}
+
+fn apply_for_update(
+    home: &Path,
+    input: ApplyInput,
+    launch: &dyn WorkerLauncher,
+    update: Option<(&str, &str)>,
+) -> ApiResult<Value> {
     uuid(&input.request_id)?;
     uuid(&input.check_id)?;
     let payload = RequestPayload::Apply {
@@ -853,6 +967,8 @@ pub(crate) fn apply(
     };
     let operation = {
         let _guard = native_update::lock(home, "native-update.lock")?;
+        flow::reconcile_current(home)?;
+        flow::require_available(home, update.map(|u| u.0))?;
         let mut ledger = load(home)?;
         if duplicate(home, &ledger, &input.request_id, &payload)? {
             drop(_guard);
@@ -915,7 +1031,14 @@ pub(crate) fn apply(
         ledger
             .operations
             .insert(operation.id.clone(), operation.clone());
-        save(home, &ledger)?;
+        if let Some((id, attempt)) = update {
+            if !flow::bind_operation(home, id, attempt, &operation, || save(home, &ledger))? {
+                drop(_guard);
+                return status(home, "normal", None, launch);
+            }
+        } else {
+            save(home, &ledger)?;
+        }
         operation
     };
     dispatch(home, &operation, launch)?;
@@ -941,6 +1064,8 @@ pub(crate) fn recover(
             drop(_guard);
             return status(home, mode, Some(&input.request_id), launch);
         }
+        flow::reconcile_current(home)?;
+        flow::require_recovery(home, &input.operation_id)?;
         standalone(home)?;
         if let Some(reason) = launch.unavailable_reason(home) {
             return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, reason.into()));
@@ -1104,6 +1229,9 @@ pub(crate) fn recover(
 pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/companion/update", get(http_status))
+        .route("/api/v1/companion/update/request", post(http_request))
+        .route("/api/v1/companion/update/cancel", post(http_cancel))
+        .route("/api/v1/companion/update/continue", post(http_continue))
         .route("/api/v1/companion/update/check", post(http_check))
         .route("/api/v1/companion/update/apply", post(http_apply))
         .route("/api/v1/companion/update/recover", post(http_recover))
@@ -1114,12 +1242,58 @@ async fn http_status(
     Query(query): Query<StatusQuery>,
 ) -> ApiResult<Json<Value>> {
     auth::check(&state, &headers, "admin", false)?;
-    Ok(Json(status(
-        &state.home,
-        "normal",
-        query.request_id.as_deref(),
-        launcher(),
-    )?))
+    Ok(Json(update_status(&state.home, "normal", &query)?))
+}
+
+async fn http_request(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<flow::Input>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    auth::check(&state, &headers, "admin", true)?;
+    let home = state.home.clone();
+    let result = tokio::task::spawn_blocking(move || request_update(&home, input))
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Update acceptance could not be observed".into(),
+            )
+        })??;
+    Ok((StatusCode::ACCEPTED, Json(result)))
+}
+
+async fn http_cancel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<flow::ControlInput>,
+) -> ApiResult<Json<Value>> {
+    http_flow_control(state, headers, input, "cancel").await
+}
+async fn http_continue(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<flow::ControlInput>,
+) -> ApiResult<Json<Value>> {
+    http_flow_control(state, headers, input, "continue").await
+}
+async fn http_flow_control(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    input: flow::ControlInput,
+    action: &'static str,
+) -> ApiResult<Json<Value>> {
+    auth::check(&state, &headers, "admin", true)?;
+    let home = state.home.clone();
+    let result = tokio::task::spawn_blocking(move || control_update(&home, &input, action))
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Update control could not be observed".into(),
+            )
+        })??;
+    Ok(Json(result))
 }
 async fn http_check(
     State(state): State<Arc<AppState>>,
@@ -1275,6 +1449,67 @@ fn claim_with_identity(
     Ok(operation)
 }
 
+/// Explicit recovery before Stop retains the same outer cancellation fence.
+struct WaitingRecovery {
+    update_id: String,
+    update_attempt: String,
+    action: RecoveryAction,
+}
+impl WaitingRecovery {
+    fn decision(
+        &self,
+        home: &Path,
+        event: native_update::WaitingUpdateEvent<'_>,
+    ) -> Result<native_update::WaitingUpdateDecision> {
+        if self.action == RecoveryAction::Rollback {
+            // Before Stop there is nothing to switch back. Settle this exact
+            // transaction unchanged without starting/stopping an application.
+            Ok(native_update::WaitingUpdateDecision::Cancel)
+        } else {
+            flow::worker_control(home, &self.update_id, &self.update_attempt, event)
+        }
+    }
+
+    async fn run(&self, home: &Path, operation: &Operation) -> Result<Value> {
+        native_update::run_frozen_waiting(
+            home,
+            &operation.transaction_id,
+            &operation.plan,
+            |event| self.decision(home, event),
+        )
+        .await
+    }
+}
+
+fn waiting_recovery(
+    home: &Path,
+    operation: &Operation,
+    journal: &native_update::RecoverySnapshot,
+) -> Result<Option<WaitingRecovery>> {
+    if operation.kind != OperationKind::Apply
+        || journal.transaction != operation.transaction_id
+        || !journal.standalone
+        || !matches!(journal.phase.as_str(), "intent" | "deferred")
+    {
+        return Ok(None);
+    }
+    let Some((update_id, update_attempt)) = flow::worker_update(home, &operation.id)? else {
+        return Ok(None);
+    };
+    let action = operation
+        .attempt
+        .action
+        .context("Waiting recovery needs an explicit action")?;
+    Ok(Some(WaitingRecovery {
+        update_id,
+        update_attempt,
+        action,
+    }))
+}
+
+#[cfg(test)]
+mod waiting_recovery_tests;
+
 /// The fixed manager profile invokes this command once. A duplicate manager
 /// start, delayed revoked worker or restarted process cannot reclaim its attempt.
 /// No process is spawned here and no work is implicitly retried after a crash.
@@ -1305,12 +1540,19 @@ pub async fn worker(home: &Path, operation_id: &str, attempt_id: &str) -> Result
                 journal.standalone,
                 "Another owner controls this transaction"
             );
-            native_update::recover(
-                home,
-                &operation.transaction_id,
-                operation.attempt.action == Some(RecoveryAction::Rollback),
-            )
-            .await
+            if let Some(waiting) = waiting_recovery(home, &operation, journal)? {
+                // Explicit pre-Stop recovery still crosses the saved Cancel /
+                // Installing fence. run_frozen_waiting validates every retained
+                // boundary field before accepting this same transaction.
+                waiting.run(home, &operation).await
+            } else {
+                native_update::recover(
+                    home,
+                    &operation.transaction_id,
+                    operation.attempt.action == Some(RecoveryAction::Rollback),
+                )
+                .await
+            }
         } else {
             ensure!(
                 journal.as_ref().is_none_or(|j| j.phase == "restored"),
@@ -1318,8 +1560,18 @@ pub async fn worker(home: &Path, operation_id: &str, attempt_id: &str) -> Result
             );
             match operation.kind {
                 OperationKind::Apply => {
-                    native_update::run_frozen(home, &operation.transaction_id, &operation.plan)
+                    if let Some((id, attempt)) = flow::worker_update(home, &operation.id)? {
+                        native_update::run_frozen_waiting(
+                            home,
+                            &operation.transaction_id,
+                            &operation.plan,
+                            |event| flow::worker_control(home, &id, &attempt, event),
+                        )
                         .await
+                    } else {
+                        native_update::run_frozen(home, &operation.transaction_id, &operation.plan)
+                            .await
+                    }
                 }
                 OperationKind::Rollback => {
                     native_update::rollback_with_transaction(
@@ -1363,6 +1615,7 @@ pub async fn worker(home: &Path, operation_id: &str, attempt_id: &str) -> Result
         }
         save(home, &ledger)?;
     }
+    flow::worker_finished(home, operation_id, &result)?;
     result.map(|_| ())
 }
 
@@ -1564,13 +1817,13 @@ mod tests {
         );
     }
 
-    struct Fixture {
-        root: tempfile::TempDir,
-        home: PathBuf,
-        candidate: PathBuf,
+    pub(super) struct Fixture {
+        pub(super) root: tempfile::TempDir,
+        pub(super) home: PathBuf,
+        pub(super) candidate: PathBuf,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
             let home = root.path().join("private-home");
             fs::create_dir(&home).unwrap();
@@ -1861,8 +2114,8 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct LostReply {
-        calls: AtomicUsize,
+    pub(super) struct LostReply {
+        pub(super) calls: AtomicUsize,
     }
     impl WorkerLauncher for LostReply {
         fn unavailable_reason(&self, _: &Path) -> Option<&'static str> {
