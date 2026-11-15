@@ -25,6 +25,7 @@ class CheckObservationTests(unittest.TestCase):
     OLD_ID = "1c97701c-955f-4d8e-ae6a-ccf563e6687a"
     NEW_ID = "057c2e79-cc3d-4852-ae80-66b494de6a21"
     NONCE = "private-test-runtime-nonce"
+    BUNDLE_VERIFICATION_PHASES = ("bundle_manifest", "bundle_inventory", "bundle_content", "bundle_entrypoints")
 
     def runtime(self, home, *, nonce=None, pid=101):
         (home / "runtime.json").write_text(json.dumps({"pid": pid, "process_nonce": nonce or self.NONCE,
@@ -77,6 +78,9 @@ class CheckObservationTests(unittest.TestCase):
             home = Path(directory)
             self.runtime(home)
             value = {**self.snapshot(), "state": "returned", "result": "ok"}
+            value["events"] = [{"sequence": index, "phase": phase, "state": "returned",
+                                "at_ms": 10, "elapsed_ms": 2, "result": "ok"}
+                               for index, phase in enumerate(self.BUNDLE_VERIFICATION_PHASES, 1)]
             def request(*_args, **_kwargs):
                 self.trace(home, value)
                 raise TimeoutError("no HTTP reply")
@@ -86,6 +90,7 @@ class CheckObservationTests(unittest.TestCase):
             row = install.result["check_request"]
             self.assertEqual(row["response"], "transport_unknown")
             self.assertEqual(row["observation_after"]["snapshot"]["result"], "ok")
+            self.assertEqual(row["observation_after"]["snapshot"]["events"], value["events"])
             self.assertFalse(row["observation_after"]["request_identity_bound"])
 
     def test_check_observation_failures_preserve_original_request_error(self):
@@ -315,7 +320,8 @@ class CheckObservationTests(unittest.TestCase):
                    {"state": "private-state"}, {"result": "ok"}, {"state": "returned", "result": None},
                    {"truncated": 1}]
         invalid.extend(json.dumps({**self.snapshot(), **update}) for update in updates)
-        for update in [{"phase": "private-path"}, {"state": "private-state"}, {"sequence": 2},
+        for update in [{"phase": "private-path"}, {"phase": "bundle_content/private-path"},
+                       {"state": "private-state"}, {"sequence": 2},
                        {"at_ms": True}, {"elapsed_ms": 0}, {"result": "ok"}, {"state": "returned"}]:
             value = self.snapshot()
             value["events"][0].update(update)
@@ -352,6 +358,45 @@ class CheckObservationTests(unittest.TestCase):
             rendered = json.dumps(observed)
             for private in [self.NONCE, "private-source-path", "private-error", "runtime-private-extension"]:
                 self.assertNotIn(private, rendered)
+
+    def test_bundle_verification_phases_keep_three_scans_within_fixed_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.runtime(home)
+            value = self.snapshot()
+            events = [{**value["events"][0], "sequence": index} for index in range(1, 35)]
+            for _ in range(3):
+                for phase in self.BUNDLE_VERIFICATION_PHASES:
+                    for state in ("started", "returned"):
+                        events.append({"sequence": len(events) + 1, "phase": phase, "state": state,
+                                       "at_ms": 25, "elapsed_ms": 2 if state == "returned" else None,
+                                       "result": "ok" if state == "returned" else None})
+            value["events"] = events
+            path = self.trace(home, value)
+            self.assertEqual(len(events), 58)
+            self.assertLessEqual(path.stat().st_size, 32768)
+            observed = controller.check_observation(home)
+            self.assertEqual(observed["status"], "observed")
+            self.assertEqual(observed["snapshot"]["events"], events)
+            self.assertFalse(observed["snapshot"]["truncated"])
+            self.assertEqual(observed["snapshot"]["state"], "running")
+            self.assertIsNone(observed["snapshot"]["result"])
+            self.assertTrue(observed["observation_only"])
+            self.assertFalse(observed["request_identity_bound"])
+
+            # Sequential records isolate the event bound from sequence checks.
+            events.extend({**events[-1], "sequence": index} for index in range(59, 65))
+            value["truncated"] = True
+            self.trace(home, value)
+            observed = controller.check_observation(home)
+            self.assertEqual(observed["snapshot"]["events"], events)
+            self.assertEqual(len(observed["snapshot"]["events"]), 64)
+            self.assertTrue(observed["snapshot"]["truncated"])
+            events.append({**events[-1], "sequence": 65})
+            self.trace(home, value)
+            observed = controller.check_observation(home)
+            self.assertEqual(observed["status"], "unavailable")
+            self.assertNotIn("snapshot", observed)
 
     def test_check_observation_unknown_prior_cannot_attribute_new_trace(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -424,6 +469,7 @@ class CheckObservationTests(unittest.TestCase):
             home = Path(directory)
             self.runtime(home)
             self.assertIn("bundle_verify_existing", controller.CHECK_OBSERVATION_PHASES)
+            self.assertTrue(set(self.BUNDLE_VERIFICATION_PHASES).issubset(controller.CHECK_OBSERVATION_PHASES))
             for state, result in [("returned", "ok"), ("returned", "error"), ("unwound", None)]:
                 with self.subTest(state=state, result=result):
                     value = {**self.snapshot(), "state": state, "result": result}

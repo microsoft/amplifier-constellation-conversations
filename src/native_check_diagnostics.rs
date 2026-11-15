@@ -39,6 +39,10 @@ pub(crate) enum Stage {
     BindingValidation,
     LedgerPublish,
     Response,
+    BundleManifest,
+    BundleInventory,
+    BundleContent,
+    BundleEntrypoints,
 }
 
 impl Stage {
@@ -57,6 +61,10 @@ impl Stage {
             Self::BindingValidation => "check_binding_validation",
             Self::LedgerPublish => "check_ledger_publish",
             Self::Response => "check_response",
+            Self::BundleManifest => "bundle_manifest",
+            Self::BundleInventory => "bundle_inventory",
+            Self::BundleContent => "bundle_content",
+            Self::BundleEntrypoints => "bundle_entrypoints",
         }
     }
 }
@@ -189,6 +197,14 @@ pub(crate) fn run<T, E>(
     run_with_token(home, queued, &OWNER, operation)
 }
 
+#[cfg(test)]
+pub(crate) fn run_for_test<T, E>(
+    home: &Path,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    run_with_token(home, Instant::now(), &AtomicBool::new(false), operation)
+}
+
 fn run_with_token<T, E>(
     home: &Path,
     queued: Instant,
@@ -290,6 +306,10 @@ fn known_phase(phase: &str) -> bool {
                 | "check_binding_validation"
                 | "check_ledger_publish"
                 | "check_response"
+                | "bundle_manifest"
+                | "bundle_inventory"
+                | "bundle_content"
+                | "bundle_entrypoints"
         )
 }
 
@@ -1216,6 +1236,79 @@ mod tests {
     }
 
     #[test]
+    fn three_bundle_scans_fit_the_fixed_event_budget() {
+        use crate::native_installation_diagnostics::{Phase, observe as installation};
+
+        let home = home();
+        let phases = [
+            (Stage::BundleManifest, "bundle_manifest"),
+            (Stage::BundleInventory, "bundle_inventory"),
+            (Stage::BundleContent, "bundle_content"),
+            (Stage::BundleEntrypoints, "bundle_entrypoints"),
+        ];
+        let result = run_for_test(home.path(), || {
+            // Thirteen CHECK stages and four installation phases represent the
+            // existing 34 records; three scans add eight records apiece.
+            for stage in [
+                Stage::Cleanup,
+                Stage::Prepare,
+                Stage::Lock,
+                Stage::PreviousVerify,
+                Stage::Inputs,
+                Stage::Staging,
+                Stage::PackageRecord,
+                Stage::Rebind,
+                Stage::Launcher,
+                Stage::PublicationGuards,
+                Stage::BindingValidation,
+                Stage::LedgerPublish,
+                Stage::Response,
+            ] {
+                observe(stage, || Ok::<_, anyhow::Error>(()))?;
+            }
+            for phase in [
+                Phase::BundleCopy,
+                Phase::BundleVerifyExisting,
+                Phase::BundleVerify,
+                Phase::BundleVerifyCopied,
+            ] {
+                installation(phase, || Ok(()))?;
+            }
+            for _ in 0..3 {
+                for (phase, _) in phases {
+                    observe(phase, || Ok::<_, anyhow::Error>(()))?;
+                }
+            }
+            Ok::<_, anyhow::Error>(71)
+        });
+        assert_eq!(result.unwrap(), 71);
+        let bytes = fs::read(path(home.path())).unwrap();
+        assert!(bytes.len() <= 32_768);
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["observation_only"], true);
+        assert_eq!(value["truncated"], false);
+        assert_eq!(value["state"], "returned");
+        assert_eq!(value["result"], "ok");
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 58);
+        for (index, event) in events.iter().enumerate().skip(34) {
+            assert_eq!(event["sequence"], index + 1);
+            assert_eq!(event["phase"], phases[((index - 34) / 2) % 4].1);
+            assert_eq!(event.as_object().unwrap().len(), 6);
+            if index % 2 == 0 {
+                assert_eq!(event["state"], "started");
+                assert_eq!(event["result"], Value::Null);
+                assert_eq!(event["elapsed_ms"], Value::Null);
+            } else {
+                assert_eq!(event["state"], "returned");
+                assert_eq!(event["result"], "ok");
+                assert!(event["elapsed_ms"].is_u64());
+            }
+        }
+        assert!(destination_valid(&path(home.path()), None));
+    }
+
+    #[test]
     fn event_limit_is_bounded_and_truncation_does_not_change_result() {
         let home = home();
         let owner = AtomicBool::new(false);
@@ -1332,6 +1425,8 @@ mod tests {
         run_with_token(home.path(), Instant::now(), &AtomicBool::new(false), || {
             for line in [
                 br#"{"event":"native_installation_phase","phase":"private-path","state":"started"}"#.as_slice(),
+                br#"{"event":"native_installation_phase","phase":"bundle_content/private-path","state":"started"}"#,
+                br#"{"event":"native_installation_phase","phase":"bundle_manifest","state":"started","path":"secret"}"#,
                 br#"{"event":"native_installation_phase","phase":"bundle_copy","state":"started","token":"secret"}"#,
                 br#"{"event":"native_installation_phase","phase":"bundle_copy","state":"returned","elapsed_ms":0,"result":"secret"}"#,
                 b"not json",

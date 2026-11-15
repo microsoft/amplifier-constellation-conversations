@@ -48,6 +48,7 @@ CHECK_OBSERVATION_PHASES = frozenset({
     "check_stage", "check_package_record", "check_rebind", "check_launcher",
     "check_publication_guards", "check_binding_validation", "check_ledger_publish", "check_response",
     "download_verify", "identity_create", "bootstrap_verify", "bundle_verify", "bundle_copy",
+    "bundle_manifest", "bundle_inventory", "bundle_content", "bundle_entrypoints",
     "bundle_verify_copied", "bundle_verify_existing", "bundle_publish", "binary_publish", "receipt_publish", "installed_verify",
 })
 
