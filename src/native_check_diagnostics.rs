@@ -538,16 +538,14 @@ fn ordinary(metadata: &Metadata) -> bool {
 /// Read-only check for an already-open installation-owned private receipt.
 /// This neither repairs its policy nor proves a future pathname replacement.
 pub(crate) fn private_file_policy(file: &fs::File) -> bool {
-    if !file.metadata().is_ok_and(|metadata| ordinary(&metadata)) {
-        return false;
-    }
+    let ordinary_file = file.metadata().is_ok_and(|metadata| ordinary(&metadata));
     #[cfg(windows)]
     {
-        windows_file_policy::private(file)
+        ordinary_file && windows_file_policy::private(file)
     }
     #[cfg(not(windows))]
     {
-        true
+        ordinary_file
     }
 }
 
