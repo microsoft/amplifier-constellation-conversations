@@ -102,12 +102,13 @@ const server = createServer(async (request,response) => {
     if(request.method==='GET') {send(200,{commands:[...surfaceCommands.values()].filter(v=>v.callId===call.id&&v.browser_id===url.searchParams.get('browser_id')&&v.state==='queued')});return;}
     const command=surfaceCommands.get(surfacePath[3]);if(!command||command.callId!==call.id||command.browser_id!==body.browser_id){send(403,{error:'wrong command browser'});return;}
     if(body.state==='accepted') {
+      if(command.kind==='view' && command.state==='queued' && command.command.expected_revision!==surfaces.get(call.id)?.view_revision) { command.state='failed';command.reason='stale_view';send(200,{...command,execute:false});return; }
       const execute=command.state==='queued'&&command.expires_at>Date.now()&&!['closing','closed','interrupted'].includes(call.state);
       if(execute)command.state='accepted';const result={...command,execute};
       if(holdNextSurfaceAck){holdNextSurfaceAck=false;heldSurfaceAck=()=>send(200,result);return;}
       send(200,result);return;
     }
-    if(body.state==='failed'&&command.state==='queued'){send(400,{error:'not accepted'});return;}
+    if(body.state==='failed'&&command.state==='queued'&&!(command.kind==='view'&&body.reason==='stale_view'&&body.view_revision>command.command.expected_revision)){send(400,{error:'not accepted'});return;}
     if(body.state==='uploaded'&&(!uploads.has(command.operation_id+':available')||!body.attachment_ids?.every(id=>attachments.has(id)))){send(400,{error:'image not saved'});return;}
     command.state=body.state;command.reason=body.reason;command.artifact_ids=body.attachment_ids||[];send(200,{...command,execute:false});return;
   }
@@ -203,11 +204,33 @@ await page.addInitScript(() => {
 });
 const wait = async (condition,message) => {
   for (let i=0;i<150;i++) { if (await condition()) return; await page.waitForTimeout(50); }
+  console.error(JSON.stringify({fixture_failure:message,surface:surfaces.get('call-1'),commands:[...surfaceCommands.values()].slice(-4).map(c=>({operation_id:c.operation_id,state:c.state,reason:c.reason,command:c.command}))}));
   throw new Error(message);
+};
+// Prepare positive commands only after a presence request which STARTED after
+// the completed human action has also received its response. An older in-flight
+// snapshot (or an assumed number of mouse events) is not a completion barrier.
+const observeNextSurface = async (currentState=()=>true) => {
+  const started=new Set();let matched=false;
+  const onRequest=request=>{if(request.method()==='POST'&&request.url().endsWith('/calls/call-1/surface/presence'))started.add(request);};
+  const onResponse=response=>{
+    const request=response.request();
+    if(started.has(request)&&response.ok()){
+      const body=request.postDataJSON();
+      if(body.browser_id===surfaces.get('call-1')?.browser_id&&Number.isSafeInteger(body.view_revision)&&currentState(body))matched=true;
+    }
+  };
+  page.on('request',onRequest);page.on('response',onResponse);
+  try{await wait(async()=>matched&&currentState(surfaces.get('call-1')),'current human surface intent/state was not observed before preparing a view');}
+  finally{page.off('request',onRequest);page.off('response',onResponse);}
+};
+const clickAndObserveSurface = async (locator, currentState=()=>true) => {
+  await locator.click();await observeNextSurface(currentState);
 };
 const emit = (kind,data,at=Date.now()) => events.push({seq:(events.at(-1)?.seq || 0)+1,kind,data,at});
 const surfaceCommand = (kind,command,options={}) => {
   const callId=options.callId||'call-1';
+  if(kind==='view')command={expected_browser_id:surfaces.get(callId)?.browser_id,expected_revision:surfaces.get(callId)?.view_revision,...command};
   const receipt={callId,operation_id:randomUUID(),delegation_id:'fixture-current-delegation',browser_id:surfaces.get(callId)?.browser_id,kind,command,state:'queued',created_at:Date.now(),expires_at:Date.now()+30000,artifact_ids:[],inspection:false,...options};
   surfaceCommands.set(receipt.operation_id,receipt);emit('surface_command',{...receipt});return receipt;
 };
@@ -743,15 +766,46 @@ try {
   assert.equal(await page.evaluate(()=>scrollY),0);const afterView=await page.locator('#hangup').boundingBox();assert(Math.abs(desktopAfter.y-afterView.y)<1);
   assert.equal(await page.evaluate(()=>fixture.media.length),beforeViewSensors);assert.equal(await page.evaluate(()=>fixture.draws),beforeViewFrames);
   checks.push('agent view controls focus owned cards and switch or scroll only the contained pane without moving hangup or opening media');
+  const beforeIntent = surfaces.get('call-1').view_revision;
+  holdNextSurfaceAck=true;
+  const delayedView=surfaceCommand('view',{action:'show_context'});
+  await wait(async()=>heldSurfaceAck!==null,'delayed view acceptance was not retained');
+  await page.locator('#transcript-tab').click();
+  await wait(async()=>await page.locator('#transcript-tab').getAttribute('aria-selected')==='true','human navigation did not select the transcript');
+  heldSurfaceAck();heldSurfaceAck=null;
+  await wait(async()=>delayedView.state==='failed'&&delayedView.reason==='stale_view','delayed accepted view did not preserve newer user navigation');
+  assert.equal(await page.locator('#transcript-tab').getAttribute('aria-selected'),'true');
+  await wait(async()=>surfaces.get('call-1').view_revision>beforeIntent,'human navigation did not publish a newer intent');
+  assert.equal(requests.filter(r=>r.path.endsWith(`/surface/commands/${delayedView.operation_id}/ack`)&&r.body.state==='executed').length,0);
+  const staleView=surfaceCommand('view',{action:'show_shared',expected_revision:beforeIntent});
+  await wait(async()=>staleView.state==='failed'&&staleView.reason==='stale_view','already stale view was not refused before acceptance');
+  assert.equal(requests.filter(r=>r.path.endsWith(`/surface/commands/${staleView.operation_id}/ack`)&&r.body.state==='accepted').length,0);
+  let lostView;
+  const loseViewAck=async route=>{
+    if(lostView && route.request().url().endsWith(`/surface/commands/${lostView.operation_id}/ack`) && route.request().postDataJSON().state==='accepted'){await route.fetch();await route.abort('failed');}else await route.continue();
+  };
+  await page.route('**/surface/commands/*/ack',loseViewAck);
+  lostView=surfaceCommand('view',{action:'show_context'});
+  await wait(async()=>lostView.state==='accepted','lost view acceptance did not reach the server');
+  emit('surface_command',{...lostView,state:'queued'});await page.waitForTimeout(1100);
+  assert.equal(await page.locator('#transcript-tab').getAttribute('aria-selected'),'true');
+  assert.equal(requests.filter(r=>r.path.endsWith(`/surface/commands/${lostView.operation_id}/ack`)&&r.body.state==='accepted').length,1);
+  assert.equal(requests.filter(r=>r.path.endsWith(`/surface/commands/${lostView.operation_id}/ack`)&&r.body.state==='executed').length,0);
+  await page.unroute('**/surface/commands/*/ack',loseViewAck);
+  assert.equal(await page.evaluate(()=>fixture.media.length),beforeViewSensors);
+  assert.equal(await page.evaluate(()=>fixture.draws),beforeViewFrames);
+  const restoredView=surfaceCommand('view',{action:'show_shared'});await wait(async()=>restoredView.state==='executed','current revision view did not execute');
+  checks.push('newer human navigation rejects queued and delayed-accepted view commands; lost acceptance never changes the view or replays a command');
+
   const savedIds=await page.locator('#cards .output-card[data-card-id]').evaluateAll(nodes=>nodes.map(node=>node.dataset.cardId).filter(id=>/^\d+$/.test(id)).slice(0,6));
-  await page.locator('#board-history summary').click();
+  await clickAndObserveSurface(page.locator('#board-history summary'));
   const replaceBoard=surfaceCommand('view',{action:'replace_board',card_ids:savedIds.slice(0,3)});
   await wait(async()=>replaceBoard.state==='executed','replace_board did not select saved results');
   assert.equal(await page.locator('#board-items>.output-card').count(),3);
   assert.deepEqual(await page.locator('#board-items>.output-card').evaluateAll(nodes=>nodes.map(node=>node.dataset.cardId)),savedIds.slice(0,3));
   const fullBoard=surfaceCommand('view',{action:'add_card',card_id:savedIds[3]});
   await wait(async()=>fullBoard.state==='failed','full board command did not return a failed receipt');assert.equal(fullBoard.reason,'board_full');
-  const pinned=page.locator(`#board-items>[data-card-id="${savedIds[0]}"]`);await pinned.getByRole('button',{name:'Pin',exact:true}).click();
+  const pinned=page.locator(`#board-items>[data-card-id="${savedIds[0]}"]`);await clickAndObserveSurface(pinned.getByRole('button',{name:'Pin',exact:true}),state=>state.pinned_card_ids.includes(savedIds[0]));
   const protectedBoard=surfaceCommand('view',{action:'clear_board'});
   await wait(async()=>protectedBoard.state==='failed','clear removed a pinned item');assert.equal(protectedBoard.reason,'item_protected');
   assert.equal(await page.locator('#board-items>.output-card').count(),3);
@@ -760,7 +814,7 @@ try {
   assert.deepEqual(await page.locator('#board-items>.output-card').evaluateAll(nodes=>nodes.map(node=>node.dataset.cardId)),savedIds.slice(0,3));
   assert.equal(await pinned.getByRole('button',{name:'Unpin',exact:true}).count(),1);
   await wait(async()=>surfaces.get('call-1')?.pinned_card_ids?.includes(savedIds[0]),'pin was not reported to the agent surface');
-  await pinned.getByRole('button',{name:'Unpin',exact:true}).click();await page.locator('#space-tab').click();
+  await clickAndObserveSurface(pinned.getByRole('button',{name:'Unpin',exact:true}),state=>!state.pinned_card_ids.includes(savedIds[0]));await clickAndObserveSurface(page.locator('#space-tab'));
   await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
   await wait(async()=>surfaces.get('call-1')?.focused_card_id===null,'reported reading focus stayed stale after the user returned to the end');
   const removeBoard=surfaceCommand('view',{action:'remove_card',card_id:savedIds[1]});await wait(async()=>removeBoard.state==='executed','remove did not put away a saved item');
@@ -774,14 +828,15 @@ try {
   checks.push('whiteboard presents at most three intentional items; full/protected commands fail atomically, pins are observable, removal keeps history, and automatic observations never flood current content');
 
   const readingCard=page.locator(`#board-items>[data-card-id="${savedIds[0]}"]`);
-  await readingCard.locator('.card-answer').click();await page.locator('#space-panel').evaluate(node=>{node.scrollTop=100;});
+  await clickAndObserveSurface(readingCard.locator('.card-answer'),state=>state.focused_card_id===savedIds[0]);await page.locator('#space-panel').evaluate(node=>{node.scrollTop=100;});
   const readingTop=await page.locator('#space-panel').evaluate(node=>node.scrollTop);
   const protectedReading=surfaceCommand('view',{action:'replace_board',card_ids:[savedIds[4]]});
   await wait(async()=>protectedReading.state==='failed','agent replaced an item being read');assert.equal(protectedReading.reason,'item_protected');
   emit('card',{title:'While reading',text:'Saved quietly.',presentation:'later'});
   await wait(async()=>await page.locator('#cards .output-card').filter({hasText:'While reading'}).count()===1,'reading fixture update missing');
   assert(Math.abs(await page.locator('#space-panel').evaluate(node=>node.scrollTop)-readingTop)<2,'a background update moved the reading position');
-  await page.locator('#space-tab').click();await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  await clickAndObserveSurface(page.locator('#space-tab'));await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  await wait(async()=>surfaces.get('call-1')?.focused_card_id===null,'reading focus was not released before clear_board');
   const clearBoard=surfaceCommand('view',{action:'clear_board'});await wait(async()=>clearBoard.state==='executed','unprotected board did not clear');
   assert.equal(await page.locator('#board-items>.output-card').count(),0);assert(await page.locator('#space-empty').isVisible());
   emit('card',{text:'Here is the saved Minecraft view, not a live feed.',presentation:'current',late:false,attachments:[{id:'current-output-image',name:'Saved Minecraft view',mime_type:'image/png'}],conversation_id:'room-coach'});
@@ -798,7 +853,8 @@ try {
   emit('card',{text:'Saved screenshot while reading.',presentation:'current',attachments:[{id:'reading-output-image',name:'Reading-time screenshot',mime_type:'image/png'}],conversation_id:'room-coach'});
   await wait(async()=>await page.locator('#cards .output-card').filter({hasText:'Saved screenshot while reading.'}).count()===1,'image presentation displaced a reader despite spare board capacity');
   assert.equal(await page.locator('#board-items>.output-card').count(),1);
-  await page.locator('#space-tab').click();await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  await clickAndObserveSurface(page.locator('#space-tab'));await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  await wait(async()=>surfaces.get('call-1')?.focused_card_id===null,'reading focus was not released before image fixture clear');
   const afterImageClear=surfaceCommand('view',{action:'clear_board'});await wait(async()=>afterImageClear.state==='executed','image presentation fixture did not clear');
   checks.push('explicit assistant image output decodes visibly on an available whiteboard; late, full, pinned and reading-protected results remain saved without eviction');
   emit('card',{title:'Deliberate presentation',text:'One useful thing. '+ 'Detail for the current discussion. '.repeat(50),presentation:'current'});
@@ -842,12 +898,13 @@ try {
   assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth&&document.documentElement.scrollHeight<=innerHeight));
   if(process.env.COMPANION_SCREENSHOT)await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-context-mobile.png'),fullPage:true});
   await page.setViewportSize({width:1280,height:900});
-  await page.locator('#space-tab').click();
+  await clickAndObserveSurface(page.locator('#space-tab'));
   checks.push('agent presentation preserves an item being read; whiteboard and transcript follow only from the bottom and offer an explicit jump for new content');
   checks.push('long calls retain earlier transcript text; observed connection facts are distinct from voice receipts; Context preserves reading position, offers a new-context jump and fits on a phone');
   {
     if(await page.locator('#notice').isVisible())await page.locator('#dismiss-notice').click();
     await page.locator('#space-panel').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+    await observeNextSurface(state=>state.focused_card_id===null);
     const visualClear=surfaceCommand('view',{action:'clear_board'});await wait(async()=>visualClear.state==='executed','visual board did not clear');
     emit('card',{title:'A reading nook',kind:'note',text:'A comfortable chair by the window, a small table for a book, and warm light for the evening. Start with the chair; we can refine the rest together.',presentation:'current'});
     await wait(async()=>await page.locator('#board-items>.output-card').count()===1,'visual presentation missing');
@@ -974,7 +1031,7 @@ try {
   await page.setViewportSize({width:390,height:844});
   const controls=await page.locator('.control-symbol').evaluateAll(nodes=>nodes.map(node=>({width:node.getBoundingClientRect().width,height:node.getBoundingClientRect().height})));
   assert(controls.every(size=>size.width>=44&&size.height>=44));
-  await page.locator('#transcript-tab').click();assert.equal(await page.locator('#transcript-tab').getAttribute('aria-selected'),'true');
+  await clickAndObserveSurface(page.locator('#transcript-tab'));assert.equal(await page.locator('#transcript-tab').getAttribute('aria-selected'),'true');
   checks.push('network recovery observes the same call; mobile controls and panels fit the viewport');
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT,fullPage:true});
 

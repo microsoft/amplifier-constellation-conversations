@@ -521,6 +521,12 @@ Official provider references: [Live](https://developers.openai.com/api/docs/guid
 
 ## Hands-free controls and connection awareness
 
+Before `companion_view`, read `companion_surface_status` and pass its observed
+`browser_id` as `expected_browser_id` and `view_revision` as `expected_revision`.
+Newer human navigation refuses the old command with `stale_view`, including
+navigation while acceptance is awaiting a reply; the original operation is not
+replayed. A missing revision leaves view control unavailable.
+
 An enabled call MCP server now also exposes `companion_view`,
 `companion_capture`, and `companion_surface_status`. A view operation can scroll
 one pane, change tabs, or focus an actual shared-card ID. It cannot choose DOM

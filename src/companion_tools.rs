@@ -473,6 +473,19 @@ pub async fn mcp(
                             "companion_huddle_status",
                             &value["params"]["arguments"],
                         ))
+                    || (value["params"]["name"] == "companion_action_status"
+                        && own_tool_shape_valid(
+                            "companion_action_status",
+                            &value["params"]["arguments"],
+                        )
+                        && saved_action_status(
+                            &s,
+                            &id,
+                            value["params"]["arguments"]["request_id"]
+                                .as_str()
+                                .unwrap_or(""),
+                        )?
+                        .is_some())
             }
             _ => false,
         };
