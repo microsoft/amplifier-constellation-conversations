@@ -1,56 +1,51 @@
 # Agent Conversations
 
-Reusable conversation and coordination services for people and **existing ACP
-agents**, part of [Amplifier Constellation](https://github.com/microsoft/amplifier-constellation).
+Conversations provides shared rooms, messages, and coordination for people and
+existing ACP agents. An application can use its APIs to bring several independently
+configured agents into a conversation while each agent keeps its own execution
+sessions.
 
-Conversations supplies rooms, membership, messages, authorized source context and
-observable work huddles. Experience builders use these services through their
-APIs and tools. These are source-owned conversations, distinct from the execution
-sessions of their participating agents. Current browser screens provide developer,
-administrator and reference access; products choose their own interaction.
+This repository also contains **Companion**, a browser experience for talking
+with an agent by voice and sharing what you see. Both are part of
+[Amplifier Constellation](https://github.com/microsoft/amplifier-constellation).
 
-This repository also contains the current Companion call implementation.
-Companion is a distinct product for bringing an agent into the physical world
-through live talk, seeing and sharing. It is an Experience presenting Conversations
-in the family's [five-primitives model](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/README.md).
-Its vision is separate from the services it uses and from the current preview's
-layout. This repository remains the serving home for its current call interface.
+## Try Companion
 
-- [Conversations vision](docs/VISION.md): reusable conversation and coordination services.
-- [Companion vision](docs/companion-vision.md): live interaction in the physical world.
-- [Agreements and interfaces](docs/README.md): shared promises and precise local contracts.
-- [API reference](docs/api.md): resources, supported operations and view control.
+Follow [Open Companion](docs/native-consumer-setup.md) for a personal installation:
 
-The service supports explicitly allowed local users, private conversations, and shared rooms with several independently configured ACP agents. Existing conversations stay private on upgrade. See [shared rooms](docs/shared-rooms.md) for setup, participation, attachments, and audience boundaries. Multiple conversations can run concurrently against the configured endpoints. Imported transcripts from other experiences are viewable here, with their original surface identified, but remain read-only.
+1. Download and verify a trusted package for your computer, then extract all its files.
+2. Open `Companion.app` on macOS, `agent-conversations.exe` on Windows, or
+   `agent-conversations` on Linux. The app opens in your browser.
+3. Create a local Companion password and select or add an existing agent connection.
+4. Configure a voice provider if you want to make calls, then choose **Call** when ready.
 
-[Observable huddles](docs/huddles.md) keep routine agent coordination available
-for inspection while meaningful results return to the original request. External
-participants keep their existing sessions. With installation-owned connections
-configured, agents create or reuse a huddle and invite known peers through their
-existing tools; people do not prepare rooms. Inspection and follow preferences
-do not grant work authority or start another agent.
+You can complete setup without an agent connected. Saving setup does not start a
+call or prompt a model. Microphone and camera access require your browser's
+permission. Personal setup listens only on this computer; use
+[advanced hosting](docs/native-installation.md) for HTTPS and network access.
 
-## Companion
+The [setup guide](docs/native-consumer-setup.md) also covers updates and recovery.
+An interrupted package check may still be running; check saved status before
+starting another request.
 
-The [current call interface](docs/companion.md) provides full-duplex GPT-Live
-calls to existing ACP agents, with per-agent voices and background work. Its
-`/companion` preview and optional server-side bridge exercise those capabilities.
-Companion owns its voice-provider connection; the selected ACP engine owns backend
-reasoning-provider calls. Existing text conversations and browser dictation keep
-their current behavior.
+## Build a conversation experience
 
-## Setup and technical references
+Use the [source installation guide](docs/installation.md) to configure the service
+and its ACP connections, then the [API reference](docs/api.md) to integrate it.
 
-- [Open Companion](docs/native-consumer-setup.md): open the native app and complete personal account, agent-contact and voice setup in the browser, without a local Instance or developer tools.
-- [Advanced native hosting](docs/native-installation.md): OS-account authentication, HTTPS and independently administered installations.
-- [Source installation and connection configuration](docs/installation.md): build, authentication, ACP endpoints and source credentials.
-- [Reference browser controls](docs/shared-rooms.md#reference-browser-phone-and-voice): text, voice, forms and shared-room presentation.
-- [Validation](docs/validation.md): reproducible checks and their limits.
+- [Shared rooms](docs/shared-rooms.md): membership, participation, attachments, and audience boundaries.
+- [Huddles](docs/huddles.md): inspectable agent coordination that returns results to the original request.
+- [Agreements and interfaces](docs/README.md): local contracts and the wider family boundaries.
+
+Existing conversations remain private on upgrade. Imported transcripts retain
+their original surface and are read-only. The bundled browser controls provide
+reference and administration access; applications can present their own experience.
+
+For product direction, see the [Conversations vision](docs/VISION.md) and
+[Companion vision](docs/companion-vision.md). Contributors can use the
+[validation guide](docs/validation.md).
 
 ## Contributing
-
-Invited collaborators: follow [Join the work](https://github.com/microsoft/amplifier-constellation#join-the-work)
-within your agreed access and scope. The notice below covers general public intake.
 
 > [!NOTE]
 > This project is not currently accepting external contributions, but we're actively working toward opening this up. We value community input and look forward to collaborating in the future. For now, feel free to fork and experiment!
