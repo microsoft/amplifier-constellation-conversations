@@ -1603,12 +1603,216 @@ mod tests {
         }
     }
 
+    const HISTORY_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+    // All subprocesses here belong only to these tests. Keep cleanup active even
+    // if a readiness assertion fails before the bounded waiter is entered.
+    struct HistoryChild(std::process::Child);
+    impl Drop for HistoryChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    fn history_output_tail(path: &Path) -> String {
+        use std::io::{Seek, SeekFrom};
+        let read = || -> std::io::Result<Vec<u8>> {
+            let mut file = fs::File::open(path)?;
+            let start = file.metadata()?.len().saturating_sub(HISTORY_OUTPUT_LIMIT);
+            file.seek(SeekFrom::Start(start))?;
+            let mut bytes = Vec::new();
+            file.take(HISTORY_OUTPUT_LIMIT).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        match read() {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => format!("diagnostic_unavailable:{:?}", error.kind()),
+        }
+    }
+
+    fn history_acknowledgement(path: &Path, nonce: &str) -> String {
+        let read = || -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            fs::File::open(path)?.take(64).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        match read() {
+            Ok(bytes) if bytes == nonce.as_bytes() => "match".into(),
+            Ok(_) => "mismatch".into(),
+            Err(error) => format!("diagnostic_unavailable:{:?}", error.kind()),
+        }
+    }
+
+    #[derive(Debug)]
+    enum HistoryFailure {
+        Failed(String),
+        TimedOut(String),
+    }
+
+    fn wait_for_history(
+        child: &mut HistoryChild,
+        output: &Path,
+        acknowledgement: &Path,
+        nonce: &str,
+        budget: std::time::Duration,
+    ) -> Result<(), HistoryFailure> {
+        use std::{thread, time::Instant};
+        let started = Instant::now();
+        let deadline = started + budget;
+        loop {
+            match child.0.try_wait() {
+                Ok(Some(status)) => {
+                    let ack = history_acknowledgement(acknowledgement, nonce);
+                    if status.success() && ack == "match" {
+                        return Ok(());
+                    }
+                    return Err(HistoryFailure::Failed(format!(
+                        "child_pid={} elapsed_ms={} exit={status:?} ack={ack} stdout_tail={}",
+                        child.0.id(),
+                        started.elapsed().as_millis(),
+                        history_output_tail(output)
+                    )));
+                }
+                Err(error) => {
+                    return Err(HistoryFailure::Failed(format!(
+                        "child_pid={} observation_unavailable={:?} stdout_tail={}",
+                        child.0.id(),
+                        error.kind(),
+                        history_output_tail(output)
+                    )));
+                }
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                // Exit can race the last observation. Reap this owned child, but
+                // neither a later successful exit nor a matching ack erases the
+                // timeout. Diagnostic read failures cannot replace that result.
+                let ack = history_acknowledgement(acknowledgement, nonce);
+                let kill = child.0.kill();
+                let wait = child.0.wait();
+                return Err(HistoryFailure::TimedOut(format!(
+                    "child_pid={} elapsed_ms={} ack={ack} kill={kill:?} wait={wait:?} stdout_tail={}",
+                    child.0.id(),
+                    started.elapsed().as_millis(),
+                    history_output_tail(output)
+                )));
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn history_progress(started: std::time::Instant, phase: &str, iteration: usize) {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(
+            stdout,
+            "history_progress phase={phase} iteration={iteration} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        let _ = stdout.flush();
+    }
+
     #[test]
-    fn retired_history_beyond_old_limit_does_not_block_new_launch_or_cleanup() {
+    fn history_output_retains_bounded_tail_and_unavailable_is_diagnostic_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("stdout");
+        let mut bytes = vec![b'x'; HISTORY_OUTPUT_LIMIT as usize + 123];
+        bytes.extend_from_slice(b"last fixed progress\n");
+        fs::write(&output, &bytes).unwrap();
+        let tail = history_output_tail(&output);
+        assert_eq!(tail.len(), HISTORY_OUTPUT_LIMIT as usize);
+        assert!(tail.ends_with("last fixed progress\n"));
+        fs::write(&output, [b'a', 0xff, b'z']).unwrap();
+        assert_eq!(history_output_tail(&output), "a\u{fffd}z");
+        assert!(
+            history_output_tail(&directory.path().join("absent"))
+                .starts_with("diagnostic_unavailable:")
+        );
+    }
+
+    #[test]
+    fn history_timeout_retains_progress_and_matching_ack_still_fails_and_reaps() {
         use std::{
             process::{Command, Stdio},
             thread,
             time::{Duration, Instant},
+        };
+        let proof = tempfile::tempdir().unwrap();
+        let output = proof.path().join("stdout");
+        let acknowledgement = proof.path().join("completed");
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let mut child = HistoryChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "native_update_launch::tests::history_timeout_fixture",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("CONSTELLATION_NATIVE_HISTORY_TEST_ACK", &acknowledgement)
+                .env("CONSTELLATION_NATIVE_HISTORY_TEST_NONCE", &nonce)
+                .stdin(Stdio::piped())
+                .stdout(fs::File::create(&output).unwrap())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        // Readiness is independent of the short waiter regression budget. The
+        // RAII guard reaps the helper even if startup/readiness fails here.
+        let ready_deadline = Instant::now() + Duration::from_secs(30);
+        while history_acknowledgement(&acknowledgement, &nonce) != "match" {
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(Instant::now() < ready_deadline, "Stall helper not ready");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let failure = wait_for_history(
+            &mut child,
+            &output,
+            &acknowledgement,
+            &nonce,
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        let HistoryFailure::TimedOut(diagnostic) = failure else {
+            panic!("The controlled stall must retain its timeout failure");
+        };
+        assert!(diagnostic.contains("phase=controlled_stall iteration=7"));
+        assert!(diagnostic.contains("ack=match"));
+        assert!(diagnostic.contains("kill=Ok(())"));
+        assert!(diagnostic.contains("wait=Ok("));
+        assert!(
+            child.0.try_wait().unwrap().is_some(),
+            "Owned child not reaped"
+        );
+    }
+
+    #[test]
+    #[ignore = "controlled stalled subprocess for the retained-history timeout observer"]
+    fn history_timeout_fixture() {
+        let Some(acknowledgement) = std::env::var_os("CONSTELLATION_NATIVE_HISTORY_TEST_ACK")
+        else {
+            return;
+        };
+        let nonce = std::env::var("CONSTELLATION_NATIVE_HISTORY_TEST_NONCE").unwrap();
+        assert_eq!(uuid::Uuid::parse_str(&nonce).unwrap().to_string(), nonce);
+        history_progress(std::time::Instant::now(), "controlled_stall", 7);
+        fs::write(acknowledgement, nonce.as_bytes()).unwrap();
+        // Parent retains the write end. Only termination ends this fixture; it
+        // performs no package, manager, installation or application operation.
+        let mut byte = [0];
+        std::io::stdin().read_exact(&mut byte).unwrap();
+        panic!("The controlled stall was unexpectedly released");
+    }
+
+    #[test]
+    fn retired_history_beyond_old_limit_does_not_block_new_launch_or_cleanup() {
+        use std::{
+            process::{Command, Stdio},
+            time::Duration,
         };
         // The shared guard releases flock by closing its descriptor. A parallel
         // test's child between fork and exec can briefly inherit that open file
@@ -1619,47 +1823,39 @@ mod tests {
         let acknowledgement = proof.path().join("completed");
         let nonce = uuid::Uuid::new_v4().to_string();
         let output = proof.path().join("stdout");
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "native_update_launch::tests::retired_history_fixture",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("CONSTELLATION_NATIVE_HISTORY_TEST_ACK", &acknowledgement)
-            .env("CONSTELLATION_NATIVE_HISTORY_TEST_NONCE", &nonce)
-            .stdin(Stdio::null())
-            // Keep the child's successful summary out of the selected-test
-            // controller, which deliberately requires one parent summary.
-            .stdout(fs::File::create(&output).unwrap())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                if !status.success() {
-                    let mut diagnostic = String::new();
-                    fs::File::open(&output)
-                        .unwrap()
-                        .take(32 * 1024)
-                        .read_to_string(&mut diagnostic)
-                        .unwrap();
-                    panic!("Isolated retained-history proof failed: {diagnostic}");
-                }
-                // An unknown --exact filter can exit successfully with zero
-                // tests. Only the final fixture assertion publishes this ack.
-                assert_eq!(fs::read(&acknowledgement).unwrap(), nonce.as_bytes());
-                return;
+        let mut child = HistoryChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "native_update_launch::tests::retired_history_fixture",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("CONSTELLATION_NATIVE_HISTORY_TEST_ACK", &acknowledgement)
+                .env("CONSTELLATION_NATIVE_HISTORY_TEST_NONCE", &nonce)
+                .stdin(Stdio::null())
+                // Keep the child's successful summary out of the selected-test
+                // controller, which deliberately requires one parent summary.
+                .stdout(fs::File::create(&output).unwrap())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        match wait_for_history(
+            &mut child,
+            &output,
+            &acknowledgement,
+            &nonce,
+            Duration::from_secs(60),
+        ) {
+            Ok(()) => {}
+            Err(HistoryFailure::Failed(diagnostic)) => {
+                panic!("Isolated retained-history proof failed: {diagnostic}");
             }
-            if Instant::now() >= deadline {
-                // Exit can race the final observation; always attempt reaping.
-                let _ = child.kill();
-                child.wait().unwrap();
-                panic!("Isolated retained-history proof exceeded 60 seconds");
+            Err(HistoryFailure::TimedOut(diagnostic)) => {
+                panic!("Isolated retained-history proof exceeded 60 seconds: {diagnostic}");
             }
-            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -1672,11 +1868,14 @@ mod tests {
         };
         let nonce = std::env::var("CONSTELLATION_NATIVE_HISTORY_TEST_NONCE").unwrap();
         assert_eq!(uuid::Uuid::parse_str(&nonce).unwrap().to_string(), nonce);
+        let started = std::time::Instant::now();
+        history_progress(started, "fixture_create", 0);
         let fixture = Fixture::new();
         let manager = FakeManager::new(ActionOutcome::Accepted);
         let retirement = FakeRetirement::new(RetirementOutcome::Retired { removed: true });
         let mut historical = Vec::new();
-        for _ in 0..MAX_OUTSTANDING_LAUNCHES + 4 {
+        for iteration in 0..MAX_OUTSTANDING_LAUNCHES + 4 {
+            history_progress(started, "history_cycle", iteration);
             let plan = fixture.plan();
             assert_eq!(
                 launch_with(&plan, &manager).unwrap(),
@@ -1687,12 +1886,14 @@ mod tests {
                 retire_with(&plan, &retirement).unwrap(),
                 RetirementReceipt::Retired { removed: true }
             );
+            history_progress(started, "history_retired", iteration);
             historical.push((
                 plan.marker(),
                 fs::read(plan.marker()).unwrap(),
                 retirement_path(&plan),
             ));
         }
+        history_progress(started, "final_launch", MAX_OUTSTANDING_LAUNCHES + 4);
         let next = fixture.plan();
         assert_eq!(
             launch_with(&next, &manager).unwrap(),
@@ -1701,6 +1902,7 @@ mod tests {
         let outstanding = enumerate(&fixture.home).unwrap();
         assert_eq!(outstanding.len(), 1);
         assert_eq!(outstanding[0].prepared, next);
+        history_progress(started, "final_retire", MAX_OUTSTANDING_LAUNCHES + 4);
         retirement.absent.store(false, Ordering::SeqCst);
         assert_eq!(
             retire_with(&next, &retirement).unwrap(),
@@ -1715,12 +1917,16 @@ mod tests {
             retirement.calls.load(Ordering::SeqCst),
             MAX_OUTSTANDING_LAUNCHES + 5
         );
+        history_progress(started, "retained_assertions", MAX_OUTSTANDING_LAUNCHES + 5);
         for (marker, bytes, retirement) in historical {
             assert_eq!(fs::read(marker).unwrap(), bytes);
             assert!(retirement.exists());
         }
         amplifier_native_platform::private_create(Path::new(&acknowledgement), nonce.as_bytes())
             .unwrap();
+        history_progress(started, "fixture_drop", MAX_OUTSTANDING_LAUNCHES + 5);
+        drop(fixture);
+        history_progress(started, "fixture_dropped", MAX_OUTSTANDING_LAUNCHES + 5);
     }
 
     #[test]

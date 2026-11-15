@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "version": "0.13.4",
+  "source_revision": "9160587219d0eaa74d71ee0c661a391079a3546d",
+  "release_url": "https://github.com/microsoft/amplifier-constellation-conversations/releases/download/v0.13.4/",
+  "targets": {
+    "linux-arm64": {
+      "archive": {
+        "file": "conversations-0.13.4-linux-arm64.tar.gz",
+        "sha256": "0127dab35f0ca29294d7fec03280064f629e8503dc1956c7c6d47cfa11caffef"
+      },
+      "receipt": {
+        "file": "conversations-0.13.4-linux-arm64.json",
+        "sha256": "a7803ab87221630854284d5f84a371428d83731281117701c3195cd777defa04"
+      },
+      "manifest_sha256": "178165c8db65e4c553b3337b23582941d858995c2563f697106b9c5749e2d0f9"
+    },
+    "linux-x64": {
+      "archive": {
+        "file": "conversations-0.13.4-linux-x64.tar.gz",
+        "sha256": "c7d9532f8b7fee5ee7634303ccc78dd4953d7df9132465b3a4d7b0031e89edd8"
+      },
+      "receipt": {
+        "file": "conversations-0.13.4-linux-x64.json",
+        "sha256": "e113e99ccb5c7bd0bf62288c58f5d89b6550ea9c6998302d6d760c174af3f076"
+      },
+      "manifest_sha256": "08a78ed47a92dc4a9a4994255b051226059c38179b3fa2b8643f6aea2d27be85"
+    },
+    "macos-arm64": {
+      "archive": {
+        "file": "conversations-0.13.4-macos-arm64.tar.gz",
+        "sha256": "a08eb5dae136db01f3eb6c35fbb33bc4e1b51063d5a584069679f04772caf04b"
+      },
+      "receipt": {
+        "file": "conversations-0.13.4-macos-arm64.json",
+        "sha256": "703b5f43b8f4d2958eef45140d83515e1a5afd74dd07419fcf7a2a5bdc6a8f0f"
+      },
+      "manifest_sha256": "bd32c60fe0b584c0b1cc41994a942012796c05a4658a2530299c59a1d1e72800"
+    },
+    "macos-x64": {
+      "archive": {
+        "file": "conversations-0.13.4-macos-x64.tar.gz",
+        "sha256": "caf7c111b31fe2b745c384b178312376a3373fe9427f3d1019dba827c6dff529"
+      },
+      "receipt": {
+        "file": "conversations-0.13.4-macos-x64.json",
+        "sha256": "b8c22f1b4886257140094ea44ba8369cd160f579b85a99547b9167d376ce25df"
+      },
+      "manifest_sha256": "aa31719a42625cb22a5a764733b710bcd71831d0be4ecad40855150f99a12117"
+    },
+    "windows-arm64": {
+      "archive": {
+        "file": "conversations-0.13.4-windows-arm64.zip",
+        "sha256": "ea386b4154a868d35ef3ec1e0365a6d100c0d883430c0c29446c11b4b228cc63"
+      },
+      "receipt": {
+        "file": "conversations-0.13.4-windows-arm64.json",
+        "sha256": "fe3b90ed5675e3baf7b3bcee34d143b9140c9400eb5b2dde2a9d99b3d062e922"
+      },
+      "manifest_sha256": "cb62950a9c3585622943e662904baf89ff1b6902202f891fdc51a1e905d1c56f"
+    },
+    "windows-x64": {
+      "archive": {
+        "file": "conversations-0.13.4-windows-x64.zip",
+        "sha256": "b6c11534fe6f86afbcc87c3e5283a1a6bd7937ffb5135112887a2e300cc636cb"
+      },
+      "receipt": {
+        "file": "conversations-0.13.4-windows-x64.json",
+        "sha256": "d72b3aa50d358b58bacefeba3b48eb0d3a040f3daffb6edf623ef0767649f557"
+      },
+      "manifest_sha256": "832c4a5aab11fad992dfed67fb01a60167b30ff72c50035529a68d7ccd8312ac"
+    }
+  }
+}

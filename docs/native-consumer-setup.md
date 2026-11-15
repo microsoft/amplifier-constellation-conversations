@@ -49,29 +49,42 @@ credentials, contacts, transcripts and work records are not rollback snapshots.
 An enrolled installation has one updater owner; opening the app creates no
 additional scheduler. Standalone use does not require enrollment.
 
-Open **App updates** below your contacts to manage a standalone installation in
-a separate browser tab. Download and extract the complete package for this
-computer, then choose **Check package** and review the selected version before
-installing it. An active call or unsettled work can defer the change; the page
-does not force either to stop. An enrolled installation directs you to its existing
-updater instead of starting a second owner.
+Download and extract the complete newer release, then open its app. It opens an
+update screen for the existing installation and shows the offered version. Sign in
+with the existing Companion account if needed, then choose **Update** once.
+The download can supply this restricted update screen even when the installed
+version predates it. It does not open application work, migrate the database, or
+replace the installed app merely because the download was opened.
 
-Checking a package does not install it. It verifies and stages the complete
-bundle while retaining the installation's update lock through publication of the
-check result. Installing the selected package validates its bytes again. If the
-check reply times out or the tab closes, the check may still be running; neither
-event proves cancellation or permits an automatic retry. Read the saved status
-before selecting another package.
+The request is saved before package preparation starts. The screen shows progress
+while the complete bundle is verified and staged in the background. Companion
+continues running during preparation and waits for active calls and work to finish.
+Uncertain earlier work requires attention; the updater does not discard or replay
+it. Installation uses the existing independent native worker, validates the
+prepared bytes again, and verifies the replacement before reporting success.
 
-The page reads the installation's saved operation while Companion restarts.
-Reloading the page does not submit the update again. If a request was not recorded,
-**Retry same request** deliberately reuses that request's identity and package
-selection. If Companion does not return, reopen the app on this computer. Its
-restricted recovery page uses your existing account and offers only the recovery
-actions allowed by the saved transaction. It does not open ordinary calls, create
-an agent session, or resume uncertain work. Restoring an earlier app package keeps
-the current account, contacts, conversations and work records.
-Earlier update receipts remain available after later updates.
+You can leave the page and return to the same saved request. Closing a browser or
+losing a reply does not cancel or resubmit an update. **Cancel** is available before
+the installation stop boundary; already-started file work finishes before
+cancellation is confirmed. If the preparation process exits unexpectedly,
+**Continue** can start a new verified preparation attempt only after its previous
+ownership is conclusively released. An uncertain native launch requires explicit
+recovery, never an automatic second launch.
+
+If installation fails, the existing lifecycle restores the previous package where
+it can prove that recovery is safe. The page distinguishes a verified rollback
+from an unconfirmed outcome. Reopen the downloaded app or the installed app to
+observe the retained operation and use its available recovery controls. Recovery
+uses the existing account without opening calls, creating agent sessions or
+resuming uncertain work. Restoring an earlier app package keeps the current
+account, contacts, conversations and work records. Earlier update receipts remain
+available after later updates.
+
+**App updates** remains available below the contacts. Advanced controls can select
+an extracted package on the installation computer. The separate CHECK/APPLY API
+remains for existing advanced clients; it is not the ordinary browser workflow.
+An enrolled installation directs you to its existing updater instead of creating
+a second owner or scheduler.
 
 ## Qualification limits
 

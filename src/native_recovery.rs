@@ -225,11 +225,10 @@ async fn status(
     Query(query): Query<control::StatusQuery>,
 ) -> ApiResult<Json<Value>> {
     auth::check_account(state.account(), &headers, "admin", false)?;
-    Ok(Json(control::status(
+    Ok(Json(control::update_status(
         &state.home,
         "recovery",
-        query.request_id.as_deref(),
-        control::launcher(),
+        &query,
     )?))
 }
 async fn recover(

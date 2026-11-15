@@ -222,6 +222,192 @@ fn busy(db: &Connection) -> Result<Vec<Busy>> {
     Ok(busy)
 }
 
+// Advisory only: these reads explain whether retained blockers describe known
+// work to wait for. They never remove a blocker, acknowledge an effect, or grant
+// admission. An unavailable/malformed association stays needs-attention.
+fn waiting_for_work(db: &Connection, blockers: &[Busy]) -> Result<bool> {
+    if blockers.is_empty() {
+        return Ok(false);
+    }
+    for blocker in blockers {
+        let invalid = match blocker.kind {
+            "active_calls" => {
+                "SELECT EXISTS(SELECT 1 FROM companion_calls c WHERE c.state IN ('starting','connecting','connected','closing') AND NOT EXISTS(SELECT 1 FROM conversations r JOIN room_agents a ON a.conversation_id=r.id JOIN agent_endpoints e ON e.id=a.agent_id WHERE r.id=c.conversation_id AND a.agent_id=c.agent_id))"
+            }
+            "retained_tool_servers" => {
+                "SELECT EXISTS(SELECT 1 FROM companion_tool_grants g WHERE g.port IS NOT NULL AND (g.port NOT BETWEEN 1 AND 65535 OR NOT EXISTS(SELECT 1 FROM companion_calls c JOIN conversations r ON r.id=c.conversation_id JOIN room_agents a ON a.conversation_id=r.id AND a.agent_id=c.agent_id JOIN agent_endpoints e ON e.id=a.agent_id WHERE c.id=g.call_id AND c.state IN ('starting','connecting','connected','closing'))))"
+            }
+            "conversation_work" => {
+                "SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.status='working' AND NOT EXISTS(SELECT 1 FROM room_agents a JOIN agent_endpoints e ON e.id=a.agent_id WHERE a.conversation_id=c.id))"
+            }
+            "streaming_messages" => {
+                "SELECT EXISTS(SELECT 1 FROM messages m WHERE m.status='streaming' AND (COALESCE(m.role,'')!='assistant' OR NOT EXISTS(SELECT 1 FROM conversations c JOIN room_agents a ON a.conversation_id=c.id JOIN agent_endpoints e ON e.id=a.agent_id WHERE c.id=m.conversation_id AND a.agent_id=m.agent_id AND c.status='working')))"
+            }
+            "pending_or_uncertain_inputs" => {
+                if !waiting_inputs(db)? {
+                    return Ok(false);
+                }
+                continue;
+            }
+            "pending_or_uncertain_delegations" => {
+                if !waiting_delegations(db)? {
+                    return Ok(false);
+                }
+                continue;
+            }
+            "pending_or_uncertain_actions" => {
+                if !waiting_actions(db)? {
+                    return Ok(false);
+                }
+                continue;
+            }
+            // Local activity has no persisted owner-generation proof, and an
+            // unconfirmed closure or an unrecognized category is not ordinary.
+            _ => return Ok(false),
+        };
+        if db.query_row(invalid, [], |row| row.get::<_, bool>(0))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn waiting_input(db: &Connection, id: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM input_deliveries d JOIN messages source ON source.id=d.message_id AND source.conversation_id=d.conversation_id JOIN conversations c ON c.id=d.conversation_id JOIN room_agents a ON a.conversation_id=c.id AND a.agent_id=d.agent_id JOIN agent_endpoints e ON e.id=a.agent_id LEFT JOIN messages target ON target.id=d.target_turn WHERE d.id=?1 AND (d.state IN ('received','promptRequired') OR (d.state IN ('preparing','offering','submitted','received_remote','remoteQueued','incorporated') AND target.conversation_id=d.conversation_id AND target.agent_id=d.agent_id AND target.role='assistant' AND target.status='streaming') OR (d.state='preparing' AND d.mode='prompt' AND COALESCE(d.target_turn,'')!='' AND target.id IS NULL AND COALESCE(d.session_id,'')='' AND COALESCE(d.endpoint,'')='' AND d.receipt IS NULL)))",
+        [id], |row| row.get(0),
+    )?)
+}
+
+fn waiting_inputs(db: &Connection) -> Result<bool> {
+    let retained = crate::native_update::retained_legacy_inputs(db)?;
+    // Match busy()'s exact input selection and its existing historical exemption.
+    let sql = format!(
+        "SELECT d.id,d.state FROM input_deliveries d LEFT JOIN messages m ON m.id=d.target_turn AND m.conversation_id=d.conversation_id AND m.agent_id=d.agent_id AND m.role='assistant' WHERE d.state IN ('received','promptRequired','preparing','offering','submitted','received_remote','remoteQueued','ack_pending','unknown') OR (d.state='notAccepted' AND NOT ({})) OR (d.state='incorporated' AND COALESCE(m.status,'')!='complete')",
+        crate::delivery::PROVEN_NOT_STARTED
+    );
+    let mut query = db.prepare(&sql)?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let state: String = row.get(1)?;
+        if matches!(state.as_str(), "unknown" | "notAccepted") && retained.contains(&id) {
+            continue;
+        }
+        if !waiting_input(db, &id)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn waiting_delegations(db: &Connection) -> Result<bool> {
+    let mut query = db.prepare("SELECT d.state,d.message_id,c.state,c.conversation_id,c.agent_id FROM companion_delegations d LEFT JOIN companion_calls c ON c.id=d.call_id WHERE d.state IN ('waiting_transcript','dispatched','unknown')")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let state: String = row.get(0)?;
+        let message: Option<String> = row.get(1)?;
+        let call: Option<String> = row.get(2)?;
+        let room: Option<String> = row.get(3)?;
+        let agent: Option<String> = row.get(4)?;
+        let (Some(message), Some(call), Some(room), Some(agent)) = (message, call, room, agent)
+        else {
+            return Ok(false);
+        };
+        if state == "unknown" || message.is_empty() {
+            return Ok(false);
+        }
+        let associated: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM conversations c JOIN room_agents a ON a.conversation_id=c.id JOIN agent_endpoints e ON e.id=a.agent_id WHERE c.id=?1 AND a.agent_id=?2)", params![room,agent], |r| r.get(0))?;
+        if !associated {
+            return Ok(false);
+        }
+        // The call commits transcript/dispatch intent before send inserts its
+        // input. Existing intent while that call is active is not an unknown
+        // outcome. If a source row exists, it must still belong to this room.
+        let source_room: Option<String> = db
+            .query_row(
+                "SELECT conversation_id FROM messages WHERE id=?1",
+                [&message],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if source_room.as_ref().is_some_and(|value| value != &room) {
+            return Ok(false);
+        }
+        if matches!(
+            call.as_str(),
+            "starting" | "connecting" | "connected" | "closing"
+        ) {
+            continue;
+        }
+        if state != "dispatched" || call != "closed" {
+            return Ok(false);
+        }
+        let input: Option<String> = db.query_row("SELECT id FROM input_deliveries WHERE message_id=?1 AND conversation_id=?2 AND agent_id=?3", params![message,room,agent], |r| r.get(0)).optional()?;
+        if !input
+            .as_deref()
+            .is_some_and(|id| waiting_input(db, id).unwrap_or(false))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn waiting_actions(db: &Connection) -> Result<bool> {
+    let mut query = db.prepare("SELECT call_id,request_id,state,result,source FROM companion_actions WHERE state IN ('submitting','queued','accepted','unknown')")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let call: String = row.get(0)?;
+        let request: String = row.get(1)?;
+        let state: String = row.get(2)?;
+        if !matches!(state.as_str(), "queued" | "accepted") {
+            return Ok(false);
+        }
+        if crate::companion_awareness::action_settled_for_update(db, &call, &request)? {
+            continue;
+        }
+        let receipt: Value = serde_json::from_str(&row.get::<_, String>(3)?)?;
+        let source: Value = serde_json::from_str(&row.get::<_, String>(4)?)?;
+        if receipt["request_id"] != request
+            || receipt["state"] != state
+            || source["call_id"] != call
+        {
+            return Ok(false);
+        }
+        let associated: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM companion_actions a JOIN companion_calls c ON c.id=a.call_id JOIN companion_delegations d ON d.call_id=c.id AND d.id=a.delegation_id JOIN messages m ON m.id=d.message_id AND m.conversation_id=c.conversation_id JOIN conversations r ON r.id=c.conversation_id JOIN room_agents p ON p.conversation_id=r.id AND p.agent_id=c.agent_id JOIN agent_endpoints e ON e.id=p.agent_id WHERE a.call_id=?1 AND a.request_id=?2 AND COALESCE(a.connection_id,'')!='' AND d.state IN ('dispatched','completed') AND d.id=?3 AND m.id=?4 AND c.conversation_id=?5)", params![call,request,source["delegation_id"].as_str(),source["message_id"].as_str(),source["conversation_id"].as_str()], |r| r.get(0))?;
+        if !associated {
+            return Ok(false);
+        }
+        // A later explicit unknown/review/interrupted observation must not be
+        // hidden by the earlier successful acceptance acknowledgement. Absence
+        // of a later observation says only that accepted work remains pending.
+        let observation: Option<String> = db
+            .query_row(
+                "SELECT data FROM companion_observations WHERE call_id=?1 AND request_id=?2",
+                params![call, request],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = observation {
+            let value: Value = serde_json::from_str(&raw)?;
+            if value["request_id"] != request
+                || !matches!(
+                    value["state"].as_str(),
+                    Some("accepted" | "running" | "waiting" | "blocked" | "admitted" | "replied")
+                )
+                || matches!(
+                    value["delivery_state"].as_str(),
+                    Some("unknown" | "interrupted")
+                )
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn snapshot(db: &Connection) -> Result<Value> {
     let owner: Option<String> = db
         .query_row(
@@ -231,9 +417,12 @@ fn snapshot(db: &Connection) -> Result<Value> {
         )
         .optional()?;
     let busy = busy(db)?;
+    // Failure of this supplementary explanation cannot alter admission.
+    let waiting_for_work = waiting_for_work(db, &busy).unwrap_or(false);
     Ok(json!({
         "closed":owner.is_some(), "transaction_id":owner,
-        "ready":owner.is_some() && busy.is_empty(), "busy":busy
+        "ready":owner.is_some() && busy.is_empty(), "busy":busy,
+        "waiting_for_work":waiting_for_work
     }))
 }
 
@@ -816,3 +1005,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod waiting_tests;

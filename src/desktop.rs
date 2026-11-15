@@ -5,7 +5,7 @@ use crate::{
     config::{AuthMode, Config, Transport},
     native_bundle,
     native_installation_diagnostics::{Phase, observe},
-    native_update,
+    native_update, native_update_offer,
     state::AppState,
 };
 use amplifier_native_platform as platform;
@@ -76,7 +76,7 @@ fn downloaded_bundle_inner(executable: &Path) -> Result<PathBuf> {
 /// launcher. On macOS that launcher is separate from Resources/bundle.
 pub(crate) struct SelectedPackage {
     pub(crate) bundle: PathBuf,
-    launcher: PathBuf,
+    pub(crate) launcher: PathBuf,
 }
 impl SelectedPackage {
     pub(crate) fn verify_launcher(&self, checked: &native_update::CheckedPlan) -> Result<()> {
@@ -93,6 +93,10 @@ pub(crate) fn selected_package_folder(folder: &Path) -> Result<SelectedPackage> 
         folder.is_absolute() && folder.is_dir(),
         "Choose an absolute extracted package folder"
     );
+    Ok(selected_package_paths(folder))
+}
+
+pub(crate) fn selected_package_paths(folder: &Path) -> SelectedPackage {
     let is_app = cfg!(target_os = "macos")
         && folder
             .extension()
@@ -107,7 +111,61 @@ pub(crate) fn selected_package_folder(folder: &Path) -> Result<SelectedPackage> 
     } else {
         folder.to_owned()
     };
-    Ok(SelectedPackage { bundle, launcher })
+    SelectedPackage { bundle, launcher }
+}
+
+/// Identify only the fixed layout of this already-running downloaded launcher.
+/// The manifest and all payload bytes remain unverified until background CHECK.
+fn offer_package(executable: &Path) -> Result<PathBuf> {
+    let executable = dunce::canonicalize(executable)?;
+    let parent = executable.parent().context("Missing application folder")?;
+    let folder = if cfg!(target_os = "macos") && parent.file_name().is_some_and(|v| v == "MacOS") {
+        parent
+            .parent()
+            .and_then(Path::parent)
+            .context("Missing application folder")?
+    } else {
+        parent
+    };
+    let selected = selected_package_folder(folder)?;
+    ensure!(
+        selected.launcher == executable,
+        "Open the complete Companion application download"
+    );
+    let manifest = fs::symlink_metadata(selected.bundle.join("manifest.json"))?;
+    ensure!(
+        manifest.is_file() && manifest.len() <= 16 * 1024 * 1024,
+        "Open the complete Companion download with its bundled runtime"
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            manifest.file_attributes() & 0x400 == 0,
+            "Package manifest is a reparse point"
+        );
+    }
+    Ok(folder.to_owned())
+}
+
+fn download_offer(home: &Path, config: &Config, selected_version: &str) -> Result<Option<String>> {
+    // The ordinary single-computer entrypoint is local. Preserve hosted HTTPS
+    // origin/authentication and its advanced package selection unchanged.
+    if config.transport != Transport::LocalHttp
+        || !home.join("native-installation.json").exists()
+        || !native_update_offer::newer(env!("CARGO_PKG_VERSION"), selected_version)
+    {
+        return Ok(None);
+    }
+    let executable = dunce::canonicalize(std::env::current_exe()?)?;
+    let installed = platform::installed_binary(&native_bundle::APPLICATION, home);
+    if executable == dunce::canonicalize(installed)? {
+        return Ok(None);
+    }
+    let folder = offer_package(&executable)?;
+    Ok(Some(
+        native_update_offer::create_offer(home, folder, executable, env!("CARGO_PKG_VERSION"))?.id,
+    ))
 }
 
 /// Publish only a new private identity. Package installation follows publication
@@ -149,7 +207,26 @@ pub async fn launch(home: PathBuf, open_browser: bool) -> Result<()> {
     // A retained switch may intentionally have binary B with receipt A. Its
     // restricted recovery helper is verified from the immutable journal package,
     // before normal selected-installation validation or any AppState open.
-    if native_update::recovery_snapshot(&home)?.is_some_and(|j| j.phase != "restored") {
+    if let Some(journal) = native_update::recovery_snapshot(&home)?
+        && journal.phase != "restored"
+    {
+        // The downloaded application's separate listener remains available
+        // while the worker deliberately stops or replaces the ordinary app.
+        if crate::native_update_assistant::reopen_active(&home, open_browser).await? {
+            return Ok(());
+        }
+        // Waiting is still owned by the exact live update worker. A phase label
+        // alone cannot bypass recovery or authorize another application start.
+        if matches!(journal.phase.as_str(), "intent" | "deferred")
+            && crate::native_browser_update::active_waiting_update(&home, &journal.transaction)?
+        {
+            let status = native_update::local_api(&home, "GET", "status", None)
+                .await
+                .context("The waiting update's original Companion could not be verified")?;
+            verify_running_identity(&home, &config, &status)?;
+            let offer = download_offer(&home, &config, status["version"].as_str().unwrap_or(""))?;
+            return ready_or_assistant(&home, &config, open_browser, offer.as_deref()).await;
+        }
         let package = native_update::recovery_package(&home)?;
         let helper = native_update::verify_helper_package(&package)?;
         if dunce::canonicalize(std::env::current_exe()?)? != dunce::canonicalize(&helper)? {
@@ -173,7 +250,8 @@ pub async fn launch(home: PathBuf, open_browser: bool) -> Result<()> {
         let status = native_update::local_api(&home, "GET", "status", None).await
             .context("The running Companion could not be verified; no unverified local listener received a credential")?;
         verify_running_identity(&home, &config, &status)?;
-        return ready(&home, &config, open_browser);
+        let offer = download_offer(&home, &config, status["version"].as_str().unwrap_or(""))?;
+        return ready_or_assistant(&home, &config, open_browser, offer.as_deref()).await;
     }
     drop(service);
     if !home.join("native-installation.json").exists() {
@@ -190,6 +268,11 @@ pub async fn launch(home: PathBuf, open_browser: bool) -> Result<()> {
     );
     let selected = platform::installed_binary(&native_bundle::APPLICATION, &home);
     if dunce::canonicalize(std::env::current_exe()?)? != dunce::canonicalize(&selected)? {
+        let offer = download_offer(&home, &config, status["version"].as_str().unwrap_or(""))?;
+        if let Some(offer) = offer {
+            return launch_selected_with_offer(&home, &config, &selected, open_browser, &offer)
+                .await;
+        }
         let mut command = tokio::process::Command::new(&selected);
         command.arg("--home").arg(&home);
         if !open_browser {
@@ -206,6 +289,66 @@ pub async fn launch(home: PathBuf, open_browser: bool) -> Result<()> {
         auth::prepare_first_account(&home)?;
     }
     crate::server::serve_with_browser(home, open_browser).await
+}
+
+/// An older selected app already understands --no-browser. Keep its ordinary
+/// lifetime; the downloaded launcher provides the restricted update screen.
+async fn launch_selected_with_offer(
+    home: &Path,
+    config: &Config,
+    selected: &Path,
+    open_browser: bool,
+    offer_id: &str,
+) -> Result<()> {
+    let mut child = tokio::process::Command::new(selected)
+        .arg("--home")
+        .arg(home)
+        .arg("--no-browser")
+        .spawn()
+        .context("Could not open the installed Companion version")?;
+    let ready_result = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("The installed Companion exited before its update page was ready ({status})");
+            }
+            if let Ok(status) = native_update::local_api(home, "GET", "status", None).await {
+                verify_running_identity(home, config, &status)?;
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.context("The installed Companion is still starting or could not be verified; reopen it to see the saved update offer")?;
+    // A failed or lost readiness reply never authorizes another start or stop.
+    // The saved offer remains available on the normal Updates page.
+    ready_result?;
+    if !auth::first_account_needed(home)? {
+        // This downloaded process is independent of the old selected service;
+        // its update UI remains available when the native worker stops that app.
+        return crate::native_update_assistant::serve(home.to_owned(), offer_id, open_browser)
+            .await;
+    }
+    ready_with_offer(home, config, open_browser, Some(offer_id))?;
+    ensure!(
+        child.wait().await?.success(),
+        "The installed Companion could not start"
+    );
+    Ok(())
+}
+
+async fn ready_or_assistant(
+    home: &Path,
+    config: &Config,
+    open_browser: bool,
+    offer_id: Option<&str>,
+) -> Result<()> {
+    if let Some(offer_id) = offer_id
+        && !auth::first_account_needed(home)?
+    {
+        return crate::native_update_assistant::serve(home.to_owned(), offer_id, open_browser)
+            .await;
+    }
+    // Ordinary first-account setup retains its installed UI and capability.
+    ready_with_offer(home, config, open_browser, offer_id)
 }
 
 fn verify_running_identity(home: &Path, config: &Config, status: &Value) -> Result<()> {
@@ -257,6 +400,15 @@ fn ready_url(origin: &str, transport: Transport, setup_token: Option<&str>) -> R
 }
 
 pub fn ready(home: &Path, config: &Config, open_browser: bool) -> Result<()> {
+    ready_with_offer(home, config, open_browser, None)
+}
+
+fn ready_with_offer(
+    home: &Path,
+    config: &Config,
+    open_browser: bool,
+    offer_id: Option<&str>,
+) -> Result<()> {
     let runtime: Value = serde_json::from_slice(&fs::read(home.join("runtime.json"))?)?;
     let origin = if config.public_url.is_empty() {
         runtime["url"]
@@ -270,7 +422,7 @@ pub fn ready(home: &Path, config: &Config, open_browser: bool) -> Result<()> {
     } else {
         None
     };
-    let url = ready_url(origin, config.transport, setup_token.as_deref())?;
+    let url = ready_offer_url(origin, config.transport, setup_token.as_deref(), offer_id)?;
     if open_browser {
         if config.transport == Transport::LocalHttp {
             platform::open_browser(&url)?;
@@ -283,6 +435,29 @@ pub fn ready(home: &Path, config: &Config, open_browser: bool) -> Result<()> {
         println!("{}", json!({"ready":true,"id":config.id,"url":url}));
     }
     Ok(())
+}
+
+fn ready_offer_url(
+    origin: &str,
+    transport: Transport,
+    setup_token: Option<&str>,
+    offer_id: Option<&str>,
+) -> Result<String> {
+    if transport == Transport::LocalHttp
+        && setup_token.is_none()
+        && let Some(id) = offer_id
+    {
+        ensure!(
+            uuid::Uuid::parse_str(id)?.to_string() == id,
+            "Invalid update offer ID"
+        );
+        let url = format!("{}/updates?offer={id}", origin.trim_end_matches('/'));
+        platform::validate_local_url(&url)?;
+        return Ok(url);
+    }
+    // First-account creation takes precedence; latest_offer retains the hint for
+    // the authenticated UI after setup without adding a token to its URL.
+    ready_url(origin, transport, setup_token)
 }
 
 /// The caller's exact Host/Origin gate runs before this unauthenticated route.
@@ -428,6 +603,68 @@ pub async fn local_api(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn update_offer_url_contains_only_opaque_identity_and_preserves_first_account() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let origin = "http://127.0.0.1:31471";
+        assert_eq!(
+            ready_offer_url(origin, Transport::LocalHttp, None, Some(&id)).unwrap(),
+            format!("{origin}/updates?offer={id}")
+        );
+        assert_eq!(
+            ready_offer_url(origin, Transport::LocalHttp, Some("setup-token"), Some(&id)).unwrap(),
+            format!("{origin}/companion#setup=setup-token")
+        );
+        assert_eq!(
+            ready_offer_url(
+                "https://companion.example",
+                Transport::Https,
+                None,
+                Some(&id)
+            )
+            .unwrap(),
+            "https://companion.example"
+        );
+        for bad in [
+            "../manifest.json",
+            "https://other.example",
+            "token&command=run",
+        ] {
+            assert!(ready_offer_url(origin, Transport::LocalHttp, None, Some(bad)).is_err());
+        }
+        assert!(
+            ready_offer_url(
+                "http://remote.example",
+                Transport::LocalHttp,
+                None,
+                Some(&id)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn downloaded_offer_identifies_layout_without_claiming_payload_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = if cfg!(target_os = "macos") {
+            temp.path().join("Companion.app")
+        } else {
+            temp.path().join("download")
+        };
+        let selected = selected_package_paths(&folder);
+        fs::create_dir_all(selected.launcher.parent().unwrap()).unwrap();
+        fs::create_dir_all(&selected.bundle).unwrap();
+        fs::write(&selected.launcher, b"not a verified service").unwrap();
+        fs::write(selected.bundle.join("manifest.json"), b"not verified JSON").unwrap();
+        assert_eq!(
+            offer_package(&selected.launcher).unwrap(),
+            dunce::canonicalize(&folder).unwrap()
+        );
+        assert!(native_bundle::verify(&selected.bundle).is_err());
+        fs::remove_file(selected.bundle.join("manifest.json")).unwrap();
+        assert!(offer_package(&selected.launcher).is_err());
+    }
 
     #[test]
     fn ready_url_preserves_https_origin_and_local_setup_fragment() {

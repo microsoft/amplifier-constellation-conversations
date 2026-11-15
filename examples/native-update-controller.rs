@@ -13,7 +13,7 @@ use amplifier_native_platform::{
 };
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, path::PathBuf};
@@ -53,6 +53,44 @@ struct Request {
     setup_bundle: Option<PathBuf>,
     #[serde(default)]
     expected_original: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ObservationStage {
+    SavedLaunch,
+    ManagerObservation,
+    WorkerIdentity,
+    WorkerLiveness,
+    WorkerBinding,
+    PreviousLiveness,
+    PreviousBinding,
+    RuntimeIdentity,
+    RuntimeBinding,
+}
+
+#[derive(Debug)]
+struct ObservationFailure(ObservationStage);
+
+impl std::fmt::Display for ObservationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Native fixture observation failed at {:?}",
+            self.0
+        )
+    }
+}
+
+fn observed<T>(stage: ObservationStage, result: Result<T>) -> Result<T> {
+    result.with_context(|| ObservationFailure(stage))
+}
+
+fn unavailable(error: &anyhow::Error) -> Value {
+    // Only the fixed stage is retained. Native error chains can contain private
+    // definitions, paths and command arguments and are never copied out.
+    json!({"status":"unavailable","code":"native_controller_observation_or_dispatch_failed",
+        "diagnostic_stage":error.downcast_ref::<ObservationFailure>().map(|failure| failure.0)})
 }
 
 fn digest(value: &Value) -> Result<String> {
@@ -159,36 +197,93 @@ fn sanitized(service: &Service, snapshot: &Value, profile_matches: bool) -> Resu
 }
 
 fn application_binding(application: &Value, processes: &Value) -> Result<Option<&'static str>> {
+    application_binding_with(
+        application,
+        processes,
+        cfg!(windows),
+        process::matches,
+        process::parent_identity,
+    )
+}
+
+fn application_binding_with(
+    application: &Value,
+    processes: &Value,
+    follow_ancestry: bool,
+    mut matches: impl FnMut(&Value) -> Result<bool>,
+    mut parent_identity: impl FnMut(&Value) -> Result<Option<Value>>,
+) -> Result<Option<&'static str>> {
     if application.is_null() {
         return Ok(None);
     }
     let identities = processes.as_array().context("Missing manager identities")?;
+    if identities.is_empty() {
+        // No ancestor can match an empty manager set. In particular, do not
+        // inspect unrelated Windows system ancestors to establish no binding.
+        return Ok(None);
+    }
     if identities.iter().any(|p| p["identity"] == *application) {
-        ensure!(
-            process::matches(application)?,
-            "Application generation changed"
-        );
+        ensure!(matches(application)?, "Application generation changed");
         return Ok(Some("same_process"));
     }
     // Tasks expose the task-engine generation. Follow native, generation-checked
     // ancestry instead of equating a bare EnginePID to the application.
-    if cfg!(windows) {
+    if follow_ancestry {
         let mut current = application.clone();
         for _ in 0..8 {
-            let Some(parent) = process::parent_identity(&current)? else {
+            let Some(parent) = parent_identity(&current)? else {
                 break;
             };
             if identities.iter().any(|p| p["identity"] == parent) {
-                ensure!(
-                    process::matches(application)?,
-                    "Application generation changed"
-                );
+                ensure!(matches(application)?, "Application generation changed");
                 return Ok(Some("descendant_of_task_engine"));
             }
             current = parent;
         }
     }
     Ok(None)
+}
+
+fn application_context(
+    request: &Request,
+    result: &mut Value,
+    previous_alive: Option<bool>,
+) -> Result<()> {
+    if matches!(request.target, Target::Worker { .. }) {
+        // The current runtime and previous application belong to a different
+        // manager. Worker proof already observes its own claimed generation,
+        // its manager binding and the previous application's exact liveness.
+        return Ok(());
+    }
+    if let Some(previous) = request.previous_process.as_ref() {
+        result["previous_process_manager_binding"] = json!(if previous_alive == Some(true) {
+            observed(
+                ObservationStage::PreviousBinding,
+                application_binding(previous, &result["processes"]),
+            )?
+        } else {
+            None
+        });
+    }
+    let runtime = request.home.join("runtime.json");
+    if runtime.is_file() {
+        let identity = observed(
+            ObservationStage::RuntimeIdentity,
+            (|| -> Result<Value> {
+                let runtime: Value = serde_json::from_slice(&fs::read(runtime)?)?;
+                let pid = runtime["pid"]
+                    .as_u64()
+                    .context("Runtime process identity missing")?;
+                Ok(process::identity(u32::try_from(pid)?)?.unwrap_or(Value::Null))
+            })(),
+        )?;
+        result["application_manager_binding"] = json!(observed(
+            ObservationStage::RuntimeBinding,
+            application_binding(&identity, &result["processes"]),
+        )?);
+        result["application_identity"] = identity;
+    }
+    Ok(())
 }
 
 fn required_application_matches(
@@ -525,7 +620,8 @@ fn run(mut request: Request) -> Result<Value> {
             }
         }
         _ => {
-            let Some(prepared) = saved_launch(&request)? else {
+            let Some(prepared) = observed(ObservationStage::SavedLaunch, saved_launch(&request))?
+            else {
                 ensure!(
                     matches!(request.action, Action::Inspect),
                     "No saved launch exists to stop"
@@ -543,7 +639,10 @@ fn run(mut request: Request) -> Result<Value> {
             }
             // observe rebuilds the fixed profile from its protected identity and
             // checks the actual native manager. The marker is never enough.
-            let observation = native_update_launch::observe(&prepared)?;
+            let observation = observed(
+                ObservationStage::ManagerObservation,
+                native_update_launch::observe(&prepared),
+            )?;
             let encoded = serde_json::to_value(&prepared)?;
             let service: Service = serde_json::from_value(encoded["service"].clone())?;
             let profile: Registration = serde_json::from_value(encoded["profile"].clone())?;
@@ -575,10 +674,19 @@ fn run(mut request: Request) -> Result<Value> {
         }
     };
     if matches!(request.target, Target::Worker { .. }) {
-        let identity = actual_worker(&request, &config.id)?;
-        let alive = identity.as_ref().map(process::matches).transpose()?;
+        let identity = observed(
+            ObservationStage::WorkerIdentity,
+            actual_worker(&request, &config.id),
+        )?;
+        let alive = observed(
+            ObservationStage::WorkerLiveness,
+            identity.as_ref().map(process::matches).transpose(),
+        )?;
         let binding = if alive == Some(true) {
-            application_binding(identity.as_ref().unwrap(), &result["processes"])?
+            observed(
+                ObservationStage::WorkerBinding,
+                application_binding(identity.as_ref().unwrap(), &result["processes"]),
+            )?
         } else {
             None
         };
@@ -586,31 +694,18 @@ fn run(mut request: Request) -> Result<Value> {
         result["actual_worker_alive"] = json!(alive);
         result["actual_worker_manager_binding"] = json!(binding);
     }
-    if let Some(previous) = request.previous_process {
-        let alive = process::matches(&previous)?;
+    let previous_alive = observed(
+        ObservationStage::PreviousLiveness,
+        request
+            .previous_process
+            .as_ref()
+            .map(process::matches)
+            .transpose(),
+    )?;
+    if let Some(alive) = previous_alive {
         result["previous_process_alive"] = json!(alive);
-        // Read-only fault-fixture proof: a pre-status application has no new
-        // runtime.json yet. Bind its independently captured native generation
-        // through actual manager ancestry, not Task Scheduler EnginePID equality.
-        result["previous_process_manager_binding"] = json!(if alive {
-            application_binding(&previous, &result["processes"])?
-        } else {
-            None
-        });
     }
-    let runtime = request.home.join("runtime.json");
-    if runtime.is_file() {
-        let runtime: Value = serde_json::from_slice(&fs::read(runtime)?)?;
-        let pid = runtime["pid"]
-            .as_u64()
-            .context("Runtime process identity missing")?;
-        result["application_identity"] =
-            process::identity(u32::try_from(pid)?)?.unwrap_or(Value::Null);
-        result["application_manager_binding"] = json!(application_binding(
-            &result["application_identity"],
-            &result["processes"]
-        )?);
-    }
+    application_context(&request, &mut result, previous_alive)?;
     Ok(result)
 }
 
@@ -623,13 +718,10 @@ fn main() {
     })();
     match outcome {
         Ok(value) => println!("{value}"),
-        Err(_) => {
+        Err(error) => {
             // Native errors can contain private manager definitions/argv.
             // Preserve uncertainty without copying those strings into evidence.
-            println!(
-                "{}",
-                json!({"status":"unavailable","code":"native_controller_observation_or_dispatch_failed"})
-            );
+            println!("{}", unavailable(&error));
             std::process::exit(1);
         }
     }
@@ -638,6 +730,174 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_manager_set_never_queries_unrelated_ancestry() {
+        let application = json!({"pid":7});
+        assert_eq!(
+            application_binding_with(
+                &application,
+                &json!([]),
+                true,
+                |_| panic!("Empty manager set must not query liveness"),
+                |_| panic!("Empty manager set must not query ancestry"),
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            application_binding_with(
+                &application,
+                &Value::Null,
+                true,
+                |_| panic!("Malformed manager set must refuse before liveness"),
+                |_| panic!("Malformed manager set must refuse before ancestry"),
+            )
+            .is_err()
+        );
+    }
+
+    fn context_request(home: PathBuf, target: Target, previous: Option<Value>) -> Request {
+        Request {
+            home,
+            target,
+            previous_process: previous,
+            action: Action::Inspect,
+            setup_bundle: None,
+            expected_original: None,
+        }
+    }
+
+    #[test]
+    fn worker_observation_does_not_read_unrelated_runtime_context() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("runtime.json"),
+            "private malformed runtime",
+        )
+        .unwrap();
+        let request = context_request(
+            directory.path().to_owned(),
+            Target::Worker {
+                operation: "operation".into(),
+                attempt: "attempt".into(),
+            },
+            None,
+        );
+        let mut evidence =
+            json!({"processes":[],"actual_worker_alive":false,"previous_process_alive":false});
+        let before = evidence.clone();
+        application_context(&request, &mut evidence, None).unwrap();
+        assert_eq!(evidence, before);
+    }
+
+    #[test]
+    fn worker_observation_does_not_bind_previous_app_to_worker_manager() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = context_request(
+            directory.path().to_owned(),
+            Target::Worker {
+                operation: "operation".into(),
+                attempt: "attempt".into(),
+            },
+            Some(json!({"pid":7})),
+        );
+        let mut evidence =
+            json!({"processes":null,"actual_worker_alive":true,"previous_process_alive":true});
+        let before = evidence.clone();
+        application_context(&request, &mut evidence, Some(true)).unwrap();
+        assert_eq!(evidence, before);
+    }
+
+    #[test]
+    fn application_targets_keep_strict_runtime_and_prestatus_context() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("runtime.json"),
+            "private malformed runtime",
+        )
+        .unwrap();
+        for target in [
+            Target::Original,
+            Target::Replacement {
+                transaction: "transaction".into(),
+                nonce: None,
+            },
+        ] {
+            let mut request = context_request(directory.path().to_owned(), target, None);
+            let mut evidence = json!({"processes":[]});
+            let error = application_context(&request, &mut evidence, None).unwrap_err();
+            assert_eq!(unavailable(&error)["diagnostic_stage"], "runtime_identity");
+            request.previous_process = Some(json!({"pid":7}));
+            let error = application_context(&request, &mut json!({"processes":null}), Some(true))
+                .unwrap_err();
+            assert_eq!(unavailable(&error)["diagnostic_stage"], "previous_binding");
+        }
+    }
+
+    #[test]
+    fn matching_worker_binding_still_requires_exact_live_generation() {
+        let application = json!({"pid":7});
+        let parent = json!({"pid":8});
+        let processes = json!([{"identity":parent}]);
+        assert_eq!(
+            application_binding_with(
+                &application,
+                &processes,
+                true,
+                |_| Ok(true),
+                |_| Ok(Some(parent.clone()))
+            )
+            .unwrap(),
+            Some("descendant_of_task_engine")
+        );
+        assert!(
+            application_binding_with(
+                &application,
+                &processes,
+                true,
+                |_| Ok(false),
+                |_| Ok(Some(parent.clone()))
+            )
+            .is_err()
+        );
+        assert!(
+            application_binding_with(
+                &application,
+                &processes,
+                true,
+                |_| anyhow::bail!("private liveness error"),
+                |_| Ok(Some(parent.clone()))
+            )
+            .is_err()
+        );
+        assert!(
+            application_binding_with(
+                &application,
+                &processes,
+                true,
+                |_| Ok(true),
+                |_| anyhow::bail!("private ancestry error")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_observation_exposes_fixed_stage_without_native_error_text() {
+        let error = observed::<()>(
+            ObservationStage::WorkerLiveness,
+            Err(anyhow::anyhow!("credential and private path sentinel")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            unavailable(&error),
+            json!({"status":"unavailable",
+            "code":"native_controller_observation_or_dispatch_failed","diagnostic_stage":"worker_liveness"})
+        );
+        assert!(!unavailable(&error).to_string().contains("sentinel"));
+        assert!(unavailable(&anyhow::anyhow!("private error"))["diagnostic_stage"].is_null());
+    }
 
     #[test]
     fn original_disposal_refuses_missing_active_or_ambiguous_native_state() {

@@ -35,6 +35,7 @@ spec = importlib.util.spec_from_file_location("native_clean_install", ROOT / "te
 clean = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(clean)
 require = clean.require
+COMMAND_SECONDS = 120
 
 # Do not synchronously close a timed-out Windows pipe while its daemon reader
 # may own the buffered stream lock. Keep it alive until exact service cleanup
@@ -375,7 +376,7 @@ class Installation:
             self.result["native_operation_timings_omitted"] = self.result.get("native_operation_timings_omitted", 0) + 1
         self.checkpoint()
 
-    def command(self, arguments: list, *, expect_success: bool = True, extra_env=None, timeout=120, input_text=None):
+    def command(self, arguments: list, *, expect_success: bool = True, extra_env=None, timeout=COMMAND_SECONDS, input_text=None):
         env = dict(self.env)
         env.update(extra_env or {})
         operation = self.begin_operation(command_label(arguments), timeout)
