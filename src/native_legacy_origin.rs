@@ -640,7 +640,8 @@ mod linux {
                 )),
                 32 => {
                     let mut bytes = [0u8; 16];
-                    for (index, group) in local_ip.as_bytes().chunks_exact(8).enumerate() {
+                    for (index, group) in local_ip.as_bytes().as_chunks::<8>().0.iter().enumerate()
+                    {
                         bytes[index * 4..index * 4 + 4].copy_from_slice(
                             &u32::from_str_radix(std::str::from_utf8(group)?, 16)?.to_ne_bytes(),
                         );
