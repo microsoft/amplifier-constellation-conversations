@@ -45,6 +45,27 @@ For product direction, see the [Conversations vision](docs/VISION.md) and
 [Companion vision](docs/companion-vision.md). Contributors can use the
 [validation guide](docs/validation.md).
 
+
+<!-- ecosystem-map:start -->
+## Where this fits
+
+Conversation services, reference experiences, ACP connections and authorized service tools share this repository.
+
+Roles: Conversation, Experience, Connection, Tool.
+
+![Ecosystem roles and component relationships](docs/ecosystem-map.svg)
+
+[Open the map](docs/ecosystem-map.svg) · [Product overview](https://microsoft.github.io/amplifier-constellation/projects/amplifier-constellation-conversations/) · [Map guide](https://github.com/microsoft/amplifier-constellation/blob/main/docs/ecosystem-maps.md)
+
+<details>
+<summary>The five shared building blocks</summary>
+
+[![Experience, Conversation, Agent Instance, Connection and Tool](https://raw.githubusercontent.com/microsoft/amplifier-constellation/main/site/assets/art/building-blocks.png)](https://microsoft.github.io/amplifier-constellation/)
+
+</details>
+
+<!-- ecosystem-map:end -->
+
 ## Contributing
 
 > [!NOTE]

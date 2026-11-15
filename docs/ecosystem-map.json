@@ -1,0 +1,112 @@
+{
+  "audience": "Builders of shared rooms and coordinated agent experiences",
+  "citations": [
+    {
+      "path": "README.md",
+      "ref": "83a695b2af088deb216e96d84866458869f27842",
+      "sha256": "cceef4beac46c1ff8288788dd2653251818219f50a8b249ee936c99c5f97c363",
+      "url": "https://github.com/microsoft/amplifier-constellation-conversations/blob/83a695b2af088deb216e96d84866458869f27842/README.md"
+    },
+    {
+      "path": "docs/README.md",
+      "ref": "83a695b2af088deb216e96d84866458869f27842",
+      "sha256": "85f567742c3f68901e7f51938c14808890edaac814750cb9726d0e4ab5b2bc69",
+      "url": "https://github.com/microsoft/amplifier-constellation-conversations/blob/83a695b2af088deb216e96d84866458869f27842/docs/README.md"
+    },
+    {
+      "path": "docs/shared-rooms.md",
+      "ref": "83a695b2af088deb216e96d84866458869f27842",
+      "sha256": "119c3fbf5245acb6d119e88279d92f5ea1a758234c50126dc0065a1141e45421",
+      "url": "https://github.com/microsoft/amplifier-constellation-conversations/blob/83a695b2af088deb216e96d84866458869f27842/docs/shared-rooms.md"
+    }
+  ],
+  "display_name": "Agent Conversations",
+  "edges": [
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "rooms"
+    },
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "huddles"
+    },
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "experiences"
+    },
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "attachments"
+    },
+    {
+      "from": "attachments",
+      "relation": "uses",
+      "to": "agents"
+    },
+    {
+      "from": "experiences",
+      "relation": "uses",
+      "to": "rooms"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "self",
+      "kind": "self",
+      "label": "Agent Conversations",
+      "repository": "microsoft/amplifier-constellation-conversations"
+    },
+    {
+      "id": "rooms",
+      "kind": "internal",
+      "label": "Rooms, membership and messages"
+    },
+    {
+      "id": "huddles",
+      "kind": "internal",
+      "label": "Huddle coordination"
+    },
+    {
+      "id": "experiences",
+      "kind": "internal",
+      "label": "Reference UI and Companion"
+    },
+    {
+      "id": "attachments",
+      "kind": "internal",
+      "label": "ACP attachments"
+    },
+    {
+      "id": "agents",
+      "kind": "external",
+      "label": "Independent agent endpoints"
+    }
+  ],
+  "notes": [
+    "The current docs explicitly map Conversation, Experience, Connection and advertised Tool roles.",
+    "Companion and Conversations currently share this repository; planned extraction is not completed ownership.",
+    "The experience does not own the external agent execution sessions."
+  ],
+  "page_kind": "conversation service with bundled experience",
+  "purpose": "Provide source-owned rooms, messages and coordination for people and existing ACP agents.",
+  "ref": "83a695b2af088deb216e96d84866458869f27842",
+  "repository": "microsoft/amplifier-constellation-conversations",
+  "roles": [
+    "Conversation",
+    "Experience",
+    "Connection",
+    "Tool"
+  ],
+  "start_cta": {
+    "basis": "Existing approved README route; target release assets/availability not freshly audited in this plan.",
+    "label": "Read the conversation-service guide",
+    "url": "https://github.com/microsoft/amplifier-constellation-conversations/blob/main/docs/installation.md"
+  },
+  "summary": "Conversation services, reference experiences, ACP connections and authorized service tools share this repository.",
+  "supports_roles": [],
+  "visibility": "public"
+}
