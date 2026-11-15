@@ -2393,12 +2393,7 @@ async fn call_permissions_are_visible_only_to_owner_and_noticed_once_without_arg
         .filter(|v| v["op"] == "append")
         .collect::<Vec<_>>();
     assert_eq!(appends.len(), 1);
-    assert!(
-        appends[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("permission choice")
-    );
+    assert_eq!(appends[0]["content"], "An action requested your approval.");
     assert!(!commands.contains("never-say-this"));
     assert!(!commands.contains("Private operation"));
     let path = format!("/api/v1/conversations/{room}/permissions/{}", pending.id);

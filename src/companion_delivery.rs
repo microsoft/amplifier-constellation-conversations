@@ -372,6 +372,56 @@ mod tests {
         assert!(take_ready(&f.s, &f.call).unwrap().is_none());
     }
     #[test]
+    fn permission_notice_delivered_after_decision_remains_a_request_event() {
+        for (choice, decision) in [
+            (Some("yes"), "allow_once"),
+            (Some("no"), "reject_once"),
+            (None, "cancelled"),
+        ] {
+            let f = fixture();
+            let request = permission(&f);
+            notice(&f);
+            let batch = take_ready(&f.s, &f.call).unwrap().unwrap();
+            let batch_id = batch["batch_id"].as_str().unwrap();
+            sent(&f.s, &f.call, batch_id).unwrap();
+            // Like the recorded call, the choice is still pending at send but
+            // resolves while the already sent notice can still reach the model.
+            permission_decide(&f, &request.id, choice);
+            assert!(f.s.permissions.list(&f.room, "owner").is_empty());
+            let delivered = &batch["commands"][0];
+            assert_eq!(delivered["channel"], "commentary");
+            assert_eq!(delivered["event_id"], format!("permission_{}", request.id));
+            assert_eq!(delivered["content"], "An action requested your approval.");
+            notice(&f);
+            let revision = take_ready(&f.s, &f.call).unwrap().unwrap();
+            assert_eq!(revision["commands"][0]["channel"], "thinking");
+            assert_eq!(
+                revision["commands"][0]["event_id"],
+                format!("permission_{}_current_{decision}", request.id)
+            );
+            // The revision neither rewrites the attempted notice nor proves
+            // any tool execution or completion. It is not audio cancellation.
+            let retained: String =
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT updates FROM companion_voice_batches WHERE id=?1",
+                        [batch_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&retained).unwrap(),
+                batch["commands"]
+            );
+            assert_eq!(state(&f, batch_id), "sent");
+            sent(&f.s, &f.call, revision["batch_id"].as_str().unwrap()).unwrap();
+            notice(&f);
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        }
+    }
+    #[test]
     fn permission_sent_then_resolved_updates_context_once_without_speaking_or_completion_claim() {
         let f = fixture();
         let request = permission(&f);
@@ -627,7 +677,7 @@ mod tests {
             &f.call,
             "commentary",
             None,
-            "A permission choice is waiting on your screen before that request can continue.",
+            "An action requested your approval.",
             &format!("permission_{}", request.id),
         )
         .unwrap();
