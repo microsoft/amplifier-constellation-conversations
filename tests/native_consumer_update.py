@@ -50,6 +50,140 @@ CHECK_OBSERVATION_PHASES = frozenset({
     "download_verify", "identity_create", "bootstrap_verify", "bundle_verify", "bundle_copy",
     "bundle_verify_copied", "bundle_verify_existing", "bundle_publish", "binary_publish", "receipt_publish", "installed_verify",
 })
+MANAGED_SETUP_PHASES = frozenset({
+    "download_verify", "identity_create", "bootstrap_verify", "bundle_verify", "bundle_copy",
+    "bundle_verify_copied", "bundle_verify_existing", "bundle_publish", "binary_publish", "receipt_publish", "installed_verify",
+})
+MANAGED_SETUP_DIAGNOSTIC_BYTES = 32768
+MANAGED_SETUP_DIAGNOSTIC_EVENTS = 64
+
+
+def _managed_setup_phases(stderr):
+    """Project only the existing content-free installation records, never raw errors."""
+    if not isinstance(stderr, bytes):
+        return {"status": "unavailable", "events": []}
+    truncated = len(stderr) > MANAGED_SETUP_DIAGNOSTIC_BYTES
+    sample = stderr[-MANAGED_SETUP_DIAGNOSTIC_BYTES:]
+    if truncated:
+        sample = sample.partition(b"\n")[2]  # Never parse a partial leading record.
+    events, omitted = [], 0
+    for line in sample.splitlines():
+        if len(line) > 1024:
+            continue
+        try:
+            value = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(value, dict) or value.get("event") != "native_installation_phase" or not isinstance(value.get("phase"), str) or value["phase"] not in MANAGED_SETUP_PHASES:
+            continue
+        keys = {"event", "phase", "state"}
+        if value.get("state") == "returned":
+            keys |= {"elapsed_ms", "result"}
+            if type(value.get("elapsed_ms")) is not int or not 0 <= value["elapsed_ms"] <= 2**64-1 or not isinstance(value.get("result"), str) or value["result"] not in {"ok", "error"}:
+                continue
+        elif value.get("state") != "started":
+            continue
+        if set(value) != keys:
+            continue
+        events.append(value)
+        if len(events) > MANAGED_SETUP_DIAGNOSTIC_EVENTS:
+            events.pop(0)
+            omitted += 1
+    return {"status": "available", "events": events, "input_truncated": truncated, "events_omitted": omitted}
+
+
+def _managed_setup_return(value):
+    if not isinstance(value, dict):
+        return {"status": "unavailable"}
+    result = {"status": value.get("status") if isinstance(value.get("status"), str) and value["status"] in {"prepared", "unavailable"} else "unrecognized"}
+    if "code" in value:
+        allowed = {"controller_observation_timeout", "native_controller_observation_or_dispatch_failed"}
+        result["code"] = value["code"] if isinstance(value["code"], str) and value["code"] in allowed else "unrecognized"
+    if type(value.get("service_started")) is bool:
+        result["service_started"] = value["service_started"]
+    manifest = value.get("manifest_sha256")
+    if isinstance(manifest, str) and len(manifest) == 64 and all(c in "0123456789abcdef" for c in manifest):
+        result["manifest_sha256"] = manifest
+    return result
+
+
+def _save_managed_setup_observation(install, row, stderr, value, *, preserve_error=False):
+    try:
+        install.result["managed_setup_observation"] = {
+            **row, "returned": _managed_setup_return(value), "installation_phases": _managed_setup_phases(stderr)}
+        install.checkpoint()
+    except Exception:
+        pass  # Optional diagnostics cannot change the action result or its original assertion.
+    except BaseException:
+        if not preserve_error:
+            raise  # Operator cancellation still interrupts a normal pre/post-action path.
+
+
+def _prepare_managed_once(observer, payload):
+    # This action verifies and installs a whole previous bundle. Reclassify its
+    # old generic observation allowance (45s) to the existing installation
+    # command allowance (120s); observation/Stop and product clocks are unchanged.
+    install = observer.install
+    row = {"action": "prepare_managed", "outcome": "intent_recorded", "timeout_seconds": lifecycle.COMMAND_SECONDS,
+           "previous_observer_timeout_seconds": 45, "budget_basis": "existing_lifecycle_installation_command",
+           "pid": None, "pid_is_authority": False, "return_code": None, "elapsed_seconds": 0,
+           "kill": "not_requested", "reap": "not_observed", "mutation_retries": 0}
+    child, stdout, stderr, value = None, None, None, None
+    _save_managed_setup_observation(install, row, stderr, value)
+    started = time.monotonic()
+    try:
+        child = subprocess.Popen([str(observer.controller)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, cwd=install.root, env=install.env)
+        row["pid"] = child.pid
+        try:
+            stdout, stderr = child.communicate(json.dumps(payload).encode(), timeout=lifecycle.COMMAND_SECONDS)
+        except subprocess.TimeoutExpired as timeout:
+            row["outcome"] = "timeout_unknown"
+            stdout, stderr = timeout.stdout, timeout.stderr
+            row["kill"] = "requested"
+            try:
+                child.kill()  # Existing exact owned qualification-helper cleanup, never an app PID.
+            except BaseException:
+                row["kill"] = "failed_or_interrupted"
+                raise
+            row["kill"] = "returned"
+            try:
+                stdout, stderr = child.communicate(timeout=10)
+                row["reap"] = "communicate_returned"
+            except subprocess.TimeoutExpired as drain_timeout:
+                if drain_timeout.stdout is not None:
+                    stdout = drain_timeout.stdout
+                if drain_timeout.stderr is not None:
+                    stderr = drain_timeout.stderr
+                install.unsettled_commands.append(child)
+                row["reap"] = "unknown_after_drain"
+            # Even a late normal exit does not turn the timed-out preparation
+            # into success or authorize another setup/Start.
+            value = {"status": "unavailable", "code": "controller_observation_timeout"}
+        else:
+            row["outcome"] = "returned"
+            row["reap"] = "communicate_returned"
+            require(len(stdout) <= 65536, "Native controller output exceeded its bound")
+            value = json.loads(stdout)
+            require(isinstance(value, dict), "Native controller returned invalid evidence")
+            if child.returncode:
+                require(value.get("status") == "unavailable", "Native observer failed without an uncertainty receipt")
+            if child.returncode != 0 or value.get("status") != "prepared" or value.get("service_started") is not False:
+                row["outcome"] = "returned_unknown_or_refused"
+        row.update(return_code=child.returncode, exit_observed=child.returncode is not None,
+                   elapsed_seconds=time.monotonic()-started)
+        _save_managed_setup_observation(install, row, stderr, value)
+        return value
+    except BaseException:
+        if row["outcome"] != "timeout_unknown":
+            row["outcome"] = "interrupted_or_failed"
+        row.update(return_code=child.returncode if child is not None else None,
+                   exit_observed=child is not None and child.returncode is not None,
+                   elapsed_seconds=time.monotonic()-started)
+        if child is not None and child.returncode is None and child not in install.unsettled_commands:
+            install.unsettled_commands.append(child)
+        _save_managed_setup_observation(install, row, stderr, value, preserve_error=True)
+        raise
 
 
 class PrivateCapture:
@@ -99,6 +233,8 @@ class NativeObserver:
         require(action in {"prepare_managed", "inspect", "observe_retirement", "stop"}, "Native controller action is not fixed")
         payload = {"home": str(self.install.home.resolve()), "action": action, "target": target,
                    "previous_process": previous, "setup_bundle": str(setup_bundle) if setup_bundle is not None else None}
+        if action == "prepare_managed":
+            return _prepare_managed_once(self, payload)
         child = subprocess.Popen([str(self.controller)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, cwd=self.install.root, env=self.install.env)
         try:
