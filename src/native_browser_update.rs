@@ -829,6 +829,9 @@ pub(crate) fn status(
     Ok(
         json!({"supported":true,"owner":if enrolled { "enrolled" } else { "standalone" },"mode":mode,
         "current":{"version":installed["version"]},"check":check,"operation":operation,"request":request,
+        // A verified result can precede worker-lock release. Keep observing
+        // the same snapshot's action guards; this flag never grants an action.
+        "execution_pending":pending || active,
         "actions":{"check":!enrolled && mode == "normal" && !pending && !active,
             "apply":can_launch && mode == "normal" && !pending && checked.is_some_and(|c| c.plan["available"] == true),
             "recover":can_launch && resumable,"rollback":can_launch && rollback},"reason":reason}),
@@ -1857,7 +1860,8 @@ mod tests {
                 .to_owned()
         }
     }
-    static DIAGNOSTIC_FIXTURE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static DIAGNOSTIC_FIXTURE_SERIAL: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     #[tokio::test(flavor = "current_thread")]
     async fn authenticated_check_retains_content_free_phase_observations() {
@@ -2464,6 +2468,43 @@ mod tests {
         assert!(!serialized.contains("source_revision"));
     }
     #[test]
+    fn completed_result_keeps_observing_until_execution_lock_is_released() {
+        let fixture = Fixture::new();
+        let launch = LostReply::default();
+        let checked = fixture.check(&launch);
+        let request = id();
+        let accepted = apply(
+            &fixture.home,
+            ApplyInput {
+                request_id: request.clone(),
+                check_id: checked,
+            },
+            &launch,
+        )
+        .unwrap();
+        let transaction = accepted["operation"]["transaction_id"].as_str().unwrap();
+        journal(&fixture.home, transaction, "restored");
+        let execution = native_update::lock(&fixture.home, WORKER_LOCK).unwrap();
+        let waiting = status(&fixture.home, "normal", Some(&request), &launch).unwrap();
+        assert_eq!(waiting["operation"]["phase"], "completed");
+        assert_eq!(waiting["operation"]["outcome"], "applied");
+        assert_eq!(waiting["execution_pending"], true);
+        for action in ["check", "apply", "recover", "rollback"] {
+            assert_eq!(waiting["actions"][action], false);
+        }
+        let ledger_before = fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap();
+        drop(execution);
+        let settled = status(&fixture.home, "normal", Some(&request), &launch).unwrap();
+        assert_eq!(settled["execution_pending"], false);
+        assert_eq!(settled["actions"]["rollback"], true);
+        assert_eq!(settled["operation"], waiting["operation"]);
+        assert_eq!(
+            fs::read(fixture.home.join(DIRECTORY).join(LEDGER)).unwrap(),
+            ledger_before
+        );
+        assert_eq!(launch.calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
     fn older_request_cannot_hide_new_pending_dispatch_or_enable_mutations() {
         let fixture = Fixture::new();
         let launch = LostReply::default();
@@ -2493,6 +2534,7 @@ mod tests {
         .unwrap();
         let old_receipt = status(&fixture.home, "normal", Some(&old), &launch).unwrap();
         assert_eq!(old_receipt["operation"]["id"], old);
+        assert_eq!(old_receipt["execution_pending"], true);
         for action in ["check", "apply", "recover", "rollback"] {
             assert_eq!(old_receipt["actions"][action], false);
         }

@@ -1,6 +1,6 @@
 //! Exercise retained flow boundaries with the existing complete native bundle
 //! fixture. LostReply is a launch seam, not a real OS manager or executable run.
-use super::super::tests::{Fixture, LostReply};
+use super::super::tests::{DIAGNOSTIC_FIXTURE_SERIAL, Fixture, LostReply};
 use super::*;
 use std::sync::atomic::Ordering;
 
@@ -103,6 +103,7 @@ fn repeated_exact_request_reuses_its_saved_attempt_and_conflicting_or_competing_
 
 #[test]
 fn cancellation_before_preparation_records_once_and_never_reads_or_dispatches_a_package() {
+    let _diagnostic_fixture = DIAGNOSTIC_FIXTURE_SERIAL.blocking_lock();
     let fixture = Fixture::new();
     let request = input(fixture.root.path().join("absent-cancelled-package"));
     let attempt = accept(&fixture.home, request.clone()).unwrap().unwrap();
@@ -138,6 +139,7 @@ fn cancellation_before_preparation_records_once_and_never_reads_or_dispatches_a_
 
 #[test]
 fn full_preparation_dispatches_once_and_lost_acknowledgement_never_authorizes_another_attempt() {
+    let _diagnostic_fixture = DIAGNOSTIC_FIXTURE_SERIAL.blocking_lock();
     let fixture = Fixture::new();
     let request = input(fixture.candidate.clone());
     let attempt = accept(&fixture.home, request.clone()).unwrap().unwrap();
@@ -184,6 +186,7 @@ fn full_preparation_dispatches_once_and_lost_acknowledgement_never_authorizes_an
 
 #[test]
 fn corrupt_candidate_refuses_before_native_child_and_preserves_the_installed_receipt() {
+    let _diagnostic_fixture = DIAGNOSTIC_FIXTURE_SERIAL.blocking_lock();
     for relative in ["manifest.json", "bridge/live.mjs"] {
         let fixture = Fixture::new();
         let installed = fs::read(fixture.home.join("native-installation.json")).unwrap();
@@ -257,6 +260,7 @@ fn request_and_control_status_project_no_package_path_secret_or_process_generati
 
 #[test]
 fn stale_controls_and_old_request_reads_never_mutate_a_new_parent() {
+    let _diagnostic_fixture = DIAGNOSTIC_FIXTURE_SERIAL.blocking_lock();
     let fixture = Fixture::new();
     let first = input(fixture.candidate.clone());
     let attempt = accept(&fixture.home, first.clone()).unwrap().unwrap();

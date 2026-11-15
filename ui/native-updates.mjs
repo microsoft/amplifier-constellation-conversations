@@ -126,7 +126,9 @@ function settledLegacyChild() {
 }
 function ongoing() {
   const update = selectedUpdate(), operation = selectedOperation();
-  return Boolean(pending || referenceUnconfirmed() || (update && !terminal(update) && update.state !== 'failed') ||
+  // A saved result may finish before its worker releases execution ownership.
+  // Keep observing; only the existing action flags authorize any next change.
+  return Boolean(status?.execution_pending === true || pending || referenceUnconfirmed() || (update && !terminal(update) && update.state !== 'failed') ||
     (operation && !['completed','restored','deferred','failed'].includes(operation.phase)));
 }
 function schedule() {

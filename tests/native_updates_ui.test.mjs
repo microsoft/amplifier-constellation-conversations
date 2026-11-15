@@ -12,6 +12,7 @@ function fixture(){
   const f={authenticated:true,owner:'standalone',mode:'normal',current:{version:'0.13.4'},update:null,control:null,operation:null,
     actions:{request:true,recover:false,rollback:false},posts:[],gets:[],fail:null,storage:new Map()};
   f.status=url=>({supported:true,owner:f.owner,mode:f.mode,current:f.current,actions:f.actions,operation:f.operation,
+    ...(Object.hasOwn(f,'execution_pending')?{execution_pending:f.execution_pending}:{}),
     ...(!f.legacy?{update:f.update}:{}),offer:f.legacy?null:{id:offer,version:'0.13.5',current_version:f.current.version},
     ...(f.assistant?{assistant:true,companion_url:'http://127.0.0.1:51234/companion'}:{}),
     ...(url.searchParams.has('request_id')?{request:{id:url.searchParams.get('request_id'),state:f.update?.id===url.searchParams.get('request_id')?'recorded':'not_recorded'}}:{}),
@@ -64,6 +65,7 @@ async function open(f,{url='http://fixture/updates?offer='+offer,storageThrows=f
   await vm.runInNewContext('(async()=>{'+source+'\n})()',globals);
   return {nodes,async click(id){const el=nodes.get(id);assert(el&&!el.disabled,id+' disabled');return el.onclick?.();},
     async submit(id){return nodes.get(id).onsubmit({preventDefault(){}});},
+    pollScheduled(){return [...timers.values()].some(t=>t.ms===3000);},
     async poll(){const timer=[...timers.values()].find(t=>t.ms===3000);assert(timer,'poll scheduled');return timer.fn();}};
 }
 test('one normal Update sends the offered ID, promptly renders progress and reloads by original UUID',async()=>{
@@ -153,6 +155,38 @@ test('explicit rollback stays foreground across reload without reassigning the c
   const reloaded=await open(f);assert.equal(f.gets.at(-1).searchParams.get('request_id'),request.request_id);assert.equal(reloaded.nodes.get('update-progress-title').textContent,'Installing the package');
   f.operation.phase='restored';await reloaded.click('update-refresh');assert.equal(reloaded.nodes.get('update-progress-title').textContent,'Previous version restored');assert.equal(f.posts.length,2);
   f.legacy=true;await reloaded.click('update-refresh');assert.equal(reloaded.nodes.get('update-progress-title').textContent,'Previous version restored');assert.equal(f.posts.length,2);
+});
+test('completed result keeps observing execution settlement through reload without replaying Update',async()=>{
+  const f=fixture(),ui=await open(f);f.fail='after-record';await ui.click('update-start');const parent=f.update.id,child=randomUUID();
+  Object.assign(f.update,{state:'completed',phase:'completed',operation_id:child,can_cancel:false,can_continue:false});
+  f.operation={id:child,phase:'completed',outcome:'applied'};f.execution_pending=true;
+  f.actions={request:false,check:false,apply:false,recover:false,rollback:false};await ui.click('update-refresh');
+  assert.equal(ui.nodes.get('update-progress-title').textContent,'Update complete');
+  assert.equal(ui.nodes.get('update-rollback').hidden,true);assert.equal(ui.pollScheduled(),true);
+  await ui.submit('update-rollback-confirmation');assert.equal(f.posts.length,1);
+  const reload=await open(f);assert.equal(reload.pollScheduled(),true);
+  assert.equal(f.gets.at(-1).searchParams.get('request_id'),parent);
+  assert.deepEqual(JSON.parse(f.storage.get('companion-native-update')),{id:parent,operation_id:child});
+  f.execution_pending=false;f.actions={request:true,check:true,apply:false,recover:false,rollback:true};
+  const reads=f.gets.length;await reload.poll();assert.equal(f.gets.length,reads+1);
+  assert.equal(reload.nodes.get('update-rollback').hidden,false);assert.equal(reload.pollScheduled(),false);
+  assert.deepEqual(JSON.parse(f.storage.get('companion-native-update')),{id:parent,operation_id:child});
+  assert.equal(f.posts.length,1);assert.equal(f.posts[0].path,root+'/request');
+});
+test('historical selected completion observes newer pending execution without gaining rollback authority',async()=>{
+  const f=fixture(),ui=await open(f);await ui.click('update-start');const historical=f.update.id,child=randomUUID();
+  Object.assign(f.update,{state:'completed',phase:'completed',operation_id:child,can_cancel:false,can_continue:false});
+  f.operation={id:child,phase:'completed',outcome:'applied'};
+  // Request-specific history remains selected while global execution belongs to
+  // a newer operation. The advisory flag must never grant an old action.
+  f.execution_pending=true;f.actions={request:false,check:false,apply:false,recover:false,rollback:false};
+  await ui.click('update-refresh');assert.equal(ui.pollScheduled(),true);await ui.poll();
+  assert.equal(ui.nodes.get('update-reference-value').textContent,historical);
+  assert.equal(f.gets.at(-1).searchParams.get('request_id'),historical);
+  assert.equal(ui.nodes.get('update-rollback').hidden,true);await ui.submit('update-rollback-confirmation');assert.equal(f.posts.length,1);
+  f.execution_pending=false;await ui.poll();assert.equal(ui.pollScheduled(),false);
+  assert.equal(ui.nodes.get('update-rollback').hidden,true);await ui.submit('update-rollback-confirmation');assert.equal(f.posts.length,1);
+  assert.deepEqual(JSON.parse(f.storage.get('companion-native-update')),{id:historical,operation_id:child});
 });
 test('lost rollback acknowledgement cannot display original parent completion or an unrelated native result',async()=>{
   const f=fixture(),ui=await open(f);await ui.click('update-start');const original=randomUUID();Object.assign(f.update,{state:'completed',operation_id:original,can_cancel:false});f.operation={id:original,phase:'completed',outcome:'applied'};f.actions.rollback=true;await ui.click('update-refresh');
