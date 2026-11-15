@@ -219,6 +219,17 @@ class NativeBuildHarnessTests(unittest.TestCase):
     def test_startup_authorization_qualification_runs_on_each_native_target(self):
         self.assertIn(("native_update::startup_tests::", False), rust_tests.SELECTIONS)
 
+    def test_adoption_state_executes_on_supported_linux_targets(self):
+        for target in ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]:
+            selected = rust_tests.selections_for(target)
+            self.assertIn(("native_adoption_state::", False), selected)
+            self.assertIn(("native_legacy_origin::", False), selected)
+        for target in ["aarch64-apple-darwin", "aarch64-pc-windows-msvc"]:
+            selected = rust_tests.selections_for(target)
+            self.assertIn(("native_update::adoption::", False), selected)
+            self.assertNotIn(("native_adoption_state::", False), selected)
+            self.assertNotIn(("native_legacy_origin::", False), selected)
+
     def test_certificate_failures_are_not_retried_as_startup_delays(self):
         error = ssl.SSLCertVerificationError(1, "Missing Authority Key Identifier")
         self.assertTrue(clean.certificate_failure(error))

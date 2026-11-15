@@ -17,12 +17,19 @@ pub(super) enum Target {
     Replacement {
         prepared: crate::native_update_launch::PreparedLaunch,
     },
+    LegacyOrigin {
+        home: PathBuf,
+        origin: Value,
+    },
 }
 impl Target {
     fn service(&self) -> Result<Service> {
         match self {
             Self::Startup { snapshot } => native_startup_state::native_service(snapshot),
             Self::Replacement { prepared } => prepared.service(),
+            Self::LegacyOrigin { home, origin } => {
+                crate::native_legacy_origin::validate(home, origin)
+            }
         }
     }
     fn validate_profile(&self, native: &Value) -> Result<()> {
@@ -38,6 +45,9 @@ impl Target {
                     "Replacement profile changed"
                 );
                 Ok(())
+            }
+            Self::LegacyOrigin { origin, .. } => {
+                crate::native_legacy_origin::native_profile(origin, native)
             }
         }
     }
@@ -263,8 +273,10 @@ pub(super) fn start(home: &Path, j: &mut Value, target: Target) -> Result<()> {
     // The profile may not exist yet for an independent replacement. Its existing
     // launch module durably binds registration and Start to the fixed attempt.
     let before = match &r.target {
-        Target::Startup { snapshot } => {
-            native_startup_state::validate(snapshot)?;
+        Target::Startup { .. } | Target::LegacyOrigin { .. } => {
+            if let Target::Startup { snapshot } = &r.target {
+                native_startup_state::validate(snapshot)?;
+            }
             let observed = installation::snapshot(&r.target.service()?)?;
             r.target.validate_profile(&observed)?;
             ensure!(
@@ -278,11 +290,13 @@ pub(super) fn start(home: &Path, j: &mut Value, target: Target) -> Result<()> {
     store(home, j, &r)?; // Intent precedes any manager dispatch.
     crate::native_update_clock::check()?;
     r.start = match &r.target {
-        Target::Startup { .. } => Ack::from_result(installation::request_state(
-            &r.target.service()?,
-            ServiceAction::Start,
-            before.as_ref().unwrap(),
-        )),
+        Target::Startup { .. } | Target::LegacyOrigin { .. } => {
+            Ack::from_result(installation::request_state(
+                &r.target.service()?,
+                ServiceAction::Start,
+                before.as_ref().unwrap(),
+            ))
+        }
         Target::Replacement { prepared } => match crate::native_update_launch::launch(prepared) {
             Ok(crate::native_update_launch::LaunchReceipt::Accepted) => Ack::Accepted,
             Ok(crate::native_update_launch::LaunchReceipt::Refused { code }) => {
@@ -1002,10 +1016,14 @@ pub(super) async fn stop(home: &Path, j: &mut Value) -> Result<Option<Installati
         .context("No exact accepted application generation was captured")?
         .clone();
     if r.exit_before_switch.is_none() {
-        ensure!(
-            installed(home)?["package"] == r.binding.package,
-            "Installed package changed before cleanup"
-        );
+        if j["kind"] == "legacy_adoption" {
+            adoption::validate_candidate_cleanup(home, j, &r.binding.package)?;
+        } else {
+            ensure!(
+                installed(home)?["package"] == r.binding.package,
+                "Installed package changed before cleanup"
+            );
+        }
     }
     if r.exit_before_switch.is_some() {
         ensure!(

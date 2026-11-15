@@ -142,6 +142,22 @@ enum BundleAction {
 }
 #[derive(Subcommand)]
 enum NativeUpdateAction {
+    /// Capture a qualified legacy service before its owner maintenance stop.
+    CaptureLegacy {
+        transaction: String,
+        #[arg(long)]
+        legacy_sha256: String,
+    },
+    /// Adopt only an already stopped, captured legacy Conversations installation.
+    AdoptExisting {
+        transaction: String,
+        #[arg(long)]
+        package: PathBuf,
+    },
+    /// Recover the exact legacy adoption without replaying conversation work.
+    RecoverAdoption {
+        transaction: String,
+    },
     /// Restore the retained previous bundle through a new idle transaction.
     Rollback {
         transaction: String,
@@ -404,6 +420,17 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Action::NativeUpdate { action } => {
             let value = match action {
+                NativeUpdateAction::CaptureLegacy {
+                    transaction,
+                    legacy_sha256,
+                } => native_update::capture_legacy_origin(&home, &transaction, &legacy_sha256)?,
+                NativeUpdateAction::AdoptExisting {
+                    transaction,
+                    package,
+                } => native_update::adopt_existing(&home, &transaction, &package).await?,
+                NativeUpdateAction::RecoverAdoption { transaction } => {
+                    native_update::recover_adoption(&home, &transaction).await?
+                }
                 NativeUpdateAction::Bootstrap { package } => {
                     native_update::bootstrap(&home, &package)?
                 }
