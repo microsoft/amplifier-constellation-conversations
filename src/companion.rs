@@ -1676,7 +1676,7 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
     observe_results(s, id, room, true)?;
     permission_notice(s, id, room)
 }
-fn permission_notice(s: &AppState, id: &str, room: &str) -> Result<()> {
+pub(crate) fn permission_notice(s: &AppState, id: &str, room: &str) -> Result<()> {
     if !active_call(s, id)? {
         return Ok(());
     }
@@ -1701,12 +1701,178 @@ fn permission_notice(s: &AppState, id: &str, room: &str) -> Result<()> {
                 id,
                 "commentary",
                 None,
-                "A permission choice is waiting on your screen before that request can continue.",
+                PERMISSION_WAITING,
                 &format!("permission_{permission_id}"),
             )?;
         }
     }
+    // The live permission store is single-use. Revisit this call's retained
+    // notices too: resolved, expired and dropped requests disappear from list().
+    let recorded = {
+        let db = s.db.lock().unwrap();
+        let mut q = db.prepare("SELECT json_extract(data,'$.id') FROM companion_events WHERE call_id=?1 AND kind='permission' AND json_extract(data,'$.state')='pending'")?;
+        q.query_map([id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for permission in recorded {
+        let revision = {
+            let db = s.db.lock().unwrap();
+            permission_revision(s, &db, id, &permission)?
+        };
+        let Some(revision) = revision else { continue };
+        let revision_key = format!("permission_{permission}_current_");
+        let decision = revision["event_id"]
+            .as_str()
+            .unwrap()
+            .strip_prefix(&revision_key)
+            .unwrap();
+        if decision != "unconfirmed" {
+            // Keep the exact observed audit fact in the existing call record.
+            // The global audit is bounded; pruning it must not erase this known
+            // decision or turn its retained context back into an unknown.
+            event(
+                s,
+                id,
+                &format!("permission:{permission}:decision:{decision}"),
+                "permission",
+                json!({"id":permission,"state":"resolved","decision":decision,
+                    "actor":owner,"conversation_id":room,"source":"permission.decided"}),
+            )?;
+        }
+        let pending_key = format!("permission_{permission}");
+        crate::companion_delivery::supersede_pending(s, id, &pending_key)?;
+        let attempted = s.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM companion_voice_batches WHERE call_id=?1 AND semantic_key=?2 AND state IN ('dispatching','sent','unknown'))",
+            params![id, pending_key], |r| r.get::<_, bool>(0),
+        )?;
+        if attempted {
+            // Dispatching/unknown may already have reached the provider. Do not
+            // retract that evidence or repeat it; offer one current quiet fact.
+            crate::companion_delivery::enqueue_batch(
+                s,
+                id,
+                &format!("permission_{permission}_current"),
+                vec![revision],
+            )?;
+        }
+    }
     Ok(())
+}
+const PERMISSION_WAITING: &str =
+    "A permission choice is waiting on your screen before that request can continue.";
+
+fn permission_pending(s: &AppState, db: &Connection, call: &str, permission: &str) -> Result<bool> {
+    let (room, owner): (String, String) = db.query_row(
+        "SELECT conversation_id,owner FROM companion_calls WHERE id=?1",
+        [call],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(s.permissions
+        .list(&room, &owner)
+        .iter()
+        .any(|p| p["id"] == permission))
+}
+fn permission_recorded(db: &Connection, call: &str, permission: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND event_key=?2 AND kind='permission' AND json_extract(data,'$.id')=?3 AND json_extract(data,'$.state')='pending')",
+        params![call, format!("permission:{permission}"), permission], |r| r.get(0),
+    )?)
+}
+fn permission_revision(
+    s: &AppState,
+    db: &Connection,
+    call: &str,
+    permission: &str,
+) -> Result<Option<Value>> {
+    if !permission_recorded(db, call, permission)? || permission_pending(s, db, call, permission)? {
+        return Ok(None);
+    }
+    // resolve() removes/sends the request before the audit write. Absence alone
+    // therefore proves neither a grant nor a denial (also true after expiry,
+    // request drop, audit retention, or process restart).
+    let decisions = {
+        let mut q = db.prepare("SELECT DISTINCT decision FROM (
+            SELECT json_extract(a.data,'$.decision') AS decision FROM audit a
+            JOIN companion_calls c ON c.id=?1 AND c.conversation_id=a.conversation_id
+            WHERE a.kind='permission.decided' AND json_extract(a.data,'$.actor')=c.owner AND json_extract(a.data,'$.request_id')=?2
+            UNION ALL
+            SELECT json_extract(e.data,'$.decision') FROM companion_events e JOIN companion_calls c ON c.id=e.call_id
+            WHERE e.call_id=?1 AND e.kind='permission' AND json_extract(e.data,'$.id')=?2
+                AND json_extract(e.data,'$.state')='resolved' AND json_extract(e.data,'$.source')='permission.decided'
+                AND json_extract(e.data,'$.actor')=c.owner AND json_extract(e.data,'$.conversation_id')=c.conversation_id
+                AND e.event_key='permission:'||?2||':decision:'||json_extract(e.data,'$.decision')
+        )")?;
+        q.query_map(params![call, permission], |r| r.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let decision = match decisions.as_slice() {
+        [Some(kind)]
+            if matches!(
+                kind.as_str(),
+                "allow_once" | "allow_always" | "reject_once" | "reject_always" | "cancelled"
+            ) =>
+        {
+            kind.as_str()
+        }
+        _ => "unconfirmed",
+    };
+    let fact = match decision {
+        "allow_once" | "allow_always" => "The caller allowed that permission request.",
+        "reject_once" | "reject_always" => "The caller rejected that permission request.",
+        "cancelled" => "The caller cancelled that permission choice.",
+        _ => "The outcome is not confirmed by the available decision record.",
+    };
+    let content = format!(
+        "Permission choice {permission} is no longer pending. {fact} This does not establish tool execution, task progress or completion."
+    );
+    Ok(Some(
+        json!({"op":"append","channel":"thinking","delegation_id":null,
+        "event_id":format!("permission_{permission}_current_{decision}"),"content":content}),
+    ))
+}
+fn permission_event_id(command: &Value) -> Option<(&str, bool)> {
+    let key = command["event_id"].as_str()?.strip_prefix("permission_")?;
+    let (permission, current) = key
+        .split_once("_current_")
+        .map_or((key, false), |(id, _)| (id, true));
+    Some((permission, current))
+}
+/// Exact application-authored permission facts only. This never resolves a
+/// permission or changes an ACP decision. It also does not claim a network CAS:
+/// a decision after selection may cross the bridge write and needs a revision.
+pub(crate) fn permission_update_matches(
+    s: &AppState,
+    db: &Connection,
+    call: &str,
+    command: &Value,
+) -> Result<bool> {
+    let Some((permission, current)) = permission_event_id(command) else {
+        return Ok(true);
+    };
+    if current {
+        return Ok(permission_revision(s, db, call, permission)?.as_ref() == Some(command));
+    }
+    Ok(permission_recorded(db, call, permission)?
+        && permission_pending(s, db, call, permission)?
+        && *command
+            == json!({"op":"append","channel":"commentary","delegation_id":null,
+            "event_id":format!("permission_{permission}"),"content":PERMISSION_WAITING}))
+}
+pub(crate) fn is_permission_revision_batch(
+    s: &AppState,
+    db: &Connection,
+    call: &str,
+    semantic_key: &str,
+    commands: &[Value],
+) -> Result<bool> {
+    let [command] = commands else {
+        return Ok(false);
+    };
+    let Some((permission, true)) = permission_event_id(command) else {
+        return Ok(false);
+    };
+    Ok(semantic_key == format!("permission_{permission}_current")
+        && permission_update_matches(s, db, call, command)?)
 }
 /// A call-local receipt lets voice answer whether an answer has returned without
 /// inventing external progress or asking the backend the same question again.

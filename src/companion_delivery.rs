@@ -163,12 +163,32 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     let mut selected = None;
     for (id, semantic_key, raw) in rows {
         let commands: Vec<Value> = serde_json::from_str(&raw)?;
-        if speech_ready || crate::companion::is_pending_context_batch(&semantic_key, &commands) {
+        // Recheck permission presence and revision under the same DB transaction
+        // that selects delivery. A resolved unsent notice is never speech-ready.
+        if !commands.iter().try_fold(true, |valid, command| {
+            Ok::<_, anyhow::Error>(
+                valid && crate::companion::permission_update_matches(s, &tx, call, command)?,
+            )
+        })? {
+            tx.execute("UPDATE companion_voice_batches SET state='superseded',updated_at=?2 WHERE id=?1 AND state='pending'", params![id, now_ms()])?;
+            continue;
+        }
+        if speech_ready
+            || crate::companion::is_pending_context_batch(&semantic_key, &commands)
+            || crate::companion::is_permission_revision_batch(
+                s,
+                &tx,
+                call,
+                &semantic_key,
+                &commands,
+            )?
+        {
             selected = Some((id, commands));
             break;
         }
     }
     let Some((id, commands)) = selected else {
+        tx.commit()?;
         return Ok(None);
     };
     let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND state IN ('connecting','connected'))", [call], |r|r.get(0))?;
@@ -296,6 +316,349 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    fn permission(f: &Fixture) -> crate::permissions::Request {
+        f.s.permissions
+            .request(
+                &f.room,
+                "owner",
+                "default",
+                &json!({
+                    "options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"},
+                               {"optionId":"no","name":"Reject","kind":"reject_once"}]
+                }),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap()
+    }
+    fn permission_decide(f: &Fixture, id: &str, choice: Option<&str>) {
+        let kind =
+            f.s.permissions
+                .resolve(&f.room, "owner", id, choice)
+                .unwrap();
+        f.s.audit("permission.decided",Some(&f.room),json!({"actor":"owner","request_id":id,"decision":kind.unwrap_or_else(||"cancelled".into())})).unwrap();
+    }
+    fn notice(f: &Fixture) {
+        crate::companion::permission_notice(&f.s, &f.call, &f.room).unwrap();
+    }
+    #[test]
+    fn permission_resolved_before_dispatch_never_sends_stale_waiting_commentary() {
+        let f = fixture();
+        let request = permission(&f);
+        notice(&f);
+        permission_decide(&f, &request.id, Some("yes"));
+        // Deliberately do not reconcile: this exercises the final dispatch check.
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        notice(&f);
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        assert_eq!(f.s.db.lock().unwrap().query_row("SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='context_delivery' AND json_extract(data,'$.state')='queued'",[&f.call],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+    #[test]
+    fn permission_still_pending_is_sent_once_without_changing_authority() {
+        let f = fixture();
+        let request = permission(&f);
+        notice(&f);
+        notice(&f);
+        let batch = take_ready(&f.s, &f.call).unwrap().unwrap();
+        assert_eq!(
+            batch["commands"][0]["event_id"],
+            format!("permission_{}", request.id)
+        );
+        assert_eq!(batch["commands"][0]["channel"], "commentary");
+        assert_eq!(f.s.permissions.list(&f.room, "owner").len(), 1);
+        sent(&f.s, &f.call, batch["batch_id"].as_str().unwrap()).unwrap();
+        notice(&f);
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+    }
+    #[test]
+    fn permission_sent_then_resolved_updates_context_once_without_speaking_or_completion_claim() {
+        let f = fixture();
+        let request = permission(&f);
+        notice(&f);
+        let batch = take_ready(&f.s, &f.call).unwrap().unwrap();
+        sent(&f.s, &f.call, batch["batch_id"].as_str().unwrap()).unwrap();
+        permission_decide(&f, &request.id, Some("yes"));
+        notice(&f);
+        let revision = take_ready(&f.s, &f.call)
+            .unwrap()
+            .expect("A sent pending notice needs current context");
+        assert_eq!(revision["commands"][0]["channel"], "thinking");
+        let content = revision["commands"][0]["content"].as_str().unwrap();
+        assert!(content.contains("allowed"));
+        assert!(content.contains("does not establish"));
+        assert!(!content.contains("cannot continue"));
+        sent(&f.s, &f.call, revision["batch_id"].as_str().unwrap()).unwrap();
+        notice(&f);
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+    }
+
+    #[test]
+    fn permission_dispatch_race_and_restart_unknown_keep_original_evidence_and_one_revision() {
+        for prior in ["dispatching", "sent", "unknown"] {
+            let f = fixture();
+            let request = permission(&f);
+            notice(&f);
+            let batch = take_ready(&f.s, &f.call).unwrap().unwrap();
+            f.s.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE companion_voice_batches SET state=?2 WHERE id=?1",
+                    params![batch["batch_id"].as_str().unwrap(), prior],
+                )
+                .unwrap();
+            permission_decide(&f, &request.id, Some("no"));
+            notice(&f);
+            notice(&f);
+            assert_eq!(state(&f, batch["batch_id"].as_str().unwrap()), prior);
+            let revision = take_ready(&f.s, &f.call).unwrap().unwrap();
+            assert_eq!(revision["commands"][0]["channel"], "thinking");
+            assert!(
+                revision["commands"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("rejected")
+            );
+            assert_ne!(
+                revision["commands"][0]["event_id"],
+                batch["commands"][0]["event_id"]
+            );
+            notice(&f);
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn permission_resolve_audit_gap_never_infers_a_grant_and_later_exact_audit_supersedes_unknown()
+    {
+        let f = fixture();
+        let request = permission(&f);
+        notice(&f);
+        let original = take_ready(&f.s, &f.call).unwrap().unwrap();
+        f.s.permissions
+            .resolve(&f.room, "owner", &request.id, Some("yes"))
+            .unwrap();
+        notice(&f);
+        // The unknown revision is queued, but actual decision evidence arrives
+        // before its dispatch. Current-state validation must reject that revision.
+        f.s.audit(
+            "permission.decided",
+            Some(&f.room),
+            json!({"actor":"owner","request_id":request.id,"decision":"allow_once"}),
+        )
+        .unwrap();
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        notice(&f);
+        let revision = take_ready(&f.s, &f.call).unwrap().unwrap();
+        assert!(
+            revision["commands"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("allowed")
+        );
+        assert_eq!(
+            state(&f, original["batch_id"].as_str().unwrap()),
+            "dispatching"
+        );
+        assert!(
+            f.s.permissions
+                .resolve(&f.room, "owner", &request.id, Some("yes"))
+                .is_err()
+        );
+    }
+    #[test]
+    fn permission_missing_and_wrong_scope_decisions_are_only_unconfirmed() {
+        for mode in [
+            "dropped",
+            "wrong-actor",
+            "wrong-room",
+            "wrong-request",
+            "invalid-decision",
+        ] {
+            let f = fixture();
+            let request = permission(&f);
+            notice(&f);
+            take_ready(&f.s, &f.call).unwrap().unwrap();
+            let id = request.id.clone();
+            drop(request);
+            if mode != "dropped" {
+                f.s.audit(
+                    "permission.decided",
+                    Some(if mode == "wrong-room" {
+                        "other-room"
+                    } else {
+                        &f.room
+                    }),
+                    json!({
+                        "actor":if mode=="wrong-actor" {"other-owner"} else {"owner"},
+                        "request_id":if mode=="wrong-request" {"another-request"} else {&id},
+                        "decision":if mode=="invalid-decision" {"complete"} else {"allow_once"}
+                    }),
+                )
+                .unwrap();
+            }
+            notice(&f);
+            let revision = take_ready(&f.s, &f.call).unwrap().unwrap();
+            let text = revision["commands"][0]["content"].as_str().unwrap();
+            assert!(text.contains("no longer pending"));
+            assert!(text.contains("not confirmed"));
+            assert!(!text.contains("allowed"));
+            assert!(!text.contains("rejected"));
+            notice(&f);
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn permission_current_revision_is_quiet_but_still_requires_fresh_known_private_surface() {
+        for mode in [
+            "speaking",
+            "stale",
+            "unknown",
+            "private-revoked",
+            "mixed-batch",
+        ] {
+            let f = fixture();
+            let request = permission(&f);
+            notice(&f);
+            take_ready(&f.s, &f.call).unwrap().unwrap();
+            permission_decide(&f, &request.id, None);
+            notice(&f);
+            f.s.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE companion_surfaces SET user_speaking=1,playback=?2 WHERE call_id=?1",
+                    params![
+                        f.call,
+                        json!({"state":"suppressed","floor":"user"}).to_string()
+                    ],
+                )
+                .unwrap();
+            match mode {
+                "stale" => {
+                    f.s.db
+                        .lock()
+                        .unwrap()
+                        .execute(
+                            "UPDATE companion_surfaces SET updated_at=?2 WHERE call_id=?1",
+                            params![f.call, now_ms() - 6000],
+                        )
+                        .unwrap();
+                }
+                "unknown" => {
+                    f.s.db
+                        .lock()
+                        .unwrap()
+                        .execute(
+                            "UPDATE companion_surfaces SET playback=?2 WHERE call_id=?1",
+                            params![
+                                f.call,
+                                json!({"state":"unknown","floor":"unknown"}).to_string()
+                            ],
+                        )
+                        .unwrap();
+                }
+                "private-revoked" => {
+                    f.s.db
+                        .lock()
+                        .unwrap()
+                        .execute("UPDATE conversations SET shared=1 WHERE id=?1", [&f.room])
+                        .unwrap();
+                }
+                "mixed-batch" => {
+                    let db = f.s.db.lock().unwrap();
+                    let (id,raw):(String,String)=db.query_row("SELECT id,updates FROM companion_voice_batches WHERE call_id=?1 AND state='pending'",[&f.call],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                    let mut commands: Vec<Value> = serde_json::from_str(&raw).unwrap();
+                    commands.push(update("unrelated", "Unrelated quiet context"));
+                    db.execute(
+                        "UPDATE companion_voice_batches SET updates=?2 WHERE id=?1",
+                        params![id, serde_json::to_string(&commands).unwrap()],
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            let value = take_ready(&f.s, &f.call).unwrap();
+            if mode == "speaking" {
+                let batch = value.unwrap();
+                assert_eq!(batch["commands"][0]["channel"], "thinking");
+                assert!(
+                    batch["commands"][0]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cancelled")
+                );
+            } else {
+                assert!(value.is_none(), "{mode}");
+            }
+        }
+    }
+    #[test]
+    fn permission_independent_choices_and_invalid_option_preserve_pending_authority() {
+        let f = fixture();
+        let first = permission(&f);
+        let second = permission(&f);
+        notice(&f);
+        assert!(
+            f.s.permissions
+                .resolve(&f.room, "owner", &second.id, Some("invented"))
+                .is_err()
+        );
+        permission_decide(&f, &first.id, Some("yes"));
+        notice(&f);
+        let batch = take_ready(&f.s, &f.call).unwrap().unwrap();
+        assert_eq!(
+            batch["commands"][0]["event_id"],
+            format!("permission_{}", second.id)
+        );
+        assert_eq!(f.s.permissions.list(&f.room, "owner")[0]["id"], second.id);
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+    }
+    #[test]
+    fn permission_discovery_then_resolution_before_enqueue_is_rejected_at_dispatch() {
+        let f = fixture();
+        let request = permission(&f);
+        // Exact retained discovery, followed by resolve, followed by the delayed
+        // old append: the two original non-atomic producer steps can race.
+        f.s.db.lock().unwrap().execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'permission',?3,?4)",params![f.call,format!("permission:{}",request.id),json!({"id":request.id,"state":"pending"}).to_string(),now_ms()]).unwrap();
+        permission_decide(&f, &request.id, Some("yes"));
+        crate::companion::queue_append(
+            &f.s,
+            &f.call,
+            "commentary",
+            None,
+            "A permission choice is waiting on your screen before that request can continue.",
+            &format!("permission_{}", request.id),
+        )
+        .unwrap();
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        notice(&f);
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+    }
+
+    #[test]
+    fn permission_observed_decision_survives_global_audit_retention_without_repeating_context() {
+        let f = fixture();
+        let request = permission(&f);
+        notice(&f);
+        take_ready(&f.s, &f.call).unwrap().unwrap();
+        permission_decide(&f, &request.id, Some("yes"));
+        notice(&f);
+        f.s.db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM audit WHERE kind='permission.decided'", [])
+            .unwrap();
+        let revision = take_ready(&f.s, &f.call).unwrap().unwrap();
+        assert!(
+            revision["commands"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("allowed")
+        );
+        notice(&f);
+        assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+        assert_eq!(f.s.db.lock().unwrap().query_row("SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='permission' AND json_extract(data,'$.state')='resolved'",[&f.call],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
 
     #[test]
