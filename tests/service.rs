@@ -1773,6 +1773,261 @@ async fn independent_agents_have_independent_room_sessions_and_selective_group_p
     assert!(f.state.db.lock().unwrap().query_row("SELECT session_id IS NULL FROM room_agents WHERE conversation_id=?1 AND agent_id='reviewer'",[private_id],|r|r.get::<_,bool>(0)).unwrap());
 }
 #[tokio::test]
+async fn detaching_one_agent_preserves_remaining_session_and_revokes_old_grants() {
+    let f = fixture();
+    let mut agent = f.state.config.agent.clone().unwrap();
+    agent.env.insert("FIXTURE_RESTORE".into(), "resume".into());
+    for id in ["default", "reviewer"] {
+        assert_eq!(
+            request(
+                &f.app,
+                "POST",
+                "/api/v1/agents",
+                Some(&f.admin),
+                Some(json!({"id":id,"config":agent}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let (_, room) = request(
+        &f.app,
+        "POST",
+        "/api/v1/conversations",
+        Some(&f.admin),
+        Some(json!({"title":"Independent participants","agent_ids":["default","reviewer"]})),
+    )
+    .await;
+    let id = room["id"].as_str().unwrap();
+    let messages_path = format!("/api/v1/conversations/{id}/messages");
+    for target in ["default", "reviewer"] {
+        assert_eq!(
+            request(
+                &f.app,
+                "POST",
+                &messages_path,
+                Some(&f.admin),
+                Some(json!({"text":format!("Initial work for {target}"),
+                    "request_id":uuid::Uuid::new_v4(),"target_agent_ids":[target]}))
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED
+        );
+        wait_idle(&f, id).await;
+    }
+    let binding = || -> (Option<String>, Option<String>, i64) {
+        f.state.db.lock().unwrap().query_row(
+            "SELECT session_id,endpoint,last_seq FROM room_agents WHERE conversation_id=?1 AND agent_id='reviewer'",
+            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+    };
+    let before_binding = binding();
+    assert!(before_binding.0.is_some() && before_binding.1.is_some() && before_binding.2 > 0);
+    let before_messages = f.state.messages(id, 100).unwrap();
+    // Retained legacy room-wide columns must still be cleared by audience changes.
+    f.state.db.lock().unwrap().execute(
+        "UPDATE conversations SET session_id='legacy-session',endpoint='legacy-endpoint' WHERE id=?1",
+        [id]).unwrap();
+    let grant = context::grant(&f.state, id).unwrap();
+    let (_, credential) = request(
+        &f.app,
+        "POST",
+        "/api/v1/agents/reviewer/context-credential",
+        Some(&f.admin),
+        Some(json!({})),
+    )
+    .await;
+    let token = credential["token"].as_str().unwrap();
+    let query_path = "/agents/reviewer/context/v1/query";
+    let access = json!({"mode":"grant","grant":grant});
+    assert_eq!(
+        request(
+            &f.app,
+            "POST",
+            query_path,
+            Some(token),
+            Some(json!({"operation":"read","access":access,"conversation_id":id}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+
+    let (cancel, _receiver) = tokio::sync::watch::channel(false);
+    f.state.running.lock().unwrap().insert(id.into(), cancel);
+    assert_eq!(
+        request(
+            &f.app,
+            "DELETE",
+            &format!("/api/v1/conversations/{id}/agents/default"),
+            Some(&f.admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    f.state.running.lock().unwrap().remove(id);
+    assert_eq!(binding(), before_binding);
+    assert_eq!(f.state.room_agents(id).unwrap().len(), 2);
+    assert_eq!(
+        request(
+            &f.app,
+            "POST",
+            query_path,
+            Some(token),
+            Some(json!({"operation":"read","access":access,"conversation_id":id}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+
+    let (status, removed) = request(
+        &f.app,
+        "DELETE",
+        &format!("/api/v1/conversations/{id}/agents/default"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(removed["removed"], true);
+    // Audience revocation must not orphan another participant's existing work.
+    assert_eq!(
+        binding(),
+        before_binding,
+        "Unchanged participant lost its native binding"
+    );
+    assert_eq!(f.state.messages(id, 100).unwrap(), before_messages);
+    assert_eq!(
+        f.state
+            .room_agents(id)
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["reviewer"]
+    );
+    assert_eq!(
+        f.state.conversation_info(id).unwrap().unwrap()["shared"],
+        true
+    );
+    assert!(
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT session_id IS NULL AND endpoint IS NULL FROM conversations WHERE id=?1",
+                [id],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        request(
+            &f.app,
+            "POST",
+            query_path,
+            Some(token),
+            Some(json!({"operation":"authorize","access":access,"conversation_id":id}))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let fresh_access = json!({"mode":"grant","grant":context::grant(&f.state,id).unwrap()});
+    let (status, authorized) = request(
+        &f.app,
+        "POST",
+        query_path,
+        Some(token),
+        Some(json!({"operation":"authorize","access":fresh_access,"conversation_id":id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(authorized["owner"], false);
+    for access in [json!({"mode":"owner"}), access, fresh_access] {
+        assert_eq!(
+            request(
+                &f.app,
+                "POST",
+                "/context/v1/query",
+                Some(&f.context),
+                Some(json!({"operation":"read","access":access,"conversation_id":id}))
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    assert_eq!(
+        request(
+            &f.app,
+            "POST",
+            &messages_path,
+            Some(&f.admin),
+            Some(
+                json!({"text":"Continue the review","request_id":uuid::Uuid::new_v4(),
+            "target_agent_ids":["reviewer"]})
+            )
+        )
+        .await
+        .0,
+        StatusCode::ACCEPTED
+    );
+    wait_idle(&f, id).await;
+    let after_binding = binding();
+    assert_eq!(after_binding.0, before_binding.0);
+    assert_eq!(after_binding.1, before_binding.1);
+    assert!(after_binding.2 > before_binding.2);
+    let after_messages = f.state.messages(id, 100).unwrap();
+    assert_eq!(
+        &after_messages[..before_messages.len()],
+        before_messages.as_slice()
+    );
+    let frames = std::fs::read_to_string(f._home.path().join("frames.jsonl")).unwrap();
+    let frames: Vec<Value> = frames
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|r| r["method"] == "session/new")
+            .count(),
+        2
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|r| r["method"] == "session/resume")
+            .count(),
+        1
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|r| r["method"] == "session/load" || r["method"] == "session/cancel")
+    );
+    let resumed = frames
+        .iter()
+        .find(|r| r["method"] == "session/resume")
+        .unwrap();
+    assert_eq!(resumed["params"]["sessionId"], before_binding.0.unwrap());
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|r| r["method"] == "session/prompt")
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn attachments_are_private_bounded_and_honest_about_acp_capabilities() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     let f = fixture();
