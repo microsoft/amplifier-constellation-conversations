@@ -54,7 +54,7 @@ The [Conversation boundary](https://github.com/microsoft/amplifier-constellation
 keeps the source-owned exchange distinct from an agent's execution session. The
 following room-to-session mapping is this service's ACP implementation contract.
 
-Each `(conversation, agent connection)` has its own resumable ACP session and public-message cursor. No session is reused across rooms or between agents. Changing an audience revokes source grants and resets working sessions. Sharing a formerly private conversation never carries its previous private ACP working context into the room.
+Each `(conversation, agent connection)` has its own resumable ACP session and public-message cursor. No session is reused across rooms or between agents. Audience changes revoke source grants. Adding participants or removing a person resets working sessions; removing an agent preserves the remaining agents' bindings as described below. Sharing a formerly private conversation never carries its previous private ACP working context into the room.
 
 For a saved binding, Conversations uses an advertised standard `session/resume`, which does not replay agent history. It uses `session/load` only when resume is not advertised and load is supported. A failed restore preserves the binding and never creates a replacement or replays the prompt. Endpoints offering neither retain the existing bounded room-transcript setup for a new working session.
 
