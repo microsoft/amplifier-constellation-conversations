@@ -64,6 +64,8 @@ Work stays serialized within each room, with up to four active agent turns per i
 
 A room can have up to 50 people and eight agents. Buffered group replies become public only when complete. Failed or cancelled work retains its session binding and original source messages. An uncertain delivery needs explicit review before that agent continues; it is never silently rebuilt or replayed. Removal of a person immediately revokes room access and cancels current work; adding participants waits for the current turn to finish.
 
+An agent can be removed when no room turn is running. Removal revokes outstanding room grants. Other agents retain their saved session bindings and acknowledged transcript positions; their next turn uses the existing restore path with a fresh grant. This does not extend an old grant's lifetime or establish uninterrupted context access for background work using that grant. Removing an agent does not erase the shared transcript.
+
 ## Attachments and history
 
 A message can include up to four private attachments. Supported formats:
