@@ -486,11 +486,22 @@ pub async fn detach_agent(
     if running.contains_key(&id) {
         return Err(ApiError::busy());
     }
-    s.reset_room(&id)?;
-    s.db.lock().unwrap().execute(
-        "DELETE FROM room_agents WHERE conversation_id=?1 AND agent_id=?2",
-        params![id, agent],
-    )?;
+    {
+        let mut db = s.db.lock().unwrap();
+        let tx = db.transaction()?;
+        // Revoke the old audience's capabilities without discarding another
+        // participant's independent session or acknowledged transcript position.
+        tx.execute("DELETE FROM grants WHERE conversation_id=?1", [&id])?;
+        tx.execute(
+            "DELETE FROM room_agents WHERE conversation_id=?1 AND agent_id=?2",
+            params![id, agent],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET shared=1,session_id=NULL,endpoint=NULL,updated_at=?2 WHERE id=?1",
+            params![id, now_ms()],
+        )?;
+        tx.commit()?;
+    }
     drop(running);
     s.audit("room.agent_removed", Some(&id), json!({"agent_id":agent}))?;
     s.changed();

@@ -54,7 +54,7 @@ The [Conversation boundary](https://github.com/microsoft/amplifier-constellation
 keeps the source-owned exchange distinct from an agent's execution session. The
 following room-to-session mapping is this service's ACP implementation contract.
 
-Each `(conversation, agent connection)` has its own resumable ACP session and public-message cursor. No session is reused across rooms or between agents. Changing an audience revokes source grants and resets working sessions. Sharing a formerly private conversation never carries its previous private ACP working context into the room.
+Each `(conversation, agent connection)` has its own resumable ACP session and public-message cursor. No session is reused across rooms or between agents. Audience changes revoke source grants. Adding participants or removing a person resets working sessions; removing an agent preserves the remaining agents' bindings as described below. Sharing a formerly private conversation never carries its previous private ACP working context into the room.
 
 For a saved binding, Conversations uses an advertised standard `session/resume`, which does not replay agent history. It uses `session/load` only when resume is not advertised and load is supported. A failed restore preserves the binding and never creates a replacement or replays the prompt. Endpoints offering neither retain the existing bounded room-transcript setup for a new working session.
 
@@ -63,6 +63,8 @@ Choose **Everyone here** to give each agent a bounded opportunity to contribute.
 Work stays serialized within each room, with up to four active agent turns per installation. You can keep posting while work continues. A steering-capable endpoint receives eligible follow-ups through its existing turn; an ordinary ACP endpoint receives them in order after its current prompt. Each recipient has a separate durable delivery record and session. New input neither cancels work nor replaces a pending approval. **Stop** remains a separate action and stops accepted queued messages too. See [delivery and recovery](input-continuity.md).
 
 A room can have up to 50 people and eight agents. Buffered group replies become public only when complete. Failed or cancelled work retains its session binding and original source messages. An uncertain delivery needs explicit review before that agent continues; it is never silently rebuilt or replayed. Removal of a person immediately revokes room access and cancels current work; adding participants waits for the current turn to finish.
+
+An agent can be removed when no room turn is running. Removal revokes outstanding room grants. Other agents retain their saved session bindings and acknowledged transcript positions; their next turn uses the existing restore path with a fresh grant. This does not extend an old grant's lifetime or establish uninterrupted context access for background work using that grant. Removing an agent does not erase the shared transcript.
 
 ## Attachments and history
 
