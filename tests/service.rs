@@ -2027,6 +2027,302 @@ async fn detaching_one_agent_preserves_remaining_session_and_revokes_old_grants(
     );
 }
 
+// These cases control public admission order with the existing turn gate. They
+// do not inject a scheduler checkpoint inside the synchronous delete handler.
+async fn acp_membership_idle(f: &Fixture, room: &str) {
+    let mut changes = f.state.changes.subscribe();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let working = f.state.running.lock().unwrap().contains_key(room);
+            if !working {
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("The fixture's admitted turn did not settle");
+}
+
+fn acp_membership_frames(f: &Fixture) -> Vec<Value> {
+    std::fs::read_to_string(f._home.path().join("frames.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+async fn acp_membership_post(
+    f: &Fixture,
+    room: &str,
+    agent: &str,
+    id: &str,
+    text: &str,
+) -> StatusCode {
+    request(
+        &f.app,
+        "POST",
+        &format!("/api/v1/conversations/{room}/messages"),
+        Some(&f.admin),
+        Some(json!({"text":text,"request_id":id,"target_agent_ids":[agent]})),
+    )
+    .await
+    .0
+}
+
+async fn acp_membership_admission_case(delete_room: bool, admission_first: bool) {
+    let f = fixture();
+    let mut agent = f.state.config.agent.clone().unwrap();
+    agent.env.insert("FIXTURE_RESTORE".into(), "resume".into());
+    for id in ["default", "reviewer"] {
+        assert_eq!(
+            request(
+                &f.app,
+                "POST",
+                "/api/v1/agents",
+                Some(&f.admin),
+                Some(json!({"id":id,"config":agent}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let agents = if delete_room {
+        vec!["default"]
+    } else {
+        vec!["default", "reviewer"]
+    };
+    let room = f
+        .state
+        .create_room(
+            "Admission order",
+            "owner",
+            &agents.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let room = room["id"].as_str().unwrap().to_owned();
+    // Deleting a whole room intentionally removes its bindings. B's unaffected
+    // control must be in another room; detaching A preserves B in this room.
+    let b_room = if delete_room {
+        f.state
+            .create_room("Unaffected work", "owner", &["reviewer".into()])
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    } else {
+        room.clone()
+    };
+    for (id, target) in [(&room, "default"), (&b_room, "reviewer")] {
+        assert_eq!(
+            acp_membership_post(
+                &f,
+                id,
+                target,
+                &uuid::Uuid::new_v4().to_string(),
+                "Seed work"
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+        acp_membership_idle(&f, id).await;
+    }
+    let binding = |room: &str, agent: &str| -> (String, String, i64) {
+        f.state.db.lock().unwrap().query_row(
+            "SELECT session_id,endpoint,last_seq FROM room_agents WHERE conversation_id=?1 AND agent_id=?2",
+            rusqlite::params![room, agent], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap()
+    };
+    let a_before = binding(&room, "default");
+    let b_before = binding(&b_room, "reviewer");
+    assert_ne!(a_before.0, b_before.0);
+    let b_history = f.state.messages(&b_room, 100).unwrap();
+    let frames_before = acp_membership_frames(&f);
+    let grant = context::grant(&f.state, &room).unwrap();
+    let grants = || -> Vec<String> {
+        let db = f.state.db.lock().unwrap();
+        db.prepare("SELECT hash FROM grants WHERE conversation_id=?1 ORDER BY hash")
+            .unwrap()
+            .query_map([&room], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(!grants().is_empty());
+    let delete_path = if delete_room {
+        format!("/api/v1/conversations/{room}")
+    } else {
+        format!("/api/v1/conversations/{room}/agents/default")
+    };
+    if admission_first {
+        // Intake is durable and owns the room, but no ACP peer can dispatch yet.
+        let permits = f
+            .state
+            .turn_gate
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let input = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            acp_membership_post(&f, &room, "default", &input, "Admitted before removal").await,
+            StatusCode::ACCEPTED
+        );
+        assert!(f.state.running.lock().unwrap().contains_key(&room));
+        let delivery: (i64, String) = f
+            .state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*),min(state) FROM input_deliveries WHERE message_id=?1",
+                [&input],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delivery, (1, "received".into()));
+        let messages = f.state.messages(&room, 100).unwrap();
+        let old_grants = grants();
+        assert_eq!(
+            request(&f.app, "DELETE", &delete_path, Some(&f.admin), None)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(f.state.messages(&room, 100).unwrap(), messages);
+        assert_eq!(grants(), old_grants);
+        assert_eq!(binding(&room, "default"), a_before);
+        assert_eq!(binding(&b_room, "reviewer"), b_before);
+        assert_eq!(acp_membership_frames(&f), frames_before);
+        drop(permits);
+        acp_membership_idle(&f, &room).await;
+        let delivered = agent_conversations::delivery::list(&f.state, &room).unwrap();
+        let rows: Vec<_> = delivered
+            .iter()
+            .filter(|row| row["message_id"] == input)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["state"], "completed");
+        let frames = acp_membership_frames(&f);
+        let prompts: Vec<_> = frames
+            .iter()
+            .filter(|row| {
+                row["method"] == "session/prompt"
+                    && row["params"]["_meta"]["com.microsoft.amplifier.conversations"]["messageId"]
+                        == input
+            })
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0]["params"]["sessionId"], a_before.0);
+    }
+    let before_removal = f.state.messages(&room, 100).unwrap();
+    assert_eq!(
+        request(&f.app, "DELETE", &delete_path, Some(&f.admin), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert!(grants().is_empty());
+    if delete_room {
+        assert!(!f.state.exists(&room).unwrap());
+    } else {
+        assert_eq!(f.state.messages(&room, 100).unwrap(), before_removal);
+        assert_eq!(f.state.room_agents(&room).unwrap().len(), 1);
+    }
+    assert_eq!(binding(&b_room, "reviewer"), b_before);
+    // A's admitted source/reply may extend the shared room; it cannot rewrite B's work.
+    assert_eq!(
+        &f.state.messages(&b_room, 100).unwrap()[..b_history.len()],
+        b_history.as_slice()
+    );
+    assert_eq!(request(&f.app, "POST", "/context/v1/query", Some(&f.context),
+        Some(json!({"operation":"read","access":{"mode":"grant","grant":grant},"conversation_id":room}))).await.0,
+        StatusCode::FORBIDDEN);
+    let frames = acp_membership_frames(&f);
+    let refused = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        acp_membership_post(&f, &room, "default", &refused, "Must not dispatch").await,
+        if delete_room {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        }
+    );
+    let absent: (i64, i64) = f.state.db.lock().unwrap().query_row(
+        "SELECT (SELECT count(*) FROM messages WHERE id=?1),(SELECT count(*) FROM input_deliveries WHERE message_id=?1)",
+        [&refused], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(absent, (0, 0));
+    assert_eq!(acp_membership_frames(&f), frames);
+    let b_input = uuid::Uuid::new_v4().to_string();
+    let b_text = "Continue the remaining agent's work";
+    assert_eq!(
+        acp_membership_post(&f, &b_room, "reviewer", &b_input, b_text).await,
+        StatusCode::ACCEPTED
+    );
+    acp_membership_idle(&f, &b_room).await;
+    let b_after = binding(&b_room, "reviewer");
+    assert_eq!((&b_after.0, &b_after.1), (&b_before.0, &b_before.1));
+    assert!(b_after.2 > b_before.2);
+    let frames = acp_membership_frames(&f);
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|row| row["method"] == "session/new")
+            .count(),
+        2
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|row| row["method"] == "session/resume")
+            .count(),
+        1 + usize::from(admission_first)
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|row| row["method"] == "session/prompt")
+            .count(),
+        3 + usize::from(admission_first)
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|row| row["method"] == "session/load" || row["method"] == "session/cancel")
+    );
+    let last = frames
+        .iter()
+        .rev()
+        .find(|row| row["method"] == "session/prompt")
+        .unwrap();
+    assert_eq!(last["params"]["sessionId"], b_before.0);
+    assert_eq!(
+        last["params"]["_meta"]["com.microsoft.amplifier.conversations"]["messageId"],
+        b_input
+    );
+    assert_eq!(last["params"]["prompt"][0]["text"], b_text);
+}
+
+#[tokio::test]
+async fn acp_membership_admission_before_detach() {
+    acp_membership_admission_case(false, true).await;
+}
+
+#[tokio::test]
+async fn acp_membership_admission_after_detach() {
+    acp_membership_admission_case(false, false).await;
+}
+
+#[tokio::test]
+async fn acp_membership_admission_before_room_deletion() {
+    acp_membership_admission_case(true, true).await;
+}
+
+#[tokio::test]
+async fn acp_membership_admission_after_room_deletion() {
+    acp_membership_admission_case(true, false).await;
+}
+
 #[tokio::test]
 async fn attachments_are_private_bounded_and_honest_about_acp_capabilities() {
     use base64::{Engine, engine::general_purpose::STANDARD};
