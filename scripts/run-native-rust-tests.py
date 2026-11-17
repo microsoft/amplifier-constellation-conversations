@@ -32,6 +32,7 @@ SELECTIONS = [
     ("native_update_launch::", False),
     ("native_startup_state::", False),
     ("update_admission::", False),
+    ("companion::handoff::tests::", False),
     ("companion_awareness::process_tests::stalled_observer_and_descendant_are_stopped_without_facts", True),
 ]
 

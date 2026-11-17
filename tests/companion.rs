@@ -47,16 +47,29 @@ fn fixture(mode: &str) -> Fixture {
         .unwrap();
     let python = String::from_utf8(python.stdout).unwrap().trim().to_owned();
     let bridge = home.path().join("bridge.py");
-    std::fs::write(&bridge,r#"import json,sys,pathlib,traceback
+    std::fs::write(&bridge,r#"import json,sys,pathlib,traceback,threading,time
 root=pathlib.Path(__file__).parent
 def fixture_exception(kind,error,tb):
  with (root/'bridge-error.txt').open('w') as output:traceback.print_exception(kind,error,tb,file=output)
 sys.excepthook=fixture_exception
-def emit(v): print(json.dumps(v),flush=True)
+emit_lock=threading.Lock()
+def emit(v):
+ with emit_lock:print(json.dumps(v),flush=True)
 c=json.loads(sys.stdin.readline())
 with (root/'bridge-starts').open('a') as f:f.write('start\n')
 (root/'bridge-initial.json').write_text(json.dumps(c))
 voice=(root/'bridge-mode').read_text()
+if voice=='followthrough':
+ # Test-only provider control: production receives actual bridge events, not
+ # pre-populated delegation rows. Atomic publication avoids partial reads.
+ def provider_inputs():
+  inbox=root/'provider-input.json'
+  while True:
+   if inbox.exists():
+    events=json.loads(inbox.read_text());inbox.unlink()
+    for event in events:emit({'type':'event','event':event})
+   time.sleep(.01)
+ threading.Thread(target=provider_inputs,daemon=True).start()
 receipt_port=34567
 if voice=='retained_receipt':
  import os,threading,http.server,atexit
@@ -90,7 +103,7 @@ if voice not in ('quiet','connecting','upload_delegate','retained_receipt'):
   emit({'type':'event','event':event});emit({'type':'event','event':event})
  if voice in ('anchor','anchors'):emit({'type':'event','event':{'type':'session.input_transcript.delta','event_id':'human-tail','delta':' elsewhere','start_ms':13000,'end_ms':13200}})
  if voice=='overlap_ack':emit({'type':'event','event':{'type':'session.output_transcript.delta','event_id':'assistant-ack','delta':'Let me check.','start_ms':90,'end_ms':110}})
- if voice in ('delegate','missing','overlap_ack','anchor','anchors','append_error'):
+ if voice in ('delegate','missing','overlap_ack','anchor','anchors','append_error','followthrough'):
   event={'type':'session.delegation.created','event_id':'delegation-1','offset_ms':100,'delegation':{'id':'delegate-1','target':'client'}}
   if voice in ('anchor','anchors'):event['offset_ms']=13000
   emit({'type':'event','event':event});emit({'type':'event','event':event})
@@ -511,6 +524,7 @@ async fn public_fragments_are_retained_without_automatic_backend_prompt() {
             .count(),
         1
     );
+    tokio::time::sleep(Duration::from_millis(2300)).await;
     assert!(!f.home.path().join("acp.jsonl").exists());
     let count: i64 =
         f.s.db
@@ -531,6 +545,10 @@ async fn public_fragments_are_retained_without_automatic_backend_prompt() {
         .unwrap()
     );
     end(&f, id).await;
+    assert!(
+        !f.home.path().join("acp.jsonl").exists(),
+        "initial speech is not close-tail work"
+    );
 }
 #[tokio::test]
 async fn duplicate_delegation_executes_one_actual_acp_prompt_and_only_settled_result_returns() {
@@ -3033,6 +3051,565 @@ fn agent_fixture_env(f: &Fixture, name: &str, value: &str) {
         [config.to_string()],
     )
     .unwrap();
+}
+
+// These regressions reproduce a real missed follow-up: the provider supplied
+// human transcripts and a voice acknowledgment, but no second delegation.
+// All inputs below cross the fake provider's stdio boundary into production
+// provider_event; none inserts a correction delegation or input delivery.
+fn followthrough_correction_events() -> Vec<Value> {
+    [
+        " I'm",
+        " the reviewer",
+        ", so",
+        " I",
+        " approve",
+        " that option",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, text)| {
+        json!({"type":"session.input_transcript.delta",
+                "event_id":format!("followthrough-human-{i}"),"delta":text,
+                "start_ms":1000 + i * 200,"end_ms":1200 + i * 200})
+    })
+    .collect()
+}
+
+fn followthrough_provider_delegation() -> Value {
+    json!({"type":"session.delegation.created","event_id":"followthrough-provider-request",
+        "offset_ms":2200,"delegation":{"id":"followthrough-provider","target":"client"}})
+}
+
+async fn followthrough_provider_events(f: &Fixture, call: &Value, events: &[Value]) {
+    let input = f.home.path().join("provider-input.json");
+    assert!(!input.exists(), "previous provider batch not consumed");
+    let staged = f.home.path().join("provider-input.staged");
+    std::fs::write(&staged, serde_json::to_vec(events).unwrap()).unwrap();
+    std::fs::rename(staged, &input).unwrap();
+    let call_id = call["id"].as_str().unwrap();
+    let last = events.last().unwrap()["event_id"].as_str().unwrap();
+    for _ in 0..200 {
+        let observed: bool = f
+            .s
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM companion_events WHERE call_id=?1 AND event_key=?2)",
+                rusqlite::params![call_id, last],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if observed {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("fake provider event was not retained: {last}");
+}
+
+fn followthrough_prompts(f: &Fixture) -> Vec<Value> {
+    companion_acp_frames(f)
+        .into_iter()
+        .filter(|v| v["method"] == "session/prompt")
+        .collect()
+}
+
+fn assert_followthrough_source(frame: &Value) {
+    let text = frame["params"]["prompt"][0]["text"].as_str().unwrap();
+    let segments = current_human_segments(text);
+    let human = segments
+        .iter()
+        .filter(|v| v["role"] == "user")
+        .map(|v| v["text"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(human, " I'm the reviewer, so I approve that option");
+    assert!(
+        !human.contains("Please inspect"),
+        "old instruction became new authority"
+    );
+    assert!(
+        !human.contains("other reviewer"),
+        "voice promise became human authority"
+    );
+}
+
+fn assert_no_internal_provider_delegation(f: &Fixture) {
+    let commands =
+        std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap_or_default();
+    for command in commands.lines() {
+        let command: Value = serde_json::from_str(command).unwrap();
+        assert!(
+            !command["delegation_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("companion-human:")),
+            "internal handoff must not impersonate a provider delegation: {command}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn followthrough_without_provider_delegation_reaches_same_backend_once() {
+    let f = fixture("followthrough");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    until(&f, id, "card").await;
+    // An unknown old action is an observation fixture, not an actual new effect.
+    // This test proves forwarding leaves its identity/result unchanged; actual
+    // helper lost-ACK/no-reexecution coverage remains in companion_tools.rs.
+    let unknown_action = uuid::Uuid::new_v4().to_string();
+    let unknown_result =
+        json!({"request_id":unknown_action,"state":"unknown","transport_submitted":null})
+            .to_string();
+    f.s.db.lock().unwrap().execute("INSERT INTO companion_actions(call_id,request_id,delegation_id,connection_id,instruction,source,state,result,created_at) VALUES(?1,?2,'delegate-1','fixture-only','Original effect; do not replay','{}','unknown',?3,?4)",rusqlite::params![id,unknown_action,unknown_result,now_ms()]).unwrap();
+    let mut events = followthrough_correction_events();
+    // The real failure contained a plausible voice answer. It must not count
+    // as acceptance of the human correction by the underlying agent.
+    events.push(
+        json!({"type":"session.output_transcript.delta","event_id":"followthrough-voice-ack",
+        "delta":"Got it, I'll ask the other reviewer.","start_ms":2400,"end_ms":2800}),
+    );
+    followthrough_provider_events(&f, &call, &events).await;
+    companion_frame(&f, "session/prompt", 2).await;
+    let prompts = followthrough_prompts(&f);
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(
+        prompts[0]["params"]["sessionId"],
+        prompts[1]["params"]["sessionId"]
+    );
+    assert_followthrough_source(&prompts[1]);
+    // Duplicate transcript events must not turn the correction into new work.
+    followthrough_provider_events(&f, &call, &events).await;
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert_eq!(followthrough_prompts(&f).len(), 2);
+    {
+        let db = f.s.db.lock().unwrap();
+        let cards: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cards, 2);
+        let accepted: i64 = db.query_row("SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='context_delivery' AND json_extract(data,'$.channel')='commentary' AND json_extract(data,'$.state')='accepted'", [id], |r|r.get(0)).unwrap();
+        assert_eq!(
+            accepted, 2,
+            "corrected result must reach provider commentary"
+        );
+        let retained: (String, String, String) = db
+            .query_row(
+                "SELECT request_id,state,result FROM companion_actions WHERE call_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (unknown_action, "unknown".into(), unknown_result));
+    }
+    assert_no_internal_provider_delegation(&f);
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn followthrough_provider_and_automatic_admission_share_human_source() {
+    for provider_first in [true, false] {
+        let f = fixture("followthrough");
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        until(&f, id, "card").await;
+        let mut events = followthrough_correction_events();
+        if provider_first {
+            events.extend([
+                followthrough_provider_delegation(),
+                followthrough_provider_delegation(),
+            ]);
+        }
+        followthrough_provider_events(&f, &call, &events).await;
+        companion_frame(&f, "session/prompt", 2).await;
+        if !provider_first {
+            followthrough_provider_events(
+                &f,
+                &call,
+                &[
+                    followthrough_provider_delegation(),
+                    followthrough_provider_delegation(),
+                ],
+            )
+            .await;
+        }
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        let prompts = followthrough_prompts(&f);
+        assert_eq!(prompts.len(), 2, "provider_first={provider_first}");
+        assert_followthrough_source(&prompts[1]);
+        assert_no_internal_provider_delegation(&f);
+        end(&f, id).await;
+    }
+}
+
+#[tokio::test]
+async fn followthrough_without_provider_delegation_steers_active_original_turn() {
+    let f = fixture("followthrough");
+    companion_steering_peer(&f, "native");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    companion_frame(&f, "session/prompt", 1).await;
+    followthrough_provider_events(&f, &call, &followthrough_correction_events()).await;
+    companion_frame(&f, "_session/steering", 1).await;
+    let frames = companion_acp_frames(&f);
+    let steering = frames
+        .iter()
+        .find(|v| v["method"] == "_session/steering")
+        .unwrap();
+    assert_followthrough_source(steering);
+    assert_eq!(followthrough_prompts(&f).len(), 1);
+    std::fs::write(f.home.path().join("steering-release"), b"1").unwrap();
+    until(&f, id, "card").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(followthrough_prompts(&f).len(), 1);
+    assert_eq!(
+        companion_acp_frames(&f)
+            .iter()
+            .filter(|v| v["method"] == "_session/steering")
+            .count(),
+        1
+    );
+    assert_no_internal_provider_delegation(&f);
+    end(&f, id).await;
+}
+
+#[tokio::test]
+async fn followthrough_close_preserves_observed_tail_without_reopening_media() {
+    let f = fixture("followthrough");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    until(&f, id, "card").await;
+    followthrough_provider_events(&f, &call, &followthrough_correction_events()).await;
+    // Close before the quiet coalescing window: an already established backend
+    // conversation must retain this observed human tail as partial source.
+    end(&f, id).await;
+    companion_frame(&f, "session/prompt", 2).await;
+    let prompts = followthrough_prompts(&f);
+    assert_eq!(prompts.len(), 2);
+    assert_followthrough_source(&prompts[1]);
+    assert_eq!(
+        prompts[0]["params"]["sessionId"],
+        prompts[1]["params"]["sessionId"]
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(f.home.path().join("bridge-starts")).unwrap(),
+        "start\n"
+    );
+    let (_, record) = request(&f, "GET", &format!("/api/v1/companion/calls/{id}"), None).await;
+    assert_eq!(record["state"], "closed");
+    let commands = std::fs::read_to_string(f.home.path().join("bridge-commands")).unwrap();
+    let commands = commands
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let closed = commands.iter().position(|v| v["op"] == "close").unwrap();
+    assert!(
+        !commands[closed + 1..].iter().any(|v| v["op"] == "append"),
+        "no new speech after media close"
+    );
+    assert_no_internal_provider_delegation(&f);
+}
+
+#[tokio::test]
+async fn followthrough_revoked_private_room_closes_without_admitting_human_tail() {
+    let f = fixture("followthrough");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    until(&f, id, "card").await;
+    followthrough_provider_events(&f, &call, &followthrough_correction_events()).await;
+    assert_eq!(followthrough_prompts(&f).len(), 1);
+    // Revoke the private room boundary after actual provider intake, before
+    // quiet admission. The close-tail path must recheck current access too.
+    f.s.db.lock().unwrap().execute("INSERT INTO room_members(conversation_id,username,role,joined_at) VALUES(?1,'other','member',?2)",rusqlite::params![call["conversation_id"].as_str().unwrap(),now_ms()]).unwrap();
+    until(&f, id, "closed").await;
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert_eq!(followthrough_prompts(&f).len(), 1);
+    let db = f.s.db.lock().unwrap();
+    let retained:i64=db.query_row("SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='transcript' AND event_key LIKE 'followthrough-human-%'",[id],|r|r.get(0)).unwrap();
+    assert_eq!(retained, 6, "unadmitted human source remains saved");
+    let actions: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM companion_actions WHERE call_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(actions, 0);
+    let deliveries: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM input_deliveries WHERE conversation_id=?1",
+            [call["conversation_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deliveries, 1,
+        "revocation must not create another backend delivery"
+    );
+}
+
+#[tokio::test]
+async fn followthrough_received_only_steering_remains_unknown_without_replay() {
+    let f = fixture("followthrough");
+    companion_steering_peer(&f, "received-only");
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    companion_frame(&f, "session/prompt", 1).await;
+    followthrough_provider_events(&f, &call, &followthrough_correction_events()).await;
+    companion_frame(&f, "_session/steering", 1).await;
+    followthrough_provider_events(
+        &f,
+        &call,
+        &[
+            followthrough_provider_delegation(),
+            followthrough_provider_delegation(),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert_eq!(followthrough_prompts(&f).len(), 1);
+    assert_eq!(
+        companion_acp_frames(&f)
+            .iter()
+            .filter(|v| v["method"] == "_session/steering")
+            .count(),
+        1
+    );
+    std::fs::write(f.home.path().join("steering-release"), b"1").unwrap();
+    wait_delegation(&f, &call, "delegate-1", "completed").await;
+    let mut deliveries = Vec::<(String, String)>::new();
+    for _ in 0..200 {
+        deliveries = {
+            let db = f.s.db.lock().unwrap();
+            // A covered provider signal intentionally aliases the canonical
+            // source. Count actual delivery identities, not join aliases.
+            let mut q=db.prepare("SELECT DISTINCT d.id,d.state FROM input_deliveries d JOIN companion_delegations c ON c.message_id=d.message_id WHERE c.call_id=?1 AND c.id!='delegate-1'").unwrap();
+            q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        if deliveries.len() == 1 && deliveries[0].1 == "unknown" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "one original delivery, including aliases"
+    );
+    assert_eq!(
+        deliveries[0].1, "unknown",
+        "received only is not incorporation/completion"
+    );
+    end(&f, id).await;
+    assert_eq!(followthrough_prompts(&f).len(), 1);
+}
+
+async fn followthrough_card_count(f: &Fixture, id: &str, expected: i64) {
+    for _ in 0..500 {
+        let count: i64 =
+            f.s.db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        if count == expected {
+            return;
+        }
+        assert!(count < expected, "unexpected duplicate result card");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("missing canonical result card {expected}");
+}
+
+#[tokio::test]
+async fn followthrough_actual_action_unknown_ack_and_status_correction_never_repeat_effect() {
+    let f = fixture("followthrough");
+    let python = f.s.agent("default").unwrap().unwrap().command;
+    let helper = f.home.path().join("caption-helper.py");
+    std::fs::write(
+        &helper,
+        r#"import json,pathlib,sys
+root=pathlib.Path(__file__).parent
+body=json.load(sys.stdin)
+with (root/'caption-effects.jsonl').open('a') as out:out.write(json.dumps(body)+'\n')
+# Real disposable effect has happened; deliberately lose its acknowledgment.
+sys.exit(17)
+"#,
+    )
+    .unwrap();
+    std::fs::write(f.home.path().join("companion-actions.json"),json!({"enabled":true,"agents":{"default":[{"id":"fixture-caption","label":"Disposable caption","description":"Local test effect only","command":[python,helper]}]}}).to_string()).unwrap();
+
+    // The ACP fixture calls the real loopback product action endpoint. The
+    // helper is actually launched; no live connector, world, model or provider
+    // is configured. This is not an official MCP SDK transport qualification.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let app = f.app.clone();
+    f.browser_tasks
+        .lock()
+        .unwrap()
+        .push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+    agent_fixture_env(&f, "FIXTURE_ACTION_API", &api);
+    let agent = f.home.path().join("caption-agent.py");
+    std::fs::write(&agent,r#"import json,os,pathlib,re,sys,urllib.request,uuid
+root=pathlib.Path(__file__).parent
+def emit(value):print(json.dumps({'jsonrpc':'2.0',**value}),flush=True)
+def tool(method,suffix,body=None):
+ config=json.loads((root/'bridge-initial.json').read_text())['mcp']
+ request=urllib.request.Request(os.environ['FIXTURE_ACTION_API']+'/api/v1/companion/calls/'+config['call_id']+'/tools/'+suffix,method=method,data=None if body is None else json.dumps(body).encode(),headers={'Authorization':'Bearer '+config['token'],'Content-Type':'application/json'})
+ with urllib.request.urlopen(request,timeout=5) as response:result=json.load(response)
+ with (root/'caption-observations.jsonl').open('a') as out:out.write(json.dumps({'method':method,'suffix':suffix,'result':result})+'\n')
+ return result
+for line in sys.stdin:
+ value=json.loads(line);method=value.get('method');params=value.get('params',{})
+ with (root/'acp.jsonl').open('a') as out:out.write(json.dumps(value)+'\n')
+ if method=='initialize':result={'protocolVersion':1,'agentCapabilities':{'loadSession':True,'mcpCapabilities':{'http':True}}}
+ elif method in ('session/new','session/load'):result={'sessionId':params.get('sessionId','caption-fixture-session')}
+ elif method=='session/prompt':
+  text=params['prompt'][0]['text']
+  current=json.loads(text.split('Current human source (',1)[1].split('):\n',1)[1].split('\n\nRecent conversation,',1)[0])
+  human=''.join(s['text'] for s in current if s['role']=='user')
+  answer='The disposable caption plan is ready; no action requested.'
+  if 'apply the revised caption' in human:
+   request_id=str(uuid.uuid4());(root/'caption-request').write_text(request_id)
+   delegation=re.search(r"This new request's delegation_id is ([^;]+);",text).group(1)
+   receipt=tool('POST','actions',{'request_id':request_id,'delegation_id':delegation,'connection_id':'fixture-caption','instruction':'Apply the revised disposable caption once.'})
+   assert receipt['state']=='unknown',receipt
+   status=tool('GET','actions/'+request_id)
+   assert status['state']=='unknown' and status['request_id']==request_id,status
+   answer='The original caption action outcome is unknown. I will not repeat it.'
+  elif 'Only inspect that original receipt' in human:
+   request_id=(root/'caption-request').read_text()
+   status=tool('GET','actions/'+request_id)
+   assert status['state']=='unknown' and status['request_id']==request_id,status
+   answer='I checked the same original receipt. It remains unknown; nothing was resubmitted.'
+  emit({'method':'session/update','params':{'sessionId':params['sessionId'],'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':answer}}}})
+  result={'stopReason':'end_turn'}
+ else:continue
+ emit({'id':value['id'],'result':result})
+"#).unwrap();
+    {
+        let db = f.s.db.lock().unwrap();
+        let raw: String = db
+            .query_row(
+                "SELECT config FROM agent_endpoints WHERE id='default'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut config: Value = serde_json::from_str(&raw).unwrap();
+        config["args"] = json!([agent]);
+        db.execute(
+            "UPDATE agent_endpoints SET config=?1 WHERE id='default'",
+            [config.to_string()],
+        )
+        .unwrap();
+    }
+    let (_, call) = start(&f).await;
+    let id = call["id"].as_str().unwrap();
+    followthrough_card_count(&f, id, 1).await;
+    let effect_event = json!({"type":"session.input_transcript.delta","event_id":"caption-new-human","delta":"Actually, apply the revised caption to the fixture once.","start_ms":1000,"end_ms":1200});
+    followthrough_provider_events(&f, &call, std::slice::from_ref(&effect_event)).await;
+    followthrough_card_count(&f, id, 2).await;
+    let original: String = std::fs::read_to_string(f.home.path().join("caption-request")).unwrap();
+    let before: (String, String, String) = f
+        .s
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT state,result,source FROM companion_actions WHERE call_id=?1 AND request_id=?2",
+            rusqlite::params![id, original],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(before.0, "unknown");
+    let correction = json!({"type":"session.input_transcript.delta","event_id":"caption-status-correction","delta":"Only inspect that original receipt; do not apply again.","start_ms":3000,"end_ms":3400});
+    followthrough_provider_events(&f, &call, std::slice::from_ref(&correction)).await;
+    followthrough_card_count(&f, id, 3).await;
+    let provider = json!({"type":"session.delegation.created","event_id":"caption-late-provider","offset_ms":3400,"delegation":{"id":"caption-late-provider","target":"client"}});
+    followthrough_provider_events(
+        &f,
+        &call,
+        &[effect_event, correction, provider.clone(), provider],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    let effects = std::fs::read_to_string(f.home.path().join("caption-effects.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        effects.len(),
+        1,
+        "lost ACK and refinement must not repeat the helper effect"
+    );
+    assert_eq!(effects[0]["request_id"], original);
+    assert_eq!(effects[0]["source"]["call_id"], id);
+    assert_eq!(
+        effects[0]["source"]["original_text"],
+        "Actually, apply the revised caption to the fixture once."
+    );
+    assert_eq!(effects[0]["source"]["actor"], "owner");
+    let observations = std::fs::read_to_string(f.home.path().join("caption-observations.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|v| v["method"] == "POST")
+            .count(),
+        1
+    );
+    assert_eq!(
+        observations.iter().filter(|v| v["method"] == "GET").count(),
+        2
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|v| v["result"]["state"] == "unknown")
+    );
+    assert_eq!(followthrough_prompts(&f).len(), 3);
+    let after: (String, String, String) = f
+        .s
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT state,result,source FROM companion_actions WHERE call_id=?1 AND request_id=?2",
+            rusqlite::params![id, original],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+    assert_no_internal_provider_delegation(&f);
+    end(&f, id).await;
+    assert_eq!(
+        std::fs::read_to_string(f.home.path().join("caption-effects.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
