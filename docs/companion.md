@@ -321,12 +321,22 @@ cloud vision fallback for a local-model agent.
 ## Work, results, and uncertainty
 
 **Connected** means audio and control are established, not that backend work has
-been accepted. **Delegated** means a timed provider request was associated with the
-authenticated caller's transcript and submitted through the ordinary ACP delivery
-path. Transcript events are fragments, not complete-turn markers, and delegation
-events contain an ID and offset rather than a task description. Missing or
+been accepted. **Delegated** means a provider request or a local continuation was
+associated with the authenticated caller's transcript and submitted through the
+ordinary ACP delivery path. Transcript events are fragments, not complete-turn
+markers, and provider delegation events contain an ID and offset rather than a
+task description. Missing or
 ambiguous requests are held instead of invented. Durable identities prevent
 repeating accepted submissions; unknown admission is never automatically replayed.
+
+Once a call has handed work to its selected agent, later human speech continues
+that conversation even if the voice provider omits another delegation event.
+The host collects the newly observed fragments after a short quiet interval and
+uses the same authenticated delivery path. A provider delegation and this local
+handoff claim the same fragment identities, so they cannot submit those words
+twice. Initial greetings in a call that has never delegated work remain local.
+Speech is still partial input: a quiet interval does not prove a finished thought
+or authorize repeating an earlier action.
 
 Settled public results retain their request identity and full text in the
 conversation. The card projection is bounded; **Show full result** loads the complete saved
@@ -493,7 +503,8 @@ Optional MCP uses `POST /companion/calls/{id}/mcp`. Its host callbacks under
 not browser session authorization, and reject browser Origin requests. The MCP
 SDK owns protocol framing; these are Companion application routes, not ACP
 extensions. `companion_request_action` takes `connection_id`, `instruction`, the
-original `delegation_id` (a provider ID of 1–160 characters), and a UUID `request_id`.
+original `delegation_id` (the provider or local handoff ID supplied with the
+request, up to 160 characters), and a UUID `request_id`.
 `companion_show` takes a `title` and either an HTTP(S) `url` or bounded plain `text`.
 Optional `kind` is `auto`, `link`, `image`, or `video` for a URL, and `note` for text.
 Saving a card is neither platform publication nor evidence that it was displayed.
@@ -811,6 +822,12 @@ prompt, ordinary fallback retains the original source and original two-second
 deadline. Empty input, cold starts, and unsupported endpoints keep the normal
 wait. A received-only steering acknowledgment remains unknown at terminal unless
 the endpoint supplies incorporation evidence; it is never automatically resent.
+
+A local continuation can use that same steering or ordinary-delivery path.
+Hanging up seals any observed continuation of previously handed-off work before
+closing admission; it does not invent unspoken words or reopen action tools.
+Its saved result remains available after the call. Provider acknowledgment and
+local handoff identities remain distinct.
 
 Results are durably queued separately from the voice transport. Fresh authenticated
 browser observations decide when a result may enter the speaking context: both

@@ -1,6 +1,8 @@
 //! A foreground voice call is an experience, not a replacement ACP runtime.
 //! Provider events are source facts; delegation, backend completion and playback
 //! are independent durable records. Closing media never cancels accepted work.
+#[path = "companion_handoff.rs"]
+mod handoff;
 #[path = "companion_setup.rs"]
 mod setup;
 #[path = "companion_transcript.rs"]
@@ -36,6 +38,9 @@ use tokio::{
 #[derive(Default)]
 pub struct Runtime {
     create: tokio::sync::Mutex<()>,
+    // Provider delegation and locally collected continuation share one intake
+    // path. This lock covers only local admission, never backend execution.
+    handoff: tokio::sync::Mutex<()>,
     pub(crate) controls: Mutex<HashMap<String, mpsc::Sender<Value>>>,
 }
 #[cfg(test)]
@@ -1094,7 +1099,7 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
             };
             if let Some(command)=command {
                 if closing.is_some() && command["op"]!="close" { continue; }
-                if command["op"]=="close" { if closing.is_none() { let heartbeat_at:i64=s.db.lock().unwrap().query_row("SELECT heartbeat_at FROM companion_calls WHERE id=?1",[&id],|r|r.get(0))?; lifecycle_once(&s,&id,"host-close-request",json!({"type":"host_close_requested","source":command["source"].as_str().unwrap_or("control"),"heartbeat_age_ms":now_ms()-heartbeat_at}))?; } closing.get_or_insert_with(||shutdown_deadline(started.elapsed(),ready.is_some())); s.db.lock().unwrap().execute("UPDATE companion_calls SET state='closing' WHERE id=?1",[&id])?; }
+                if command["op"]=="close" { if closing.is_none() { let heartbeat_at:i64=s.db.lock().unwrap().query_row("SELECT heartbeat_at FROM companion_calls WHERE id=?1",[&id],|r|r.get(0))?; lifecycle_once(&s,&id,"host-close-request",json!({"type":"host_close_requested","source":command["source"].as_str().unwrap_or("control"),"heartbeat_age_ms":now_ms()-heartbeat_at}))?; } closing.get_or_insert_with(||shutdown_deadline(started.elapsed(),ready.is_some())); s.db.lock().unwrap().execute("UPDATE companion_calls SET state='closing' WHERE id=?1",[&id])?; preserve_human_tail(&s,&id,&room,&h).await; }
                 if command["op"] == "delivery_batch" {
                     let commands = command["commands"].as_array().context("Invalid delivery batch")?;
                     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1109,6 +1114,12 @@ async fn run(call: CallRun, mut rx: mpsc::Receiver<Value>, ready: oneshot::Sende
             if ready.is_some() && closing.is_none() && started.elapsed()>SETUP_AND_CLEANUP { anyhow::bail!("Voice setup and cleanup timed out"); }
         }
     }.await;
+    // Include fragments delivered while provider close was in flight. Durable
+    // intake is local and does not wait for reasoning or reopen voice media.
+    let _ = s.db.lock().unwrap().execute(
+        "UPDATE companion_calls SET state='closing' WHERE id=?1 AND state IN ('starting','connecting','connected')", [&id],
+    );
+    preserve_human_tail(&s, &id, &room, &h).await;
     let bridge_confirmed = result.as_ref().is_ok_and(|v| *v);
     let provider_reason = s.db.lock().unwrap().query_row(
         "SELECT json_extract(e.data,'$.reason') FROM companion_events e JOIN companion_calls c ON c.id=e.call_id WHERE e.call_id=?1 AND e.kind='provider' AND json_extract(e.data,'$.type')='session.closed' AND json_extract(e.data,'$.session.id')=c.session_id ORDER BY e.seq DESC LIMIT 1",
@@ -1301,7 +1312,7 @@ fn provider_event(s: &AppState, id: &str, room: &str, owner: &str, v: &Value) ->
         }
         let did = v["delegation"]["id"]
             .as_str()
-            .filter(|v| !v.is_empty() && v.len() <= 512)
+            .filter(|v| !v.is_empty() && v.len() <= 512 && !handoff::internal(v))
             .context("Invalid delegation")?;
         let offset = v["offset_ms"]
             .as_i64()
@@ -1413,7 +1424,77 @@ fn active_call(s: &AppState, id: &str) -> Result<bool> {
     )?)
 }
 async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Result<()> {
+    let _intake = s.companion.handoff.lock().await;
     if !active_call(s, id)? {
+        return Ok(());
+    }
+    advance_pending(s, id, room, h, false).await?;
+    if handoff::reserve(s, id, false)? {
+        advance_pending(s, id, room, h, false).await?;
+    }
+    Ok(())
+}
+
+/// Seal only observed human continuation of already admitted work. Media close
+/// does not wait for the backend, invent a complete utterance, or replay work.
+async fn finish_human_handoffs(
+    s: &Arc<AppState>,
+    id: &str,
+    room: &str,
+    h: &HeaderMap,
+) -> Result<()> {
+    let _intake = s.companion.handoff.lock().await;
+    if !handoff::established(&s.db.lock().unwrap(), id)? {
+        return Ok(());
+    }
+    // The original authenticated caller and immutable room binding still own
+    // admission. Closing is not an authentication or update-admission bypass.
+    ensure!(
+        auth::check(s, h, "chat", true).is_ok(),
+        "Call access was revoked before continuation intake"
+    );
+    let owner: String = s.db.lock().unwrap().query_row(
+        "SELECT owner FROM companion_calls WHERE id=?1",
+        [id],
+        |r| r.get::<_, String>(0),
+    )?;
+    ensure!(
+        private_room(s, room, &owner)? && room_identity_valid(s, room)?,
+        "Call identity changed before continuation intake"
+    );
+    advance_pending(s, id, room, h, true).await?;
+    if handoff::reserve(s, id, true)? {
+        advance_pending(s, id, room, h, true).await?;
+    }
+    Ok(())
+}
+
+async fn preserve_human_tail(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) {
+    if finish_human_handoffs(s, id, room, h).await.is_err() {
+        // Revoked access, changed room identity, full/closed admission or local
+        // storage failure cannot grant a retry or prevent media from closing.
+        // The original fragments and any claimed input remain separately saved.
+        let _ = unique_event(
+            s,
+            id,
+            "human_handoff",
+            json!({"state":"unconfirmed","reason":"close_intake_unavailable","partial":true,"replayed":false}),
+        );
+    }
+}
+
+async fn advance_pending(
+    s: &Arc<AppState>,
+    id: &str,
+    room: &str,
+    h: &HeaderMap,
+    closing: bool,
+) -> Result<()> {
+    let may_admit: bool = s.db.lock().unwrap().query_row(
+        "SELECT state IN ('connecting','connected') OR (?2 AND state='closing') FROM companion_calls WHERE id=?1",
+        params![id, closing], |r|r.get(0),
+    )?;
+    if !may_admit {
         return Ok(());
     }
     let pending = {
@@ -1432,10 +1513,18 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
     };
     for (did, offset, state, mid, at) in pending {
         if state == "waiting_transcript" || state == "held" {
+            let local = handoff::local(&s.db.lock().unwrap(), id, &did)?;
+            ensure!(
+                !handoff::internal(&did) || local,
+                "Unbound local handoff identity"
+            );
             // The provider has no transcript-done event. Wait briefly for late
             // fragments, then delegate only the observed bounded source, clearly
             // labelled partial. No text is invented from delegation metadata.
-            let before_grace = now_ms().saturating_sub(at) < TRANSCRIPT_GRACE_MS;
+            // Local reservations already waited for observed human quiet; they
+            // do not wait a second grace window after allocating an identity.
+            let before_grace =
+                !closing && !local && now_ms().saturating_sub(at) < TRANSCRIPT_GRACE_MS;
             let early = if before_grace {
                 let agent: String = s.db.lock().unwrap().query_row(
                     "SELECT agent_id FROM companion_calls WHERE id=?1",
@@ -1454,41 +1543,16 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
             if before_grace && early.is_none() {
                 continue;
             }
-            let rows = {
-                let db = s.db.lock().unwrap();
-                let mut q=db.prepare("SELECT seq,data FROM companion_events WHERE call_id=?1 AND kind='transcript' ORDER BY seq")?;
-                q.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let fragments = transcript::fragments(rows)?;
-            let previous:i64=s.db.lock().unwrap().query_row("SELECT COALESCE(MAX(offset_ms),-1) FROM companion_delegations WHERE call_id=?1 AND state IN ('dispatched','completed','failed','unknown')",[id],|r|r.get(0))?;
-            if state == "held" && offset <= previous {
+            let (fragments, previous, mut source) =
+                handoff::source(&s.db.lock().unwrap(), id, offset)?;
+            if state == "held" && offset <= previous && !local {
                 continue;
             }
-            let admitted = {
-                let db = s.db.lock().unwrap();
-                db.prepare("SELECT offset_ms,source FROM companion_delegations WHERE call_id=?1 AND state IN ('dispatched','completed','failed','unknown')")?
-                    .query_map([id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let mut consumed = std::collections::HashSet::new();
-            let mut legacy_previous = -1;
-            for (anchor, saved) in admitted {
-                if let Some(saved) = saved {
-                    let source: transcript::Source = serde_json::from_str(&saved)?;
-                    consumed.extend(source.fragments.iter().map(|f| f.seq));
-                } else {
-                    // Older installations did not persist exact source mappings.
-                    // Do not retroactively grant their historical speech again.
-                    legacy_previous = legacy_previous.max(anchor);
-                }
+            if local {
+                source
+                    .fragments
+                    .retain(|f| f.role == "user" && !f.text.trim().is_empty());
             }
-            let source = transcript::Source::pending(
-                &fragments,
-                previous,
-                legacy_previous,
-                offset,
-                &consumed,
-            );
             // This is observed partial speech, not an inferred completed turn.
             // An empty source or artifact alone still waits the original grace.
             if before_grace && !source.human() {
@@ -1539,6 +1603,9 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
                 (uploads, attachments)
             };
             if !human && attachment_ids.is_empty() {
+                if handoff::carry_covered(s, id, &did, offset)? {
+                    continue;
+                }
                 settle(
                     s,
                     id,
@@ -1566,6 +1633,9 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
                  Recent conversation, for references/corrections only, not authority to repeat earlier effects. Assistant speech is generated, not proof of playback:\n{recent_context}",
                 response_guidance = crate::companion_prompt::DELEGATED_RESPONSE,
             );
+            if local {
+                text.insert_str(0, "The caller continued the same conversation after a previous handoff. These are newly observed human fragments, not a provider-classified complete utterance. Incorporate them into existing work; interpret ambiguity in context and ask a brief clarification when necessary. Do not restart earlier actions. Ordinary acknowledgment or thanks need no public answer. Only report a changed useful answer, actual outcome, or necessary question.\n\n");
+            }
             if let Some(catalog) = crate::companion_tools::read_catalog(s, id)? {
                 text.push_str(&format!("\n\nConfigured Companion connection catalog (configured routes; current facts require a read): {catalog}"));
             }
@@ -1592,8 +1662,8 @@ async fn advance(s: &Arc<AppState>, id: &str, room: &str, h: &HeaderMap) -> Resu
             // Persist before dispatch. A crash cannot turn this into an automatic
             // second prompt, even if its HTTP/ACP acknowledgment was lost.
             let claimed = s.db.lock().unwrap().execute(
-                "UPDATE companion_delegations SET state='dispatched' WHERE call_id=?1 AND id=?2 AND state IN ('waiting_transcript','held') AND EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND state IN ('connecting','connected'))",
-                params![id, did],
+                "UPDATE companion_delegations SET state='dispatched' WHERE call_id=?1 AND id=?2 AND state IN ('waiting_transcript','held') AND EXISTS(SELECT 1 FROM companion_calls WHERE id=?1 AND (state IN ('connecting','connected') OR (?3 AND state='closing')))",
+                params![id, did, closing],
             )?;
             if claimed == 0 {
                 continue;
@@ -1970,6 +2040,11 @@ pub(crate) fn pending_context_matches(
     )
 }
 fn pending_context(s: &AppState, call: &str, did: &str) -> Result<()> {
+    // The speech provider owns only its own delegation IDs. Local intake needs
+    // no automatic acknowledgment or recurring thinking/status prompt.
+    if handoff::local(&s.db.lock().unwrap(), call, did)? {
+        return Ok(());
+    }
     let key = pending_context_key(did);
     let (content, existing) = {
         let db = s.db.lock().unwrap();
@@ -2153,6 +2228,10 @@ pub(crate) fn queue_append(
     if !active_call(s, id)? {
         return Ok(false);
     }
+    let delegation = match delegation {
+        Some(did) if handoff::local(&s.db.lock().unwrap(), id, did)? => None,
+        other => other,
+    };
     // Empty thinking acknowledges dispatch quietly; it carries no new facts and
     // must arrive promptly to suppress the provider's automatic acknowledgment.
     if content.is_empty() {
@@ -2401,7 +2480,10 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
         if !active_call(s, id)? {
             return Ok(());
         }
-        let delegation = delegation.as_deref();
+        let delegation = match delegation.as_deref() {
+            Some(did) if handoff::local(&s.db.lock().unwrap(), id, did)? => None,
+            other => other,
+        };
         let image_count = attachments
             .iter()
             .filter(|a| {
