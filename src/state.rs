@@ -27,6 +27,7 @@ pub struct AppState {
     pub db: Mutex<Connection>,
     pub changes: watch::Sender<u64>,
     pub(crate) native_shutdown: watch::Sender<bool>,
+    pub(crate) portrait_refresh: Arc<Semaphore>,
     pub login_gate: Arc<Semaphore>,
     pub turn_gate: Arc<Semaphore>,
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
@@ -52,6 +53,8 @@ impl AppState {
             CREATE TABLE IF NOT EXISTS import_sources(source TEXT PRIMARY KEY,surface TEXT NOT NULL,token_id TEXT UNIQUE NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY);")?;
         crate::rooms::migrate(&db, &config)?;
+        crate::agent_portraits::migrate(&db)?;
+        crate::room_notes::migrate(&db)?;
         crate::delivery::migrate(&db)?;
         crate::companion::migrate(&db)?;
         crate::companion_tools::migrate(&db)?;
@@ -98,6 +101,7 @@ impl AppState {
             db: Mutex::new(db),
             changes: watch::channel(0).0,
             native_shutdown: watch::channel(false).0,
+            portrait_refresh: Arc::new(Semaphore::new(1)),
             login_gate: Arc::new(Semaphore::new(2)),
             turn_gate: Arc::new(Semaphore::new(4)),
             running: Mutex::new(HashMap::new()),
@@ -169,8 +173,14 @@ impl AppState {
     ) -> Result<Vec<Value>> {
         let db = self.db.lock().unwrap();
         // Cap text inside SQLite before allocating a context projection.
-        let mut q=db.prepare("SELECT id,role,substr(text,1,20000),status,created_at,length(CAST(text AS BLOB)),actor,seq FROM (SELECT seq,id,role,text,status,created_at,actor FROM messages WHERE conversation_id=?1 AND (?3 IS NULL OR seq<?3) AND (?4='' OR instr(lower(text),lower(?4))>0) ORDER BY seq DESC LIMIT ?2) ORDER BY seq")?;
-        Ok(q.query_map(params![id,limit as i64,before,search],|r|Ok(json!({"id":r.get::<_,String>(0)?,"role":r.get::<_,String>(1)?,"text":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"original_bytes":r.get::<_,i64>(5)?,"actor":r.get::<_,String>(6)?,"seq":r.get::<_,i64>(7)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut q=db.prepare("SELECT m.id,role,substr(text,1,20000),status,created_at,length(CAST(text AS BLOB)),actor,seq,n.revision FROM (SELECT seq,id,role,text,status,created_at,actor FROM messages WHERE conversation_id=?1 AND (?3 IS NULL OR seq<?3) AND (?4='' OR instr(lower(text),lower(?4))>0) ORDER BY seq DESC LIMIT ?2) m LEFT JOIN room_notes n ON n.id=m.id ORDER BY seq")?;
+        Ok(q.query_map(params![id,limit as i64,before,search],|r|{
+            let mut item=json!({"id":r.get::<_,String>(0)?,"role":r.get::<_,String>(1)?,"text":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"original_bytes":r.get::<_,i64>(5)?,"actor":r.get::<_,String>(6)?,"seq":r.get::<_,i64>(7)?});
+            if let Some(revision)=r.get::<_,Option<i64>>(8)?{
+                item["room_note"]=json!({"note_id":item["id"],"revision":revision});
+            }
+            Ok(item)
+        })?.collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn messages(&self, id: &str, limit: usize) -> Result<Vec<Value>> {
         self.message_page(id, None, limit, "")
@@ -225,6 +235,10 @@ impl AppState {
         let mut stmt=db.prepare("SELECT seq,id,role,text,status,created_at,updated_at,actor,agent_id,targets FROM (SELECT * FROM messages WHERE conversation_id=?1 AND (?2 IS NULL OR seq<?2) AND (?3='' OR instr(lower(text),lower(?3))>0) ORDER BY seq DESC LIMIT ?4) ORDER BY seq")?;
         let mut rows=stmt.query_map(params![id,before,search,limit as i64],|r|Ok(json!({"seq":r.get::<_,i64>(0)?,"id":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"text":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"created_at":r.get::<_,i64>(5)?,"updated_at":r.get::<_,i64>(6)?,"actor":r.get::<_,String>(7)?,"agent_id":r.get::<_,Option<String>>(8)?,"target_agent_ids":serde_json::from_str::<Value>(&r.get::<_,String>(9)?).unwrap_or(json!([]))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for m in &mut rows {
+            if m["status"] == "room_note" {
+                m["room_note"] = crate::room_notes::note(&db, id, m["id"].as_str().unwrap_or(""))?
+                    .unwrap_or(Value::Null);
+            }
             let mut q=db.prepare("SELECT id,name,mime_type,bytes FROM attachments WHERE message_id=?1 ORDER BY created_at")?;
             m["attachments"]=json!(q.query_map([m["id"].as_str().unwrap_or("")], |r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"mime_type":r.get::<_,String>(2)?,"bytes":r.get::<_,i64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
         }

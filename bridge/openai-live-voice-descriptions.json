@@ -1,0 +1,20 @@
+{
+  "provider": "OpenAI",
+  "model": "gpt-live-1",
+  "source": "https://developers.openai.com/api/docs/guides/live-conversations#voice-options",
+  "descriptions": {
+    "quartz": "English · Australian · Feminine",
+    "ripple": "English · Australian · Masculine",
+    "vesper": "English · British · Masculine",
+    "willow": "English · Irish · Feminine",
+    "stone": "English · Irish · Masculine",
+    "gleam": "English · North American · Feminine",
+    "meridian": "English · North American · Masculine",
+    "bossa": "Portuguese · Brazilian · Feminine",
+    "tempo": "Portuguese · Brazilian · Masculine",
+    "beacon": "English · Filipino · Masculine",
+    "delta": "English · Southern U.S. · Feminine",
+    "cinder": "English · Southern U.S. · Masculine",
+    "shida": "Japanese · Feminine"
+  }
+}

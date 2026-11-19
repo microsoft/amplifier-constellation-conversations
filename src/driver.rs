@@ -462,6 +462,24 @@ impl CompletedTurn {
         let _ = self.0.child.wait().await;
     }
 }
+/// Request only the optional installation identity. Unsupported peers may
+/// initialize normally but are never asked to create a session or run a turn.
+pub(crate) async fn observe_identity(agent: &Agent) -> Result<Option<Value>> {
+    const NS: &str = "com.microsoft.amplifier.identity";
+    const GET: &str = "_amplifier/identity/get";
+    let mut client = Client::start_inspection(agent).await?;
+    let read = tokio::time::timeout(Duration::from_secs(10), async {
+        let init = client.peer.request("initialize",json!({"protocolVersion":1,"clientInfo":{"name":"agent-conversations","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{},"_meta":{NS:{"mode":"observe"}}})).await?;
+        ensure!(init["protocolVersion"]==1,"Unsupported ACP version");
+        let cap = &init["_meta"][NS];
+        if cap["schema"] != "agent-identity/1" || cap["method"] != GET { return Ok(None); }
+        Ok(Some(client.peer.request(GET,json!({})).await?))
+    }).await;
+    client.terminate();
+    client.child.wait().await?;
+    read.context("Contact identity timed out")?
+}
+
 pub async fn probe(agent: &Agent) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(30),async {
         let mut c=Client::start(agent).await?;

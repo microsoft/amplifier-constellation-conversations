@@ -205,7 +205,11 @@ fn execute(state: &AppState, q: Query, agent: &str) -> ApiResult<Json<Value>> {
                 let truncated = end < original_bytes;
                 truncated_any |= truncated;
                 remaining -= text.len();
-                messages.push(json!({"id":m["id"],"seq":m["seq"],"text":text,"truncated":truncated,"original_bytes":original_bytes,"actor":m["actor"],"role":m["role"],"label":m["actor"],"at":m["created_at"],"status":m["status"],"url":source_url(state,id),"thread_id":null}));
+                let mut item = json!({"id":m["id"],"seq":m["seq"],"text":text,"truncated":truncated,"original_bytes":original_bytes,"actor":m["actor"],"role":m["role"],"label":m["actor"],"at":m["created_at"],"status":m["status"],"url":source_url(state,id),"thread_id":null});
+                if let Some(note) = m.get("room_note") {
+                    item["room_note"] = note.clone();
+                }
+                messages.push(item);
             }
             messages.reverse();
             let complete =

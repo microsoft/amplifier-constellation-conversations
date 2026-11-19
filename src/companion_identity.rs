@@ -97,6 +97,24 @@ pub(crate) fn latest(s: &AppState, owner: &str, agent: &str) -> Result<Value> {
         .unwrap_or(Value::Null))
 }
 
+/// Only the caller's most recent private room for this same endpoint may
+/// provide a history hint. The timestamp is not a live reachability probe.
+pub(crate) fn last_request(s: &AppState, owner: &str, agent: &str) -> Result<Option<Value>> {
+    let db = s.db.lock().unwrap();
+    let call:Option<String> = db.query_row(
+        "SELECT id FROM companion_calls WHERE owner=?1 AND agent_id=?2 ORDER BY created_at DESC,id DESC LIMIT 1",
+        params![owner,agent], |r|r.get(0)).optional()?;
+    let Some(call) = call else { return Ok(None) };
+    let Some(source) = crate::companion_history::private_identity(&db, &call)? else {
+        return Ok(None);
+    };
+    let result=db.query_row(&format!(
+        "SELECT state,updated_at FROM input_deliveries WHERE conversation_id=?1 AND agent_id=?2 AND (state IN {} OR state='completed') ORDER BY (state IN {}) DESC,sequence DESC LIMIT 1",
+        crate::delivery::REVIEW_STATES,crate::delivery::REVIEW_STATES),
+        params![source.room,agent],|r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).optional()?;
+    Ok(result.map(|(state,at)|json!({"state":if state=="completed" {"completed"} else {"needs_review"},"at":at,"conversation_id":source.room})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

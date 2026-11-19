@@ -259,8 +259,11 @@ test('one existing show tool can author a short plain note without URL or HTML a
  const {client,requests}=await fixture(t);const text='One useful comparison.\n<script>literal text only</script>';
  assert.notEqual((await client.callTool({name:'companion_show',arguments:{title:'Compare',text}})).isError,true);
  assert.equal(requests[0].body.kind,'note');assert.equal(requests[0].body.text,text);assert.equal(requests[0].body.url,undefined);
- for(const args of [{title:'None'},{title:'Both',text:'note',url:'https://example.test'},{title:'Long',text:'漢'.repeat(401)},{title:'Blank',text:' '},{title:'Wrong kind',text:'Note',kind:'image'},{title:'Wrong kind',url:'https://example.test',kind:'note'},{title:'HTML',text:'plain',html:'<script/>'}])assert.equal((await client.callTool({name:'companion_show',arguments:args})).isError,true);
- assert.equal(requests.length,1);
+ const formatted={title:'Diagram',kind:'markdown',text:'```mermaid\nflowchart TD\nA --> B\n```'};
+ assert.notEqual((await client.callTool({name:'companion_show',arguments:formatted})).isError,true);
+ assert.deepEqual(requests[1].body,formatted);
+ for(const args of [{title:'None'},{title:'Both',text:'note',url:'https://example.test'},{title:'Invalid URL mode',url:'https://example.test',kind:'markdown'},{title:'Long',text:'漢'.repeat(401)},{title:'Blank',text:' '},{title:'Wrong kind',text:'Note',kind:'image'},{title:'Wrong kind',url:'https://example.test',kind:'note'},{title:'HTML',text:'plain',html:'<script/>'}])assert.equal((await client.callTool({name:'companion_show',arguments:args})).isError,true);
+ assert.equal(requests.length,2);
 });
 
 test('saved result images use a bounded 2 MiB transport without increasing phone capture limits',async t=>{
@@ -441,4 +444,18 @@ test('view controls require an observed bounded human-interaction revision',asyn
  assert.notEqual((await client.callTool({name:'companion_view',arguments:args})).isError,true);
  assert.equal(requests[0].body.expected_revision,7);
  assert.equal(requests[0].body.expected_browser_id,args.expected_browser_id);
+});
+
+test('durable edits and reads stay on existing note endpoints with caller-supplied revision and retry identity',async t=>{
+ const {client,requests}=await fixture(t);
+ const note_id=randomUUID(),request_id=randomUUID();
+ const args={note_id,request_id,expected_revision:0,title:'Packing',text:'Tickets'};
+ assert.notEqual((await client.callTool({name:'companion_show',arguments:args})).isError,true);
+ assert.deepEqual(requests[0].body,{...args,kind:'note'});
+ const read=await client.callTool({name:'companion_shared',arguments:{note_id}});
+ assert.notEqual(read.isError,true);assert(requests[1].path.endsWith('shared?note_id='+note_id));
+ for(const invalid of [{note_id,title:'Missing operation',text:'a'},{...args,expected_revision:-1},{...args,text:undefined,url:'https://example.org'}]){
+  assert.equal((await client.callTool({name:'companion_show',arguments:invalid})).isError,true);
+ }
+ assert.equal(requests.length,2);
 });

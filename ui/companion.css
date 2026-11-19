@@ -188,6 +188,9 @@ main {
   margin-bottom:25px;
   letter-spacing:-.07em
 }
+.contact-avatar, .call-avatar { position:relative; overflow:hidden; }
+.contact-portrait {position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+
 .contact-card:nth-child(3n+2) .contact-avatar {
   background:#e9e5ee;
   color:#695675
@@ -492,6 +495,7 @@ input,textarea {
 .call-status[data-status="error"] .status-dot {
   background:#ad6349
 }
+.call-status[data-status="blocked"] .status-dot,
 .call-status[data-status="reconnecting"] .status-dot {
   background:#b59445
 }
@@ -828,6 +832,10 @@ input,textarea {
   background:var(--paper);
   border:1px solid var(--line);
   border-radius:var(--radius)
+}
+.ended-card .recovery-card {
+  margin:24px 0 0;
+  text-align:left
 }
 .recovery-card h2 { margin-bottom:10px }
 .recovery-card p { color:var(--muted) }

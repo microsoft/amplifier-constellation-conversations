@@ -2356,9 +2356,59 @@ async fn attachments_are_private_bounded_and_honest_about_acp_capabilities() {
         .0,
         StatusCode::NOT_FOUND
     );
+    for (name, mime, source) in [
+        (
+            "drawing.svg",
+            "image/svg+xml",
+            "<svg xmlns='http://www.w3.org/2000/svg'/>",
+        ),
+        ("template.html", "text/html", "<h1>Original template</h1>"),
+        ("diagram.mmd", "text/vnd.mermaid", "flowchart LR\nA --> B"),
+    ] {
+        let (status, stored) = request(
+            &f.app,
+            "POST",
+            &format!("{base}/attachments"),
+            Some(&f.admin),
+            Some(json!({"name":name,"mime_type":mime,"data":STANDARD.encode(source)})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let url = stored["url"].as_str().unwrap();
+        assert_eq!(
+            user_request(&f, "robin", "GET", url, None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let response = f
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(url)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", f.admin))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment;")
+        );
+        if mime != "text/vnd.mermaid" {
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "text/plain; charset=utf-8"
+            );
+        }
+        assert_eq!(to_bytes(response.into_body(), 2048).await.unwrap(), source);
+    }
     for (name, mime, data) in [
         ("../escape.txt", "text/plain", b"x".as_slice()),
-        ("active.svg", "image/svg+xml", b"<svg/>".as_slice()),
+        ("binary.svg", "image/svg+xml", b"\0".as_slice()),
         ("fake.png", "image/png", b"<html>".as_slice()),
     ] {
         assert_eq!(

@@ -172,6 +172,27 @@ Preferences are saved for the signed-in person and selected agent. A change take
 effect on their next call; it does not change the current voice, ACP identity,
 model, or working session.
 
+Outside a call, **Play voice sample** plays an installed recording for the selected
+voice and model. **Stop sample**, selecting another voice, or closing the dialog
+ends playback. Choosing a sample leaves the saved voice unchanged. The picker
+shows which voices have no installed sample. Language, regional influence and voice presentation in the provider
+catalog come from the [GPT-Live voice guide](https://developers.openai.com/api/docs/guides/live-conversations#voice-options)
+for choices supported by the installed bridge.
+
+Operators can add recordings they own or have permission to use to a private
+`voice-previews` directory in the Companion installation home. Use a separate
+file for each sample, named for its exact provider voice (for example,
+`cedar.wav`). Use canonical mono 24 kHz, 16-bit PCM WAV with a 44-byte header
+and up to 12 seconds of audio. Add `index.json` with the following shape:
+
+```json
+{"provider":"OpenAI","model":"gpt-live-1","samples":{"cedar":{"sha256":"<lowercase SHA-256 of cedar.wav>","source":"<recording origin or permission reference>"}}}
+```
+
+The server checks the model, supported voice, file format and digest before serving
+audio to the signed-in browser. Playback uses the local recording and leaves the
+microphone, voice provider, agent and conversation idle.
+
 The settings panel also identifies the configured cloud voice model and the
 reasoning model/settings last reported by the selected ACP backend. Unknown
 settings remain unknown. Only advertised model and thinking selections are
@@ -478,6 +499,8 @@ require the session's `X-CSRF-Token`. All paths below start with `/api/v1`.
 
 | Method and path | Purpose |
 | --- | --- |
+| `POST /agents/{id}/portrait` | **Refresh contact image** requests the installed identity from the saved endpoint. Requires an administrator. This read opens no agent session and sends no model prompt. |
+| `GET /agents/{id}/portrait` | Serves the saved PNG to a signed-in observer. Contacts without a published portrait show initials. |
 | `GET /companion` | Contacts, effective voice preference, availability, and an existing open call. |
 | `GET /companion/agents/{id}/voice-settings` | Voice choices, configured `voice_provider`/`voice_model`, nullable last-reported `backend`, and `applies_to: "next_call"`. |
 | `PUT /companion/agents/{id}/voice-settings` | Save `{ "voice": "marin" }` for this person and agent. |
@@ -506,6 +529,26 @@ extensions. `companion_request_action` takes `connection_id`, `instruction`, the
 original `delegation_id` (the provider or local handoff ID supplied with the
 request, up to 160 characters), and a UUID `request_id`.
 `companion_show` takes a `title` and either an HTTP(S) `url` or bounded plain `text`.
+To show the selected agent’s saved picture on a private call, use
+`companion_show` with `kind: "portrait"` and a title. A successful receipt
+identifies the image attachment in the room. Reopening the conversation shows
+that same image, even if the agent later changes its picture.
+
+For a list or note that should stay editable, include a new UUID for `note_id`,
+a UUID for `request_id`, and `expected_revision: 0`. The reply contains the note
+revision and the existing board's card ID. Call `companion_shared` with the
+`note_id` before a correction, then send the complete revised title and text with
+that revision and a new request ID. Repeating the identical operation returns
+its original revision. A stale revision or changed payload on a reused request
+is refused.
+
+The same note appears as one message in Conversations. Room members can reopen
+it and select **Edit note**. Authenticated room clients can read or edit through
+`GET` or `PUT /api/v1/conversations/{room}/notes/{note_id}`. PUT takes `title`,
+`text`, `request_id`, and `expected_revision` and follows the room's chat
+authorization. Editing updates the existing card in an active call and preserves
+its current board position. A room-note edit does not submit an agent turn.
+
 Optional `kind` is `auto`, `link`, `image`, or `video` for a URL, and `note` for text.
 Saving a card is neither platform publication nor evidence that it was displayed.
 
@@ -1046,6 +1089,16 @@ presence for display, never infer playback or human attention.
 To write a short note, `companion_show` accepts `text` (at most 1,200 UTF-8 bytes)
 instead of `url`, with a title and optional `kind: "note"`. The caller sees plain
 text; HTML and media references in a note are not executed or automatically loaded.
+Use `kind: "markdown"` with the same title and text to show formatted notes.
+Conversations messages and Companion cards share the same renderer. Code fences
+labelled `svg` and `mermaid` preview bounded static diagrams with their original
+source. Supported Mermaid diagrams are acyclic flowcharts with named boxes,
+plain labels and solid arrows, up to 24 nodes and 48 edges. Unsupported syntax
+shows the source. SVG supports static shapes, paths and labels, with no linked
+resources, scripts, styles or animation. HTML is shown as source. The same
+formats, Markdown, and plain text can be uploaded as private room documents up
+to 200 KB. Open a document preview to read it; the original download remains
+available subject to the room's ordinary attachment permissions.
 Existing URL/media calls retain their shape.
 
 ### Independent voice hang-up

@@ -2352,3 +2352,154 @@ async fn huddle_native_permissions_bind_installed_identity_and_active_source_wit
         0
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn authenticated_contact_portrait_reaches_the_private_board_and_survives_rebinding() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use sha2::{Digest, Sha256};
+    let f = fixture();
+    let dir = f.home.path();
+    let mut png = vec![];
+    {
+        let mut enc = png::Encoder::new(&mut png, 512, 512);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&vec![99; 512 * 512])
+            .unwrap();
+    }
+    let doc = json!({"schema":"agent-identity/1","agent_id":"test-agent","avatar":{"kind":"uploaded","media_type":"image/png","width":512,"height":512,"bytes":png.len(),"sha256":format!("{:x}",Sha256::digest(&png)),"data":STANDARD.encode(&png)}});
+    std::fs::write(dir.join("picture.json"), doc.to_string()).unwrap();
+    let script = dir.join("identity.py");
+    std::fs::write(&script,r#"import json,pathlib,sys,time
+for line in sys.stdin:
+    r=json.loads(line)
+    with open('requests','a') as log: print(r['method'],file=log)
+    if r['method']=='initialize':
+        assert not r['params']['clientCapabilities'] and r['params']['_meta']['com.microsoft.amplifier.identity']=={'mode':'observe'}
+        v={'protocolVersion':1,'_meta':{'com.microsoft.amplifier.identity':{'schema':'agent-identity/1','method':'_amplifier/identity/get','observation_only':True}}}
+    else:
+        assert r['method']=='_amplifier/identity/get' and r['params']=={}
+        if pathlib.Path('hold-observation').exists():
+            pathlib.Path('observation-started').touch()
+            for _ in range(300):
+                if pathlib.Path('release-observation').exists(): break
+                time.sleep(0.01)
+            else: raise RuntimeError('test observation not released')
+        v=json.loads(pathlib.Path('picture.json').read_text())
+    print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':v}),flush=True)
+"#).unwrap();
+    let mut agent = f.s.agent("default").unwrap().unwrap();
+    agent.command = "python3".into();
+    agent.args = vec![script.to_string_lossy().to_string()];
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_endpoints SET config=? WHERE id='default'",
+            [serde_json::to_string(&agent).unwrap()],
+        )
+        .unwrap();
+    let c = call(&f);
+    let token = std::fs::read_to_string(dir.join("secrets/control-token")).unwrap();
+    let endpoint = "/api/v1/agents/default/portrait";
+    let fetch = |method: &str, path: String, login: bool| {
+        let app = f.app.clone();
+        let mut req = Request::builder().method(method).uri(path);
+        if login {
+            req = req.header("authorization", format!("Bearer {}", token.trim()));
+        }
+        async move {
+            let r = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+            (
+                r.status(),
+                to_bytes(r.into_body(), 2 * 1024 * 1024).await.unwrap(),
+            )
+        }
+    };
+    assert_eq!(
+        fetch("POST", endpoint.into(), false).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(fetch("POST", endpoint.into(), true).await.0, StatusCode::OK);
+    let (ok, cached) = fetch("GET", endpoint.into(), true).await;
+    assert_eq!(ok, StatusCode::OK);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("requests")).unwrap(),
+        "initialize\n_amplifier/identity/get\n"
+    );
+    let (_, out) = request(
+        &f,
+        &c,
+        "POST",
+        "shared",
+        Some(json!({"title":"My portrait","kind":"portrait"})),
+        &c.token,
+        false,
+    )
+    .await;
+    assert_eq!(out["state"], "saved");
+    let attachment: String =
+        f.s.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM attachments WHERE conversation_id=?1 AND message_id IS NOT NULL",
+                [&c.room],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let path = format!(
+        "/api/v1/conversations/{}/attachments/{}",
+        c.room, attachment
+    );
+    assert_eq!(
+        fetch("GET", path.clone(), false).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    agent.label = "Changed".into();
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_endpoints SET config=? WHERE id='default'",
+            [serde_json::to_string(&agent).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        fetch("GET", endpoint.into(), true).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (ok, retained) = fetch("GET", path, true).await;
+    assert_eq!(ok, StatusCode::OK);
+    assert_eq!(retained, cached);
+
+    // Re-entering the same configuration while a prior observation is in flight
+    // represents a new endpoint binding, even when the bytes and row ID coincide.
+    std::fs::write(dir.join("hold-observation"), []).unwrap();
+    let in_flight = fetch("POST", endpoint.into(), true);
+    let rebind = async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !dir.join("observation-started").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let db = f.s.db.lock().unwrap();
+        db.execute(
+            "UPDATE agent_endpoints SET config=config WHERE id='default'",
+            [],
+        )
+        .unwrap();
+        std::fs::write(dir.join("release-observation"), []).unwrap();
+    };
+    let ((status, _), ()) = tokio::join!(in_flight, rebind);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        fetch("GET", endpoint.into(), true).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
