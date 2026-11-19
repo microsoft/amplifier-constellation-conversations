@@ -133,7 +133,8 @@ try {
       assert.equal(await page.locator('#call-detail').innerText(),'Voice is connected. New agent work is on hold.');
     }
     await page.locator('#hangup').click();
-    await page.locator('#call-ended').waitFor();
+    // The same screen is visible during the asynchronous provider close.
+    await page.getByRole('heading',{name:'Call ended',exact:true}).waitFor();
     assert.deepEqual(errors,[]);
     console.log(scenario+': call connected, local speech played through the browser, agent outcome observed and browser hang-up confirmed');
   } catch (error) {
