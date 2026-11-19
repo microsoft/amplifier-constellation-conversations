@@ -2550,6 +2550,17 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
         let live_text = if pending_action { "" } else { text };
         if !live_text.trim().is_empty() || image_count > 0 {
             if live_text.len() <= 480 && image_count == 0 {
+                // Only an ordinary, complete, caller-linked text result may be
+                // considered for quiet source confirmation at final delivery.
+                let event_id = if !late
+                    && !quiet_action_result
+                    && attachments.is_empty()
+                    && delegation.is_some()
+                {
+                    format!("plain-result:{message}")
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                };
                 queue_append(
                     s,
                     id,
@@ -2560,7 +2571,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                     },
                     delegation,
                     live_text,
-                    &uuid::Uuid::new_v4().to_string(),
+                    &event_id,
                 )?;
             } else {
                 let (parts, omitted) = complete_fragments(live_text, 360, 16);

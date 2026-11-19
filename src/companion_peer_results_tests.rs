@@ -657,3 +657,169 @@ fn unknown_submission_keeps_long_answer_on_original_thinking_channel() {
             .any(|e| e["message_id"] == "answer" && e["text"] == text)
     );
 }
+
+#[test]
+fn exact_generated_first_answer_gets_one_quiet_authoritative_confirmation() {
+    let text = "Violet, orange, green.";
+    for case in [
+        "match",
+        "negation",
+        "quantity",
+        "caller_repeat",
+        "another_request",
+        "permission",
+        "attachment",
+        "external_action",
+        "interrupted",
+        "unbound_source",
+        "long_gap",
+        "after_card",
+        "changed_card_link",
+        "changed_room",
+    ] {
+        let f = fixture();
+        answer(&f, "target", text);
+        delivery(&f, "spoken-request", "target", false);
+        let fragment = |role: &str, word: &str, start: i64| {
+            let db = f.s.db.lock().unwrap();
+            let key = uuid::Uuid::new_v4().to_string();
+            insert_event(&db,&f.call,&key,"transcript",&json!({"event_id":key,"role":role,"text":word,"start_ms":start,"end_ms":start+200,"fragment":true,"playback":if role=="user"{"not_applicable"}else{"unconfirmed"}})).unwrap();
+            // Retain sequence and media offsets while simulating an idle floor.
+            db.execute(
+                "UPDATE companion_events SET at=?1 WHERE seq=last_insert_rowid()",
+                [now_ms() - 3000],
+            )
+            .unwrap();
+            (db.last_insert_rowid(), key)
+        };
+        let (seq, key) = fragment("user", " Name the colors.", 15200);
+        let source = json!({"version":1,"offset_ms":15200,"previous_anchor_ms":-1,"fragments":[{"seq":seq,"event_id":key,"role":"user","text":" Name the colors.","start_ms":15200,"end_ms":15400}]});
+        f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at,source) VALUES(?1,'client-request',15200,'dispatched','spoken-request',?2,?3)",params![f.call,now_ms(), if case=="unbound_source" {None} else {Some(source.to_string())}]).unwrap();
+        fragment("assistant", " Violet,", 16600);
+        fragment(
+            "assistant",
+            if case == "negation" {
+                " not orange,"
+            } else {
+                " orange,"
+            },
+            16800,
+        );
+        if case != "after_card" {
+            fragment(
+                "assistant",
+                if case == "quantity" {
+                    " 2 green."
+                } else {
+                    " green."
+                },
+                if case == "long_gap" { 30000 } else { 17400 },
+            );
+        }
+        if case == "attachment" {
+            f.s.db.lock().unwrap().execute("INSERT INTO attachments(id,conversation_id,name,mime_type,data,bytes,created_by,created_at,message_id) VALUES('details',?1,'details.txt','text/plain',X'4142',2,'Coach',?2,'target')",params![f.room,now_ms()]).unwrap();
+        }
+        observe_results(&f.s, &f.call, &f.room, true).unwrap();
+        match case {
+            "external_action" => {
+                f.s.db.lock().unwrap().execute("INSERT INTO companion_actions VALUES(?1,'action-request','client-request','test','test','{}','unknown','{}',?2)",params![f.call,now_ms()]).unwrap();
+            }
+            "interrupted" => {
+                insert_event(
+                    &f.s.db.lock().unwrap(),
+                    &f.call,
+                    "interruption",
+                    "playback",
+                    &json!({"phase":"released"}),
+                )
+                .unwrap();
+            }
+            "caller_repeat" => {
+                fragment("user", " Repeat that.", 18000);
+            }
+            "after_card" => {
+                fragment("assistant", " green.", 17400);
+            }
+            "another_request" => {
+                f.s.db.lock().unwrap().execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at) VALUES(?1,'another',18200,'waiting_transcript','another-input',?2)",params![f.call,now_ms()]).unwrap();
+            }
+            "permission" => {
+                insert_event(
+                    &f.s.db.lock().unwrap(),
+                    &f.call,
+                    "permission-id",
+                    "permission",
+                    &json!({"state":"pending"}),
+                )
+                .unwrap();
+            }
+            "changed_card_link" => {
+                f.s.db.lock().unwrap().execute("UPDATE companion_events SET data=json_set(data,'$.message_id','other') WHERE call_id=?1 AND event_key='result:target'",[&f.call]).unwrap();
+            }
+            "changed_room" => {
+                f.s.db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE conversations SET shared=1 WHERE id=?1", [&f.room])
+                    .unwrap();
+            }
+            _ => (),
+        }
+        let batch = crate::companion_delivery::take_ready(&f.s, &f.call).unwrap();
+        if case == "changed_room" {
+            assert!(batch.is_none());
+            continue;
+        }
+        let batch = batch.expect(case);
+        let command = &batch["commands"][0];
+        if case == "match" {
+            assert_eq!(command["channel"], "thinking", "{case}");
+            assert_eq!(
+                command["content"],
+                format!("The selected agent returned this answer for this request: {text}")
+            );
+        } else {
+            assert_eq!(command["channel"], "commentary", "{case}");
+            assert_eq!(command["content"], text, "{case}");
+        }
+        assert_eq!(command["delegation_id"], "client-request");
+        if case == "changed_card_link" {
+            assert_eq!(
+                events(&f)
+                    .iter()
+                    .filter(|card| card["message_id"] == "other" && card["text"] == text)
+                    .count(),
+                1
+            );
+            continue;
+        }
+        assert_eq!(
+            events(&f)
+                .iter()
+                .filter(|e| e["message_id"] == "target" && e["text"] == text)
+                .count(),
+            1
+        );
+        if case == "match" {
+            // No acknowledgement: a restart retains uncertainty and the original
+            // authoritative card without issuing another append.
+            let db = f.s.db.lock().unwrap();
+            crate::companion_delivery::migrate(&db).unwrap();
+            let saved: String = db
+                .query_row(
+                    "SELECT state FROM companion_voice_batches WHERE id=?1",
+                    [batch["batch_id"].as_str().unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(saved, "unknown");
+        }
+        observe_results(&f.s, &f.call, &f.room, true).unwrap();
+        assert!(
+            crate::companion_delivery::take_ready(&f.s, &f.call)
+                .unwrap()
+                .is_none(),
+            "{case}"
+        );
+    }
+}
