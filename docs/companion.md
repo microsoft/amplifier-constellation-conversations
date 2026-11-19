@@ -172,12 +172,14 @@ Preferences are saved for the signed-in person and selected agent. A change take
 effect on their next call; it does not change the current voice, ACP identity,
 model, or working session.
 
-Outside a call, **Play voice sample** plays an installed recording for the selected
-voice and model. **Stop sample**, selecting another voice, or closing the dialog
-ends playback. Choosing a sample leaves the saved voice unchanged. The picker
-shows which voices have no installed sample. Language, regional influence and voice presentation in the provider
-catalog come from the [GPT-Live voice guide](https://developers.openai.com/api/docs/guides/live-conversations#voice-options)
-for choices supported by the installed bridge.
+Browse the list to read descriptions before choosing a voice. Filter by voice
+presentation, regional influence, or language. **Not listed** includes voices
+for which the provider omits that detail. Filtering keeps your selection.
+The descriptions cover supported voices in the [GPT-Live voice guide](https://developers.openai.com/api/docs/guides/live-conversations#voice-options).
+
+Outside a call, use **Play** beside any voice with an installed recording.
+You can compare samples before selecting a voice. Choose a row and use
+**Save voice** to apply it to your next call with that contact.
 
 Operators can add recordings they own or have permission to use to a private
 `voice-previews` directory in the Companion installation home. Use a separate

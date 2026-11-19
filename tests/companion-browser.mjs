@@ -20,6 +20,7 @@ files.set('companion.css', Buffer.concat([files.get('markdown.css'),files.get('c
 const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
 const surfaces = new Map(), surfaceCommands = new Map(), permissions = new Map();
 let holdNextSurfaceAck = false, heldSurfaceAck = null;
+let holdNextVoiceSave=false, releaseVoiceSave=null;
 let failNextResult = false;
 const huddleViews=new Map(),huddleMessages=[{id:'huddle-report-1',seq:1,role:'assistant',actor:'Coach',agent_id:'coach',status:'complete',text:'Private huddle evidence <img src=x onerror="window.huddleInjected=true">',created_at:1794330000000,target_agent_ids:[]}];
 let huddleFollowing=false,huddleListFails=false,holdNextHuddleRead=false,heldHuddleRead=null;
@@ -65,8 +66,14 @@ const server = createServer(async (request,response) => {
   const agentPath = url.pathname.match(/^\/api\/v1\/companion\/agents\/([^/]+)\/(voice-settings|capabilities)$/);
   if (agentPath) {
     if (agentPath[2] === 'capabilities') { send(200,{image_input:agentPath[1] !== 'jarvis',capabilities_available:true}); return; }
-    if (request.method === 'PUT') voices.set(agentPath[1],body.voice);
-    send(200,{voice:voices.get(agentPath[1]) || 'marin',available_voices:['marin','cedar','ash'],preview_voices:['marin','cedar'],voice_descriptions:{cedar:'Fixture description'},applies_to:'next_call',voice_provider:'OpenAI',voice_model:'fixture-live',available_voice_models:['fixture-live'],backend_settings_editable:false,backend:agentPath[1]==='jarvis'?null:{agent:{name:'fixture-runtime',title:'Fixture reasoning runtime'},model:{id:'fixture-model',name:'Fixture reasoning model'},observed_at:1794157902184,options:[{id:'reasoning',name:'Thinking',category:'thought_level',value:'medium',label:'Medium',editable:false}]}}); return;
+    if (request.method === 'PUT') {
+      if (holdNextVoiceSave) {
+        holdNextVoiceSave=false;
+        await new Promise(resolve=>{releaseVoiceSave=resolve;});
+      }
+      voices.set(agentPath[1],body.voice);
+    }
+    send(200,{voice:voices.get(agentPath[1]) || 'marin',available_voices:['marin','cedar','ash','quartz','vesper','shida'],preview_voices:['marin','cedar'],voice_descriptions:{cedar:'Fixture description',quartz:'English · Australian · Feminine',vesper:'English · British · Masculine',shida:'Japanese · Masculine'},voice_traits:{quartz:{language:'English',region:'Australian',presentation:'Feminine'},vesper:{language:'English',region:'British',presentation:'Masculine'},shida:{language:'Japanese',presentation:'Masculine'},not_offered:{language:'Unexpected'}},applies_to:'next_call',voice_provider:'OpenAI',voice_model:'fixture-live',available_voice_models:['fixture-live'],backend_settings_editable:false,backend:agentPath[1]==='jarvis'?null:{agent:{name:'fixture-runtime',title:'Fixture reasoning runtime'},model:{id:'fixture-model',name:'Fixture reasoning model'},observed_at:1794157902184,options:[{id:'reasoning',name:'Thinking',category:'thought_level',value:'medium',label:'Medium',editable:false}]}}); return;
   }
   const huddleList=url.pathname.match(/^\/api\/v1\/conversations\/([^/]+)\/huddles$/);
   if(huddleList){
@@ -213,9 +220,11 @@ await page.addInitScript(() => {
     createBufferSource(){return {connect(){},disconnect(){},start(){if(this.buffer.getChannelData(0).some(x=>x!==0))fixture.shutters++;}};}
   };
   const playing=new WeakSet(), nativePlay=HTMLMediaElement.prototype.play, nativePause=HTMLMediaElement.prototype.pause;
-  const isSample=el=>el.src.includes('/voice-previews/');
-  Object.defineProperty(HTMLMediaElement.prototype,'paused',{get(){return !playing.has(this);}});
-  HTMLMediaElement.prototype.play=async function(){if(isSample(this))return nativePlay.call(this);playing.add(this);this.dispatchEvent(new Event('playing'));};
+  const nativePaused=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'paused').get;
+  const samples=new WeakSet();
+  const isSample=el=>samples.has(el)||el.src.includes('/voice-previews/');
+  Object.defineProperty(HTMLMediaElement.prototype,'paused',{get(){return isSample(this)?nativePaused.call(this):!playing.has(this);}});
+  HTMLMediaElement.prototype.play=async function(){if(isSample(this)){samples.add(this);fixture.lastSample=this;return nativePlay.call(this);}playing.add(this);this.dispatchEvent(new Event('playing'));};
   HTMLMediaElement.prototype.pause=function(){if(isSample(this))return nativePause.call(this);playing.delete(this);this.dispatchEvent(new Event('pause'));};
   Object.defineProperty(HTMLVideoElement.prototype,'videoWidth',{get(){return 640;}});
   Object.defineProperty(HTMLVideoElement.prototype,'videoHeight',{get(){return 480;}});
@@ -264,30 +273,80 @@ try {
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-contacts.png'),fullPage:true});
 
   await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
-  await page.locator('#voice-choice:not([disabled])').waitFor();
+  const voiceOption=id=>page.locator(`#voice-choice input[type=radio][name=voice-choice][value="${id}"]`);
+  const shownVoices=()=>page.locator('#voice-choice input[type=radio]:visible').evaluateAll(nodes=>nodes.map(node=>node.value).sort());
+  const sample=(verb,id)=>page.getByRole('button',{name:`${verb} sample of ${id}`,exact:true});
+  const filter=key=>page.locator('#voice-filter-'+key);
+  const previewGets=()=>requests.filter(r=>r.path.includes('/voice-previews/')).map(r=>r.path.split('/').at(-1));
+  const mutations=()=>requests.filter(r=>r.method!=='GET').length;
+  await voiceOption('marin').waitFor();
+  assert(await voiceOption('marin').isChecked());
+  assert.deepEqual(await shownVoices(),['ash','cedar','marin','quartz','shida','vesper']);
+  for (const text of ['Fixture description','English · Australian · Feminine','English · British · Masculine','Japanese · Masculine']) {
+    assert(await page.getByText(text,{exact:true}).isVisible());
+  }
+  const modelDetails=page.locator('details').filter({has:page.locator('#voice-model-facts')}).locator(':scope > summary');
+  await modelDetails.click();
   assert.match(await page.locator('#voice-model-facts').innerText(),/OpenAI · fixture-live/);assert.match(await page.locator('#voice-model-facts').innerText(),/Fixture reasoning runtime/);assert.match(await page.locator('#voice-model-facts').innerText(),/Fixture reasoning model/);
   await page.locator('#voice-advanced summary').click();assert.match(await page.locator('#voice-advanced-facts').innerText(),/Thinking.*Medium/s);assert.equal(await page.locator('#voice-advanced input,#voice-advanced select').count(),0);
-  const previewGets=()=>requests.filter(r=>r.path.includes('/voice-previews/')).map(r=>r.path.split('/').at(-1));
   assert.deepEqual(previewGets(),[]);
-  const mutationsBeforeSample=requests.filter(r=>r.method!=='GET').length;
-  for(const voice of ['marin','cedar']){
-    await page.locator('#voice-choice').selectOption(voice);
-    await page.getByRole('button',{name:'Play voice sample'}).click();
-    await wait(async()=>await page.locator('#voice-preview-status').innerText()==='Playing a recorded sample.','real sample playback did not start');
-    assert(await page.getByRole('button',{name:'Stop sample'}).isVisible());
-    if(voice==='marin')await page.getByRole('button',{name:'Stop sample'}).click();
-  }
-  assert.equal(await page.locator('#voice-description').innerText(),'Fixture description');
-  await page.locator('#voice-choice').selectOption('ash');
-  assert(await page.getByRole('button',{name:'Play voice sample'}).isDisabled());
-  assert.match(await page.locator('#voice-preview-status').innerText(),/No sample is installed/);
-  assert.deepEqual(previewGets(),['marin','cedar']);
-  assert.equal(requests.filter(r=>r.method!=='GET').length,mutationsBeforeSample);
+  const mutationsBeforeSample=mutations();
+  assert.equal(await filter('language').locator('option[value=Unexpected]').count(),0);
+  await filter('presentation').selectOption('Feminine');
+  assert.deepEqual(await shownVoices(),['quartz']);
+  await filter('region').selectOption('British');
+  assert.deepEqual(await shownVoices(),[]);assert(await page.locator('#voice-no-matches').isVisible());
+  await page.locator('#voice-reset-filters').click();
+  assert(await voiceOption('marin').isChecked());
+  await filter('language').selectOption('Japanese');
+  await filter('region').selectOption('__unlisted__');
+  assert.deepEqual(await shownVoices(),['shida']);
+  await filter('language').selectOption('');
+  await filter('presentation').selectOption('__unlisted__');
+  assert.deepEqual(await shownVoices(),['ash','cedar','marin']);
+  await filter('region').selectOption('');await filter('presentation').selectOption('');
+  assert.deepEqual(previewGets(),[]);assert.equal(mutations(),mutationsBeforeSample);
+
+  await sample('Play','cedar').click();
+  await wait(async()=>await page.locator('#voice-preview-status').innerText()==='Playing a recorded sample.','real sample playback did not start');
+  assert(await voiceOption('marin').isChecked(),'auditioning a different voice changed the selection');
+  await sample('Stop','cedar').click();
+  assert(await page.evaluate(()=>fixture.lastSample.paused));
+  await sample('Play','marin').click();
+  await sample('Stop','marin').waitFor();
+  await page.locator('#close-voice-settings').click();
+  await wait(async()=>await page.evaluate(()=>fixture.lastSample.paused),'sample continued after closing the dialog');
+  await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
+  await voiceOption('marin').waitFor();
+  assert(await voiceOption('marin').isChecked());
+  await voiceOption('marin').focus();await page.keyboard.press('ArrowDown');
+  assert.equal(await voiceOption('marin').isChecked(),false,'radio group ignored native arrow navigation');
+  await voiceOption('ash').focus();await page.keyboard.press('Space');
+  assert(await voiceOption('ash').isChecked());
+  assert(await page.getByRole('button',{name:'No sample for ash',exact:true}).isDisabled());
+  assert.deepEqual(previewGets(),['cedar','marin']);
+  assert.equal(mutations(),mutationsBeforeSample);
   assert.equal(await page.evaluate(()=>fixture.media.length),0);
-  checks.push('two installation-local voice samples actually play out of call, stop on command or voice change, and acquire no media or session; an unavailable sample stays explicit');
+  checks.push('browse descriptions and filter intersections before choosing; missing traits stay unlisted, previews leave the radio selection and saved voice alone, and close stops audio');
+  const coachVoiceReads=()=>requests.filter(r=>r.path==='/api/v1/companion/agents/coach/voice-settings' && r.method==='GET').length;
+  holdNextVoiceSave=true;
   await page.locator('#save-voice').click();
-  await wait(async()=>/next call/.test(await page.locator('#voice-settings-status').innerText()),'voice save missing');
-  assert.equal(voices.get('coach'),'ash'); assert.equal(requests.find(request=>request.method==='PUT').csrf,csrf);
+  await wait(async()=>!!releaseVoiceSave,'pending voice save never reached server');
+  assert(await page.locator('#save-voice').isDisabled());
+  await page.locator('#close-voice-settings').click();
+  const beforeReopen=coachVoiceReads();
+  await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
+  assert(await page.locator('#voice-choice').isDisabled(),'picker exposed a stale value before the save completed');
+  assert.equal(coachVoiceReads(),beforeReopen);
+  releaseVoiceSave();
+  await voiceOption('ash').waitFor();
+  assert(await voiceOption('ash').isChecked());
+  assert.equal(coachVoiceReads(),beforeReopen+1);
+  assert.equal(voices.get('coach'),'ash');
+  assert.equal(await page.locator('.contact-card[data-agent-id="coach"] .contact-voice').textContent(),'Voice · ash');
+  const voiceWrites=requests.filter(r=>r.method==='PUT'&&r.path.endsWith('/voice-settings'));
+  assert.equal(voiceWrites.length,1);assert.equal(voiceWrites[0].csrf,csrf);
+  checks.push('a saved voice can finish after closing the picker; reopening waits for that single write and both the picker and contact show its result');
   assert.equal(await page.evaluate(()=>fixture.media.length),0); await page.locator('#close-voice-settings').click();
   checks.push('discoverable per-agent voice choice persists through authenticated API and applies to the next call');
 
@@ -296,9 +355,9 @@ try {
   assert.deepEqual(await page.evaluate(()=>fixture.peers[0].order),['track','channel','offer']);
   assert.equal(await page.evaluate(()=>fixture.channels[0].label),'oai-events');
   assert.equal(await page.evaluate(()=>fixture.channels[0].sent.length),0);
-  await page.locator('#call-voice-settings').click();await page.locator('#voice-choice:not([disabled])').waitFor();
-  assert.match(await page.locator('#voice-model-facts').innerText(),/Voice in this call.*ash/s);assert(await page.locator('#voice-preview').isHidden());
-  await page.locator('#voice-choice').selectOption('cedar');await page.locator('#save-voice').click();
+  await page.locator('#call-voice-settings').click();await voiceOption('marin').waitFor();await modelDetails.click();
+  assert.match(await page.locator('#voice-model-facts').innerText(),/Voice in this call.*ash/s);assert.equal(await page.getByRole('button',{name:/^(Play|Stop) sample of /}).count(),0);
+  await voiceOption('cedar').check();await page.locator('#save-voice').click();
   await wait(async()=>/cedar will be used/.test(await page.locator('#voice-settings-status').innerText()),'next-call voice setting not saved');
   assert.match(await page.locator('#voice-model-facts').innerText(),/Voice in this call.*ash/s);await page.locator('#close-voice-settings').click();
   assert.equal(await page.evaluate(()=>fixture.media.length),1);assert.equal(calls.size,1);
@@ -1172,7 +1231,7 @@ try {
   await page.getByRole('button',{name:'Call Jarvis',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','Jarvis fixture did not connect');
   await wait(async()=>/cannot inspect/.test(await page.locator('#share-capability').innerText()),'effective capability missing before capture');
-  await page.locator('#call-voice-settings').click();await page.locator('#voice-choice:not([disabled])').waitFor();assert.match(await page.locator('#voice-model-facts').innerText(),/Reasoning model.*Not yet reported/s);assert(await page.locator('#voice-advanced').isHidden());await page.locator('#close-voice-settings').click();
+  await page.locator('#call-voice-settings').click();await voiceOption('marin').waitFor();await modelDetails.click();assert.match(await page.locator('#voice-model-facts').innerText(),/Reasoning model.*Not yet reported/s);assert(await page.locator('#voice-advanced').isHidden());await page.locator('#close-voice-settings').click();
   await page.locator('#camera-toggle').click();
   const shuttersBeforeSuspended=await page.evaluate(async()=>{await fixture.audioContexts.at(-1).suspend();return fixture.shutters;});
   await page.locator('#capture-photo').click();

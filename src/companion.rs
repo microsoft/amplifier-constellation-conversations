@@ -374,10 +374,12 @@ fn voice_settings_value(
     agent: &str,
     profile: &Profile,
 ) -> Result<Value> {
+    let traits = voice_previews::traits();
     Ok(json!({
         "voice":selected_voice(s, owner, agent, profile)?,
         "available_voices":VOICES,
-        "voice_descriptions":voice_previews::descriptions(),
+        "voice_traits":traits,
+        "voice_descriptions":traits.map(voice_previews::descriptions),
         "preview_voices":voice_previews::index(&s.home).as_ref().map(|index| index.voices()).unwrap_or_default(),
         "voice_provider":"OpenAI",
         "voice_model":VOICE_MODEL,

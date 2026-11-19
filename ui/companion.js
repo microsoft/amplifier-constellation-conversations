@@ -136,7 +136,7 @@ function showLogin() {
   // A later login must not inherit private presentation or recovery state. Old
   // asynchronous callbacks may close their media, but cannot repopulate it.
   state.authGeneration++; state.recovery = null; state.contacts = [];
-  stopVoicePreview(); $('voice-settings').close(); state.voiceContact = null; $('voice-choice').replaceChildren(); $('voice-settings-status').textContent = ''; $('voice-model-facts').replaceChildren(); $('voice-advanced-facts').replaceChildren(); $('cards').replaceChildren(); $('board-items').replaceChildren(); $('board-history').open = false; $('paste-input').value = ''; $('paste-composer').hidden = true; $('share-receipt').hidden = true; $('transcript').replaceChildren(); $('contacts').replaceChildren();
+  stopVoicePreview(); $('voice-settings').close(); state.voiceContact = null; voicePicker = null; pendingVoiceSaves.clear(); $('voice-selection-summary').textContent = ''; $('voice-choice').replaceChildren(); $('voice-settings-status').textContent = ''; $('voice-model-facts').replaceChildren(); $('voice-advanced-facts').replaceChildren(); $('cards').replaceChildren(); $('board-items').replaceChildren(); $('board-history').open = false; $('paste-input').value = ''; $('paste-composer').hidden = true; $('share-receipt').hidden = true; $('transcript').replaceChildren(); $('contacts').replaceChildren();
   $('call-permissions').replaceChildren(); $('permission-alert').hidden = true; $('context-items').replaceChildren(); $('context-empty').hidden = false;
   $('caption-speaker').textContent = ''; $('caption-text').textContent = ''; notice('');
   $('ended-detail').textContent = '';
@@ -1216,75 +1216,182 @@ function showModelFacts(contact, result) {
   $('voice-advanced').hidden = options.length === 0;
   for (const option of options) fact($('voice-advanced-facts'),option.name || option.id,option.label || option.value || 'Not reported');
 }
-let sampleAudio = null, sampleVoices = [], voiceDescriptions = {};
+const voiceFacets = ['presentation', 'region', 'language'];
+const unlistedVoiceTrait = '__unlisted__';
+const pendingVoiceSaves = new Map();
+let voicePicker = null, preview = null;
+
 function stopVoicePreview() {
-  const audio = sampleAudio;
-  sampleAudio = null;
-  if (audio) { audio.pause(); audio.removeAttribute('src'); audio.load(); }
+  if (preview) {
+    const {clip, button, voice} = preview;
+    preview = null;
+    clip.onended = clip.onerror = clip.onplaying = null;
+    clip.pause(); clip.removeAttribute('src'); clip.load();
+    setPreviewButton(button, voice, false);
+  }
+  $('voice-preview-status').textContent = '';
 }
-function updateVoicePreview() {
-  const voice = $('voice-choice').value;
-  const description = Object.hasOwn(voiceDescriptions,voice) ? voiceDescriptions[voice] : '';
-  $('voice-description').textContent = description; $('voice-description').hidden = !description;
-  $('voice-preview').hidden = !state.voiceContact || Boolean(state.call) || !voice;
-  const available = sampleVoices.includes(voice);
-  $('preview-voice').disabled = !available;
-  $('preview-voice').textContent = sampleAudio ? 'Stop sample' : 'Play voice sample';
-  $('voice-preview-status').textContent = sampleAudio ? 'Loading voice sample…'
-    : available ? '' : 'No sample is installed for this voice.';
+function setPreviewButton(button, voice, playing) {
+  const label = (playing ? 'Stop sample of ' : 'Play sample of ') + voice;
+  button.setAttribute('aria-label', label);
+  button.title = label;
+  button.textContent = playing ? 'Stop' : 'Play';
 }
-$('voice-choice').onchange = () => {stopVoicePreview(); updateVoicePreview();};
-$('preview-voice').onclick = async () => {
-  if (sampleAudio) {stopVoicePreview(); updateVoicePreview(); return;}
-  const voice = $('voice-choice').value, contact = state.voiceContact;
-  if (!contact || state.call || !sampleVoices.includes(voice)) return;
+async function auditionVoice(picker, voice, button) {
+  const wasPlaying = preview?.button === button;
+  stopVoicePreview();
+  if (wasPlaying || picker !== voicePicker || state.call || !picker.samples.has(voice)) return;
   const clip = new Audio();
-  sampleAudio = clip;
+  preview = {clip, button, voice};
+  setPreviewButton(button, voice, true);
+  $('voice-preview-status').textContent = 'Loading voice sample…';
   const finish = (failed = false) => {
-    if (sampleAudio !== clip) return;
-    stopVoicePreview(); updateVoicePreview();
+    if (preview?.clip !== clip) return;
+    stopVoicePreview();
     if (failed) $('voice-preview-status').textContent = 'This voice sample could not be played.';
   };
-  clip.onplaying = () => { if (sampleAudio === clip) $('voice-preview-status').textContent = 'Playing a recorded sample.'; };
+  clip.onplaying = () => { if (preview?.clip === clip) $('voice-preview-status').textContent = 'Playing a recorded sample.'; };
   clip.onended = () => finish();
   clip.onerror = () => finish(true);
-  clip.preload = 'none';
-  clip.src = `/api/v1/companion/agents/${encodeURIComponent(contact.id)}/voice-previews/${encodeURIComponent(voice)}`;
-  updateVoicePreview();
+  clip.src = `/api/v1/companion/agents/${encodeURIComponent(picker.contact.id)}/voice-previews/${encodeURIComponent(voice)}`;
   try { await clip.play(); } catch { finish(true); }
+}
+function updateVoiceSelection(picker) {
+  $('voice-selection-summary').textContent = picker.selected ? 'Selected · ' + picker.selected : '';
+  $('save-voice').disabled = picker.saving || !picker.selected || picker.selected === picker.saved;
+}
+function makeVoiceRow(picker, voice) {
+  const row = element('div', 'voice-row');
+  row.dataset.voice = voice;
+  const input = element('input');
+  input.type = 'radio'; input.name = 'voice-choice'; input.value = voice;
+  input.checked = picker.selected === voice;
+  const title = element('strong', 'voice-name', voice);
+  const details = element('span', 'voice-description', picker.descriptions[voice] || 'No description listed.');
+  const text = element('span', 'voice-row-text'); text.append(title, details);
+  const label = element('label', 'voice-option'); label.append(input, text); row.append(label);
+  input.onchange = () => {
+    picker.selected = voice;
+    $('voice-settings-status').textContent = '';
+    updateVoiceSelection(picker);
+  };
+  if (!state.call) {
+    const button = element('button', 'voice-audition');
+    button.type = 'button';
+    if (picker.samples.has(voice)) {
+      setPreviewButton(button, voice, false);
+      button.onclick = () => auditionVoice(picker, voice, button);
+    } else {
+      button.disabled = true;
+      button.textContent = 'No sample';
+      button.setAttribute('aria-label', 'No sample for ' + voice);
+    }
+    row.append(button);
+  }
+  return row;
+}
+function updateVoiceFilters() {
+  const picker = voicePicker;
+  if (!picker) return;
+  const filters = voiceFacets.map(key => [key, $('voice-filter-' + key).value]).filter(([,value]) => value);
+  let count = 0;
+  for (const row of $('voice-choice').children) {
+    const traits = picker.traits[row.dataset.voice] || {};
+    row.hidden = !filters.every(([key,value]) => (traits[key] || unlistedVoiceTrait) === value);
+    if (!row.hidden) count++;
+    else if (preview && row.contains(preview.button)) stopVoicePreview();
+  }
+  $('voice-reset-filters').hidden = !filters.length;
+  $('voice-no-matches').hidden = !picker.voices.length || count !== 0;
+  $('voice-result-count').textContent = count + (count === 1 ? ' voice' : ' voices');
+}
+function loadVoiceFilters(picker) {
+  let offered = false;
+  for (const key of voiceFacets) {
+    const select = $('voice-filter-' + key);
+    const values = new Set(picker.voices.map(voice => picker.traits[voice]?.[key]).filter(Boolean));
+    select.replaceChildren(new Option('All', ''));
+    for (const value of [...values].sort()) select.add(new Option(value, value));
+    if (values.size && picker.voices.some(voice => !picker.traits[voice]?.[key])) select.add(new Option('Not listed', unlistedVoiceTrait));
+    select.parentElement.hidden = !values.size;
+    offered ||= values.size > 0;
+    select.onchange = updateVoiceFilters;
+  }
+  $('voice-filters').hidden = !offered;
+  updateVoiceFilters();
+}
+$('voice-reset-filters').onclick = () => {
+  const first = voiceFacets.map(key => $('voice-filter-' + key)).find(select => select.value);
+  for (const key of voiceFacets) $('voice-filter-' + key).value = '';
+  updateVoiceFilters();
+  first?.focus();
 };
 async function openVoiceSettings(contact) {
-  state.voiceContact = contact; const generation = state.authGeneration;
-  stopVoicePreview(); sampleVoices = []; voiceDescriptions = {}; $('voice-preview').hidden = true; $('voice-description').hidden = true;
-  $('voice-settings-title').textContent = `Voice for ${contact.label || 'agent'}`; $('voice-choice').replaceChildren(); $('voice-model-facts').replaceChildren(); $('voice-advanced-facts').replaceChildren(); $('voice-advanced').hidden = true; $('voice-advanced').open = false;
-  $('voice-settings-status').textContent = 'Loading available voices…'; $('save-voice').disabled = true; $('voice-choice').disabled = true;
+  stopVoicePreview();
+  state.voiceContact = contact;
+  const picker = {contact, generation:state.authGeneration, selected:'', saved:'', saving:false, voices:[], samples:new Set(), descriptions:{}, traits:{}};
+  voicePicker = picker;
+  $('voice-settings-title').textContent = `Voice for ${contact.label || 'agent'}`;
+  $('voice-choice').replaceChildren(); $('voice-choice').disabled = true;
+  $('voice-filters').hidden = true; $('voice-reset-filters').hidden = true; $('voice-no-matches').hidden = true;
+  $('voice-result-count').textContent = ''; $('voice-model-facts').replaceChildren(); $('voice-advanced-facts').replaceChildren();
+  $('voice-advanced').hidden = true; $('voice-advanced').open = false; $('voice-model-facts').parentElement.open = false;
+  $('voice-settings-status').textContent = 'Loading available voices…';
+  updateVoiceSelection(picker);
   if (!$('voice-settings').open) $('voice-settings').showModal();
+  $('voice-settings').querySelector('.voice-scroll').scrollTop = 0;
   try {
+    // A save can finish after the user closes the picker. Read the committed choice on reopen.
+    const pending = pendingVoiceSaves.get(contact.id);
+    if (pending) await pending.catch(() => {});
+    if (voicePicker !== picker) return;
     const result = await api(`/api/v1/companion/agents/${encodeURIComponent(contact.id)}/voice-settings`);
-    if (state.voiceContact !== contact || generation !== state.authGeneration) return;
+    if (voicePicker !== picker || state.voiceContact !== contact) return;
     showModelFacts(contact,result);
-    const voices = Array.isArray(result.available_voices) ? result.available_voices.filter(voice => typeof voice === 'string') : [];
-    $('voice-choice').replaceChildren(...voices.map(voice => { const option = element('option',null,voice); option.value = voice; return option; }));
-    $('voice-choice').value = result.voice; $('voice-choice').disabled = !voices.length; $('save-voice').disabled = !voices.length;
-    sampleVoices = Array.isArray(result.preview_voices) ? result.preview_voices.filter(voice=>voices.includes(voice)) : [];
-    voiceDescriptions = result.voice_descriptions || {};
-    updateVoicePreview();
-    $('voice-settings-status').textContent = voices.length ? 'Saved choices apply to your next call with this agent.' : 'No voice choices are available.';
-  } catch (error) { if (state.voiceContact === contact && generation === state.authGeneration) $('voice-settings-status').textContent = error.message; }
+    picker.voices = Array.isArray(result.available_voices) ? result.available_voices.filter(v => typeof v === 'string' && v) : [];
+    picker.saved = result.voice;
+    picker.selected = picker.voices.includes(result.voice) ? result.voice : '';
+    picker.samples = new Set(result.preview_voices || []);
+    picker.descriptions = result.voice_descriptions || {};
+    picker.traits = result.voice_traits || {};
+    // Show the saved voice first, then described choices. Filtering never changes a selection.
+    const rank = v => v === picker.saved ? 0 : picker.descriptions[v] ? 1 : 2;
+    picker.voices.sort((a,b) => rank(a) - rank(b) || a.localeCompare(b));
+    $('voice-choice').replaceChildren(...picker.voices.map(voice => makeVoiceRow(picker, voice)));
+    $('voice-choice').disabled = !picker.voices.length;
+    loadVoiceFilters(picker); updateVoiceSelection(picker);
+    $('voice-settings-status').textContent = picker.voices.length ? '' : 'No voice choices are available.';
+  } catch (error) { if (voicePicker === picker) $('voice-settings-status').textContent = error.message; }
 }
 $('voice-settings-form').onsubmit = async event => {
-  event.preventDefault(); const contact = state.voiceContact, generation = state.authGeneration; if (!contact) return;
-  $('save-voice').disabled = true;
+  event.preventDefault();
+  const picker = voicePicker;
+  if (!picker || $('save-voice').disabled) return;
+  const {contact, selected} = picker;
+  picker.saving = true; updateVoiceSelection(picker);
+  const request = api(`/api/v1/companion/agents/${encodeURIComponent(contact.id)}/voice-settings`,'PUT',{voice:selected});
+  pendingVoiceSaves.set(contact.id,request);
   try {
-    const result = await api(`/api/v1/companion/agents/${encodeURIComponent(contact.id)}/voice-settings`,'PUT',{voice:$('voice-choice').value});
-    if (state.voiceContact !== contact || generation !== state.authGeneration) return;
-    showModelFacts(contact,result); contact.voice = result.voice; $('voice-settings-status').textContent = `Saved. ${result.voice} will be used for your next call with ${contact.label}.`;
-    const card = [...$('contacts').children].find(card => card.dataset.agentId === contact.id); if (card) card.querySelector('.contact-voice').textContent = `Voice · ${result.voice}`;
-  } catch (error) { if (state.voiceContact === contact && generation === state.authGeneration) $('voice-settings-status').textContent = error.message; }
-  finally { if (state.voiceContact === contact && generation === state.authGeneration) $('save-voice').disabled = false; }
+    const result = await request;
+    if (state.authGeneration !== picker.generation) return;
+    const currentContact = state.contacts.find(item => item.id === contact.id);
+    if (currentContact) currentContact.voice = result.voice;
+    const card = [...$('contacts').children].find(card => card.dataset.agentId === contact.id);
+    if (card) card.querySelector('.contact-voice').textContent = `Voice · ${result.voice}`;
+    if (voicePicker !== picker || state.voiceContact !== contact) return;
+    showModelFacts(contact,result); picker.saved = result.voice;
+    $('voice-settings-status').textContent = `Saved. ${result.voice} will be used for your next call with ${contact.label}.`;
+  } catch (error) { if (voicePicker === picker) $('voice-settings-status').textContent = error.message; }
+  finally {
+    if (pendingVoiceSaves.get(contact.id) === request) pendingVoiceSaves.delete(contact.id);
+    if (voicePicker === picker) { picker.saving = false; updateVoiceSelection(picker); }
+  }
 };
 $('close-voice-settings').onclick = () => $('voice-settings').close();
-$('voice-settings').addEventListener('close', () => { stopVoicePreview(); state.voiceContact = null; sampleVoices=[]; voiceDescriptions={}; });
+$('voice-settings').addEventListener('close', () => {
+  if ($('voice-settings').open) return;
+  stopVoicePreview(); state.voiceContact = null; voicePicker = null;
+});
 $('call-voice-settings').onclick = () => { if (current(state.call)) openVoiceSettings(state.call.contact); };
 
 function releaseTransport(call) {

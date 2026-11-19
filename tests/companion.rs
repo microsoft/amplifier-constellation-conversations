@@ -5134,6 +5134,34 @@ async fn recorded_voice_previews_are_bound_to_installation_model_and_source() {
         prefs["voice_descriptions"]["vesper"],
         "English · British · Masculine"
     );
+    assert_eq!(
+        prefs["voice_traits"]["vesper"],
+        json!({"language":"English","region":"British","presentation":"Masculine"})
+    );
+    assert_eq!(
+        prefs["voice_traits"]["shida"],
+        json!({"language":"Japanese","presentation":"Masculine"})
+    );
+    assert_eq!(prefs["voice_descriptions"]["shida"], "Japanese · Masculine");
+    let traits = prefs["voice_traits"].as_object().unwrap();
+    let descriptions = prefs["voice_descriptions"].as_object().unwrap();
+    let available = prefs["available_voices"].as_array().unwrap();
+    assert!(available.contains(&json!("cedar")));
+    assert!(!traits.contains_key("cedar"));
+    assert!(!descriptions.contains_key("cedar"));
+    assert_eq!(
+        traits.keys().collect::<Vec<_>>(),
+        descriptions.keys().collect::<Vec<_>>()
+    );
+    for (voice, fields) in traits {
+        assert!(available.contains(&json!(voice)));
+        let description = ["language", "region", "presentation"]
+            .iter()
+            .filter_map(|field| fields[field].as_str())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        assert_eq!(descriptions[voice], description);
+    }
     let get = |with_token: bool| {
         let req = Request::builder().uri(url);
         let req = if with_token {
