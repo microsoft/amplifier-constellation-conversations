@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, header},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs::File, io::Read, path::Path as FsPath, sync::Arc};
 
@@ -33,20 +33,52 @@ struct Sample {
     source: String,
 }
 
-/// Bridge-owned provider facts also usable by other voice clients.
-pub(super) fn descriptions() -> Option<&'static BTreeMap<String, String>> {
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct VoiceTraits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presentation: Option<String>,
+}
+
+/// Expose only provider-documented traits of voices selectable by this bridge.
+pub(super) fn traits() -> Option<&'static BTreeMap<String, VoiceTraits>> {
     #[derive(Deserialize)]
     struct Catalog {
+        provider: String,
         model: String,
-        descriptions: BTreeMap<String, String>,
+        voices: BTreeMap<String, VoiceTraits>,
     }
     static LIVE: std::sync::LazyLock<Catalog> = std::sync::LazyLock::new(|| {
-        serde_json::from_str(include_str!(
+        let mut catalog: Catalog = serde_json::from_str(include_str!(
             "../bridge/openai-live-voice-descriptions.json"
         ))
-        .expect("valid built-in OpenAI catalog")
+        .expect("valid built-in OpenAI catalog");
+        catalog.voices.retain(|id, _| VOICES.contains(&id.as_str()));
+        catalog
     });
-    (LIVE.model == VOICE_MODEL).then_some(&LIVE.descriptions)
+    (LIVE.provider == "OpenAI" && LIVE.model == VOICE_MODEL).then_some(&LIVE.voices)
+}
+
+pub(super) fn descriptions(traits: &BTreeMap<String, VoiceTraits>) -> BTreeMap<&str, String> {
+    traits
+        .iter()
+        .map(|(voice, fields)| {
+            let description = [
+                fields.language.as_deref(),
+                fields.region.as_deref(),
+                fields.presentation.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            (voice.as_str(), description)
+        })
+        .collect()
 }
 
 fn bounded_file(path: &FsPath, limit: usize) -> Result<Vec<u8>> {
