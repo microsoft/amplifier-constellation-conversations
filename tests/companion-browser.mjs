@@ -336,7 +336,7 @@ try {
   await page.locator('#close-voice-settings').click();
   const beforeReopen=coachVoiceReads();
   await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
-  assert(await page.locator('#voice-choice').isDisabled(),'picker exposed a stale value before the save completed');
+  assert(await page.locator('#voice-choice').evaluate(fieldset=>fieldset.disabled && fieldset.elements.length===0),'picker exposed a stale value before the save completed');
   assert.equal(coachVoiceReads(),beforeReopen);
   releaseVoiceSave();
   await voiceOption('ash').waitFor();
