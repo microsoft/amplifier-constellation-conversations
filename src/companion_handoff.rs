@@ -4,7 +4,7 @@
 //! authenticated delivery queue decides admission/steering/unknown outcomes.
 use super::{AppState, TRANSCRIPT_GRACE_MS, insert_event, now_ms, transcript};
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use std::collections::HashSet;
 
@@ -39,7 +39,7 @@ pub(super) fn source(
         .query_map([call], |r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let fragments = transcript::fragments(rows)?;
-    let admitted = db.prepare("SELECT offset_ms,source FROM companion_delegations WHERE call_id=?1 AND state IN ('dispatched','completed','failed','unknown')")?
+    let admitted = db.prepare("SELECT offset_ms,source FROM companion_delegations WHERE call_id=?1 AND state IN ('dispatched','completed','failed','unknown','call_control_requested')")?
         .query_map([call], |r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut consumed = HashSet::new();
@@ -59,6 +59,83 @@ pub(super) fn source(
     let source =
         transcript::Source::pending(&fragments, previous, legacy_previous, offset, &consumed);
     Ok((fragments, previous, source))
+}
+
+/// Native call control has already accepted this exact source and the host is
+/// closing the same session. This receipt supplies no authority for other work.
+pub(super) fn closing_control(
+    db: &Connection,
+    call: &str,
+    source: &transcript::Source,
+) -> Result<Option<String>> {
+    let Some(last) = source
+        .fragments
+        .iter()
+        .rev()
+        .find(|f| f.role == "user" && !f.text.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(event_id) = &last.event_id else {
+        return Ok(None);
+    };
+    Ok(db.query_row(
+        "SELECT e.event_key FROM companion_events e JOIN companion_calls c ON c.id=e.call_id
+         WHERE e.call_id=?1 AND e.kind='call_control' AND c.state='closing'
+           AND json_extract(e.data,'$.action')='end_call' AND json_extract(e.data,'$.decision')='requested'
+           AND e.event_key='voice-control:' || json_extract(e.data,'$.decision_event_id')
+           AND json_extract(e.data,'$.session_id')=c.session_id
+           AND json_extract(e.data,'$.source_event_id')=?2 AND json_extract(e.data,'$.source_start_ms')=?3
+           AND json_extract(e.data,'$.source_end_ms')=?4 AND EXISTS(
+             SELECT 1 FROM companion_events h WHERE h.call_id=c.id AND h.kind='lifecycle'
+               AND h.event_key='host-close-request' AND h.seq>e.seq
+               AND json_extract(h.data,'$.type')='host_close_requested'
+               AND json_extract(h.data,'$.source')='voice_control')
+         LIMIT 1", params![call,event_id,last.start_ms,last.end_ms], |r|r.get(0)).optional()?)
+}
+
+/// Only exact standalone directives may be satisfied without another model
+/// turn. Unknown wording, compound requests and separate utterances continue
+/// through ordinary intake. This predicate never initiates a close.
+pub(super) fn only_close_command(source: &transcript::Source) -> bool {
+    let groups = transcript::group(&source.fragments, source.offset_ms);
+    let mut human = groups
+        .iter()
+        .filter(|g| g.role == "user" && !g.text.trim().is_empty());
+    let Some(group) = human.next() else {
+        return false;
+    };
+    if human.next().is_some() || group.crosses_delegation_anchor {
+        return false;
+    }
+    let text = group
+        .text
+        .trim()
+        .trim_end_matches(['.', '!'])
+        .trim_end()
+        .to_ascii_lowercase();
+    let text = text.strip_prefix("okay, ").unwrap_or(&text);
+    let text = text.strip_prefix("please ").unwrap_or(text);
+    let text = text.strip_prefix("go ahead and ").unwrap_or(text);
+    matches!(text, "end the call" | "end this call" | "hang up")
+}
+
+pub(super) fn retain_control_source(
+    s: &AppState,
+    call: &str,
+    id: &str,
+    control: &str,
+) -> Result<()> {
+    let mut db = s.db.lock().unwrap();
+    let tx = db.transaction()?;
+    if tx.execute("UPDATE companion_delegations SET state='call_control_requested' WHERE call_id=?1 AND id=?2 AND state IN ('waiting_transcript','held')",params![call,id])?==1 {
+        insert_event(&tx,call,&format!("delegation:{id}:call-control"),"delegation",
+          &json!({"id":id,"state":"call_control_requested","control_receipt":control,"backend_dispatched":false}))?;
+    }
+    tx.commit()?;
+    drop(db);
+    s.changed();
+    Ok(())
 }
 
 /// Called under the intake mutex, after provider reservations were considered.
@@ -128,11 +205,11 @@ pub(super) fn carry_covered(s: &AppState, call: &str, id: &str, offset: i64) -> 
     if local(&db, call, id)? {
         return Ok(false);
     }
-    let rows = db.prepare("SELECT id,message_id,source FROM companion_delegations WHERE call_id=?1 AND state IN ('dispatched','completed','failed','unknown') ORDER BY created_at DESC,id")?
-        .query_map([call],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))?
+    let rows = db.prepare("SELECT id,message_id,source,state FROM companion_delegations WHERE call_id=?1 AND state IN ('dispatched','completed','failed','unknown','call_control_requested') ORDER BY created_at DESC,id")?
+        .query_map([call],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (prior, message, saved) in rows {
-        if !local(&db, call, &prior)? {
+    for (prior, message, saved, state) in rows {
+        if state != "call_control_requested" && !local(&db, call, &prior)? {
             continue;
         }
         let Some(saved) = saved else {
@@ -145,6 +222,18 @@ pub(super) fn carry_covered(s: &AppState, call: &str, id: &str, offset: i64) -> 
             .any(|f| f.role == "user" && f.start_ms <= offset)
         {
             continue;
+        }
+        if state == "call_control_requested" {
+            // A duplicated reservation at the same anchor can reference the
+            // same native control, but must never borrow an older agent input.
+            if source.offset_ms == offset
+                && let Some(control) = closing_control(&db, call, &source)?
+            {
+                drop(db);
+                retain_control_source(s, call, id, &control)?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
         let tx = db.transaction()?;
         tx.execute("UPDATE companion_delegations SET state='carried_forward',message_id=?3 WHERE call_id=?1 AND id=?2 AND state IN ('waiting_transcript','held')",params![call,id,message])?;
@@ -180,6 +269,97 @@ mod tests {
 
     fn fragment(db: &Connection, seq: i64, start: i64, text: &str) {
         db.execute("INSERT INTO companion_events VALUES(?1,'call',?2,'transcript',?3)",params![seq,format!("event-{seq}"),json!({"role":"user","start_ms":start,"end_ms":start+100,"text":text,"event_id":format!("event-{seq}")}).to_string()]).unwrap();
+    }
+
+    #[test]
+    fn only_unambiguous_standalone_close_is_consumed() {
+        let db = db();
+        fragment(&db, 1, 1000, "Okay, go ahead and ");
+        fragment(&db, 2, 1300, "end the call");
+        let pending = |offset| source(&db, "call", offset).unwrap().2;
+        assert!(only_close_command(&pending(1400)));
+        assert!(!only_close_command(&pending(1300)), "partial source");
+        fragment(&db, 3, 1500, " and save the note.");
+        assert!(!only_close_command(&pending(2000)), "compound clause");
+        db.execute("DELETE FROM companion_events", []).unwrap();
+        fragment(&db, 4, 1000, "Save my note.");
+        fragment(&db, 5, 6000, "Hang up!");
+        assert!(
+            !only_close_command(&pending(7000)),
+            "separate earlier request"
+        );
+        db.execute("DELETE FROM companion_events", []).unwrap();
+        fragment(&db, 6, 1000, "Don't hang up!");
+        assert!(!only_close_command(&pending(2000)), "negation");
+    }
+
+    #[test]
+    fn native_control_needs_same_call_session_source_and_host_receipt() {
+        let db = db();
+        db.execute_batch(
+            "ALTER TABLE companion_calls ADD COLUMN state TEXT;
+            ALTER TABLE companion_calls ADD COLUMN session_id TEXT;
+            UPDATE companion_calls SET state='closing',session_id='session';",
+        )
+        .unwrap();
+        fragment(&db, 1, 1000, "End the call");
+        let pending = source(&db, "call", 1200).unwrap().2;
+        let control = json!({"action":"end_call","decision":"requested","decision_event_id":"decision","session_id":"session","source_event_id":"event-1","source_start_ms":1000,"source_end_ms":1100});
+        let receipt = || closing_control(&db, "call", &pending).unwrap();
+        db.execute(
+            "INSERT INTO companion_events VALUES(2,'call','voice-control:decision','call_control',?1)",
+            [control.to_string()],
+        )
+        .unwrap();
+        assert!(receipt().is_none(), "a request alone cannot settle a close");
+        db.execute(
+            "INSERT INTO companion_events VALUES(3,'elsewhere','host-close-request','lifecycle',?1)",
+            [json!({"type":"host_close_requested","source":"voice_control"}).to_string()],
+        )
+        .unwrap();
+        assert!(receipt().is_none(), "another call's host receipt");
+        db.execute("UPDATE companion_events SET call_id='call',data=json_set(data,'$.source','browser') WHERE seq=3", []).unwrap();
+        assert!(receipt().is_none(), "manual close");
+        db.execute("UPDATE companion_events SET data=json_set(data,'$.source','voice_control') WHERE seq=3", []).unwrap();
+        assert_eq!(receipt().as_deref(), Some("voice-control:decision"));
+        for (key, value) in [
+            ("session_id", json!("different")),
+            ("source_event_id", json!("event-9")),
+            ("decision_event_id", json!("other-decision")),
+            ("source_start_ms", json!(999)),
+            ("source_end_ms", json!(1099)),
+            ("decision", json!("unknown")),
+            ("action", json!("other")),
+        ] {
+            let mut different = control.clone();
+            different[key] = value;
+            db.execute(
+                "UPDATE companion_events SET data=?1 WHERE seq=2",
+                [different.to_string()],
+            )
+            .unwrap();
+            assert!(receipt().is_none(), "mismatched {key}");
+        }
+        db.execute(
+            "UPDATE companion_events SET data=?1 WHERE seq=2",
+            [control.to_string()],
+        )
+        .unwrap();
+        db.execute("UPDATE companion_calls SET state='connected'", [])
+            .unwrap();
+        assert!(receipt().is_none(), "no active host-close state");
+    }
+
+    #[test]
+    fn native_hangup_consumes_only_its_source_and_establishes_no_agent_work() {
+        let db = db();
+        fragment(&db, 1, 1000, "End the call");
+        let handled = source(&db, "call", 1100).unwrap().2;
+        db.execute("INSERT INTO companion_delegations VALUES('call','control',1100,'call_control_requested','no-message',?1)", [serde_json::to_string(&handled).unwrap()]).unwrap();
+        assert!(!source(&db, "call", 1100).unwrap().2.human());
+        assert!(!established(&db, "call").unwrap());
+        fragment(&db, 2, 900, "A late independent instruction.");
+        assert_eq!(source(&db, "call", 1100).unwrap().2.fragments[0].seq, 2);
     }
 
     #[test]

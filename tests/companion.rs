@@ -70,7 +70,12 @@ if voice in ('followthrough','browser_qa'):
   while True:
    if inbox.exists():
     events=json.loads(inbox.read_text());inbox.unlink()
-    for event in events:emit({'type':'event','event':event})
+    for event in events:
+     if event.get('type')=='fixture-native-close':
+      emit(dict(event,type='call_control'))
+      emit({'type':'event','event':{'type':'session.closed','event_id':'fixture-end-terminal','session':{'id':'live-fixture'},'reason':'close_requested','usage':{'seconds':7}}})
+      emit({'type':'closed','confirmed':True,'session_id':'live-fixture'})
+     else:emit({'type':'event','event':event})
    time.sleep(.01)
  threading.Thread(target=provider_inputs,daemon=True).start()
 receipt_port=34567
@@ -3156,6 +3161,101 @@ fn assert_no_internal_provider_delegation(f: &Fixture) {
                 .is_some_and(|id| id.starts_with("companion-human:")),
             "internal handoff must not impersonate a provider delegation: {command}"
         );
+    }
+}
+
+#[tokio::test]
+async fn native_close_and_pending_reasoning_reservation_preserve_only_independent_work() {
+    for (prefix, final_fragment, has_work, duplicate) in [
+        ("Okay, go ahead and ", "end the call", false, false),
+        ("Okay, go ahead and ", "end the call", false, true),
+        ("Save my note ", "and end the call", true, false),
+    ] {
+        let speech = format!("{prefix}{final_fragment}");
+        let f = fixture("followthrough");
+        let (_, call) = start(&f).await;
+        let id = call["id"].as_str().unwrap();
+        until(&f, id, "card").await;
+        let initial_turns = if duplicate {
+            // A duplicated close reservation must never point at this real,
+            // earlier local turn or manufacture an additional model input.
+            followthrough_provider_events(&f, &call, &followthrough_correction_events()).await;
+            companion_frame(&f, "session/prompt", 2).await;
+            2
+        } else {
+            1
+        };
+        let addr = f.home.path().join("provider-input.json");
+        let staging = f.home.path().join("final-phrase.staged");
+        let mut events = vec![
+            json!({"type":"session.input_transcript.delta","event_id":"prefix-source","delta":prefix,"start_ms":4000,"end_ms":4200}),
+            json!({"type":"session.input_transcript.delta","event_id":"end-source","delta":final_fragment,"start_ms":4200,"end_ms":4400}),
+            json!({"type":"session.delegation.created","event_id":"end-reservation","offset_ms":4500,"delegation":{"id":"end-delegation","target":"client"}}),
+        ];
+        if duplicate {
+            events.push(json!({"type":"session.delegation.created","event_id":"duplicate-reservation","offset_ms":4500,"delegation":{"id":"duplicate-close","target":"client"}}));
+        }
+        events.push(json!({"type":"fixture-native-close","action":"end_call","decision":"requested","session_id":"live-fixture","source_event_id":"end-source","trigger_id":"end-trigger","decision_event_id":"end-decision","source_start_ms":4200,"source_end_ms":4400,"probability":0.99}));
+        std::fs::write(&staging, serde_json::to_vec(&events).unwrap()).unwrap();
+        std::fs::rename(staging, addr).unwrap();
+        let closed = until(&f, id, "closed").await;
+        let events = closed["events"].as_array().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e["kind"] == "closed" && e["data"]["confirmed"] == true)
+        );
+        for fragment in [prefix, final_fragment] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["kind"] == "transcript" && e["data"]["text"] == fragment)
+            );
+        }
+        if has_work {
+            for _ in 0..100 {
+                if followthrough_prompts(&f).len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let prompts = followthrough_prompts(&f);
+            assert_eq!(prompts.len(), 2);
+            let text = prompts[1]["params"]["prompt"][0]["text"].as_str().unwrap();
+            assert!(text.contains(&speech) && text.contains("host is already closing"));
+        } else {
+            let db = f.s.db.lock().unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM input_deliveries WHERE conversation_id=?1",
+                    [call["conversation_id"].as_str().unwrap()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                initial_turns
+            );
+            let expected: &[&str] = if duplicate {
+                &["end-delegation", "duplicate-close"]
+            } else {
+                &["end-delegation"]
+            };
+            for &reservation in expected {
+                assert!(
+                    events.iter().any(|e| e["data"]["id"] == reservation
+                        && e["data"]["state"] == "call_control_requested"
+                        && e["data"]["control_receipt"] == "voice-control:end-decision"
+                        && e["data"]["backend_dispatched"] == false),
+                    "reservation {reservation}: {:?}",
+                    events
+                        .iter()
+                        .filter(|e| e["kind"] == "delegation")
+                        .map(|e| (&e["data"]["id"], &e["data"]["state"]))
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(followthrough_prompts(&f).len(), initial_turns as usize);
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM companion_delegations WHERE call_id=?1 AND state='call_control_requested'",[id],|r|r.get::<_,i64>(0)).unwrap(),expected.len() as i64);
+        }
     }
 }
 

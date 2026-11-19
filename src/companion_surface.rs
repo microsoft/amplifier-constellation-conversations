@@ -251,8 +251,7 @@ pub struct Presence {
     capture_consent: bool,
     user_speaking: Option<bool>,
     agent_speaking: Option<bool>,
-    #[serde(default)]
-    board_card_ids: Vec<String>,
+    board_card_ids: Option<Vec<String>>,
     #[serde(default)]
     pinned_card_ids: Vec<String>,
     focused_card_id: Option<String>,
@@ -656,6 +655,33 @@ fn record_event(
     db.execute("INSERT OR IGNORE INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,?3,?4,?5)",params![id,format!("surface:{operation}:{state}"),kind,data.to_string(),now_ms()])?;
     Ok(())
 }
+// Older clients could omit membership and have it recorded as an empty
+// array. Only an explicit empty report, or a verified nonempty report, can
+// establish membership at its saved time. Use this rule for voice and reads.
+const VERIFIED_BOARD_REPORT: &str =
+    "event_key GLOB 'board:*' AND json_extract(data,'$.source')='authenticated_browser_membership'
+     AND json_type(data,'$.membership_verified')='true' AND json_type(data,'$.card_ids')='array'
+     AND (json_array_length(data,'$.card_ids')>0 OR json_type(data,'$.explicit_membership')='true')";
+
+fn latest_board_report(db: &Connection, call: &str) -> Result<Option<(String, Vec<String>)>> {
+    // Apply the evidence predicate *after* selecting the latest observation.
+    // An ambiguous newer row cannot resurrect an older trusted snapshot.
+    let sql = format!(
+        "SELECT event_key,json_extract(data,'$.card_ids') FROM
+        (SELECT event_key,data FROM companion_events WHERE call_id=?1 AND kind='surface_observation'
+         ORDER BY seq DESC LIMIT 1) WHERE {VERIFIED_BOARD_REPORT}"
+    );
+    let row: Option<(String, String)> = db
+        .query_row(&sql, [call], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    row.map(|(key, raw)| Ok((key, serde_json::from_str(&raw)?)))
+        .transpose()
+}
+
+fn last_report_was_empty(db: &Connection, call: &str) -> Result<bool> {
+    Ok(latest_board_report(db, call)?.is_some_and(|(_, ids)| ids.is_empty()))
+}
+
 /// Do not send obsolete browser membership after it waited for the caller's
 /// floor. Ownership/private identity is checked by the common delivery gate.
 pub(crate) fn board_presentation_allowed(
@@ -670,17 +696,26 @@ pub(crate) fn board_presentation_allowed(
         else {
             continue;
         };
-        let latest: Option<(String,String,String)> = db.query_row(
-            "SELECT e.event_key,e.data,p.board_card_ids FROM companion_events e JOIN companion_surfaces p ON p.call_id=e.call_id WHERE e.call_id=?1 AND e.kind='surface_observation' ORDER BY e.seq DESC LIMIT 1",
-            [call],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        ).optional()?;
-        let Some((key, data, raw)) = latest else {
+        let Some((key, saved)) = latest_board_report(db, call)? else {
             return Ok(false);
         };
-        let mut current: Vec<String> = serde_json::from_str(&raw)?;
+        let raw: Option<String> = db
+            .query_row(
+                "SELECT board_card_ids FROM companion_surfaces WHERE call_id=?1 AND updated_at>=?2",
+                params![call, now_ms() - FRESH_MS],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(mut current) = raw
+            .as_deref()
+            .map(serde_json::from_str::<Option<Vec<String>>>)
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(false);
+        };
         current.sort();
-        let saved: Value = serde_json::from_str(&data)?;
-        if key != event || saved["card_ids"] != json!(current) {
+        if key != event || saved != current {
             return Ok(false);
         }
     }
@@ -694,20 +729,20 @@ pub async fn presence(
     Json(presence): Json<Presence>,
 ) -> ApiResult<Json<Value>> {
     let (p, _) = browser(&s, &id, &h, true)?;
+    let reported_cards = presence.board_card_ids.as_deref().unwrap_or_default();
     if uuid::Uuid::parse_str(&presence.browser_id).is_err()
         || presence
             .view_revision
             .is_some_and(|r| !(0..=MAX_VIEW_REVISION).contains(&r))
         || !valid_playback(&presence)
         || (presence.capture_consent && !presence.camera_enabled)
-        || presence.board_card_ids.len() > 3
-        || presence.board_card_ids.iter().any(|id| !valid_card_id(id))
-        || presence
-            .board_card_ids
+        || reported_cards.len() > 3
+        || reported_cards.iter().any(|id| !valid_card_id(id))
+        || reported_cards
             .iter()
             .collect::<std::collections::HashSet<_>>()
             .len()
-            != presence.board_card_ids.len()
+            != reported_cards.len()
         || presence
             .pinned_card_ids
             .iter()
@@ -717,11 +752,11 @@ pub async fn presence(
         || presence
             .pinned_card_ids
             .iter()
-            .any(|id| !presence.board_card_ids.contains(id))
+            .any(|id| !reported_cards.contains(id))
         || presence
             .focused_card_id
             .as_ref()
-            .is_some_and(|id| !presence.board_card_ids.contains(id))
+            .is_some_and(|id| !reported_cards.contains(id))
     {
         return Err(ApiError::bad(
             "Use an enabled camera for capture consent and at most three owned board cards",
@@ -733,7 +768,7 @@ pub async fn presence(
     if !live || crate::companion_history::private_identity(&s.db.lock().unwrap(), &id)?.is_none() {
         return Err(ApiError::forbidden());
     }
-    for card in &presence.board_card_ids {
+    for card in reported_cards {
         if !card_exists(&s, &id, card)? {
             return Err(ApiError::missing());
         }
@@ -770,16 +805,23 @@ pub async fn presence(
             "The browser view revision is stale".into(),
         ));
     }
-    let mut old_board: Vec<String> = current
+    // The JSON text "null" means this presence omitted board membership.
+    // An explicit [] is an observation of an empty board. Older browser
+    // clients can continue to report camera and playback without a board.
+    let mut old_board = current
         .as_ref()
-        .map(|(_, _, _, raw, _)| serde_json::from_str(raw))
+        .map(|(_, _, _, raw, _)| serde_json::from_str::<Option<Vec<String>>>(raw))
         .transpose()
         .map_err(anyhow::Error::from)?
-        .unwrap_or_default();
-    let mut board = presence.board_card_ids.clone();
-    old_board.sort();
+        .flatten();
+    if let Some(ids) = &mut old_board {
+        ids.sort();
+    }
+    let mut board = reported_cards.to_vec();
     board.sort();
-    let board_changed = old_board != board;
+    let board_changed = presence.board_card_ids.is_some()
+        && (old_board.as_ref() != Some(&board)
+            || (board.is_empty() && !last_report_was_empty(&tx, &id)?));
     tx.execute("INSERT INTO companion_surfaces(call_id,browser_id,session_hash,camera_enabled,capture_consent,user_speaking,agent_speaking,updated_at,board_card_ids,pinned_card_ids,focused_card_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(call_id) DO UPDATE SET browser_id=excluded.browser_id,session_hash=excluded.session_hash,camera_enabled=excluded.camera_enabled,capture_consent=excluded.capture_consent,user_speaking=excluded.user_speaking,agent_speaking=excluded.agent_speaking,updated_at=excluded.updated_at,board_card_ids=excluded.board_card_ids,pinned_card_ids=excluded.pinned_card_ids,focused_card_id=excluded.focused_card_id",params![id,presence.browser_id,p.session_hash,presence.camera_enabled,presence.capture_consent,presence.user_speaking,presence.agent_speaking,now_ms(),serde_json::to_string(&presence.board_card_ids).unwrap(),serde_json::to_string(&presence.pinned_card_ids).unwrap(),presence.focused_card_id])?;
     tx.execute(
         "UPDATE companion_surfaces SET playback=?2,view_revision=?3 WHERE call_id=?1",
@@ -803,18 +845,15 @@ pub async fn presence(
         // Membership is affirmative evidence about this board, independent
         // of whether an image decoded or the person looked at it. Keep these
         // distinct from the earlier publication offer and from image analysis.
-        let content = if board.is_empty() {
-            "The shared board is now empty. Previously saved items remain in history.".to_owned()
-        } else {
-            format!(
-                "The shared board currently contains these saved items: {}. This confirms they are on the board. Image decoding and whether the caller looked at them are unknown.",
-                json!(identities)
-            )
-        };
+        let observed_at = now_ms();
+        let content = format!(
+            "This call's browser at {observed_at} (Unix ms) reported: {}. [] means empty at that time. For earlier contents check dated board observations. What the caller saw and whether images decoded are unknown.",
+            json!(identities)
+        );
         if content.len() > 480 {
             return Err(anyhow::anyhow!("Board observation exceeds context bound").into());
         }
-        tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'surface_observation',?3,?4)",params![id,event_id,json!({"card_ids":board,"identities":identities,"source":"authenticated_browser_membership","board_state":if board.is_empty(){"empty"}else{"items_present"},"membership_verified":true,"human_viewed":null,"image_decoded":null}).to_string(),now_ms()])?;
+        tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'surface_observation',?3,?4)",params![id,event_id,json!({"card_ids":board,"identities":identities,"source":"authenticated_browser_membership","board_state":if board.is_empty(){"empty"}else{"items_present"},"membership_verified":true,"explicit_membership":true,"human_viewed":null,"image_decoded":null}).to_string(),observed_at])?;
         Some((event_id, content))
     } else {
         None
@@ -1256,6 +1295,31 @@ fn shared_artifacts(
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Recent *observations*, not a list of all previously saved or shown cards.
+/// Before explicit_membership was recorded, an omitted board in a legacy
+/// heartbeat could generate an apparent empty observation. Such historical
+/// rows cannot support an assertion that the browser reported an empty board.
+fn board_observations(db: &Connection, call: &str) -> Result<Value> {
+    const LIMIT: usize = 4;
+    let sql = format!(
+        "SELECT at,json_extract(data,'$.card_ids'),event_key FROM companion_events
+        WHERE call_id=?1 AND kind='surface_observation' AND {VERIFIED_BOARD_REPORT}
+        ORDER BY seq DESC LIMIT ?2"
+    );
+    let mut query = db.prepare(&sql)?;
+    let mut snapshots = Vec::new();
+    let mut rows = query.query(params![call, LIMIT as i64 + 1])?;
+    while let Some(row) = rows.next()? {
+        let ids = serde_json::from_str::<Vec<String>>(&row.get::<_, String>(1)?)?;
+        snapshots.push(json!({"observation_id":row.get::<_,String>(2)?,"observed_at":row.get::<_,i64>(0)?,"card_ids":ids}));
+    }
+    let more = snapshots.len() > LIMIT;
+    snapshots.truncate(LIMIT);
+    Ok(
+        json!({"source":"authenticated_browser_membership","scope":"this_call","order":"newest_first",
+        "snapshots":snapshots,"older_matching_observations_omitted":more,"human_viewed":null}),
+    )
+}
 fn current_status(s: &AppState, id: &str, owner: &str, room: &str) -> Result<Value> {
     let db = s.db.lock().unwrap();
     type CurrentSurface = (
@@ -1283,19 +1347,29 @@ fn current_status(s: &AppState, id: &str, owner: &str, room: &str) -> Result<Val
         )
         .optional()?;
     let artifacts = shared_artifacts(&db, id, owner, room, None)?;
+    let mut board = presence
+        .as_ref()
+        .filter(|_| fresh)
+        .map(|p| serde_json::from_str::<Option<Vec<String>>>(&p.3))
+        .transpose()?
+        .flatten();
+    if board.as_ref().is_some_and(Vec::is_empty) && !last_report_was_empty(&db, id)? {
+        board = None;
+    }
+    let observations = board_observations(&db, id)?;
     Ok(
         json!({"kind":"surface","state":if fresh {"available"} else {"unconfirmed"},
         "camera_enabled":presence.as_ref().filter(|_|fresh).map(|p|p.0),
         "capture_consent":presence.as_ref().filter(|_|fresh).map(|p|p.1),
         "observed_at":presence.as_ref().map(|p|p.2),"image_input":capability.flatten(),
-        "board_card_ids":presence.as_ref().filter(|_|fresh).and_then(|p|serde_json::from_str::<Value>(&p.3).ok()),
+        "board_card_ids":board,
         "pinned_card_ids":presence.as_ref().filter(|_|fresh).and_then(|p|serde_json::from_str::<Value>(&p.4).ok()),
         "focused_card_id":presence.as_ref().filter(|_|fresh).and_then(|p|p.5.as_ref()),
         "view_revision":presence.as_ref().filter(|_|fresh).and_then(|p|p.6),
         "browser_id":presence.as_ref().filter(|_|fresh).map(|p|&p.7),
         "view_revision_scope":"human_interaction",
-        "board_capacity":3,"artifacts":artifacts,
-        "guidance":"Read an already shared image by its artifact_id instead of asking for another photo. Existing explicit browser capture consent does not need to be requested again. Saved availability is not inspection; stale browser state is unknown. Keep the board useful and sparse, and preserve pinned or currently read material."}),
+        "board_capacity":3,"artifacts":artifacts,"board_observations":observations,
+        "guidance":"Read an already shared image by its artifact_id instead of asking for another photo. Existing explicit browser capture consent does not need to be requested again. Only fresh board_card_ids describe current membership. For earlier contents, cite a dated browser snapshot from this call. Other times and human viewing are unknown; saved artifacts alone establish neither."}),
     )
 }
 fn artifact_status(
@@ -1551,7 +1625,7 @@ mod acceptance_tests {
         {
             let db = f.state.db.lock().unwrap();
             db.execute("UPDATE companion_surfaces SET user_speaking=1,agent_speaking=0,board_card_ids='[\"1\"]' WHERE call_id=?1",[&f.call]).unwrap();
-            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'board:first','surface_observation','{\"card_ids\":[\"1\"]}',?2)",params![f.call,now_ms()]).unwrap();
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'board:first','surface_observation','{\"card_ids\":[\"1\"],\"source\":\"authenticated_browser_membership\",\"membership_verified\":true}',?2)",params![f.call,now_ms()]).unwrap();
         }
         crate::companion_delivery::enqueue_batch(
             &f.state,
@@ -1569,6 +1643,23 @@ mod acceptance_tests {
             let db = f.state.db.lock().unwrap();
             db.execute("UPDATE companion_surfaces SET user_speaking=0,board_card_ids='[]' WHERE call_id=?1",[&f.call]).unwrap();
             db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'board:empty','surface_observation','{\"card_ids\":[]}',?2)",params![f.call,now_ms()]).unwrap();
+            assert!(
+                !board_presentation_allowed(&db, &f.call, &[append("board:empty")]).unwrap(),
+                "old inferred empty"
+            );
+            db.execute("UPDATE companion_events SET data=?2 WHERE call_id=?1 AND event_key='board:empty'",
+                params![f.call,json!({"source":"assistant_summary","membership_verified":true,"explicit_membership":true,"card_ids":[]}).to_string()]).unwrap();
+            assert!(
+                !board_presentation_allowed(&db, &f.call, &[append("board:empty")]).unwrap(),
+                "untrusted source"
+            );
+            db.execute("UPDATE companion_events SET data=?2 WHERE call_id=?1 AND event_key='board:empty'",
+                params![f.call,json!({"source":"authenticated_browser_membership","membership_verified":true,"card_ids":[]}).to_string()]).unwrap();
+            assert!(
+                !board_presentation_allowed(&db, &f.call, &[append("board:empty")]).unwrap(),
+                "verified legacy empty still ambiguous"
+            );
+            db.execute("UPDATE companion_events SET data=json_set(data,'$.explicit_membership',json('true')) WHERE call_id=?1 AND event_key='board:empty'",[&f.call]).unwrap();
             assert!(!board_presentation_allowed(&db, &f.call, &[append("board:first")]).unwrap());
         }
         // The older pending item cannot leak after the browser changed it.
@@ -1588,6 +1679,21 @@ mod acceptance_tests {
             .unwrap()
             .unwrap();
         assert_eq!(ready["commands"][0]["event_id"], "board:empty");
+        // The saved event remains historical evidence when a later heartbeat
+        // omits the board or the browser's live membership ages out.
+        let db = f.state.db.lock().unwrap();
+        db.execute(
+            "UPDATE companion_surfaces SET board_card_ids='null' WHERE call_id=?1",
+            [&f.call],
+        )
+        .unwrap();
+        assert!(!board_presentation_allowed(&db, &f.call, &[append("board:empty")]).unwrap());
+        db.execute(
+            "UPDATE companion_surfaces SET board_card_ids='[]',updated_at=0 WHERE call_id=?1",
+            [&f.call],
+        )
+        .unwrap();
+        assert!(!board_presentation_allowed(&db, &f.call, &[append("board:empty")]).unwrap());
     }
 
     fn capability_batches(f: &Fixture) -> Vec<(String, Value)> {

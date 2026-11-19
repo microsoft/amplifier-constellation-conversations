@@ -2505,12 +2505,15 @@ async fn browser_board_membership_is_scoped_deduplicated_and_tracks_return_to_im
     assert_eq!(latest[0]["event_id"], events[2].0);
     let text = latest[0]["content"].as_str().unwrap();
     assert!(text.contains(&result) && text.contains(&card));
-    assert!(text.contains("This confirms they are on the board"));
-    assert!(text.contains("Image decoding and whether the caller looked at them are unknown"));
+    assert!(text.contains("This call's browser at "));
+    assert!(text.contains("For earlier contents check dated board observations"));
+    assert!(text.contains("What the caller saw and whether images decoded are unknown"));
     let empty: Value = serde_json::from_str(&batches[1].1).unwrap();
-    assert_eq!(
-        empty[0]["content"],
-        "The shared board is now empty. Previously saved items remain in history."
+    assert!(
+        empty[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("reported: []. [] means empty at that time")
     );
     assert!(
         !text.contains("Here is the requested screenshot"),
@@ -2523,6 +2526,207 @@ async fn browser_board_membership_is_scoped_deduplicated_and_tracks_return_to_im
         before,
         "Presence does not create prompts, actions or authority"
     );
+}
+
+#[tokio::test]
+async fn board_history_separates_reports_from_saved_cards_and_omitted_legacy_presence() {
+    let f = fixture();
+    let c = call(&f);
+    let other = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    let path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
+    let (_, saved) = request(
+        &f,
+        &c,
+        "POST",
+        "shared",
+        Some(json!({"url":"https://example.test/diagram","title":"A saved diagram"})),
+        &c.token,
+        false,
+    )
+    .await;
+    let card = saved["card_id"].as_str().unwrap();
+    let browser_report = |ids: Option<Value>| {
+        let mut body = json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false});
+        if let Some(ids) = ids {
+            body["board_card_ids"] = ids;
+        }
+        body
+    };
+    // A saved card and a legacy heartbeat do not establish any board.
+    for ids in [None, Some(json!([card])), None] {
+        let sent = ids.is_some();
+        let response = browser_request(
+            &f,
+            "POST",
+            &path,
+            Some(browser_report(ids)),
+            "browser",
+            true,
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK);
+        let status = surface_status(&f, &c, "current").await;
+        assert_eq!(status["state"], "available"); // legacy camera/playback presence still works
+        assert_eq!(
+            status["board_card_ids"],
+            if sent { json!([card]) } else { Value::Null }
+        );
+        let history = &status["board_observations"];
+        assert!(history.get("human_viewed").unwrap().is_null());
+        let snapshots = history["snapshots"].as_array().unwrap();
+        if sent {
+            assert_eq!(snapshots.len(), 1);
+            assert_eq!(snapshots[0]["card_ids"], json!([card]));
+            assert!(snapshots[0]["observed_at"].as_i64().unwrap() > 0);
+        }
+    }
+    let last = surface_status(&f, &c, "current").await;
+    assert_eq!(
+        last["board_observations"]["snapshots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "An omitted board after known membership must not create an empty observation"
+    );
+    // Retained old empty rows could have come from omitted membership. A
+    // different call and an unverified event cannot supply earlier contents.
+    {
+        let db = f.s.db.lock().unwrap();
+        for (call, key, source, ids) in [
+            (
+                &c.id,
+                "board:legacy-empty",
+                "authenticated_browser_membership",
+                json!([]),
+            ),
+            (
+                &c.id,
+                "board:untrusted",
+                "assistant_summary",
+                json!(["untrusted"]),
+            ),
+            (
+                &other.id,
+                "board:other",
+                "authenticated_browser_membership",
+                json!(["other-private"]),
+            ),
+        ] {
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'surface_observation',?3,1)",
+                params![call,key,json!({"source":source,"membership_verified":true,"card_ids":ids}).to_string()]).unwrap();
+        }
+    }
+    let status = surface_status(&f, &c, "current").await;
+    assert_eq!(status["board_observations"], last["board_observations"]);
+    // A legacy nonempty snapshot is still positive evidence. Numeric card
+    // IDs always passed through the authenticated, same-call ownership check.
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'board:legacy-nonempty','surface_observation',?2,1)",
+            params![c.id,json!({"source":"authenticated_browser_membership","membership_verified":true,"card_ids":[card]}).to_string()]).unwrap();
+    }
+    let observed = surface_status(&f, &c, "current").await;
+    assert_eq!(
+        observed["board_observations"]["snapshots"][0],
+        json!({"observation_id":"board:legacy-nonempty","observed_at":1,"card_ids":[card]})
+    );
+    for ids in [json!([]), json!([card]), json!([]), json!([card])] {
+        assert_eq!(
+            browser_request(
+                &f,
+                "POST",
+                &path,
+                Some(browser_report(Some(ids))),
+                "browser",
+                true
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let status = surface_status(&f, &c, "current").await;
+    let history = &status["board_observations"];
+    assert_eq!(history["source"], "authenticated_browser_membership");
+    assert_eq!(history["scope"], "this_call");
+    assert_eq!(history["older_matching_observations_omitted"], true);
+    let snapshots = history["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 4);
+    assert_eq!(snapshots[0]["card_ids"], json!([card]));
+    assert_eq!(snapshots[1]["card_ids"], json!([]));
+    assert!(
+        snapshots
+            .windows(2)
+            .all(|s| s[0]["observed_at"].as_i64() >= s[1]["observed_at"].as_i64())
+    );
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE companion_surfaces SET updated_at=0 WHERE call_id=?1",
+            [&c.id],
+        )
+        .unwrap();
+    let stale = surface_status(&f, &c, "current").await;
+    assert_eq!(stale["state"], "unconfirmed");
+    assert!(stale["board_card_ids"].is_null());
+    assert_eq!(stale["board_observations"], *history);
+}
+
+#[tokio::test]
+async fn first_explicit_empty_supersedes_ambiguous_legacy_board_exactly_once() {
+    let f = fixture();
+    let c = call(&f);
+    let browser = uuid::Uuid::new_v4().to_string();
+    presence(&f, &c, &browser, false, false).await;
+    {
+        // Old binaries saved [] for an omitted array. A previous explicit
+        // report must not be promoted past a more recent ambiguous report.
+        let db = f.s.db.lock().unwrap();
+        db.execute(
+            "UPDATE companion_surfaces SET board_card_ids='[]' WHERE call_id=?1",
+            [&c.id],
+        )
+        .unwrap();
+        for (key, explicit) in [("board:trusted-old", true), ("board:ambiguous", false)] {
+            let mut data = json!({"source":"authenticated_browser_membership","membership_verified":true,"card_ids":[]});
+            if explicit {
+                data["explicit_membership"] = json!(true);
+            }
+            db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'surface_observation',?3,1)",params![c.id,key,data.to_string()]).unwrap();
+        }
+    }
+    let status = surface_status(&f, &c, "current").await;
+    assert!(status["board_card_ids"].is_null());
+    assert_eq!(
+        status["board_observations"]["snapshots"][0]["observation_id"],
+        "board:trusted-old"
+    );
+    let path = format!("/api/v1/companion/calls/{}/surface/presence", c.id);
+    let body = json!({"browser_id":browser,"view_revision":0,"camera_enabled":false,"capture_consent":false,"board_card_ids":[]});
+    let mut observed = None;
+    for _ in 0..2 {
+        assert_eq!(
+            browser_request(&f, "POST", &path, Some(body.clone()), "browser", true)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let status = surface_status(&f, &c, "current").await;
+        assert_eq!(status["board_card_ids"], json!([]));
+        let reports = status["board_observations"]["snapshots"]
+            .as_array()
+            .unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0]["card_ids"], json!([]));
+        assert!(reports[0]["observed_at"].as_i64().unwrap() > 1);
+        if let Some(first) = &observed {
+            assert_eq!(first, &reports[0]);
+        }
+        observed = Some(reports[0].clone());
+    }
 }
 
 #[tokio::test]
