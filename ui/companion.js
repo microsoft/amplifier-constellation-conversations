@@ -719,6 +719,7 @@ function renderContextEvent(call, event) {
   } else if (event.kind === 'delegation' && text(data.id)) {
     const descriptions = {
       waiting_transcript:['Collecting your request','Waiting for the available speech before sending this request.'],
+      call_control_requested:['Hang-up requested','The end-call request reached Companion. The call record shows its final status.'],
       dispatched:['Saved for agent','Saved for agent handling. This does not confirm forwarding, task acceptance or completion.'],
       completed:['Agent response saved','A response is saved in this call’s history. Check the result for what was answered or completed.'],
       incorporated:['Included in an agent turn','Included with other input. This alone does not confirm each question was answered.'],
@@ -727,7 +728,8 @@ function renderContextEvent(call, event) {
       unknown:['Result unconfirmed','A result is not confirmed. Existing work has not been replayed.']
     };
     const [status,note] = descriptions[data.state] || ['Request status unknown','No recognized delivery state is available.'];
-    const facts = {title:`Request to ${call.contact.label}`,status,note,source:'Your call'};
+    const title = data.state === 'call_control_requested' ? 'Call control' : `Request to ${call.contact.label}`;
+    const facts = {title,status,note,source:'Your call'};
     if (data.state === 'completed' && data.delivery_state === 'incorporated') facts.note = 'A shared agent response is saved in history. This does not confirm that every included question was answered.';
     if (text(data.request_text)) facts.content = data.request_text;
     if (text(data.message)) facts.note = `${note} ${data.message}`;

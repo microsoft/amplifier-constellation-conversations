@@ -1566,6 +1566,14 @@ try {
   await page.evaluate(()=>{const peer=fixture.peers.at(-1);peer.connectionState='connected';peer.dispatchEvent(new Event('connectionstatechange'));});
   checks.push('closing status outages remain explicitly unconfirmed and actual audio failure stays visible without an automatic new call');
 
+  emit('delegation',{id:'closing-directive',state:'call_control_requested',backend_dispatched:false});
+  const nativeCloseReceipt=page.locator('.context-entry').filter({hasText:'Hang-up requested'});
+  await wait(async()=>await nativeCloseReceipt.count()===1,'native control receipt was unavailable');
+  assert.match(await nativeCloseReceipt.textContent(),/Call control/);
+  assert.doesNotMatch(await nativeCloseReceipt.textContent(),/Request to Coach|Agent response saved/);
+  assert(await page.locator('#call-ended').isHidden(),'a control request alone must not end the call');
+  checks.push('native hang-up receipt stays distinct from agent work and provider-confirmed closure');
+
   closingCall.state='closed';closingCall.closure={confirmed:true,provider_reason:'close_requested',reason:'Your microphone and camera are off. Accepted work can continue.'};
   await page.locator('#call-ended:not([hidden])').waitFor();
   assert.equal(await page.locator('#ended-title').innerText(),'Call ended');

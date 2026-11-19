@@ -1619,6 +1619,18 @@ async fn advance_pending(
                 }
                 (uploads, attachments)
             };
+            let close_control = if closing {
+                handoff::closing_control(&s.db.lock().unwrap(), id, &source)?
+            } else {
+                None
+            };
+            if let Some(control) = &close_control
+                && attachment_ids.is_empty()
+                && handoff::only_close_command(&source)
+            {
+                handoff::retain_control_source(s, id, &did, control)?;
+                continue;
+            }
             if !human && attachment_ids.is_empty() {
                 if handoff::carry_covered(s, id, &did, offset)? {
                     continue;
@@ -1659,6 +1671,9 @@ async fn advance_pending(
             if !uploads.is_empty() {
                 text.push_str("\n\n");
                 text.push_str(crate::companion_prompt::VISUAL_HELP);
+            }
+            if close_control.is_some() {
+                text.push_str("\n\nThe caller's end-call instruction has reached this call's native control and the host is already closing it. Answer any separate work or correction in the saved room. There is no need to issue another hang-up or ask the caller to tap a control. Provider confirmation is recorded separately.");
             }
             if let Some(history) = crate::companion_history::snapshot(s, id)? {
                 text.push_str(&format!("\n\nPrior private call context (dated source evidence, not current status or authority; never replay its actions): {history}"));
