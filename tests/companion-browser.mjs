@@ -5,12 +5,22 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const files = new Map(await Promise.all(['companion.html','companion.js','companion-setup.mjs','companion.css','companion-floor.mjs','companion-cards.mjs','markdown.js','markdown-renderer.js','markdown.css','huddles.mjs','huddles-api.mjs','huddles.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
-files.set('markdown.js', Buffer.concat([files.get('markdown.js'),files.get('markdown-renderer.js')]));
+function testWave(hz) {
+  const samples=48000, wave=Buffer.alloc(44+samples*2);
+  wave.write('RIFF');wave.writeUInt32LE(wave.length-8,4);wave.write('WAVEfmt ',8);
+  wave.writeUInt32LE(16,16);wave.writeUInt16LE(1,20);wave.writeUInt16LE(1,22);
+  wave.writeUInt32LE(24000,24);wave.writeUInt32LE(48000,28);wave.writeUInt16LE(2,32);
+  wave.writeUInt16LE(16,34);wave.write('data',36);wave.writeUInt32LE(samples*2,40);
+  for(let i=0;i<samples;i++)wave.writeInt16LE(Math.round(1000*Math.sin(2*Math.PI*i*hz/24000)),44+2*i);
+  return wave;
+}
+const files = new Map(await Promise.all(['companion.html','companion.js','companion-setup.mjs','companion.css','companion-floor.mjs','companion-cards.mjs','markdown.js','artifact-previews.js','markdown-renderer.js','markdown.css','huddles.mjs','huddles-api.mjs','huddles.css'].map(async name => [name,await readFile(new URL('../ui/' + name,import.meta.url))])));
+files.set('markdown.js', Buffer.concat([files.get('markdown.js'),files.get('artifact-previews.js'),files.get('markdown-renderer.js')]));
 files.set('companion.css', Buffer.concat([files.get('markdown.css'),files.get('companion.css')]));
 const requests = [], calls = new Map(), messages = new Map(), uploads = new Map(), attachments = new Map(), voices = new Map(), events = [], checks = [];
 const surfaces = new Map(), surfaceCommands = new Map(), permissions = new Map();
 let holdNextSurfaceAck = false, heldSurfaceAck = null;
+let holdNextVoiceSave=false, releaseVoiceSave=null;
 let failNextResult = false;
 const huddleViews=new Map(),huddleMessages=[{id:'huddle-report-1',seq:1,role:'assistant',actor:'Coach',agent_id:'coach',status:'complete',text:'Private huddle evidence <img src=x onerror="window.huddleInjected=true">',created_at:1794330000000,target_agent_ids:[]}];
 let huddleFollowing=false,huddleListFails=false,holdNextHuddleRead=false,heldHuddleRead=null;
@@ -21,7 +31,7 @@ const newHuddleView=id=>({id,revision:0,state:{selected_conversation_id:null,pan
 const fullResultText = "Complete saved answer. " + "Source fact. ".repeat(6000) + " FINAL QUALIFIER: broader testing remains incomplete. <script>window.fullResultInjected=true</script> [Source](https://example.com/source)";
 let rejectNextUpload = false, holdNextUpload = false, heldUpload = null;
 let loggedIn = false, pollFails = false, heartbeatFails = false, controlFails = false, catalogAvailable = true, catalogFails = false, nextCall = 1;
-let authOwner = 'fixture-user', holdNextClose = false, heldClose = null;
+let authOwner = 'fixture-user', holdNextClose = false, heldClose = null, closeImmediately = false;
 const csrf = 'fixture-csrf';
 const server = createServer(async (request,response) => {
   const url = new URL(request.url,'http://fixture');
@@ -45,11 +55,25 @@ const server = createServer(async (request,response) => {
     const active=[...calls.values()].find(call=>call.owner===authOwner&&['starting','connecting','connected','closing'].includes(call.state));
     send(200,{available:catalogAvailable,active_call:active?{id:active.id,conversation_id:active.conversation_id,state:active.state}:null,contacts:[{id:'coach',label:'Coach',voice:voices.get('coach') || 'marin',description:'A thoughtful native teammate.'},{id:'rook',label:'Rook',voice:'cedar',description:'<img src=x onerror="window.injection=true"> Codex teammate.'},{id:'jarvis',label:'Jarvis',voice:'ash',description:'Local reasoning, cloud voice.',image_input:false}]}); return;
   }
+  const previewPath = url.pathname.match(/^\/api\/v1\/companion\/agents\/coach\/voice-previews\/(marin|cedar)$/);
+  if (previewPath) {
+    // Optional private recordings can exercise the same decoder in local qualification.
+    const clip = process.env.COMPANION_TEST_PREVIEWS
+      ? await readFile(process.env.COMPANION_TEST_PREVIEWS+'/'+previewPath[1]+'.wav')
+      : testWave(previewPath[1]==='marin' ? 440 : 660);
+    response.writeHead(200,{'Content-Type':'audio/wav','Cache-Control':'no-store'});response.end(clip);return;
+  }
   const agentPath = url.pathname.match(/^\/api\/v1\/companion\/agents\/([^/]+)\/(voice-settings|capabilities)$/);
   if (agentPath) {
     if (agentPath[2] === 'capabilities') { send(200,{image_input:agentPath[1] !== 'jarvis',capabilities_available:true}); return; }
-    if (request.method === 'PUT') voices.set(agentPath[1],body.voice);
-    send(200,{voice:voices.get(agentPath[1]) || 'marin',available_voices:['marin','cedar','ash'],applies_to:'next_call',voice_provider:'OpenAI',voice_model:'fixture-live',available_voice_models:['fixture-live'],backend_settings_editable:false,backend:agentPath[1]==='jarvis'?null:{agent:{name:'fixture-runtime',title:'Fixture reasoning runtime'},model:{id:'fixture-model',name:'Fixture reasoning model'},observed_at:1794157902184,options:[{id:'reasoning',name:'Thinking',category:'thought_level',value:'medium',label:'Medium',editable:false}]}}); return;
+    if (request.method === 'PUT') {
+      if (holdNextVoiceSave) {
+        holdNextVoiceSave=false;
+        await new Promise(resolve=>{releaseVoiceSave=resolve;});
+      }
+      voices.set(agentPath[1],body.voice);
+    }
+    send(200,{voice:voices.get(agentPath[1]) || 'marin',available_voices:['marin','cedar','ash','quartz','vesper','shida'],preview_voices:['marin','cedar'],voice_descriptions:{cedar:'Fixture description',quartz:'English · Australian · Feminine',vesper:'English · British · Masculine',shida:'Japanese · Masculine'},voice_traits:{quartz:{language:'English',region:'Australian',presentation:'Feminine'},vesper:{language:'English',region:'British',presentation:'Masculine'},shida:{language:'Japanese',presentation:'Masculine'},not_offered:{language:'Unexpected'}},applies_to:'next_call',voice_provider:'OpenAI',voice_model:'fixture-live',available_voice_models:['fixture-live'],backend_settings_editable:false,backend:agentPath[1]==='jarvis'?null:{agent:{name:'fixture-runtime',title:'Fixture reasoning runtime'},model:{id:'fixture-model',name:'Fixture reasoning model'},observed_at:1794157902184,options:[{id:'reasoning',name:'Thinking',category:'thought_level',value:'medium',label:'Medium',editable:false}]}}); return;
   }
   const huddleList=url.pathname.match(/^\/api\/v1\/conversations\/([^/]+)\/huddles$/);
   if(huddleList){
@@ -117,7 +141,8 @@ const server = createServer(async (request,response) => {
     const call = calls.get(callPath[1]); if (!call) { send(404,{error:'missing call'}); return; }
     if (controlFails) { send(503,{error:'fixture control outage'}); return; }
     if (callPath[2] === 'close') {
-      if (call.state !== 'closed') { call.state='closing'; call.closeChecks=2; }
+      if (closeImmediately) { call.state='closed'; closeImmediately=false; }
+      else if (call.state !== 'closed') { call.state='closing'; call.closeChecks=2; }
       if (holdNextClose) { holdNextClose=false; heldClose=(status=503)=>send(status,status===200?{id:call.id,state:call.state}:{error:'fixture delayed close failure'}); return; }
       send(200,{id:call.id,state:call.state}); return;
     }
@@ -194,10 +219,13 @@ await page.addInitScript(() => {
     createBuffer(channels,length,rate){const samples=new Float32Array(length);return {getChannelData:()=>samples};}
     createBufferSource(){return {connect(){},disconnect(){},start(){if(this.buffer.getChannelData(0).some(x=>x!==0))fixture.shutters++;}};}
   };
-  const playing=new WeakSet();
-  Object.defineProperty(HTMLMediaElement.prototype,'paused',{get(){return !playing.has(this);}});
-  HTMLMediaElement.prototype.play=async function(){playing.add(this);this.dispatchEvent(new Event('playing'));};
-  HTMLMediaElement.prototype.pause=function(){playing.delete(this);this.dispatchEvent(new Event('pause'));};
+  const playing=new WeakSet(), nativePlay=HTMLMediaElement.prototype.play, nativePause=HTMLMediaElement.prototype.pause;
+  const nativePaused=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'paused').get;
+  const samples=new WeakSet();
+  const isSample=el=>samples.has(el)||el.src.includes('/voice-previews/');
+  Object.defineProperty(HTMLMediaElement.prototype,'paused',{get(){return isSample(this)?nativePaused.call(this):!playing.has(this);}});
+  HTMLMediaElement.prototype.play=async function(){if(isSample(this)){samples.add(this);fixture.lastSample=this;return nativePlay.call(this);}playing.add(this);this.dispatchEvent(new Event('playing'));};
+  HTMLMediaElement.prototype.pause=function(){if(isSample(this))return nativePause.call(this);playing.delete(this);this.dispatchEvent(new Event('pause'));};
   Object.defineProperty(HTMLVideoElement.prototype,'videoWidth',{get(){return 640;}});
   Object.defineProperty(HTMLVideoElement.prototype,'videoHeight',{get(){return 480;}});
   CanvasRenderingContext2D.prototype.drawImage=function(){fixture.draws++;};
@@ -245,12 +273,80 @@ try {
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-contacts.png'),fullPage:true});
 
   await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
-  await page.locator('#voice-choice:not([disabled])').waitFor();
+  const voiceOption=id=>page.locator(`#voice-choice input[type=radio][name=voice-choice][value="${id}"]`);
+  const shownVoices=()=>page.locator('#voice-choice input[type=radio]:visible').evaluateAll(nodes=>nodes.map(node=>node.value).sort());
+  const sample=(verb,id)=>page.getByRole('button',{name:`${verb} sample of ${id}`,exact:true});
+  const filter=key=>page.locator('#voice-filter-'+key);
+  const previewGets=()=>requests.filter(r=>r.path.includes('/voice-previews/')).map(r=>r.path.split('/').at(-1));
+  const mutations=()=>requests.filter(r=>r.method!=='GET').length;
+  await voiceOption('marin').waitFor();
+  assert(await voiceOption('marin').isChecked());
+  assert.deepEqual(await shownVoices(),['ash','cedar','marin','quartz','shida','vesper']);
+  for (const text of ['Fixture description','English · Australian · Feminine','English · British · Masculine','Japanese · Masculine']) {
+    assert(await page.getByText(text,{exact:true}).isVisible());
+  }
+  const modelDetails=page.locator('details').filter({has:page.locator('#voice-model-facts')}).locator(':scope > summary');
+  await modelDetails.click();
   assert.match(await page.locator('#voice-model-facts').innerText(),/OpenAI · fixture-live/);assert.match(await page.locator('#voice-model-facts').innerText(),/Fixture reasoning runtime/);assert.match(await page.locator('#voice-model-facts').innerText(),/Fixture reasoning model/);
   await page.locator('#voice-advanced summary').click();assert.match(await page.locator('#voice-advanced-facts').innerText(),/Thinking.*Medium/s);assert.equal(await page.locator('#voice-advanced input,#voice-advanced select').count(),0);
-  await page.locator('#voice-choice').selectOption('ash'); await page.locator('#save-voice').click();
-  await wait(async()=>/next call/.test(await page.locator('#voice-settings-status').innerText()),'voice save missing');
-  assert.equal(voices.get('coach'),'ash'); assert.equal(requests.find(request=>request.method==='PUT').csrf,csrf);
+  assert.deepEqual(previewGets(),[]);
+  const mutationsBeforeSample=mutations();
+  assert.equal(await filter('language').locator('option[value=Unexpected]').count(),0);
+  await filter('presentation').selectOption('Feminine');
+  assert.deepEqual(await shownVoices(),['quartz']);
+  await filter('region').selectOption('British');
+  assert.deepEqual(await shownVoices(),[]);assert(await page.locator('#voice-no-matches').isVisible());
+  await page.locator('#voice-reset-filters').click();
+  assert(await voiceOption('marin').isChecked());
+  await filter('language').selectOption('Japanese');
+  await filter('region').selectOption('__unlisted__');
+  assert.deepEqual(await shownVoices(),['shida']);
+  await filter('language').selectOption('');
+  await filter('presentation').selectOption('__unlisted__');
+  assert.deepEqual(await shownVoices(),['ash','cedar','marin']);
+  await filter('region').selectOption('');await filter('presentation').selectOption('');
+  assert.deepEqual(previewGets(),[]);assert.equal(mutations(),mutationsBeforeSample);
+
+  await sample('Play','cedar').click();
+  await wait(async()=>await page.locator('#voice-preview-status').innerText()==='Playing a recorded sample.','real sample playback did not start');
+  assert(await voiceOption('marin').isChecked(),'auditioning a different voice changed the selection');
+  await sample('Stop','cedar').click();
+  assert(await page.evaluate(()=>fixture.lastSample.paused));
+  await sample('Play','marin').click();
+  await sample('Stop','marin').waitFor();
+  await page.locator('#close-voice-settings').click();
+  await wait(async()=>await page.evaluate(()=>fixture.lastSample.paused),'sample continued after closing the dialog');
+  await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
+  await voiceOption('marin').waitFor();
+  assert(await voiceOption('marin').isChecked());
+  await voiceOption('marin').focus();await page.keyboard.press('ArrowDown');
+  assert.equal(await voiceOption('marin').isChecked(),false,'radio group ignored native arrow navigation');
+  await voiceOption('ash').focus();await page.keyboard.press('Space');
+  assert(await voiceOption('ash').isChecked());
+  assert(await page.getByRole('button',{name:'No sample for ash',exact:true}).isDisabled());
+  assert.deepEqual(previewGets(),['cedar','marin']);
+  assert.equal(mutations(),mutationsBeforeSample);
+  assert.equal(await page.evaluate(()=>fixture.media.length),0);
+  checks.push('browse descriptions and filter intersections before choosing; missing traits stay unlisted, previews leave the radio selection and saved voice alone, and close stops audio');
+  const coachVoiceReads=()=>requests.filter(r=>r.path==='/api/v1/companion/agents/coach/voice-settings' && r.method==='GET').length;
+  holdNextVoiceSave=true;
+  await page.locator('#save-voice').click();
+  await wait(async()=>!!releaseVoiceSave,'pending voice save never reached server');
+  assert(await page.locator('#save-voice').isDisabled());
+  await page.locator('#close-voice-settings').click();
+  const beforeReopen=coachVoiceReads();
+  await page.getByRole('button',{name:'Voice settings for Coach',exact:true}).click();
+  assert(await page.locator('#voice-choice').evaluate(fieldset=>fieldset.disabled && fieldset.elements.length===0),'picker exposed a stale value before the save completed');
+  assert.equal(coachVoiceReads(),beforeReopen);
+  releaseVoiceSave();
+  await voiceOption('ash').waitFor();
+  assert(await voiceOption('ash').isChecked());
+  assert.equal(coachVoiceReads(),beforeReopen+1);
+  assert.equal(voices.get('coach'),'ash');
+  assert.equal(await page.locator('.contact-card[data-agent-id="coach"] .contact-voice').textContent(),'Voice · ash');
+  const voiceWrites=requests.filter(r=>r.method==='PUT'&&r.path.endsWith('/voice-settings'));
+  assert.equal(voiceWrites.length,1);assert.equal(voiceWrites[0].csrf,csrf);
+  checks.push('a saved voice can finish after closing the picker; reopening waits for that single write and both the picker and contact show its result');
   assert.equal(await page.evaluate(()=>fixture.media.length),0); await page.locator('#close-voice-settings').click();
   checks.push('discoverable per-agent voice choice persists through authenticated API and applies to the next call');
 
@@ -259,9 +355,9 @@ try {
   assert.deepEqual(await page.evaluate(()=>fixture.peers[0].order),['track','channel','offer']);
   assert.equal(await page.evaluate(()=>fixture.channels[0].label),'oai-events');
   assert.equal(await page.evaluate(()=>fixture.channels[0].sent.length),0);
-  await page.locator('#call-voice-settings').click();await page.locator('#voice-choice:not([disabled])').waitFor();
-  assert.match(await page.locator('#voice-model-facts').innerText(),/Voice in this call.*ash/s);
-  await page.locator('#voice-choice').selectOption('cedar');await page.locator('#save-voice').click();
+  await page.locator('#call-voice-settings').click();await voiceOption('marin').waitFor();await modelDetails.click();
+  assert.match(await page.locator('#voice-model-facts').innerText(),/Voice in this call.*ash/s);assert.equal(await page.getByRole('button',{name:/^(Play|Stop) sample of /}).count(),0);
+  await voiceOption('cedar').check();await page.locator('#save-voice').click();
   await wait(async()=>/cedar will be used/.test(await page.locator('#voice-settings-status').innerText()),'next-call voice setting not saved');
   assert.match(await page.locator('#voice-model-facts').innerText(),/Voice in this call.*ash/s);await page.locator('#close-voice-settings').click();
   assert.equal(await page.evaluate(()=>fixture.media.length),1);assert.equal(calls.size,1);
@@ -348,7 +444,7 @@ try {
   emit('provider',{type:'session.usage.updated',usage:{seconds:1}});
   emit('transcript',{role:'assistant',text:' A little more context.',fragment:true,playback:'unconfirmed',start_ms:500,end_ms:1000});
   emit('delegation',{id:'d1',state:'dispatched'});
-  await wait(async()=>await page.locator('#call-status-text').innerText()==='Working together','delegated work not visible');
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Waiting for a result','saved request should wait for an agent result');
   assert.match(await page.locator('.context-entry').textContent(),/Saved for agent/);assert.match(await page.locator('.context-entry').textContent(),/does not confirm forwarding/);
   assert.equal(await page.locator('.transcript-entry').count(),1);assert.match(await page.locator('.transcript-entry').innerText(),/playback\. A little/);
   assert.equal(await page.locator('.presence.speaking').count(),0);
@@ -673,7 +769,7 @@ try {
   assert.equal(Buffer.from(attachments.get('fixture-attachment-2').data,'base64').toString(),'Notes pasted while talking.');
   assert.equal(attachments.get('fixture-attachment-3').mime_type,'application/pdf');
   assert.equal(attachments.get('fixture-attachment-4').mime_type,'image/png');
-  await page.locator('#share-files').setInputFiles({name:'not-allowed.html',mimeType:'text/html',buffer:Buffer.from('<script>bad()</script>')});
+  await page.locator('#share-files').setInputFiles({name:'unsupported.zip',mimeType:'application/zip',buffer:Buffer.from('fixture bytes')});
   await wait(async()=>await page.locator('.upload-card[data-state="failed"]').count()===1,'unsupported file state missing');
   assert.equal(attachments.size,4);
   rejectNextUpload=true;
@@ -1023,6 +1119,24 @@ try {
   const mobileHangup=await page.locator('#hangup').boundingBox();assert(mobileHangup.y>=0&&mobileHangup.y+mobileHangup.height<=844);
   assert(await page.locator('#space-panel').evaluate(node=>node.scrollHeight>node.clientHeight));
   await page.locator('#space-panel').evaluate(node=>{node.scrollTop=0;});
+  // Revisions address the original board card; adding a correction must not reinsert it.
+  const noteId=randomUUID();
+  emit('card',{kind:'note',note_id:noteId,revision:1,title:'Packing',text:'Passport',conversation_id:'room-coach',presentation:'current'});
+  const noteCard=page.locator(`.output-card[data-note-id="${noteId}"]`);
+  await wait(async()=>await noteCard.count()===1,'room note never appeared');
+  const boardId=await noteCard.getAttribute('data-board-id');
+  const original=await noteCard.elementHandle();
+  const originalParent=await noteCard.evaluate(e=>e.parentElement.id);
+  emit('room_note_edit',{note_id:noteId,revision:2,card_id:boardId,title:'Travel list',text:'Passport and tickets'});
+  emit('room_note_edit',{note_id:noteId,revision:1,card_id:boardId,title:'Stale',text:'Wrong revision'});
+  await wait(async()=>await noteCard.getAttribute('data-note-revision')==='2','room note revision never appeared');
+  assert.equal(await noteCard.count(),1);
+  assert.equal(await noteCard.locator('.card-answer').innerText(),'Passport and tickets');
+  assert.equal(await noteCard.locator('h2').evaluate(e=>e.firstChild.textContent),'Travel list');
+  assert.equal(await noteCard.evaluate((e,first)=>e===first,original),true);
+  assert.equal(await noteCard.evaluate(e=>e.parentElement.id),originalParent);
+  await original.dispose();
+  checks.push('editing a room note updates its original card in place, retains its board position and ignores an older revision');
   const mobileAfter=await page.locator('#hangup').boundingBox();assert(Math.abs(mobileHangup.y-mobileAfter.y)<1);
   if (process.env.COMPANION_SCREENSHOT) await page.screenshot({path:process.env.COMPANION_SCREENSHOT.replace('.png','-mobile-shared.png'),fullPage:true});
   await page.setViewportSize({width:844,height:390});
@@ -1039,6 +1153,34 @@ try {
   await wait(async()=>heldSurfaceAck!==null,'late surface acceptance fixture not ready');
   await page.locator('#screen-awake').uncheck();await page.evaluate(()=>{fixture.delayWake=true;});await page.locator('#screen-awake').check();
   await wait(async()=>page.evaluate(()=>fixture.wakeGrants.length===1),'hangup pending screen lock fixture missing');
+  // Sample painted mobile frames, including those between the click and the close receipt.
+  const observePostCall = () => page.evaluate(() => {
+    const frames = [];
+    window.postCallFrames = frames;
+    function observe() {
+      const ended = document.getElementById('call-ended');
+      if (!ended.hidden) frames.push({
+        recovery: !document.getElementById('call-recovery').hidden,
+        focus: document.activeElement.id,
+        top: ended.getBoundingClientRect().top,
+        title: document.getElementById('ended-title').textContent
+      });
+      if (window.postCallFrames === frames) requestAnimationFrame(observe);
+    }
+    requestAnimationFrame(observe);
+  });
+  const assertStableClose = async () => {
+    const frames = await page.evaluate(() => {
+      const frames = window.postCallFrames;
+      delete window.postCallFrames;
+      return frames;
+    });
+    assert(frames.length > 0 && frames.some(frame => frame.title === 'Call ended'));
+    assert(frames.every(frame => !frame.recovery), 'a routine close painted the earlier-call recovery panel');
+    assert(frames.every(frame => frame.focus === 'back-to-contacts'), 'closing moved focus off the post-call action');
+    assert(frames.every(frame => Math.abs(frame.top - frames[0].top) < 1), 'the post-call screen moved during close');
+  };
+  await observePostCall();
   holdNextClose=true;
   const voiceHangup=surfaceCommand('hangup',{action:'end_call'});
   await page.locator('#call-ended:not([hidden])').waitFor();
@@ -1048,12 +1190,17 @@ try {
   await page.evaluate(()=>{fixture.delayWake=false;fixture.wakeGrants.shift()();});
   await wait(async()=>page.evaluate(()=>fixture.wakeLocks.every(lock=>lock.released)),'late wake lock survived call end');
   assert(await page.evaluate(()=>fixture.peers.every(peer=>!peer.closed)&&fixture.channels.every(channel=>!channel.closed)&&fixture.audioContexts.every(context=>!context.closed)),'silent transport must remain until terminal close');
+  assert(await page.locator('#call-recovery').isHidden(), 'routine hang-up displayed an earlier-call warning');
+  assert(await page.locator('#call-again').isDisabled());
   heldClose(200);heldClose=null;
   heldSurfaceAck();heldSurfaceAck=null;await page.waitForTimeout(100);
   assert.ok(!requests.some(r=>r.path.endsWith(`/${lateView.operation_id}/ack`)&&r.body.state==='executed'));
-  assert.match(await page.locator('#recovery-detail').innerText(),/Closing/);
+  assert.equal(await page.locator('#ended-title').innerText(),'Ending call…');
   await wait(async()=>calls.get('call-1').state==='closed','close not reported');
   await wait(async()=>page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)&&fixture.channels.every(channel=>channel.closed)&&fixture.wakeLocks.every(lock=>lock.released)&&fixture.audioContexts.every(context=>context.closed)),'terminal close did not release retained transports');
+  await wait(async()=>page.evaluate(()=>window.postCallFrames.some(frame=>frame.title==='Call ended')),'settled post-call frame not observed');
+  await assertStableClose();
+  assert(await page.locator('#call-again').isEnabled());
   assert(!requests.some(request=>/cancel|stop/.test(request.path)));
   assert.equal(await page.evaluate(()=>Object.keys(localStorage).length),0);
   checks.push('voice hangup releases devices, peer, audio and wake lock; close acceptance is not terminal; backend work is not cancelled');
@@ -1084,7 +1231,7 @@ try {
   await page.getByRole('button',{name:'Call Jarvis',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','Jarvis fixture did not connect');
   await wait(async()=>/cannot inspect/.test(await page.locator('#share-capability').innerText()),'effective capability missing before capture');
-  await page.locator('#call-voice-settings').click();await page.locator('#voice-choice:not([disabled])').waitFor();assert.match(await page.locator('#voice-model-facts').innerText(),/Reasoning model.*Not yet reported/s);assert(await page.locator('#voice-advanced').isHidden());await page.locator('#close-voice-settings').click();
+  await page.locator('#call-voice-settings').click();await voiceOption('marin').waitFor();await modelDetails.click();assert.match(await page.locator('#voice-model-facts').innerText(),/Reasoning model.*Not yet reported/s);assert(await page.locator('#voice-advanced').isHidden());await page.locator('#close-voice-settings').click();
   await page.locator('#camera-toggle').click();
   const shuttersBeforeSuspended=await page.evaluate(async()=>{await fixture.audioContexts.at(-1).suspend();return fixture.shutters;});
   await page.locator('#capture-photo').click();
@@ -1093,7 +1240,19 @@ try {
   assert.match(await page.locator('#notice-text').innerText(),/Photo captured.*shutter sound is unavailable/);
   assert.equal(await page.evaluate(()=>fixture.shutters),shuttersBeforeSuspended);
   checks.push('a suspended audio context shows that the photo was captured and sound was unavailable, without repeating a cue or preventing storage');
-  await page.locator('#hangup').click();await wait(async()=>calls.get('call-3').state==='interrupted','Jarvis close not settled');
+  const closePath='/api/v1/companion/calls/call-3/close';
+  await page.route('**'+closePath,async route=>{await route.fetch(); await route.abort('failed');});
+  await page.locator('#hangup').click();
+  await page.locator('#call-ended #recover-call').waitFor();
+  assert.equal(await page.locator('#call-again').isDisabled(),true);
+  assert.equal(await page.evaluate(()=>document.activeElement.id),'back-to-contacts');
+  await page.locator('#check-call-status').click();
+  await wait(async()=>await page.locator('#check-call-status').isEnabled(),'same-call read did not finish');
+  assert(await page.locator('#call-ended #call-recovery').isVisible());
+  await page.locator('#check-call-status').click();
+  await wait(async()=>calls.get('call-3').state==='interrupted','Jarvis close not settled');
+  assert.equal(requests.filter(r=>r.method==='POST'&&r.path===closePath).length,1);
+  checks.push('a lost close reply shows actionable recovery on the same post-call screen; same-call reads resolve it without replay or extra media');
   await wait(async()=>/provider closure was not confirmed/.test(await page.locator('#ended-detail').innerText()),'unconfirmed provider closure was misreported');
   checks.push('effective image limitation appears before capture; saving remains available without claiming the agent can see it');
 
@@ -1154,15 +1313,23 @@ try {
   await wait(async()=>await page.locator('#recover-call').isHidden(),'previous call did not close');
   assert.equal(calls.get('reloaded-call').state,'closed');assert.equal(await page.evaluate(()=>fixture.media.length),0);
   catalogAvailable=true;
-  await page.reload();await page.getByRole('button',{name:'Call Rook',exact:true}).click();
+  await page.reload();await page.getByRole('button',{name:'Call Coach',exact:true}).click();
   await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','fresh call blocked after explicit prior closure');
   assert.equal(requests.filter(request=>request.path==='/api/v1/companion/calls').length,beforeReload+1);
-  await page.locator('#hangup').click();await wait(async()=>await page.locator('#recover-call').isHidden(),'last fixture call did not close');
+  closeImmediately=true;
+  await observePostCall();
+  await page.locator('#hangup').click();
+  await wait(async()=>page.evaluate(()=>window.postCallFrames.some(frame=>frame.title==='Call ended')),'fast close did not settle');
+  await assertStableClose();
   checks.push('reload discovers the owner’s existing call without media or redial; explicit close permits a later fresh call');
 
-  await page.locator('#back-to-contacts').click();events.length=0;
-  await page.getByRole('button',{name:'Call Coach',exact:true}).click();
-  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','logout fixture did not connect');
+  events.length=0;
+  const requestsBeforeRedial=requests.filter(request=>request.path==='/api/v1/companion/calls').length;
+  await page.locator('#call-again').click();
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','explicit redial did not connect');
+  assert.equal(requests.filter(request=>request.path==='/api/v1/companion/calls').length,requestsBeforeRedial+1);
+  assert.equal([...calls.values()].at(-1).request.agent_id,'coach');
+  checks.push('mobile fast and delayed hang-ups keep the same post-call card and focus on every sampled frame; explicit redial places one call to the same contact');
   emit('transcript',{role:'user',text:'Private prior caller text.',fragment:true,start_ms:0,end_ms:100});
   emit('card',{text:'Private prior caller result.',conversation_id:'room-coach'});
   emit('context_delivery',{event_id:'private-context',state:'queued',content:'Private prior caller context.'});
@@ -1328,7 +1495,7 @@ try {
     assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeOriginal,'late original creation must not close again');
     assert.equal(await page.evaluate(()=>fixture.peers.at(-1).closed||fixture.tracks.at(-1).stopped),false);
     await page.unroute('**/api/v1/companion/calls');
-    await page.locator('#hangup').click();await wait(async()=>await page.locator('#call-recovery').isHidden(),'pending creation successor did not settle');
+    await page.locator('#hangup').click();await wait(async()=>await page.locator('#ended-title').innerText()==='Call ended','pending creation successor did not settle');
     checks.push(`late original creation ${lateOutcome} ${deliveryStage} preserves explicit recovery ownership and never restores a settled call`);
   }
 
@@ -1407,5 +1574,24 @@ try {
   assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closesBeforeClosing);
   checks.push('matching terminal closure shows Call ended and releases devices through the existing path without another close request');
   assert.deepEqual(errors,[]);
+
+  events.length=0;
+  await page.locator('#call-again').click();
+  await wait(async()=>await page.locator('#call-status-text').innerText()==='Connected','slow close fixture did not connect');
+  const slowCall=[...calls.values()].at(-1), closeCount=requests.filter(r=>r.path.endsWith('/close')).length;
+  holdNextClose=true;await page.locator('#hangup').click();
+  await wait(async()=>heldClose!==null,'slow close was not held');
+  // After the existing HTTP deadline, the missing reply stays actionable on this card.
+  await page.locator('#call-ended #check-call-status').waitFor({timeout:20000});
+  assert.equal(await page.locator('#recovery-title').innerText(),'Call status unconfirmed');
+  assert(await page.locator('#recover-call').isEnabled());
+  assert(await page.locator('#call-again').isDisabled());
+  assert.equal(await page.evaluate(()=>document.activeElement.id),'back-to-contacts');
+  assert(await page.evaluate(()=>fixture.tracks.every(track=>track.stopped)&&fixture.peers.every(peer=>peer.closed)));
+  slowCall.state='closed';await page.locator('#check-call-status').click();
+  await wait(async()=>await page.locator('#call-again').isEnabled(),'same-call terminal read did not permit redial');
+  heldClose();heldClose=null;
+  assert.equal(requests.filter(r=>r.path.endsWith('/close')).length,closeCount+1);
+  checks.push('a close POST with no reply reaches its original deadline, then offers a same-call status read on the post-call card; one close POST, released media and no automatic redial');
   console.log(JSON.stringify({passed:checks.length,checks,scope:'real Chromium UI; fake API, media, and provider; no paid calls'},null,2));
 } finally { await browser.close(); await new Promise(resolve=>server.close(resolve)); }

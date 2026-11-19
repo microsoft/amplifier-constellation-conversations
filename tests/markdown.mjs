@@ -4,16 +4,17 @@ import http from 'node:http';
 import assert from 'node:assert/strict';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const ui = path.join(process.cwd(), 'ui');
-const script = await fs.readFile(path.join(ui, 'markdown.js'), 'utf8') + await fs.readFile(path.join(ui, 'markdown-renderer.js'), 'utf8');
+const script = await fs.readFile(path.join(ui, 'markdown.js'), 'utf8') + await fs.readFile(path.join(ui,'artifact-previews.js'),'utf8') + await fs.readFile(path.join(ui, 'markdown-renderer.js'), 'utf8');
 const css = await fs.readFile(path.join(ui, 'markdown.css'), 'utf8');
 const companionCards = await fs.readFile(path.join(ui, 'companion-cards.mjs'), 'utf8');
 const server = http.createServer((req,res) => {
   if(req.url === '/markdown.js') {res.setHeader('Content-Type','text/javascript');res.end(script);}
   else if(req.url === '/companion-cards.mjs') {res.setHeader('Content-Type','text/javascript');res.end(companionCards);}
+  else if(req.url==='/api/v1/conversations/current/attachments/missing'){res.writeHead(404);res.end();}
   else res.end(`<style>body{margin:12px}.markdown{max-width:100%}${css}</style><main class="markdown"></main><script src="/markdown.js"></script>`);
 });
 await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
-const browser = await chromium.launch({headless:true,args:['--no-sandbox']});
+const browser = await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE || undefined,args:['--no-sandbox']});
 try {
   const page=await browser.newPage({viewport:{width:390,height:844}});
   const external=[]; page.on('request', r=>{if(!r.url().startsWith('http://127.0.0.1:'))external.push(r.url());});
@@ -87,4 +88,27 @@ try {
   for(const value of times.missing){assert.match(value,/Saved time unavailable/);assert(!value.includes('<time'));}
   assert.deepEqual(external,[],'rendering must not fetch linked images or wrong-conversation attachments');
   console.log('PASS Companion result cards: real Markdown, complete caveat/source preservation, strict conversation-scoped links, no HTML/media loads, durable saved timestamp and unknown absence');
+  const preview = await page.evaluate(async()=>{
+    const root=document.querySelector('main');
+    const mermaid='flowchart LR\nStart["Start here"] --> Finish[Done]';
+    const svg='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 90 40"><title>Example</title><rect width="60" height="30" fill="#445566"/></svg>';
+    const fence=(kind,text)=>'```'+kind+'\n'+text+'\n```';
+    root.innerHTML=renderMarkdown([fence('mermaid',mermaid),fence('svg',svg),fence('html','<h1>Source only</h1>'),fence('mermaid','sequenceDiagram\nA ->> B: Hello'),fence('svg',svg.replace('<rect','<image href="https://example.test/external" /><rect'))].join('\n\n'));
+    const diagrams=[...root.querySelectorAll('.artifact-diagram')];
+    await Promise.all(diagrams.map(image=>image.decode()));
+    return {sizes:diagrams.map(image=>image.naturalWidth),sources:[...root.querySelectorAll('code')].map(code=>code.textContent),
+      unavailable:[...root.querySelectorAll('p')].filter(p=>p.textContent.includes('preview unavailable')).length,
+      markup:root.querySelectorAll('h1,image,script').length,
+      crossRoom:roomArtifacts.attachment({id:'a',name:'doc',mime_type:'text/html'},'/api/v1/conversations/another/attachments/a','current')===null};
+  });
+  assert.equal(preview.sizes.length,2);assert(preview.sizes.every(width=>width>0));
+  assert.equal(preview.unavailable,2);assert.equal(preview.markup,0);assert.equal(preview.crossRoom,true);
+  assert(preview.sources.includes('<h1>Source only</h1>'));
+  await page.evaluate(()=>{
+    const missing=roomArtifacts.attachment({id:'missing',name:'document.md',mime_type:'text/markdown'},'/api/v1/conversations/current/attachments/missing','current');
+    document.querySelector('main').append(missing);missing.open=true;
+  });
+  await page.getByText('Preview unavailable. The original download link is below.').waitFor();
+  assert.equal(external.filter(url=>!url.startsWith('data:image/svg+xml')).length,0);
+  console.log('PASS bounded Mermaid and SVG, unsupported diagram source, inert HTML, missing/other-room artifacts and no external diagram loads');
 } finally { await browser.close(); server.close(); }

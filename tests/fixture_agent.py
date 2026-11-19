@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A real stdio ACP peer for contract tests, with no model calls."""
 import json
+import pathlib
+import re
+import urllib.request
 import os
 import sys
 import time
@@ -75,6 +78,50 @@ for line in sys.stdin:
     elif method == "session/prompt":
         sid = params["sessionId"]
         text = params["prompt"][0]["text"]
+        scenario = os.environ.get("FIXTURE_COMPANION_EXPERIENCE")
+        if scenario == "interrupted" and not pathlib.Path("agent-restored").is_file():
+            # The agent accepted a session, but its prompt termination is uncertain.
+            sys.exit(17)
+        if scenario == "working":
+            # Only the disposable agent/voice peers are fixtures. Exercise the real
+            # call-scoped product tool handlers, board publication and private storage.
+            grant = json.loads(pathlib.Path("bridge-initial.json").read_text())["mcp"]
+            delegation = re.search(r"This new request's delegation_id is ([^;]+);", text).group(1)
+            source = json.loads(text.split("Current human source (",1)[1].split("):\n",1)[1].split("\n\nRecent conversation,",1)[0])
+            instruction = "".join(row["text"] for row in source if row["role"] == "user")
+            if "diagram and source" in instruction:
+                tool, body = "shared", {"title":"Private handoff diagram","kind":"markdown","text":"```mermaid\nflowchart LR\nA[Review] --> B[Prepare]\n```"}
+                outcome = "The diagram and source documents are ready."
+                for mime,source in [("image/svg+xml",'<svg xmlns="http://www.w3.org/2000/svg" width="80" height="48"><title>Private rectangle</title><rect width="40" height="30" fill="#234567"/></svg>'),
+                                    ("text/html",'<h1>Private HTML example</h1><script>globalThis.artifactRan=true</script>')]:
+                    write({"method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"resource","resource":{"uri":"attachment://fixture/source","mimeType":mime,"text":source}}}}})
+            elif "feedback" in instruction:
+                tool, body = "feedback", {"operation_id":str(uuid.uuid4()),"delegation_id":delegation,"text":"Keep the call status readable."}
+                outcome = "Your feedback was saved privately."
+            elif "Add" in instruction:
+                tool, body = "shared", {"title":"Private work list","text":"Review agenda\nPrepare notes","kind":"note"}
+                outcome = "The updated list is on your board."
+            elif "list" in instruction:
+                # Hold one legitimate prompt until the browser has observed the
+                # slow-request cue. Its bounded wait fails the fixture if absent.
+                until = time.monotonic()+25
+                while not pathlib.Path("release-list").exists():
+                    if time.monotonic()>until:
+                        raise TimeoutError("no browser release")
+                    time.sleep(.05)
+                tool, body = "shared", {"title":"Private work list","text":"Review agenda","kind":"note"}
+                outcome = "Your first list item is on the board."
+            else:
+                raise ValueError("unexpected caller input in experience fixture")
+            request = urllib.request.Request(grant["api_base"]+"/api/v1/companion/calls/"+grant["call_id"]+"/tools/"+tool,
+                data=json.dumps(body).encode(), headers={"Content-Type":"application/json","Authorization":"Bearer "+grant["token"]})
+            with urllib.request.urlopen(request, timeout=5) as reply:
+                receipt = json.load(reply)
+            if tool == "feedback":
+                assert receipt["state"]=="saved" and receipt["scope"]=="private_installation" and receipt["submitted_externally"] is False
+            write({"method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":outcome}}}})
+            write({"id":value["id"],"result":{"stopReason":"end_turn"}})
+            continue
         if os.environ.get("FIXTURE_COMPANION_PERMISSIONS")=="known":
             companion_permission(sid,"read","companion_shared")
             companion_permission(sid,"display","companion_show",{"url":"https://example.test/demo","title":"Demo","kind":"video"})

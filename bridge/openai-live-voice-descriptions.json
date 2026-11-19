@@ -1,0 +1,20 @@
+{
+  "provider": "OpenAI",
+  "model": "gpt-live-1",
+  "source": "https://developers.openai.com/api/docs/guides/live-conversations#voice-options",
+  "voices": {
+    "quartz": { "language": "English", "region": "Australian", "presentation": "Feminine" },
+    "ripple": { "language": "English", "region": "Australian", "presentation": "Masculine" },
+    "vesper": { "language": "English", "region": "British", "presentation": "Masculine" },
+    "willow": { "language": "English", "region": "Irish", "presentation": "Feminine" },
+    "stone": { "language": "English", "region": "Irish", "presentation": "Masculine" },
+    "gleam": { "language": "English", "region": "North American", "presentation": "Feminine" },
+    "meridian": { "language": "English", "region": "North American", "presentation": "Masculine" },
+    "bossa": { "language": "Portuguese", "region": "Brazilian", "presentation": "Feminine" },
+    "tempo": { "language": "Portuguese", "region": "Brazilian", "presentation": "Masculine" },
+    "beacon": { "language": "English", "region": "Filipino", "presentation": "Masculine" },
+    "delta": { "language": "English", "region": "Southern U.S.", "presentation": "Feminine" },
+    "cinder": { "language": "English", "region": "Southern U.S.", "presentation": "Masculine" },
+    "shida": { "language": "Japanese", "presentation": "Masculine" }
+  }
+}

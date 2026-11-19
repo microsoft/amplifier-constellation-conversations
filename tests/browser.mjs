@@ -1,5 +1,6 @@
 import {readFile} from 'node:fs/promises';
 import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let input='';for await(const chunk of process.stdin)input+=chunk;const cfg=JSON.parse(input);
 const browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE||undefined,args:['--no-sandbox']});
@@ -145,6 +146,20 @@ try{
   await page.evaluate(()=>window.agentConversationsControl.voice.transcript('Workshop, show activity'));
   await page.locator('#activity-panel:not([hidden])').waitFor();
   await page.evaluate(()=>window.agentConversationsControl.voice.transcript('Workshop, show conversation'));check('spoken view command follows API state');
+  const noteRoom=await page.locator('#messages').getAttribute('data-conversation'), noteId=randomUUID();
+  const noteApi=`/api/v1/conversations/${noteRoom}/notes/${noteId}`;
+  const createNote={request_id:randomUUID(),expected_revision:0,title:'Travel',text:'Passport'};
+  await api(noteApi,'PUT',createNote);
+  const roomNote=page.locator(`#messages [data-message-id="${noteId}"]`);
+  await roomNote.getByRole('button',{name:'Edit note'}).click();
+  await page.getByRole('dialog').getByLabel('Note',{exact:true}).fill('Passport and tickets');
+  await page.getByRole('button',{name:'Save note'}).click();
+  await waitFor(async()=>/revision 2/.test(await roomNote.innerText()),'updated revision missing');
+  await page.reload();
+  await waitFor(async()=>/Passport and tickets/.test(await roomNote.innerText()),'edited note missing after reopen');
+  assert.equal(await roomNote.count(),1);
+  assert.equal((await api(noteApi)).revision,2);
+  check('one durable room note is edited in Conversations, reopens at its current revision and remains one message');
   const manifest=await (await page.request.get(cfg.url+'/manifest.webmanifest')).json();assert.equal(manifest.display,'standalone');
   assert.equal((await page.request.get(cfg.url+'/sw.js')).status(),200);check('installable mobile shell with no transcript caching');
   await page.locator('#menu').click();await page.locator('#sign-out').click();await page.locator('#login:not([hidden])').waitFor();check('sign out');assert.deepEqual(errors,[]);check('no browser JavaScript errors');

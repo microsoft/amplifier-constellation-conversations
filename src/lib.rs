@@ -1,4 +1,5 @@
 pub mod acp_auth;
+mod agent_portraits;
 mod answer;
 pub mod attachments;
 pub mod attention;
@@ -45,6 +46,7 @@ mod native_update_process;
 pub mod native_update_protocol;
 pub mod permissions;
 pub mod platform;
+pub mod room_notes;
 pub mod rooms;
 pub mod server;
 mod source_delivery;

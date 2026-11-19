@@ -71,7 +71,7 @@ const server=createServer(async(req,res)=>{
   const name=p==='/'?'index.html':p.slice(1);
   if(!/^[a-z0-9.-]+$/.test(name))throw Error(`Unexpected path ${p}`);
   let data=await readFile(new URL(`../ui/${name}`,import.meta.url));
-  if(name==='markdown.js')data=Buffer.concat([data,await readFile(new URL('../ui/markdown-renderer.js',import.meta.url))]);
+  if(name==='markdown.js')data=Buffer.concat([data,await readFile(new URL('../ui/artifact-previews.js',import.meta.url)),await readFile(new URL('../ui/markdown-renderer.js',import.meta.url))]);
   res.setHeader('Content-Type',name.endsWith('.js')||name.endsWith('.mjs')?'text/javascript':name.endsWith('.css')?'text/css':name.endsWith('.svg')?'image/svg+xml':name.endsWith('.webmanifest')?'application/manifest+json':'text/html');res.end(data);
  }catch(e){unexpected.push(e.message);res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
 });

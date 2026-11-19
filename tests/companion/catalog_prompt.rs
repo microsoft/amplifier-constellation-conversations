@@ -119,6 +119,10 @@ async fn actual_delegation_contains_authorized_executable_read_catalog_and_exact
         1,
         "the accepted production response instruction reaches the actual prompt once"
     );
+    assert!(text.contains("This request has reached you, the selected contact."));
+    assert!(
+        text.contains("A request for a different named agent still needs an authorized connection")
+    );
     assert!(text.contains("Return concise useful facts, actual blockers and next steps."));
     assert!(text.contains(
         "Compare each allowance or deadline with its usage and observation time separately"

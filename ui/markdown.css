@@ -19,3 +19,8 @@
 .markdown th { background: #edf3ee; font-weight: 650; }
 .markdown input[type=checkbox] { width: auto; margin: 0 .35em 0 0; padding: 0; }
 .markdown a { text-decoration: underline; }
+
+.artifact-preview { margin-block: .4rem; }
+.artifact-preview summary, .markdown details > summary { cursor: pointer; }
+.artifact-diagram { display: block; max-width: 100%; height: auto; margin-block: .4rem; }
+.artifact-preview pre { overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

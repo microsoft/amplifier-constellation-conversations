@@ -40,6 +40,9 @@ impl Drop for Fixture {
     }
 }
 fn fixture(mode: &str) -> Fixture {
+    fixture_at(mode, None)
+}
+fn fixture_at(mode: &str, local_port: Option<u16>) -> Fixture {
     let home = tempfile::tempdir().unwrap();
     let python = std::process::Command::new("python3")
         .args(["-c", "import sys; print(sys.executable)"])
@@ -59,7 +62,7 @@ c=json.loads(sys.stdin.readline())
 with (root/'bridge-starts').open('a') as f:f.write('start\n')
 (root/'bridge-initial.json').write_text(json.dumps(c))
 voice=(root/'bridge-mode').read_text()
-if voice=='followthrough':
+if voice in ('followthrough','browser_qa'):
  # Test-only provider control: production receives actual bridge events, not
  # pre-populated delegation rows. Atomic publication avoids partial reads.
  def provider_inputs():
@@ -96,7 +99,7 @@ if voice in ('connection_lost','expired','remote_hangup','terminal_eof'):
  emit({'type':'event','event':{'type':'session.closed','event_id':'provider-terminal','session':{'id':'live-fixture'},'reason':'expired' if voice=='terminal_eof' else voice,'usage':{'seconds':120}}})
  if voice=='terminal_eof':sys.exit(0)
  emit({'type':'closed','confirmed':True,'session_id':'live-fixture'});sys.exit(0)
-if voice not in ('quiet','connecting','upload_delegate','retained_receipt'):
+if voice not in ('quiet','connecting','upload_delegate','retained_receipt','browser_qa'):
  if voice!='missing':
   event={'type':'session.input_transcript.delta','event_id':'human-1','delta':'Please inspect the supplied test context and report it.','start_ms':10,'end_ms':90}
   if voice in ('anchor','anchors'):event.update({'delta':'Please inspect the existing work, without changing anything','start_ms':12000,'end_ms':12990})
@@ -142,7 +145,7 @@ for line in sys.stdin:
    emit({'type':'event','event':{'type':'session.input_transcript.delta','event_id':'human-second','delta':'Now give me a separate summary.','start_ms':15000,'end_ms':15200}})
    emit({'type':'event','event':{'type':'session.delegation.created','event_id':'delegation-2','offset_ms':15100,'delegation':{'id':'delegate-2','target':'client'}}})
 "#).unwrap();
-    let c = Config {
+    let mut c = Config {
         id: uuid::Uuid::new_v4().to_string(),
         label: "Companion tests".into(),
         owner: "owner".into(),
@@ -177,6 +180,13 @@ for line in sys.stdin:
             client: Default::default(),
         }),
     };
+    if let Some(port) = local_port {
+        c.port = port;
+        c.public_url = format!("http://127.0.0.1:{port}");
+        c.allowed_users.clear();
+        c.transport = agent_conversations::config::Transport::LocalHttp;
+        c.auth_mode = agent_conversations::config::AuthMode::LocalPassword;
+    }
     c.save(home.path()).unwrap();
     std::fs::write(home.path().join("bridge-mode"), mode).unwrap();
     std::fs::write(home.path().join("companion.json"),json!({"enabled":true,"node":python,"bridge":bridge,"profiles":{"default":{"voice":"alloy","description":"Fixture agent"}},"max_call_seconds":1800}).to_string()).unwrap();
@@ -4957,4 +4967,296 @@ async fn queued_continuation_rechecks_endpoint_before_active_steering() {
 #[tokio::test]
 async fn queued_continuation_rechecks_private_membership_before_active_steering() {
     queued_continuation_rechecks_private_identity(false).await;
+}
+
+// Explicit opt-in because Chromium is not a dependency of the Rust test suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Chromium, Playwright and ffmpeg with the flite filter"]
+async fn browser_agent_working_and_interrupted_experiences() {
+    for scenario in ["working", "interrupted", "offline"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let f = fixture_at("browser_qa", Some(listener.local_addr().unwrap().port()));
+        std::fs::write(
+            f.home.path().join("companion-actions.json"),
+            r#"{"enabled":true,"agents":{}}"#,
+        )
+        .unwrap();
+        agent_fixture_env(&f, "FIXTURE_COMPANION_EXPERIENCE", scenario);
+        if scenario == "offline" {
+            let missing = f.home.path().join("offline-agent.py");
+            f.s.db.lock().unwrap().execute("UPDATE agent_endpoints SET config=json_set(config,'$.args',json_array(?1)) WHERE id='default'", [missing.to_str().unwrap()]).unwrap();
+        }
+        let server = f.app.clone();
+        let server_task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let browser = tokio::process::Command::new("node")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/companion-agent-experience.mjs"
+            ))
+            .arg(&f.s.config.public_url)
+            .arg(auth::cookie_name(&f.s))
+            .arg(f.home.path())
+            .arg(scenario)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        server_task.abort();
+        assert!(
+            browser.status.success(),
+            "{scenario}: {} {}",
+            String::from_utf8_lossy(&browser.stdout),
+            String::from_utf8_lossy(&browser.stderr)
+        );
+        if scenario != "working" {
+            // Restore the identical configured endpoint, then run the ordinary
+            // delivery resumption path. Historic uncertainty must still block
+            // the saved follow-up; a successful initialize never resends it.
+            if scenario == "offline" {
+                std::fs::copy(
+                    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixture_agent.py"),
+                    f.home.path().join("offline-agent.py"),
+                )
+                .unwrap();
+            }
+            std::fs::write(f.home.path().join("agent-restored"), b"1").unwrap();
+            let endpoint = f.s.agent("default").unwrap().unwrap();
+            assert_eq!(
+                agent_conversations::driver::probe(&endpoint).await.unwrap()["ok"],
+                true
+            );
+            agent_conversations::delivery::resume(&f.s);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !f.s.running.lock().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let calls = companion_acp_frames(&f);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|event| event["method"] == "session/prompt")
+                    .count(),
+                usize::from(scenario == "interrupted")
+            );
+        }
+        let db = f.s.db.lock().unwrap();
+        let count = |sql| db.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM companion_calls"), 1);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM companion_calls WHERE state='closed'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM companion_feedback"),
+            if scenario == "working" { 1 } else { 0 }
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM companion_events WHERE kind='card' AND json_extract(data,'$.kind')='note'"
+            ),
+            if scenario == "working" { 2 } else { 0 }
+        );
+        if scenario == "working" {
+            assert_eq!(
+                count("SELECT COUNT(*) FROM input_deliveries WHERE state='completed'"),
+                4
+            );
+        } else {
+            assert_eq!(
+                count(if scenario == "offline" {
+                    "SELECT COUNT(*) FROM input_deliveries WHERE state='notAccepted'"
+                } else {
+                    "SELECT COUNT(*) FROM input_deliveries WHERE state='unknown'"
+                }),
+                1
+            );
+            assert_eq!(
+                count("SELECT COUNT(*) FROM input_deliveries WHERE state='received'"),
+                1
+            );
+            assert_eq!(
+                count("SELECT COUNT(*) FROM companion_events WHERE kind='backend_status'"),
+                1
+            );
+        }
+        println!("{}", String::from_utf8_lossy(&browser.stdout));
+    }
+}
+
+#[tokio::test]
+async fn contact_history_hint_is_private_endpoint_bound_and_does_not_probe() {
+    let f = fixture("quiet");
+    let (_, call) = start(&f).await;
+    let room = call["conversation_id"].as_str().unwrap();
+    {
+        let db = f.s.db.lock().unwrap();
+        db.execute("INSERT INTO messages(id,conversation_id,role,text,status,created_at,updated_at,actor) VALUES('hint-source',?1,'user','Private request','complete',?2,?2,'owner')",rusqlite::params![room,now_ms()]).unwrap();
+        db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('hint-delivery','hint-source',?1,'default','direct','unknown',?2)",rusqlite::params![room,now_ms()]).unwrap();
+    }
+    let (_, cat) = request(&f, "GET", "/api/v1/companion", None).await;
+    assert_eq!(cat["contacts"][0]["last_request"]["state"], "needs_review");
+    assert_eq!(cat["contacts"][0]["last_request"]["conversation_id"], room);
+    assert!(!cat.to_string().contains("Private request"));
+    f.s.db
+        .lock()
+        .unwrap()
+        .execute("UPDATE conversations SET shared=1 WHERE id=?1", [room])
+        .unwrap();
+    assert!(
+        request(&f, "GET", "/api/v1/companion", None).await.1["contacts"][0]["last_request"]
+            .is_null()
+    );
+    assert!(!f.home.path().join("acp.jsonl").exists());
+}
+
+#[tokio::test]
+async fn recorded_voice_previews_are_bound_to_installation_model_and_source() {
+    use sha2::{Digest, Sha256};
+    let f = fixture("quiet");
+    let dir = f.home.path().join("voice-previews");
+    amplifier_native_platform::private_create_dir(&dir).unwrap();
+    let settings = "/api/v1/companion/agents/default/voice-settings";
+    let url = "/api/v1/companion/agents/default/voice-previews/cedar";
+    let mut wav = b"RIFF\x28\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\xc0\x5d\0\0\x80\xbb\0\0\x02\0\x10\0data\x04\0\0\0\x0a\0\x20\0".to_vec();
+    let mut index = json!({"provider":"OpenAI","model":"gpt-live-1","samples":{
+        "cedar":{"source":"local test bytes","sha256":format!("{:x}",Sha256::digest(&wav))}
+    }});
+    let put_index =
+        |value: &Value| std::fs::write(dir.join("index.json"), value.to_string()).unwrap();
+    put_index(&index);
+    std::fs::write(dir.join("cedar.wav"), &wav).unwrap();
+    let (_, prefs) = request(&f, "GET", settings, None).await;
+    assert_eq!(prefs["preview_voices"], json!(["cedar"]));
+    assert_eq!(
+        prefs["voice_descriptions"]["vesper"],
+        "English · British · Masculine"
+    );
+    assert_eq!(
+        prefs["voice_traits"]["vesper"],
+        json!({"language":"English","region":"British","presentation":"Masculine"})
+    );
+    assert_eq!(
+        prefs["voice_traits"]["shida"],
+        json!({"language":"Japanese","presentation":"Masculine"})
+    );
+    assert_eq!(prefs["voice_descriptions"]["shida"], "Japanese · Masculine");
+    let traits = prefs["voice_traits"].as_object().unwrap();
+    let descriptions = prefs["voice_descriptions"].as_object().unwrap();
+    let available = prefs["available_voices"].as_array().unwrap();
+    assert!(available.contains(&json!("cedar")));
+    assert!(!traits.contains_key("cedar"));
+    assert!(!descriptions.contains_key("cedar"));
+    assert_eq!(
+        traits.keys().collect::<Vec<_>>(),
+        descriptions.keys().collect::<Vec<_>>()
+    );
+    for (voice, fields) in traits {
+        assert!(available.contains(&json!(voice)));
+        let description = ["language", "region", "presentation"]
+            .iter()
+            .filter_map(|field| fields[field].as_str())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        assert_eq!(descriptions[voice], description);
+    }
+    let get = |with_token: bool| {
+        let req = Request::builder().uri(url);
+        let req = if with_token {
+            req.header(header::AUTHORIZATION, format!("Bearer {}", f.token))
+        } else {
+            req
+        };
+        f.app.clone().oneshot(req.body(Body::empty()).unwrap())
+    };
+    assert_eq!(get(false).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let response = get(true).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/wav");
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+        wav
+    );
+    assert_eq!(
+        request(
+            &f,
+            "GET",
+            "/api/v1/companion/agents/absent/voice-previews/cedar",
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &f,
+            "GET",
+            "/api/v1/companion/agents/default/voice-previews/verse",
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    wav[47] = 42;
+    std::fs::write(dir.join("cedar.wav"), &wav).unwrap();
+    assert_eq!(get(true).await.unwrap().status(), StatusCode::NOT_FOUND);
+    wav[0] = 0;
+    std::fs::write(dir.join("cedar.wav"), &wav).unwrap();
+    index["samples"]["cedar"]["sha256"] = json!(format!("{:x}", Sha256::digest(&wav)));
+    put_index(&index);
+    assert_eq!(get(true).await.unwrap().status(), StatusCode::NOT_FOUND);
+    index["model"] = json!("other-model");
+    put_index(&index);
+    assert_eq!(
+        request(&f, "GET", settings, None).await.1["preview_voices"],
+        json!([])
+    );
+    assert_eq!(get(true).await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert!(!f.home.path().join("bridge-starts").exists());
+    assert!(!f.home.path().join("acp.jsonl").exists());
+}
+
+// Add installation-owned model-matched samples to a disposable server. These
+// recordings stay outside the repository and are never sent to a provider.
+#[tokio::test]
+#[ignore = "requires Chromium, Playwright and COMPANION_TEST_PREVIEWS with cedar and marin"]
+async fn browser_plays_two_installation_owned_voice_samples() {
+    let f = fixture("quiet");
+    let samples = std::path::PathBuf::from(
+        std::env::var_os("COMPANION_TEST_PREVIEWS").expect("provide the private fixture directory"),
+    );
+    let dir = f.home.path().join("voice-previews");
+    amplifier_native_platform::private_create_dir(&dir).unwrap();
+    for file in ["index.json", "cedar.wav", "marin.wav"] {
+        std::fs::copy(samples.join(file), dir.join(file)).unwrap();
+    }
+    let cookie = "disposable-voice-preview-browser";
+    f.s.db.lock().unwrap().execute("INSERT INTO browser_sessions(hash,owner,csrf,expires_at) VALUES(?1,'owner','preview-csrf',?2)",rusqlite::params![auth::digest(cookie),now_ms()+120_000]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = f.app.clone();
+    let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let result = tokio::process::Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/companion-voice-preview.mjs"
+        ))
+        .args([origin.as_str(), &auth::cookie_name(&f.s), cookie])
+        .output()
+        .await
+        .unwrap();
+    task.abort();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&result.stdout));
+    assert!(!f.home.path().join("bridge-starts").exists());
+    assert!(!f.home.path().join("acp.jsonl").exists());
 }

@@ -21,6 +21,8 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[path = "companion_voice_previews.rs"]
+mod voice_previews;
 pub use setup::{connect_local_agent, save_setup, setup_status};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -34,6 +36,7 @@ use tokio::{
     process::Command,
     sync::{mpsc, oneshot},
 };
+pub use voice_previews::read as voice_preview;
 
 #[derive(Default)]
 pub struct Runtime {
@@ -330,8 +333,10 @@ pub async fn catalog(State(s): State<Arc<AppState>>, h: HeaderMap) -> ApiResult<
     for (id, profile) in c.profiles {
         if let Some(a) = s.agent(&id)? {
             let voice = selected_voice(&s, &p.actor, &id, &profile)?;
+            let avatar = crate::agent_portraits::digest(&s.db.lock().unwrap(), &id)?;
+            let last_request = crate::companion_identity::last_request(&s, &p.actor, &id)?;
             contacts
-                .push(json!({"id":id,"label":a.label,"voice":voice,"description":profile.description,"context_registered":profile.context_registered,"image_input":null,"configured_image_input":profile.image_input}));
+                .push(json!({"id":id,"label":a.label,"voice":voice,"avatar_digest":avatar,"last_request":last_request,"description":profile.description,"context_registered":profile.context_registered,"image_input":null,"configured_image_input":profile.image_input}));
         }
     }
     Ok(Json(
@@ -369,9 +374,13 @@ fn voice_settings_value(
     agent: &str,
     profile: &Profile,
 ) -> Result<Value> {
+    let traits = voice_previews::traits();
     Ok(json!({
         "voice":selected_voice(s, owner, agent, profile)?,
         "available_voices":VOICES,
+        "voice_traits":traits,
+        "voice_descriptions":traits.map(voice_previews::descriptions),
+        "preview_voices":voice_previews::index(&s.home).as_ref().map(|index| index.voices()).unwrap_or_default(),
         "voice_provider":"OpenAI",
         "voice_model":VOICE_MODEL,
         "available_voice_models":[VOICE_MODEL],
@@ -761,6 +770,14 @@ pub async fn read(
             .list(v["conversation_id"].as_str().unwrap_or(""), &p.actor)
     );
     let db = s.db.lock().unwrap();
+    // A held room can otherwise appear healthy between delegations, or stay
+    // blocked in the caller UI after a decision in the conversation.
+    let review_required: bool = db.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM companion_calls c JOIN input_deliveries d ON d.conversation_id=c.conversation_id AND d.agent_id=c.agent_id WHERE c.id=?1 AND d.state IN {})", crate::delivery::REVIEW_STATES),
+        [&id],
+        |row| row.get(0),
+    )?;
+    v["delivery_review_required"] = json!(review_required);
     let mut stmt=db.prepare("SELECT seq,kind,data,at FROM companion_events WHERE call_id=?1 AND seq>?2 ORDER BY seq LIMIT 100")?;
     let rows = stmt
         .query_map(params![id, q.after.max(0)], |r| {
@@ -1968,6 +1985,28 @@ pub(crate) fn pending_context_valid(db: &Connection, call: &str, did: &str) -> R
         params![call,did], |r|r.get(0),
     )?)
 }
+const WAIT_CUE_START_MS: i64 = 6_000;
+const WAIT_CUE_END_MS: i64 = 20_000;
+const WAIT_CUE: &str = "Your request is saved. I'm still waiting for the answer.";
+
+pub(crate) fn wait_cue_current(db: &Connection, call: &str, did: &str) -> Result<bool> {
+    if !pending_context_valid(db, call, did)? {
+        return Ok(false);
+    }
+    // An acknowledgment belongs to that exact utterance. More speech (including
+    // a generated acknowledgment), a delivery blocker, or a late open floor
+    // makes it stale. Neither elapsed time nor a saved request proves execution.
+    Ok(db.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM companion_delegations x JOIN companion_calls c ON c.id=x.call_id
+            WHERE x.call_id=?1 AND x.id=?2 AND ?3-x.created_at BETWEEN ?4 AND ?5
+            AND NOT EXISTS(SELECT 1 FROM input_deliveries d WHERE d.conversation_id=c.conversation_id AND d.agent_id=c.agent_id AND d.state IN {})
+            AND EXISTS(SELECT 1 FROM json_each(x.source,'$.fragments') f WHERE json_extract(f.value,'$.role')='user'
+                AND json_extract(f.value,'$.seq')=(SELECT MAX(e.seq) FROM companion_events e WHERE e.call_id=c.id AND e.kind='transcript')))",
+            crate::delivery::REVIEW_STATES),
+        params![call,did,now_ms(),WAIT_CUE_START_MS,WAIT_CUE_END_MS], |r|r.get(0),
+    )?)
+}
+
 fn pending_context_key(did: &str) -> String {
     format!("request-pending-{}", auth::digest(did))
 }
@@ -2101,6 +2140,19 @@ fn observe_results(s: &AppState, id: &str, room: &str, live: bool) -> Result<()>
         ).optional()?;
         if live {
             pending_context(s, id, &did)?;
+            if (WAIT_CUE_START_MS..=WAIT_CUE_END_MS).contains(&(now_ms() - at))
+                && wait_cue_current(&s.db.lock().unwrap(), id, &did)?
+            {
+                let key = format!("wait-cue:{did}");
+                crate::companion_delivery::enqueue_batch(
+                    s,
+                    id,
+                    &key,
+                    vec![
+                        json!({"op":"append","channel":"commentary","delegation_id":null,"event_id":auth::digest(&key),"content":WAIT_CUE}),
+                    ],
+                )?;
+            }
         }
         if let Some((delivery, status, text, result_message, not_started)) = result {
             if ["completed", "incorporated"].contains(&delivery.as_str())
@@ -2500,6 +2552,17 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
         let live_text = if pending_action { "" } else { text };
         if !live_text.trim().is_empty() || image_count > 0 {
             if live_text.len() <= 480 && image_count == 0 {
+                // Only an ordinary, complete, caller-linked text result may be
+                // considered for quiet source confirmation at final delivery.
+                let event_id = if !late
+                    && !quiet_action_result
+                    && attachments.is_empty()
+                    && delegation.is_some()
+                {
+                    format!("plain-result:{message}")
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                };
                 queue_append(
                     s,
                     id,
@@ -2510,7 +2573,7 @@ fn publish_result(s: &AppState, id: &str, room: &str, message: &str, text: &str)
                     },
                     delegation,
                     live_text,
-                    &uuid::Uuid::new_v4().to_string(),
+                    &event_id,
                 )?;
             } else {
                 let (parts, omitted) = complete_fragments(live_text, 360, 16);

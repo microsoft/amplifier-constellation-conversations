@@ -44,6 +44,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                     concat!(
                         include_str!("../ui/markdown.js"),
+                        include_str!("../ui/artifact-previews.js"),
                         include_str!("../ui/markdown-renderer.js")
                     ),
                 )
@@ -190,6 +191,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             }),
         )
         .route("/auth/logout", post(auth::logout))
+        .route(
+            "/api/v1/agents/{id}/portrait",
+            get(crate::agent_portraits::get).post(crate::agent_portraits::refresh),
+        )
         .route("/api/v1/companion", get(crate::companion::catalog))
         .route(
             "/api/v1/companion/calls/{id}/mcp",
@@ -254,6 +259,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/companion/agents/{id}/voice-settings",
             get(crate::companion::voice_settings).put(crate::companion::save_voice_settings),
+        )
+        .route(
+            "/api/v1/companion/agents/{id}/voice-previews/{voice}",
+            get(crate::companion::voice_preview),
         )
         .route(
             "/api/v1/companion/agents/{id}/capabilities",
@@ -365,6 +374,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/conversations/{id}",
             get(read).patch(rename).delete(remove),
+        )
+        .route(
+            "/api/v1/conversations/{id}/notes/{note}",
+            get(crate::room_notes::read).put(crate::room_notes::edit),
         )
         .route(
             "/api/v1/conversations/{id}/messages",

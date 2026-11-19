@@ -139,6 +139,92 @@ fn quiet_context_ready_in(db: &Connection, call: &str) -> Result<bool> {
         && matches!(p["floor"].as_str(), Some("open" | "user")))
 }
 
+/// For a single, directly delegated text question the duplex model sometimes
+/// generates the literal answer before its selected agent returns. The card
+/// and native result remain authoritative. Confirm their source quietly when
+/// the entire generated phrase already matches, without inferring playback.
+fn generated_answer_confirmation(
+    s: &AppState,
+    db: &Connection,
+    call: &str,
+    command: &Value,
+) -> Result<Option<String>> {
+    const PREFIX: &str = "The selected agent returned this answer for this request: ";
+    let Some(target) = command["event_id"]
+        .as_str()
+        .and_then(|id| id.strip_prefix("plain-result:"))
+    else {
+        return Ok(None);
+    };
+    let Some(did) = command["delegation_id"].as_str() else {
+        return Ok(None);
+    };
+    let text = command["content"].as_str().unwrap_or("");
+    if command["channel"] != "commentary" || text.is_empty() || PREFIX.len() + text.len() > 480 {
+        return Ok(None);
+    }
+    // Fail open to normal commentary for ambiguous or repeated requests,
+    // other inputs, actions, permission decisions, and missing source bindings.
+    let source: Option<(String,String,i64,i64,i64)> = db.query_row(
+        "SELECT c.owner,c.conversation_id,u.seq,json_extract(u.data,'$.end_ms'),card.seq
+         FROM companion_calls c
+         JOIN companion_delegations x ON x.call_id=c.id AND x.id=?2 AND x.state='completed'
+         JOIN messages input ON input.id=x.message_id AND input.conversation_id=c.conversation_id AND input.role='user' AND input.actor=c.owner
+         JOIN input_deliveries d ON d.message_id=input.id AND d.conversation_id=c.conversation_id AND d.agent_id=c.agent_id
+             AND d.participation='direct' AND d.state='completed' AND d.target_turn=?3
+         JOIN messages m ON m.id=d.target_turn AND m.conversation_id=c.conversation_id AND m.agent_id=c.agent_id
+             AND m.role='assistant' AND m.status='complete' AND m.text=?4
+         JOIN companion_events card ON card.call_id=c.id AND card.kind='card' AND card.event_key='result:'||m.id
+             AND json_extract(card.data,'$.request_id')=input.id AND json_extract(card.data,'$.delegation_id')=x.id
+             AND json_extract(card.data,'$.message_id')=m.id AND json_extract(card.data,'$.text')=m.text AND json_extract(card.data,'$.late')=0 AND json_extract(card.data,'$.truncated')=0
+             AND json_extract(card.data,'$.conversation_id')=c.conversation_id AND json_array_length(card.data,'$.attachments')=0
+         JOIN companion_events u ON u.seq=(SELECT MAX(seq) FROM companion_events WHERE call_id=c.id AND kind='transcript' AND json_extract(data,'$.role')='user')
+         WHERE c.id=?1 AND c.state IN ('connecting','connected')
+             AND json_extract(x.source,'$.version')=1 AND EXISTS(SELECT 1 FROM json_each(x.source,'$.fragments') f
+                 WHERE json_extract(f.value,'$.seq')=u.seq AND json_extract(f.value,'$.event_id')=u.event_key
+                   AND json_extract(f.value,'$.role')='user' AND json_extract(f.value,'$.text')=json_extract(u.data,'$.text'))
+             AND NOT EXISTS(SELECT 1 FROM companion_delegations WHERE call_id=c.id AND id!=x.id)
+             AND NOT EXISTS(SELECT 1 FROM input_deliveries WHERE conversation_id=c.conversation_id AND id!=d.id)
+             AND NOT EXISTS(SELECT 1 FROM messages WHERE conversation_id=c.conversation_id AND role='user' AND status!='voice_fragment' AND seq>input.seq)
+             AND NOT EXISTS(SELECT 1 FROM companion_actions WHERE call_id=c.id)
+             AND NOT EXISTS(SELECT 1 FROM companion_events WHERE call_id=c.id AND kind IN ('permission','playback'))",
+        params![call,did,target,text], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
+    ).optional()?;
+    let Some((owner, room, anchor, mut last_end, card_seq)) = source else {
+        return Ok(None);
+    };
+    if !s.permissions.list(&room, &owner).is_empty() {
+        return Ok(None);
+    }
+    let mut statement = db.prepare("SELECT seq,json_extract(data,'$.text'),json_extract(data,'$.start_ms'),json_extract(data,'$.end_ms'),json_extract(data,'$.role')='assistant' AND json_extract(data,'$.fragment')=1 AND json_extract(data,'$.event_id')=event_key FROM companion_events WHERE call_id=?1 AND kind='transcript' AND seq>?2 ORDER BY seq LIMIT 33")?;
+    let mut rows = statement.query(params![call, anchor])?;
+    let mut generated = String::new();
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        let (seq, word, start, end, exact) = (
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+        );
+        if count > 32
+            || exact != Some(true)
+            || seq >= card_seq
+            || start < last_end
+            || start.saturating_sub(last_end) > 3000
+            || end < start
+            || generated.len() + word.len() > 480
+        {
+            return Ok(None);
+        }
+        generated.push_str(&word);
+        last_end = end;
+    }
+    Ok((generated.trim() == text.trim()).then(|| format!("{PREFIX}{text}")))
+}
+
 pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     let mut db = s.db.lock().unwrap();
     let tx = db.transaction()?;
@@ -163,6 +249,12 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
     let mut selected = None;
     for (id, semantic_key, raw) in rows {
         let commands: Vec<Value> = serde_json::from_str(&raw)?;
+        if let Some(did) = semantic_key.strip_prefix("wait-cue:")
+            && !crate::companion::wait_cue_current(&tx, call, did)?
+        {
+            tx.execute("UPDATE companion_voice_batches SET state='superseded',updated_at=?2 WHERE id=?1 AND state='pending'", params![id, now_ms()])?;
+            continue;
+        }
         // Recheck permission presence and revision under the same DB transaction
         // that selects delivery. A resolved unsent notice is never speech-ready.
         if !commands.iter().try_fold(true, |valid, command| {
@@ -187,7 +279,7 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
             break;
         }
     }
-    let Some((id, commands)) = selected else {
+    let Some((id, mut commands)) = selected else {
         tx.commit()?;
         return Ok(None);
     };
@@ -226,6 +318,14 @@ pub(crate) fn take_ready(s: &AppState, call: &str) -> Result<Option<Value>> {
             tx.commit()?;
             return Ok(None);
         }
+    }
+    // Unavailable evidence leaves normal delivery intact. Only the final,
+    // admitted command changes; the original card and pending receipt persist.
+    if let [command] = commands.as_mut_slice()
+        && let Ok(Some(confirmation)) = generated_answer_confirmation(s, &tx, call, command)
+    {
+        command["channel"] = json!("thinking");
+        command["content"] = json!(confirmation);
     }
     tx.execute("UPDATE companion_voice_batches SET state='dispatching',updates=?3,updated_at=?2 WHERE id=?1 AND state='pending'",params![id,now_ms(),serde_json::to_string(&commands)?])?;
     for command in &commands {
@@ -303,6 +403,81 @@ mod tests {
             room,
         }
     }
+    #[test]
+    fn slow_request_cue_expires_on_more_speech_or_resolution_while_the_floor_is_held() {
+        for change in [
+            "correction",
+            "spoken_ack",
+            "completed",
+            "expired",
+            "blocked",
+        ] {
+            let f = fixture();
+            let now = now_ms();
+            {
+                let db = f.s.db.lock().unwrap();
+                db.execute("INSERT INTO messages(id,conversation_id,role,actor,text,status,created_at,updated_at) VALUES('m',?1,'user','owner','Make a list','complete',?2,?2)",params![f.room,now]).unwrap();
+                db.execute("INSERT INTO input_deliveries(id,message_id,conversation_id,agent_id,participation,state,updated_at) VALUES('d','m',?1,'default','direct','received',?2)",params![f.room,now]).unwrap();
+                db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'speech','transcript',?2,?3)",params![f.call,json!({"role":"user"}).to_string(),now-8000]).unwrap();
+                let seq = db.last_insert_rowid();
+                db.execute("INSERT INTO companion_delegations(call_id,id,offset_ms,state,message_id,created_at,source) VALUES(?1,'cue',100,'dispatched','m',?2,?3)",params![f.call,now-7000,json!({"fragments":[{"seq":seq,"role":"user"}]}).to_string()]).unwrap();
+                assert!(crate::companion::wait_cue_current(&db, &f.call, "cue").unwrap());
+                db.execute(
+                    "UPDATE companion_surfaces SET user_speaking=1 WHERE call_id=?1",
+                    [&f.call],
+                )
+                .unwrap();
+            }
+            let mut cue = update("cue-event", "Fixture waiting cue");
+            cue["channel"] = json!("commentary");
+            enqueue_batch(&f.s, &f.call, "wait-cue:cue", vec![cue]).unwrap();
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none());
+            {
+                let db = f.s.db.lock().unwrap();
+                match change {
+                    "correction" | "spoken_ack" => {
+                        let role = if change == "correction" {
+                            "user"
+                        } else {
+                            "assistant"
+                        };
+                        db.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,'more','transcript',?2,?3)",params![f.call,json!({"role":role}).to_string(),now-3000]).unwrap();
+                    }
+                    "completed" => {
+                        db.execute(
+                            "UPDATE input_deliveries SET state='completed' WHERE id='d'",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    "expired" => {
+                        db.execute(
+                            "UPDATE companion_delegations SET created_at=?1 WHERE id='cue'",
+                            [now - 21000],
+                        )
+                        .unwrap();
+                    }
+                    "blocked" => {
+                        db.execute(
+                            "UPDATE input_deliveries SET state='unknown' WHERE id='d'",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                db.execute(
+                    "UPDATE companion_surfaces SET user_speaking=0 WHERE call_id=?1",
+                    [&f.call],
+                )
+                .unwrap();
+            }
+            assert!(take_ready(&f.s, &f.call).unwrap().is_none(), "{change}");
+            let saved:String=f.s.db.lock().unwrap().query_row("SELECT state FROM companion_voice_batches WHERE call_id=?1 AND semantic_key='wait-cue:cue'",[&f.call],|r|r.get(0)).unwrap();
+            assert_eq!(saved, "superseded", "{change}");
+        }
+    }
+
     fn update(id: &str, text: &str) -> Value {
         json!({"op":"append","channel":"thinking","event_id":id,"delegation_id":null,"content":text})
     }

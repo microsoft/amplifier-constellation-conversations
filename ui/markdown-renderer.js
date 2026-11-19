@@ -5,6 +5,10 @@
     gfm: true,
     breaks: true,
     renderer: {
+      code({lang,text}) {
+        if (!['svg','mermaid','html'].includes(lang)) return false;
+        return `<pre><code title="artifact-${lang}">${escape(text)}</code></pre>`;
+      },
       html({text}) { return escape(text); },
       // Do not let model-written URLs silently fetch images in the user's browser.
       image({href, text}) { return `<a href="${escape(href)}">${escape(text || 'Image')}</a>`; },
@@ -35,6 +39,10 @@
     for (const input of fragment.querySelectorAll('input')) {
       if (input.type !== 'checkbox') input.remove();
       else input.disabled = true;
+    }
+    for (const code of fragment.querySelectorAll('pre > code[title^="artifact-"]')) {
+      const kind=code.title.slice('artifact-'.length);
+      code.parentElement.replaceWith(roomArtifacts.renderSource(kind,code.textContent));
     }
     const output = document.createElement('div');
     output.append(fragment);

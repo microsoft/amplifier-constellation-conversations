@@ -71,6 +71,7 @@ export function installSetup({api, getSession, signedIn, refreshContacts, showLo
       if ((setup.voices || []).includes('marin')) $('setup-voice').value = 'marin';
       const selectionChanged = () => {
         const saved = agents.find(agent => agent.id === $('setup-agent').value)?.voice_configured === true;
+        $('refresh-contact-portrait').hidden = !saved;
         $('setup-voice-fields').hidden = saved;
         $('setup-voice').disabled = saved;
         $('save-contact').textContent = saved ? 'Done' : 'Add contact';
@@ -89,6 +90,21 @@ export function installSetup({api, getSession, signedIn, refreshContacts, showLo
       if (generation === setupGeneration) { $('contact-setup').hidden = false; error('contact-setup-status',failure.message); }
     }
   }
+  $('refresh-contact-portrait').onclick = async () => {
+    const agent = $('setup-agent').value, generation = setupGeneration;
+    $('refresh-contact-portrait').disabled = true;
+    try {
+      const result = await api(`/api/v1/agents/${encodeURIComponent(agent)}/portrait`, 'POST', {});
+      if (generation !== setupGeneration || !getSession()?.admin) return;
+      await refreshContacts();
+      if (!getSession()?.admin) return;
+      $('setup-agent').value = agent;
+      $('setup-agent').onchange?.();
+      error('contact-setup-status', result.avatar_digest ? 'Contact image refreshed.' : 'This agent has no uploaded portrait. Its initials will be shown.');
+    } catch (failure) {
+      if (generation === setupGeneration) error('contact-setup-status',failure.message);
+    } finally { $('refresh-contact-portrait').disabled = false; }
+  };
   $('contact-setup-form').onsubmit = async event => {
     event.preventDefault();
     const generation = setupGeneration;

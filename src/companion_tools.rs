@@ -128,6 +128,10 @@ fn own_tool_shape_valid(tool: &str, args: &Value) -> bool {
         "companion_shared" => args.as_object().is_some_and(|a| {
             a.is_empty()
                 || (a.len() == 1
+                    && a.get("note_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::room_notes::valid_id))
+                || (a.len() == 1
                     && a.get("awareness_id")
                         .and_then(Value::as_str)
                         .is_some_and(valid_awareness_id))
@@ -404,26 +408,39 @@ fn authorize_scope(
     h: &HeaderMap,
     saved_receipt: bool,
 ) -> ApiResult<(String, String, String)> {
-    if !config(s)?.enabled {
+    let credential = call_credential(s, h)?;
+    let identity = active_or_retained_grant(&s.db.lock().unwrap(), id, credential, saved_receipt)?;
+    if !crate::companion::room_identity_valid(s, &identity.2)? {
         return Err(ApiError::forbidden());
     }
-    if h.contains_key("origin") {
+    Ok(identity)
+}
+
+fn call_credential<'a>(s: &AppState, headers: &'a HeaderMap) -> ApiResult<&'a str> {
+    if !config(s)?.enabled || headers.contains_key("origin") {
         return Err(ApiError::forbidden());
     }
-    let supplied = h
+    headers
         .get("authorization")
         .and_then(|x| x.to_str().ok())
         .and_then(|x| x.strip_prefix("Bearer "))
-        .ok_or_else(ApiError::unauthorized)?;
-    let row: Option<(String,String,String,String)> = s.db.lock().unwrap().query_row("SELECT c.owner,c.agent_id,c.conversation_id,g.token FROM companion_calls c JOIN companion_tool_grants g ON c.id=g.call_id WHERE c.id=?1 AND (?2 OR c.state IN ('connecting','connected'))",params![id,saved_receipt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        .ok_or_else(ApiError::unauthorized)
+}
+
+fn active_or_retained_grant(
+    db: &rusqlite::Connection,
+    id: &str,
+    credential: &str,
+    saved_receipt: bool,
+) -> ApiResult<(String, String, String)> {
+    let row: Option<(String,String,String,String)> = db.query_row("SELECT c.owner,c.agent_id,c.conversation_id,g.token FROM companion_calls c JOIN companion_tool_grants g ON c.id=g.call_id WHERE c.id=?1 AND (?2 OR c.state IN ('connecting','connected'))",params![id,saved_receipt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let (owner, agent, room, token) = row.ok_or_else(ApiError::missing)?;
-    if auth::digest(supplied) != auth::digest(&token)
-        || !crate::companion::room_identity_valid(s, &room)?
-    {
+    if auth::digest(credential) != auth::digest(&token) {
         return Err(ApiError::forbidden());
     }
     Ok((owner, agent, room))
 }
+
 pub async fn mcp(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -900,6 +917,9 @@ async fn invoke(command: &[String], input: &Value) -> Result<Value> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Show {
+    note_id: Option<String>,
+    request_id: Option<String>,
+    expected_revision: Option<i64>,
     url: Option<String>,
     text: Option<String>,
     title: String,
@@ -907,6 +927,21 @@ pub struct Show {
     kind: Option<String>,
 }
 fn valid_show(v: &Show) -> bool {
+    if v.note_id.is_some() || v.request_id.is_some() || v.expected_revision.is_some() {
+        return v
+            .note_id
+            .as_deref()
+            .is_some_and(crate::room_notes::valid_id)
+            && v.request_id
+                .as_deref()
+                .is_some_and(crate::room_notes::valid_id)
+            && v.expected_revision.is_some_and(|rev| rev >= 0)
+            && v.url.is_none()
+            && v.kind.as_deref().is_none_or(|kind| kind == "note")
+            && v.text
+                .as_deref()
+                .is_some_and(|text| crate::room_notes::valid_text(&v.title, text));
+    }
     !v.title.trim().is_empty()
         && v.title.len() <= 300
         && !v.title.contains(['\n', '\r'])
@@ -925,9 +960,12 @@ fn valid_show(v: &Show) -> bool {
             (None, Some(text)) => {
                 !text.trim().is_empty()
                     && text.len() <= 1200
-                    && v.kind.as_deref().is_none_or(|kind| kind == "note")
+                    && v.kind
+                        .as_deref()
+                        .is_none_or(|kind| matches!(kind, "note" | "markdown"))
             }
-            _ => false,
+            (None, None) => v.kind.as_deref() == Some("portrait"),
+            (Some(_), Some(_)) => false,
         }
 }
 
@@ -937,38 +975,100 @@ pub async fn show(
     h: HeaderMap,
     Json(v): Json<Show>,
 ) -> ApiResult<Json<Value>> {
-    let (_, agent, room) = authorize_effect(&s, &id, &h)?;
+    let credential = call_credential(&s, &h)?;
+    let mut db = s.db.lock().unwrap();
+    let tx = db.transaction()?;
+    let (owner, agent, room) = active_or_retained_grant(&tx, &id, credential, false)?;
+    // The grant, original private audience and selected endpoint must still agree
+    // in the transaction that writes the card, attachment or durable note.
+    if !crate::companion_history::private_identity(&tx, &id)?
+        .is_some_and(|call| call.owner == owner && call.agent == agent && call.room == room)
+        || crate::huddle_delivery::active_quiet_peer_turn(&tx, &id, &room, &agent)?
+    {
+        return Err(ApiError::forbidden());
+    }
     if !valid_show(&v) {
         return Err(ApiError::bad("Unsupported shared artifact"));
     }
     let eid = uuid::Uuid::new_v4().to_string();
-    let note = v.text.is_some();
-    let data = json!({"title":v.title,"text":v.text.or_else(||v.url.clone()),"url":v.url,"kind":v.kind.unwrap_or_else(||if note {"note".into()} else {"auto".into()}),"conversation_id":room,"presentation":"current"});
-    let count: i64 = s.db.lock().unwrap().query_row(
-        "SELECT COUNT(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
+    if let Some(note_id) = v.note_id {
+        let edit = crate::room_notes::Edit {
+            title: v.title,
+            text: v.text.unwrap(),
+            request_id: v.request_id.unwrap(),
+            expected_revision: v.expected_revision.unwrap(),
+        };
+        let mut result = crate::room_notes::put(&tx, &room, &note_id, &agent, &edit)?;
+        let key = format!("room-note:{note_id}");
+        let existing:Option<i64>=tx.query_row("SELECT seq FROM companion_events WHERE call_id=?1 AND event_key=?2 AND kind='card'",params![id,key],|r|r.get(0)).optional()?;
+        let card = if let Some(seq) = existing {
+            if result["replayed"] != true {
+                notify_note_edit(&tx, &room, &note_id)?;
+            }
+            seq
+        } else {
+            let count: i64 = tx.query_row(
+                "SELECT count(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if count >= 128 {
+                return Err(ApiError::bad("Shared space reached its artifact limit"));
+            }
+            let mut data =
+                crate::room_notes::note(&tx, &room, &note_id)?.ok_or_else(ApiError::missing)?;
+            data["kind"] = json!("note");
+            data["conversation_id"] = json!(room);
+            data["presentation"] = json!("current");
+            tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'card',?3,?4)",params![id,key,data.to_string(),now_ms()])?;
+            tx.last_insert_rowid()
+        };
+        result["card_id"] = json!(card.to_string());
+        tx.commit()?;
+        drop(db);
+        s.changed();
+        return Ok(Json(result));
+    }
+    let count: i64 = tx.query_row(
+        "SELECT count(*) FROM companion_events WHERE call_id=?1 AND kind='card'",
         [&id],
         |r| r.get(0),
     )?;
     if count >= 128 {
         return Err(ApiError::bad("Shared space reached its artifact limit"));
     }
-    let db = s.db.lock().unwrap();
-    if crate::huddle_delivery::active_quiet_peer_turn(&db, &id, &room, &agent)? {
-        return Err(ApiError::forbidden());
+    let note = v.text.is_some();
+    let mut data = json!({"title":v.title,"text":v.text.or_else(||v.url.clone()),"url":v.url,"kind":v.kind.unwrap_or_else(||if note {"note".into()} else {"auto".into()}),"conversation_id":room,"presentation":"current"});
+    if data["kind"] == "portrait" {
+        data["attachments"] = json!([crate::agent_portraits::share(&tx, &agent, &room, &v.title)?]);
     }
-    db.execute(
+    tx.execute(
         "INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'card',?3,?4)",
         params![id, eid, data.to_string(), now_ms()],
     )?;
+    let seq = tx.last_insert_rowid();
+    tx.commit()?;
     drop(db);
     s.changed();
     Ok(Json(
-        json!({"state":"saved","presentation":"requested_current","event_id":eid,"card_id":s.db.lock().unwrap().query_row("SELECT seq FROM companion_events WHERE call_id=?1 AND event_key=?2",params![id,eid],|r|r.get::<_,i64>(0))?.to_string(),"note":"Saved in this call and offered to the limited whiteboard. Pinned or currently read items can keep it in history; companion_surface_status reports current board IDs. Saved does not prove displayed, opened, played or watched."}),
+        json!({"state":"saved","presentation":"requested_current","event_id":eid,"card_id":seq.to_string(),"note":"Saved in this call and offered to the limited whiteboard. Pinned or currently read items can keep it in history; companion_surface_status reports current board IDs. Saved does not prove displayed, opened, played or watched."}),
     ))
+}
+/// Publish a new revision to the original card, keeping its board position and identity.
+pub fn notify_note_edit(tx: &rusqlite::Transaction, room: &str, id: &str) -> ApiResult<()> {
+    let board:Option<(String,i64)>=tx.query_row("SELECT c.id,e.seq FROM companion_calls c JOIN companion_events e ON e.call_id=c.id WHERE c.conversation_id=?1 AND c.state IN ('connecting','connected') AND e.kind='card' AND e.event_key=?2",params![room,format!("room-note:{id}")],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((call, card)) = board {
+        let mut data = crate::room_notes::note(tx, room, id)?.ok_or_else(ApiError::missing)?;
+        data["card_id"] = json!(card.to_string());
+        let key = format!("room-note:{id}:{}", data["revision"]);
+        tx.execute("INSERT INTO companion_events(call_id,event_key,kind,data,at) VALUES(?1,?2,'room_note_edit',?3,?4)",params![call,key,data.to_string(),now_ms()])?;
+    }
+    Ok(())
 }
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SharedQuery {
+    note_id: Option<String>,
     awareness_id: Option<String>,
 }
 fn valid_awareness_id(id: &str) -> bool {
@@ -985,6 +1085,14 @@ pub async fn shared(
 ) -> ApiResult<Json<Value>> {
     let (_, _, room) = authorize(&s, &id, &h)?;
     let db = s.db.lock().unwrap();
+    if let Some(note_id) = query.note_id {
+        if !crate::room_notes::valid_id(&note_id) || query.awareness_id.is_some() {
+            return Err(ApiError::bad("Invalid note lookup"));
+        }
+        return Ok(Json(
+            crate::room_notes::note(&db, &room, &note_id)?.ok_or_else(ApiError::missing)?,
+        ));
+    }
     if let Some(awareness_id) = query.awareness_id {
         if !valid_awareness_id(&awareness_id) {
             return Err(ApiError::bad("Invalid awareness identity"));
@@ -1006,6 +1114,16 @@ pub async fn shared(
     }
     let items=db.prepare("SELECT id,name,mime_type,bytes FROM attachments WHERE conversation_id=?1 ORDER BY created_at DESC LIMIT 16")?.query_map([&room],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"mime_type":r.get::<_,String>(2)?,"bytes":r.get::<_,i64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let shown=db.prepare("SELECT data,seq FROM companion_events WHERE call_id=?1 AND kind='card' ORDER BY seq DESC LIMIT 16")?.query_map([&id],|r|{let data:String=r.get(0)?;let mut value=serde_json::from_str::<Value>(&data).unwrap_or(Value::Null);value["card_id"]=json!(r.get::<_,i64>(1)?.to_string());Ok(value)})?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut shown = shown;
+    for item in &mut shown {
+        if let Some(note_id) = item["note_id"].as_str()
+            && let Some(latest) = crate::room_notes::note(&db, &room, note_id)?
+        {
+            for field in ["title", "text", "revision"] {
+                item[field] = latest[field].clone();
+            }
+        }
+    }
     Ok(Json(
         json!({"items":items,"shown":shown,"note":"Availability is not image understanding; ask through the existing attachment path."}),
     ))

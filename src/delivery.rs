@@ -200,9 +200,12 @@ fn deferred_until(db: &Connection, room: &str) -> Result<Option<i64>> {
 }
 /// Explain the existing no-replay fence without changing or acknowledging it.
 /// A locally received input behind this fence has not reached a model turn.
+/// States that require an explicit delivery review before further prompts.
+pub(crate) const REVIEW_STATES: &str = "('unknown','notAccepted')";
+
 pub(crate) fn blockers(state: &AppState, room: &str, agent: &str) -> Result<Vec<Value>> {
     let db = state.db.lock().unwrap();
-    Ok(db.prepare("SELECT id,message_id,state,target_turn FROM input_deliveries WHERE conversation_id=?1 AND agent_id=?2 AND state IN ('unknown','notAccepted') ORDER BY sequence")?
+    Ok(db.prepare(&format!("SELECT id,message_id,state,target_turn FROM input_deliveries WHERE conversation_id=?1 AND agent_id=?2 AND state IN {REVIEW_STATES} ORDER BY sequence"))?
         .query_map(params![room,agent],|r|Ok(json!({"input_id":r.get::<_,String>(0)?,"message_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"target_turn":r.get::<_,Option<String>>(3)?})))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }

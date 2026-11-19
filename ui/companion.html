@@ -44,7 +44,7 @@
         <div id="contacts" class="contacts" aria-label="Your agent contacts"></div>
         <p id="empty-contacts" class="empty-state" hidden>Add an agent to your contacts to start a conversation.</p>
         <details id="contact-setup" class="contact-setup" hidden><summary>Add an agent</summary>
-          <form id="contact-setup-form"><h2>Choose a saved connection</h2><label for="setup-agent">Agent</label><select id="setup-agent" required></select><p id="setup-agent-note" class="small"></p>
+          <form id="contact-setup-form"><h2>Choose a saved connection</h2><label for="setup-agent">Agent</label><select id="setup-agent" required></select><p id="setup-agent-note" class="small"></p><button id="refresh-contact-portrait" class="text-button" hidden type="button">Refresh contact image</button>
             <div id="setup-voice-fields"><label for="setup-voice">Voice</label><select id="setup-voice" required></select></div>
             <div id="setup-key-fields"><label for="setup-openai-key">OpenAI API key</label><input id="setup-openai-key" type="password" autocomplete="off" maxlength="8192" spellcheck="false" aria-describedby="setup-key-note"></div><p id="setup-key-note" class="small"></p>
             <p class="small">Voice uses OpenAI GPT-Live. Saving a contact does not start a call or test your key.</p><button id="save-contact" class="primary" type="submit">Add contact</button><p id="contact-setup-status" role="status"></p>
@@ -84,7 +84,7 @@
           <button id="permission-alert" class="secondary permission-alert" type="button" hidden>Review requested action</button>
           <div id="work-status" class="work-status" role="status" hidden></div>
           <details id="call-huddles" class="linked-huddles" hidden><summary>Work huddles <span id="call-huddle-count"></span></summary><div id="call-huddle-view"></div></details>
-            <div class="share-toolbar"><button id="show-paste" class="text-button" type="button" aria-label="Paste text or an image">Paste</button><button id="choose-files" class="secondary" type="button" disabled>Share files</button><input id="share-files" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,.md,.txt,.csv,.json" hidden></div>
+            <div class="share-toolbar"><button id="show-paste" class="text-button" type="button" aria-label="Paste text or an image">Paste</button><button id="choose-files" class="secondary" type="button" disabled>Share files</button><input id="share-files" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,.md,.txt,.csv,.json,.svg,.mmd,.mermaid,.html,.htm" hidden></div>
             <form id="paste-composer" class="paste-composer" hidden><label class="sr-only" for="paste-input">Paste text or an image here</label><textarea id="paste-input" rows="1" placeholder="Paste text or an image here…"></textarea><button id="share-text" class="secondary" type="submit">Share</button></form>
           <section id="space-panel" role="tabpanel" aria-labelledby="space-tab" tabindex="0">
             <div id="call-permissions" aria-live="polite"></div>
@@ -105,10 +105,51 @@
           <section id="context-panel" role="tabpanel" aria-labelledby="context-tab" tabindex="0" hidden><p class="context-note">What this call supplied, and what connected services reported. Delivery receipts do not show what the agent understood or what you heard. Open an item to see its text and source.</p><p class="small">This is a record of supplied context, not a complete view of the model’s current memory. Older entries may have been replaced or summarized.</p><div id="context-items" class="context-items" aria-live="off"></div><p id="context-empty" class="empty-state">No context receipts have arrived yet. This does not mean the agent has no context.</p></section><button id="context-new" class="new-items secondary" type="button" hidden>New context ↓</button>
         </div>
       </section>
-      <section id="call-ended" class="ended-card" hidden><p class="eyebrow">BACK WHEN YOU NEED THEM</p><h1 id="ended-title">Call ended.</h1><p id="ended-detail">Your microphone and camera are off.</p><div class="ended-actions"><button id="back-to-contacts" class="primary">Back to contacts</button><a id="ended-work-link" class="secondary" href="/" target="constellation-work" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a></div></section>
+      <section id="call-ended" class="ended-card" aria-labelledby="ended-title" hidden>
+        <p class="eyebrow">BACK WHEN YOU NEED THEM</p>
+        <h1 id="ended-title">Call ended</h1>
+        <p id="ended-detail" role="status">Your microphone and camera are off.</p>
+        <div class="ended-actions">
+          <button id="back-to-contacts" class="primary" type="button">Back to contacts</button>
+          <button id="call-again" class="secondary" type="button" disabled>Call again</button>
+          <a id="ended-work-link" class="secondary" href="/" target="constellation-work" hidden>Continue in Conversations <span aria-hidden="true">↗</span></a>
+        </div>
+      </section>
     </div>
   </main>
-  <dialog id="voice-settings" class="voice-settings" aria-labelledby="voice-settings-title"><form id="voice-settings-form"><h2 id="voice-settings-title">Voice settings</h2><p id="voice-settings-note">Your selection applies to the next call.</p><dl id="voice-model-facts" class="model-facts"></dl><details id="voice-advanced" hidden><summary>Advanced · reported settings</summary><p>Reported by this agent. These settings are read-only here.</p><dl id="voice-advanced-facts" class="model-facts"></dl></details><label for="voice-choice">Voice</label><select id="voice-choice" disabled></select><p id="voice-settings-status" role="status"></p><div class="photo-actions"><button id="save-voice" class="primary" type="submit" disabled>Save voice</button><button id="close-voice-settings" class="text-button" type="button">Close</button></div></form></dialog>
+  <dialog id="voice-settings" class="voice-settings" aria-labelledby="voice-settings-title">
+    <form id="voice-settings-form">
+      <header class="voice-heading">
+        <h2 id="voice-settings-title">Voice settings</h2>
+        <p id="voice-settings-note">Choose a voice for your next call.</p>
+      </header>
+      <div class="voice-scroll">
+        <div id="voice-filters" class="voice-filters" hidden>
+          <label>Voice presentation<select id="voice-filter-presentation"></select></label>
+          <label>Regional influence<select id="voice-filter-region"></select></label>
+          <label>Language<select id="voice-filter-language"></select></label>
+        </div>
+        <div class="voice-list-heading">
+          <span id="voice-result-count" role="status"></span>
+          <button id="voice-reset-filters" type="button" class="text-button" hidden>Clear filters</button>
+        </div>
+        <fieldset id="voice-choice" aria-label="Available voices" disabled></fieldset>
+        <p id="voice-no-matches" hidden>No voices match these filters.</p>
+        <details class="voice-model-details"><summary>Model details</summary>
+          <dl id="voice-model-facts" class="model-facts"></dl>
+          <details id="voice-advanced" hidden><summary>Advanced settings</summary><p>Reported by this agent. These settings are read-only here.</p><dl id="voice-advanced-facts" class="model-facts"></dl></details>
+        </details>
+      </div>
+      <footer class="voice-footer">
+        <div class="voice-notices"><p id="voice-preview-status" role="status"></p><p id="voice-settings-status" role="status"></p></div>
+        <div class="voice-footer-controls">
+          <span id="voice-selection-summary"></span>
+          <button id="close-voice-settings" class="text-button" type="button">Close</button>
+          <button id="save-voice" class="primary" type="submit" disabled>Save voice</button>
+        </div>
+      </footer>
+    </form>
+  </dialog>
   <audio id="remote-audio" autoplay playsinline></audio>
   <footer class="site-footer"><span>Companion · Constellation</span><span>Your voice. Your agent. A little more room.</span></footer>
 </body>

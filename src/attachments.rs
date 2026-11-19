@@ -35,6 +35,12 @@ pub async fn list(
     let items=q.query_map(params![id,p.actor],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"mime_type":r.get::<_,String>(2)?,"bytes":r.get::<_,i64>(3)?,"message_id":r.get::<_,Option<String>>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(json!({"items":items})))
 }
+const TEXT_LIMIT: usize = 200_000;
+
+fn valid_text(data: &[u8]) -> bool {
+    data.len() <= TEXT_LIMIT && std::str::from_utf8(data).is_ok_and(|s| !s.contains('\0'))
+}
+
 pub async fn upload(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
@@ -66,9 +72,8 @@ pub async fn upload(
         return Err(ApiError::bad("Choose a file between 1 byte and 2 MB"));
     }
     let valid = match u.mime_type.as_str() {
-        "text/plain" | "text/markdown" | "text/csv" | "application/json" => {
-            data.len() <= 200_000 && std::str::from_utf8(&data).is_ok_and(|s| !s.contains('\0'))
-        }
+        "text/plain" | "text/markdown" | "text/csv" | "application/json" | "text/vnd.mermaid"
+        | "image/svg+xml" | "text/html" => valid_text(&data),
         "image/png" => data.starts_with(b"\x89PNG\r\n\x1a\n"),
         "image/jpeg" => data.starts_with(b"\xff\xd8\xff"),
         "image/gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
@@ -78,7 +83,7 @@ pub async fn upload(
     };
     if !valid {
         return Err(ApiError::bad(
-            "Use a PDF or PNG, JPEG, GIF or WebP image up to 2 MB, or a UTF-8 text, Markdown, CSV or JSON file up to 200 KB.",
+            "Use a PDF or PNG, JPEG, GIF or WebP image up to 2 MB, or a UTF-8 document up to 200 KB (text, Markdown, Mermaid, SVG, HTML, CSV or JSON).",
         ));
     }
     let aid = uuid::Uuid::new_v4().to_string();
@@ -123,7 +128,7 @@ pub async fn download(
         .collect();
     let disposition = format!(
         "{}; filename=\"{safe_name}\"",
-        if mime.starts_with("image/") {
+        if mime.starts_with("image/") && mime != "image/svg+xml" {
             "inline"
         } else {
             "attachment"
@@ -131,7 +136,14 @@ pub async fn download(
     );
     Ok((
         [
-            (header::CONTENT_TYPE, mime),
+            (
+                header::CONTENT_TYPE,
+                if mime == "text/html" || mime == "image/svg+xml" {
+                    "text/plain; charset=utf-8".to_string()
+                } else {
+                    mime
+                },
+            ),
             (header::CONTENT_DISPOSITION, disposition),
         ],
         data,
@@ -163,7 +175,7 @@ pub fn prompt_content(
     let mut blocks = Vec::new();
     for id in ids {
         let (name,mime,data):(String,String,Vec<u8>)=db.query_row("SELECT name,mime_type,data FROM attachments WHERE id=?1 AND conversation_id=?2 AND message_id IS NOT NULL",params![id,room],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        if mime.starts_with("image/") {
+        if mime.starts_with("image/") && mime != "image/svg+xml" {
             if capabilities["promptCapabilities"]["image"] == true {
                 blocks.push(json!({"type":"text","text":format!("Attached image: {name}")}));
                 blocks.push(json!({"type":"image","mimeType":mime,"data":STANDARD.encode(data)}));
@@ -199,21 +211,44 @@ pub fn receive(
     block: &Value,
 ) -> anyhow::Result<bool> {
     use anyhow::{Context, ensure};
-    let (mime, data) = match block["type"].as_str() {
-        Some("image" | "audio") => (block["mimeType"].as_str(), block["data"].as_str()),
-        Some("resource") => (
-            block["resource"]["mimeType"].as_str(),
-            block["resource"]["blob"].as_str(),
-        ),
+    let content = match block["type"].as_str() {
+        Some("image" | "audio") => block,
+        Some("resource") => &block["resource"],
         _ => return Ok(false),
     };
-    let mime = mime.context("Output media type missing")?;
-    let data = data.context("Output media data missing")?;
-    ensure!(
-        data.len() <= 16 * 1024 * 1024,
-        "Generated file exceeds 12 MB"
-    );
-    let bytes = STANDARD.decode(data)?;
+    let mime = content["mimeType"]
+        .as_str()
+        .context("Output media type missing")?;
+    let text_format = match mime {
+        "text/markdown" => Some("md"),
+        "text/html" => Some("html"),
+        "image/svg+xml" => Some("svg"),
+        "text/vnd.mermaid" => Some("mmd"),
+        "text/plain" => Some("txt"),
+        _ => None,
+    };
+    let bytes = if let Some(text) = content["text"]
+        .as_str()
+        .filter(|_| block["type"] == "resource")
+    {
+        ensure!(
+            text_format.is_some() && valid_text(text.as_bytes()),
+            "Unsupported or oversized generated text resource"
+        );
+        text.as_bytes().to_vec()
+    } else {
+        let data = if block["type"] == "resource" {
+            &content["blob"]
+        } else {
+            &content["data"]
+        };
+        let data = data.as_str().context("Output media data missing")?;
+        ensure!(
+            data.len() <= 16 * 1024 * 1024,
+            "Generated file exceeds 12 MB"
+        );
+        STANDARD.decode(data)?
+    };
     ensure!(
         !bytes.is_empty() && bytes.len() <= 12 * 1024 * 1024,
         "Generated file exceeds limit"
@@ -226,8 +261,8 @@ pub fn receive(
         "audio/wav" => "wav",
         "audio/mpeg" => "mp3",
         "application/pdf" => "pdf",
-        "text/plain" => "txt",
-        _ => "bin",
+        "text/plain" => "txt", // Preserve existing generated text-blob limit.
+        _ => text_format.filter(|_| valid_text(&bytes)).unwrap_or("bin"),
     };
     let mime = if ext == "bin" {
         "application/octet-stream"
